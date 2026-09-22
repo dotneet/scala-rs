@@ -3824,8 +3824,28 @@ impl Typer {
             {
                 search = self.search_implicit(want);
             }
-            if search.is_found()
-                || self.classtag_apply_fallback(want, span).is_some()
+            if let ImplicitSearch::Found(found) = &search {
+                // A signature-level implicit fit can still fail when one of
+                // its nested macro witnesses is materialized. Such a witness
+                // cannot make this conversion applicable. Probe it here,
+                // while the view is still only a candidate, and roll back
+                // diagnostics before considering another view. A direct macro
+                // abort without a missing implicit stays a candidate: its
+                // own error is reported if the conversion is selected.
+                let mark = self.diags.len();
+                let missing_before = self.missing_implicit_count.get();
+                let mut witness = self.implicit_tree(*found, want, span, 0);
+                if !witness.ty.is_error() {
+                    self.adapt(&mut witness, want);
+                }
+                let failed = witness.ty.is_error() || self.error_count_since(mark) > 0;
+                let missing_evidence = self.missing_implicit_count.get() != missing_before;
+                self.diags.truncate(mark);
+                if !failed || !missing_evidence {
+                    continue;
+                }
+            }
+            if self.classtag_apply_fallback(want, span).is_some()
                 || (matches!(search, ImplicitSearch::None) && self.manifest_available(want, 0))
             {
                 continue;

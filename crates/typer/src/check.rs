@@ -718,6 +718,10 @@ pub struct Typer {
     /// parameter (solve `?A := B`) as readily as the other way round, and the
     /// pair came out `ambiguous overload` where nsc takes the monomorphic one.
     pub(crate) spec_probe: std::cell::Cell<bool>,
+    /// Counts implicit-argument failures, including ones reported during
+    /// macro expansion, so a speculative conversion can distinguish missing
+    /// evidence from a macro that deliberately aborts its own application.
+    pub(crate) missing_implicit_count: std::cell::Cell<u64>,
     /// Set while an argument list is being retried packed into a tuple.
     ///
     /// The retry builds a fresh `TupleN(a, b)` node and types it as the sole
@@ -1251,6 +1255,7 @@ impl Typer {
             join_parents_done: rustc_hash::FxHashSet::default(),
             relaxed_pt_depth: 0,
             spec_probe: std::cell::Cell::new(false),
+            missing_implicit_count: std::cell::Cell::new(0),
             tupling: false,
             parent_ctx: None,
             parent_arg_scope: None,

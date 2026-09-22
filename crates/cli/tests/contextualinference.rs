@@ -209,6 +209,120 @@ object Main {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn failed_derived_evidence_does_not_claim_an_implicit_view() {
+    let Some(jars) = cached_circe() else {
+        eprintln!("skip: Circe derivation jars are not cached");
+        return;
+    };
+    let cp = format!(
+        "{JAR}:{}",
+        jars.iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(":")
+    );
+    matrix_cp(&[("failed_derived_view", true)], false, &cp);
+}
+
+#[test]
+fn explicit_macro_abort_in_view_evidence_remains_an_error() {
+    let Some(jars) = cached_circe() else {
+        eprintln!("skip: Scala macro jars are not cached");
+        return;
+    };
+    let reflect = jars
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n == "scala-reflect-2.13.16.jar")
+        })
+        .unwrap();
+    let compiler = jars
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .is_some_and(|n| n == "scala-compiler-2.13.16.jar")
+        })
+        .unwrap();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("view-macro-abort-{stamp}"));
+    fs::create_dir(&root).unwrap();
+    let producer = root.join("Producer.scala");
+    let consumer = root.join("Consumer.scala");
+    fs::write(
+        &producer,
+        r#"
+import scala.language.experimental.macros
+import scala.reflect.macros.blackbox
+trait Show[A]
+object Show { implicit def derived[A]: Show[A] = macro Macros.noShow[A] }
+object Macros {
+  def noShow[A: c.WeakTypeTag](c: blackbox.Context): c.Expr[Show[A]] =
+    c.abort(c.enclosingPosition, "no instance")
+}
+class Box
+object Box {
+  implicit def boxApply(x: Box): ((Int, Int) => Int) => Int = f => f(2, 3)
+}
+trait Low {
+  implicit def response[A: Show](a: A): String => String = identity
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &consumer,
+        r#"
+import scala.language.implicitConversions
+object Main extends Low {
+  val box = new Box
+  val result = box { (x: Int, y: Int) => x + y }
+}
+"#,
+    )
+    .unwrap();
+    let cp = format!("{JAR}:{}:{}", reflect.display(), compiler.display());
+    let built = root.join("producer");
+    fs::create_dir(&built).unwrap();
+    let p = Command::new("/tmp/scala-2.13.16/bin/scalac")
+        .args(["-cp", &cp, "-d"])
+        .arg(&built)
+        .arg(&producer)
+        .output()
+        .unwrap();
+    assert!(p.status.success(), "{}", String::from_utf8_lossy(&p.stderr));
+    let cp = format!("{cp}:{}", built.display());
+    for nsc in [true, false] {
+        let output = root.join(if nsc { "nsc" } else { "native" });
+        fs::create_dir(&output).unwrap();
+        let mut cmd = Command::new(if nsc {
+            "/tmp/scala-2.13.16/bin/scalac"
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            cmd.args(["compile", "--scala-library", JAR]);
+        }
+        let p = cmd
+            .args(["-cp", &cp, "-d"])
+            .arg(&output)
+            .arg(&consumer)
+            .output()
+            .unwrap();
+        assert!(!p.status.success(), "nsc={nsc}");
+        assert!(
+            String::from_utf8_lossy(&p.stderr).contains("no instance"),
+            "nsc={nsc}: {}",
+            String::from_utf8_lossy(&p.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn cached_cats() -> Option<Vec<PathBuf>> {
     let home = std::env::var_os("HOME")?;
     let mut jars = Vec::new();
@@ -223,6 +337,34 @@ fn cached_cats() -> Option<Vec<PathBuf>> {
         jars.push(jar);
     }
     Some(jars)
+}
+
+fn cached_circe() -> Option<Vec<PathBuf>> {
+    let home = std::env::var_os("HOME")?;
+    let artifacts = [
+        "com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar",
+        "io/circe/circe-core_2.13/0.14.7/circe-core_2.13-0.14.7.jar",
+        "io/circe/circe-generic_2.13/0.14.7/circe-generic_2.13-0.14.7.jar",
+        "io/circe/circe-numbers_2.13/0.14.7/circe-numbers_2.13-0.14.7.jar",
+        "org/typelevel/cats-core_2.13/2.11.0/cats-core_2.13-2.11.0.jar",
+        "org/typelevel/cats-kernel_2.13/2.11.0/cats-kernel_2.13-2.11.0.jar",
+        "org/scala-lang/scala-reflect/2.13.16/scala-reflect-2.13.16.jar",
+        "org/scala-lang/scala-compiler/2.13.16/scala-compiler-2.13.16.jar",
+    ];
+    artifacts
+        .into_iter()
+        .map(|artifact| {
+            ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+                .into_iter()
+                .map(|cache| {
+                    PathBuf::from(&home)
+                        .join(cache)
+                        .join("https/repo1.maven.org/maven2")
+                        .join(artifact)
+                })
+                .find(|path| path.is_file())
+        })
+        .collect()
 }
 
 fn fixture(name: &str) -> PathBuf {

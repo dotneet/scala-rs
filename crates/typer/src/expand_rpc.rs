@@ -651,6 +651,8 @@ impl Typer {
                             .any(|(prior, wanted)| *prior == origin && wanted == pt)
                         {
                             self.diags.truncate(mark);
+                            self.missing_implicit_count
+                                .set(self.missing_implicit_count.get().wrapping_add(1));
                             if !silent {
                                 self.error(
                                     span,
@@ -698,6 +700,8 @@ impl Typer {
                 }
                 crate::implicits::ImplicitSearch::None => {
                     self.diags.truncate(mark);
+                    self.missing_implicit_count
+                        .set(self.missing_implicit_count.get().wrapping_add(1));
                     if !silent {
                         self.error(span, self.missing_implicit_message(pt, None));
                     }

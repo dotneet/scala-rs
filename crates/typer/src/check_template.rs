@@ -3204,6 +3204,8 @@ impl Typer {
         ty: &Type,
         diverged: Option<(SymbolId, Type)>,
     ) -> String {
+        self.missing_implicit_count
+            .set(self.missing_implicit_count.get().wrapping_add(1));
         // nsc reports the cut-off expansion rather than a plain "not found"
         // when the search ran into a diverging one.
         if let Some((sym, pt)) = diverged {
