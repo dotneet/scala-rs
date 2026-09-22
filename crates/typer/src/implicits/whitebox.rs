@@ -1,4 +1,6 @@
-//! Resume candidate fitting after a whitebox expansion determines its output.
+//! Resume candidate fitting after materialization determines its output.
+//! Whitebox macros and methods returning an implicit parameter's associated
+//! type both need the typed application before their result can be fitted.
 //! The immutable solver records work; only the enclosing mutable call-site
 //! transaction executes it. Neither inferred types nor trees escape that scope.
 use super::*;
@@ -167,25 +169,34 @@ impl Typer {
         undet: &[SymbolId],
         depth: usize,
     ) -> Option<Option<ImplicitFit>> {
-        if self.implicit_macros_disabled
-            || !self
-                .st
-                .get(id)
-                .macro_impl
-                .as_ref()
-                .is_some_and(|m| !m.blackbox)
-        {
+        let Type::Refined { parents, decls } = pt else {
+            return None;
+        };
+        if parents.len() != 1 || decls.is_empty() || crate::prefix::view_prefix(pt).is_some() {
+            return None;
+        }
+        let candidate = self.st.get(id);
+        let whitebox = !self.implicit_macros_disabled
+            && candidate.macro_impl.as_ref().is_some_and(|m| !m.blackbox);
+        // A method's result may contain an implicit parameter's associated
+        // type. Materialize against its known base before fitting the result
+        // refinement, so `List[element.Out]` uses the selected evidence.
+        let dependent = candidate.macro_impl.is_none()
+            && match &candidate.ty {
+                Type::Method { ret, .. } => self.st.path_members_in(ret).iter().any(|member| {
+                    self.st.path_member_path(*member).is_some_and(|path| {
+                        path.first()
+                            .is_some_and(|root| candidate.params.contains(root))
+                    })
+                }),
+                _ => false,
+            };
+        if !whitebox && !dependent {
             return None;
         }
         if matches!(&self.st.get(id).ty, Type::Method { paramss, .. } if paramss.iter().any(|clause| !clause.is_empty()))
             && !self.only_implicit_clauses(id)
         {
-            return None;
-        }
-        let Type::Refined { parents, decls } = pt else {
-            return None;
-        };
-        if parents.len() != 1 || decls.is_empty() || crate::prefix::view_prefix(pt).is_some() {
             return None;
         }
         let base = &parents[0];
@@ -259,13 +270,14 @@ impl Typer {
             );
         }
         drop(state);
-        if !undet
-            .iter()
-            .any(|tp| crate::check::type_mentions_tparam_deep(pt, *tp))
+        if !dependent
+            && !undet
+                .iter()
+                .any(|tp| crate::check::type_mentions_tparam_deep(pt, *tp))
         {
             return None;
         }
-        // Determine inputs and validate the macro's own evidence using the
+        // Determine inputs and validate the candidate's own evidence using the
         // ordinary solver. Nested suspended candidates are handled first.
         let fit = self.implicit_fit_at(id, base, depth, &[])?;
         if fit.targs.iter().any(|ty| {

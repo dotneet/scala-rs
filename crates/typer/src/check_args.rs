@@ -2147,10 +2147,9 @@ impl Typer {
         // its own implicit clauses; recomputing that fit under the building
         // guard can deliberately suppress the same recursive candidate and
         // lose those type arguments.
-        let fitted_targs = self
-            .selected_implicit_fit
-            .borrow_mut()
-            .take()
+        // Release the cache borrow before a nested search can update it.
+        let selected_fit = self.selected_implicit_fit.borrow_mut().take();
+        let fitted_targs = selected_fit
             .filter(|(selected, wanted, selected_depth, _)| {
                 *selected == origin && wanted == pt && *selected_depth == depth
             })

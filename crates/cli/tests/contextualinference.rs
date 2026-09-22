@@ -593,3 +593,14 @@ fn contravariant_inputs_and_covariant_output_join_from_expected_type() {
         false,
     );
 }
+
+#[test]
+fn dependent_evidence_out_types_are_fitted_before_implicit_selection() {
+    matrix(
+        &[
+            ("dependent_evidence", true),
+            ("dependent_evidence_bad", false),
+        ],
+        false,
+    );
+}
