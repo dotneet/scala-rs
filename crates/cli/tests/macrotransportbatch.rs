@@ -813,6 +813,9 @@ fn compiler_reflection_helpers_preserve_companions_access_and_encoded_names() {
         let labelled = root.join(format!("labelled-{nsc}"));
         compile("macroreflection_labelled", nsc, &labelled, &base, true);
         assert_eq!(run(&labelled, &base), b"Entry(record,7)\n");
+        let companion = root.join(format!("source-companion-{nsc}"));
+        compile("macroreflection_source_companion", nsc, &companion, &base, true);
+        assert_eq!(run(&companion, &base), b"Entry(42)\n");
     }
     fs::remove_dir_all(root).unwrap();
 }

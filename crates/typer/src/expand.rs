@@ -3137,7 +3137,9 @@ impl Typer {
                     args.push(self.tree_to_type(&tree));
                 }
                 let ty = match self.st.get(id).kind {
-                    crate::symbol::SymKind::Class => Type::Class { sym: id, args },
+                    crate::symbol::SymKind::Class | crate::symbol::SymKind::ModuleClass => {
+                        Type::Class { sym: id, args }
+                    }
                     crate::symbol::SymKind::TypeParam if args.is_empty() => Type::TypeParam(id),
                     crate::symbol::SymKind::TypeParam => {
                         self.apply_types(Type::TypeParam(id), args, span)
