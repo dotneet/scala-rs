@@ -3184,3 +3184,38 @@ object Main {{
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn collection_concat_matches_scalac() {
+    let source = r#"
+import scala.collection.immutable.ArraySeq
+
+object Main {
+  val seq = Seq(1).concat(",")
+  val vector = Vector(2L).concat(",")
+  val iterable = Iterable(3.0).concat(",")
+  val indexed = IndexedSeq(4.toShort).concat(",")
+  val list = List(5.toByte).concat(",")
+  val arraySeq = ArraySeq('x').concat(",")
+  val companion = Seq.concat(Seq(7), Seq(8L))
+  val string = "a".concat("b")
+
+  def main(args: Array[String]): Unit = {
+    println(seq.mkString("|"))
+    println(vector.mkString("|"))
+    println(iterable.mkString("|"))
+    println(indexed.mkString("|"))
+    println(list.mkString("|"))
+    println(arraySeq.mkString("|"))
+    println(companion.mkString("|"))
+    println(string)
+  }
+}
+"#;
+    source_case(
+        "collection-concat",
+        source,
+        true,
+        "1|,\n2|,\n3.0|,\n4|,\n5|,\nx|,\n7|8\nab\n",
+    );
+}

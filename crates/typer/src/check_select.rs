@@ -560,6 +560,19 @@ impl Typer {
                 found = terms;
             }
         }
+        // Pickle completion can also supply a class name's companion API.
+        // A value receiver must not gain those members: Seq.concat on the
+        // factory is distinct from xs.concat on an instance.
+        if instance_receiver {
+            let companion = receiver_class
+                .filter(|cls| self.st.get(*cls).kind == SymKind::Class)
+                .map(|cls| self.st.companion_module_class_for_implicits(cls))
+                .filter(|cls| !cls.is_none());
+            found.retain(|m| {
+                let member = self.st.get(*m);
+                !member.flags.contains(Flags::STATIC) && Some(member.owner) != companion
+            });
+        }
         // The conversion a view inserted, when one was: the member it produced
         // may be declared at the type parameters of the *value* the conversion
         // was imported from, which only that prefix can fill in.
