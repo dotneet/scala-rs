@@ -1548,7 +1548,8 @@ impl Typer {
         }
         // Explicit `.apply` on a polymorphic factory result has the same
         // receiver variables as an inserted apply. Solve them before overload
-        // applicability replaces open variables with their bounds.
+        // applicability replaces open variables with their bounds, including
+        // when a later implicit clause needs those receiver variables.
         let factory_apply = match &fun.kind {
             TreeKind::Select { qual, name } if name == "apply" => {
                 !self.undetermined_of(qual).is_empty()
@@ -1557,8 +1558,8 @@ impl Typer {
         };
         if factory_apply {
             if let Type::Method { paramss, ret } = &fun.ty {
-                if paramss.len() == 1 {
-                    let mut params = paramss[0].clone();
+                if let Some(first) = paramss.first() {
+                    let mut params = first.clone();
                     let mut ret = (**ret).clone();
                     self.instantiate_inserted_apply(
                         fun,
@@ -1984,12 +1985,23 @@ impl Typer {
                                     flatmap_array_proto =
                                         Some(crate::symbol::subst_tparams_slice(&tps, &wilds, fr));
                                 }
-                                let fret =
-                                    if matches!(fr.as_ref(), Type::TypeParam(_)) || undetermined {
-                                        Box::new(Type::Wildcard)
+                                let fret = if matches!(fr.as_ref(), Type::TypeParam(_)) {
+                                    Box::new(Type::Wildcard)
+                                } else if undetermined {
+                                    let tps = &self.st.get(sym).tparams;
+                                    let partial = crate::symbol::subst_tparams_slice(
+                                        tps,
+                                        &vec![Type::Wildcard; tps.len()],
+                                        fr,
+                                    );
+                                    Box::new(if prototype_has_fixed_argument(&partial) {
+                                        partial
                                     } else {
-                                        fr.clone()
-                                    };
+                                        Type::Wildcard
+                                    })
+                                } else {
+                                    fr.clone()
+                                };
                                 // The first type argument is the element only when
                                 // it is a *proper* type. cats' syntax classes are
                                 // `Ops[F[_], A]`, so `args[0]` is the constructor
@@ -3723,10 +3735,15 @@ impl Typer {
     /// contains the caller's open wildcard. The parameter types remain useful
     /// for typing the lambda, while its body must supply the result variable:
     /// `def f[B](g: A => R[Option[B]])` should infer `B` from `g` rather than
-    /// reject `R[Option[String]]` against invariant `R[Option[_]]`.
+    /// reject `R[Option[String]]` against invariant `R[Option[_]]`. Independent
+    /// fixed arguments in a direct partial prototype, such as R[F, _], remain
+    /// available to factories inside the body.
     fn lambda_expected_type(&self, pt: &Type) -> Type {
         match pt {
-            Type::Function { params, ret } if crate::check::pt_is_undecided(ret.as_ref()) => {
+            Type::Function { params, ret }
+                if crate::check::pt_is_undecided(ret.as_ref())
+                    && !prototype_has_fixed_argument(ret) =>
+            {
                 Type::Function {
                     params: params.clone(),
                     ret: Box::new(Type::NoType),

@@ -3517,7 +3517,10 @@ impl Typer {
             // lambda body. `def f[B](g: A => R[Option[B]])` must type
             // `g = a => some(a)` without checking `R[Option[String]]` against
             // the provisional `R[Option[_]]`; the body is what supplies B.
-            || crate::check::pt_is_undecided(&ret_pt)
+            // A direct partial result R[F, _] can still constrain a factory's
+            // fixed F, while the body continues to infer the open argument.
+            || (crate::check::pt_is_undecided(&ret_pt)
+                && !prototype_has_fixed_argument(&ret_pt))
         {
             Type::NoType
         } else {
@@ -3616,7 +3619,7 @@ impl Typer {
             }
             param_tys.push(p.ty.clone());
         }
-        let ret = if ret_pt.is_no_type() {
+        let ret = if ret_pt.is_no_type() || crate::check::pt_is_undecided(&ret_pt) {
             body.ty.clone()
         } else {
             self.adapt(body, &ret_pt);

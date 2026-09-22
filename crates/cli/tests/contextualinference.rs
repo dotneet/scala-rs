@@ -97,6 +97,34 @@ fn matrix_ordered(names: &[(&str, bool)], warm: Option<&str>, cp: &str) {
 }
 
 #[test]
+fn partially_applied_factories_keep_fixed_lambda_result_arguments() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut jars = Vec::new();
+    for artifact in ["cats-core", "cats-kernel"] {
+        let relative = format!(
+            "https/repo1.maven.org/maven2/org/typelevel/{artifact}_2.13/2.11.0/{artifact}_2.13-2.11.0.jar"
+        );
+        let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+            .into_iter()
+            .map(|cache| PathBuf::from(&home).join(cache).join(&relative))
+            .find(|path| path.is_file());
+        let Some(jar) = jar else {
+            eprintln!("skip: {artifact} 2.11.0 is not cached");
+            return;
+        };
+        jars.push(jar);
+    }
+    let cp = format!("{JAR}:{}:{}", jars[0].display(), jars[1].display());
+    matrix_cp(
+        &[("partial_factory", true), ("partial_factory_bad", false)],
+        false,
+        &cp,
+    );
+}
+
+#[test]
 fn singleton_lambda_results_infer_their_underlying_type_constructor() {
     matrix(
         &[

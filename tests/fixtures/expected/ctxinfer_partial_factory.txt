@@ -1,0 +1,4 @@
+Some(Right(42))
+Some(Left(missing))
+Some(Left(negative))
+Some(1)

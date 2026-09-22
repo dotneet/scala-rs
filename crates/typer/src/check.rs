@@ -2558,6 +2558,23 @@ pub(crate) fn type_has_wildcard(ty: &Type) -> bool {
     hit
 }
 
+/// A partial prototype can still fix an independent constructor argument.
+pub(crate) fn prototype_has_fixed_argument(pt: &Type) -> bool {
+    match pt {
+        Type::Class { args, .. } => {
+            // Nested invariant arguments such as R[String, Option[_]]
+            // cannot constrain Option[Int] before the open variable is solved.
+            args.iter()
+                .all(|arg| !type_has_wildcard(arg) || matches!(arg, Type::Wildcard))
+                && args.iter().any(|arg| {
+                    !type_has_wildcard(arg)
+                        && !matches!(arg, Type::NoType | Type::Error | Type::Any | Type::Nothing)
+                })
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn pt_is_undecided(pt: &Type) -> bool {
     fn walk(t: &Type) -> bool {
         match t {
