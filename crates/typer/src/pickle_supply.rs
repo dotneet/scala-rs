@@ -4422,6 +4422,20 @@ impl PickleSupply {
         for tp in &st.get(class_sym).tparams {
             scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
         }
+        // A JVM Signature erases the bound on `CC[_]`; the Scala pickle can
+        // retain a bound such as `CC[X] <: IterableOps[X, CC, CC[X]]`. Without
+        // it, selecting a member on a method result of type `CC[A]` sees an
+        // unconstrained type constructor even though the class declaration
+        // guarantees the collection operations.
+        let class_tparams = st.get(class_sym).tparams.clone();
+        if sig.tparams.len() == class_tparams.len() {
+            for (tp, id) in sig.tparams.iter().zip(class_tparams) {
+                if !st.get(id).tparams.is_empty() && st.get(id).bound_hi.is_none() {
+                    let shape = shape_tparam(tp);
+                    self.resolve_shape_tparam_bounds(st, bin, &scope, &shape, id);
+                }
+            }
+        }
         for p in sig.parents.clone() {
             let SigType::Ref { sym, .. } = &p else {
                 continue;
@@ -8136,6 +8150,33 @@ object Main {
             .filter(|&&m| st.get(m).jvm_name.starts_with('('))
             .count();
         assert_eq!(supplied, 0, "read a pickle for a member the prelude has");
+    }
+
+    #[test]
+    fn pickled_higher_kinded_class_parameter_keeps_its_upper_bound() {
+        let Some(jar) = jar() else {
+            eprintln!("skip: scala-library jar not present");
+            return;
+        };
+        let src = r#"
+object Main {
+  def concat(xs: scala.collection.IterableFactoryDefaults[Int, List], ys: List[Int]) = xs ++ ys
+}
+"#;
+        let (_tree, st, diags) = crate::typecheck_str_opts(src, &library_opts(&jar));
+        assert!(
+            !crate::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let cls = crate::classpath::find_by_jvm(&st, "scala/collection/IterableFactoryDefaults")
+            .expect("IterableFactoryDefaults should be loaded");
+        let cc = st.get(cls).tparams[1];
+        assert_eq!(st.get(cc).tparams.len(), 1);
+        assert!(
+            st.get(cc).bound_hi.is_some(),
+            "the bound on IterableFactoryDefaults.CC was erased"
+        );
     }
 
     #[test]
