@@ -97,6 +97,11 @@ fn matrix_ordered(names: &[(&str, bool)], warm: Option<&str>, cp: &str) {
 }
 
 #[test]
+fn nested_invariant_branch_joins_keep_common_parent_bounds() {
+    matrix(&[("nested_join", true), ("nested_join_bad", false)], false);
+}
+
+#[test]
 fn partially_applied_factories_keep_fixed_lambda_result_arguments() {
     let Some(home) = std::env::var_os("HOME") else {
         return;

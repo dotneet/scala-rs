@@ -5579,6 +5579,15 @@ impl SymbolTable {
         if self.is_sub_type(&b, &a) {
             return a;
         }
+        // A previous invariant join may already have introduced an
+        // existential argument. Join its upper bound with the next branch,
+        // rather than treating the wildcard as an unrelated reference type.
+        if let Type::BoundedWildcard { hi, .. } = &a {
+            return self.lub_at(hi.as_deref().unwrap_or(&Type::Any), &b, depth + 1);
+        }
+        if let Type::BoundedWildcard { hi, .. } = &b {
+            return self.lub_at(&a, hi.as_deref().unwrap_or(&Type::Any), depth + 1);
+        }
         // Two distinct value types meet at `AnyVal`, not `Any`: nsc's lub of
         // `Int` and `Double` (or `Boolean`) is `AnyVal`, which is what
         // `Map(1 -> 2, 3 -> 4.5)` is a map *to*. (The *weak* lub, `Double`,
