@@ -1207,3 +1207,81 @@ object Bound {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn binary_specialized_primitive_results_are_not_unboxed_twice() {
+    let library = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    let scalac = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let breeze = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+        .into_iter()
+        .map(|cache| {
+            PathBuf::from(&home).join(cache).join(
+                "https/repo1.maven.org/maven2/org/scalanlp/breeze_2.13/2.1.0/breeze_2.13-2.1.0.jar",
+            )
+        })
+        .find(|jar| jar.is_file());
+    let Some(breeze) = breeze else {
+        return;
+    };
+    if !library.is_file() || !scalac.is_file() {
+        return;
+    }
+    let root = tmp_dir("binary-specialized-result");
+    let source = root.join("Main.scala");
+    fs::write(
+        &source,
+        r#"
+import breeze.numerics.exp
+object Main {
+  val doubleValue: Double = exp.expDoubleImpl.apply(0.0)
+  val floatValue: Float = exp.expFloatImpl.apply(0.0f)
+  def main(args: Array[String]): Unit = {
+    println(doubleValue)
+    println(floatValue)
+  }
+}
+"#,
+    )
+    .unwrap();
+    let cp = format!("{}:{}", library.display(), breeze.display());
+    for native in [false, true] {
+        let out = root.join(format!("out-{native}"));
+        fs::create_dir_all(&out).unwrap();
+        let mut cmd = Command::new(if native { bin() } else { scalac.clone() });
+        if native {
+            cmd.arg("compile").arg("--scala-library").arg(&library);
+        }
+        let result = cmd
+            .arg("-cp")
+            .arg(&cp)
+            .arg(&source)
+            .arg("-d")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "native={native}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{}:{cp}", out.display()),
+                "Main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "native={native}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"1.0\n1.0\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}

@@ -1657,9 +1657,29 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             declared_value_result = st.value_class_for_result(fun.sym).is_some();
             match &st.get(fun.sym).ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => {
+                    // Binary specialization can expose a primitive JVM
+                    // result while the inherited Scala declaration still
+                    // names a type parameter. The call already returns that
+                    // primitive; adding a reference unbox would be invalid.
+                    let descriptor_result = st
+                        .get(fun.sym)
+                        .jvm_name
+                        .strip_prefix('(')
+                        .and_then(|d| d.rsplit_once(')'))
+                        .and_then(|(_, result)| match result {
+                            "Z" => Some(Type::Boolean),
+                            "B" => Some(Type::Byte),
+                            "C" => Some(Type::Char),
+                            "S" => Some(Type::Short),
+                            "I" => Some(Type::Int),
+                            "J" => Some(Type::Long),
+                            "F" => Some(Type::Float),
+                            "D" => Some(Type::Double),
+                            _ => None,
+                        });
                     fun_ty = Type::Method {
                         paramss: vec![param_tys.clone()],
-                        ret: Box::new((**ret).clone()),
+                        ret: Box::new(descriptor_result.unwrap_or_else(|| (**ret).clone())),
                     };
                 }
                 _ => {}
