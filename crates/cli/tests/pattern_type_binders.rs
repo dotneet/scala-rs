@@ -35,6 +35,7 @@ fn pattern_type_binders_match_scalac() {
         ("covariant_good", true),
         ("bound_covariant", true),
         ("runtime", true),
+        ("intersection", true),
         ("t6275", true),
         ("bad_value", false),
         ("scope", false),
@@ -64,7 +65,7 @@ fn pattern_type_binders_match_scalac() {
                 "{name}, ours={ours}: {}",
                 String::from_utf8_lossy(&result.stderr)
             );
-            if accepted && name == "runtime" {
+            if accepted && (name == "runtime" || name == "intersection") {
                 let cp = format!("{}:{jar}", out.display());
                 let ran = Command::new("java")
                     .args(["-Xverify:all", "-cp", &cp, "Main"])
@@ -75,7 +76,12 @@ fn pattern_type_binders_match_scalac() {
                     "{}",
                     String::from_utf8_lossy(&ran.stderr)
                 );
-                assert_eq!(String::from_utf8_lossy(&ran.stdout), "42\nbound\nother\n");
+                let expected = if name == "runtime" {
+                    "42\nbound\nother\n"
+                } else {
+                    "5\n5\n5\n"
+                };
+                assert_eq!(String::from_utf8_lossy(&ran.stdout), expected);
             }
             if !accepted {
                 let diagnostic = String::from_utf8_lossy(&result.stderr);

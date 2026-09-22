@@ -464,6 +464,10 @@ impl Typer {
                     } else {
                         receiver
                     }
+                } else if matches!(body.kind, TreeKind::Typed { .. }) {
+                    // A type test adds a constraint to the original value;
+                    // it does not discard the scrutinee's existing members.
+                    self.st.glb(&body.ty, sel_ty)
                 } else if self.equality_pattern_binds_scrutinee(body) {
                     // `case n @ Whatever =>` / `case n @ 1 =>` test with `==`,
                     // and `==` says nothing about the scrutinee's class: an
@@ -946,7 +950,8 @@ impl Typer {
                     // (`scala/util/Sorting.scala`'s `sort[T]`).
                     self.refine_gadt_bounds(&ty, sel_ty, &binders);
                 }
-                self.type_pattern(expr, &ty);
+                let bind_ty = self.st.glb(&ty, sel_ty);
+                self.type_pattern(expr, &bind_ty);
                 self.type_singleton_type_ref(tpt, &ty);
                 if matches!(self.st.dealias(&ty), Type::Class { sym, .. } if sym == self.st.singleton_sym)
                     && !self.st.is_sub_type(sel_ty, &Type::AnyRef)

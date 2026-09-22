@@ -3989,24 +3989,12 @@ pub(crate) fn unify_one_precise(
         // `type BaseColumnType[T] = ScalaType[T] with BaseTypedType[T]` and
         // passes `implicitly[BaseColumnType[U]]` to
         // `assertNonNullType[A](t: BaseColumnType[A])`. Components are paired
-        // by position (both sides come from the same alias whenever this
-        // fires); a non-compound actual is tried against every component, the
-        // way a subtype of the compound arrives.
+        // against the whole actual type: intersection parent order is not
+        // significant, and a type test may add a parent at the front.
         Type::Refined { parents, decls } => {
-            match actual {
-                Type::Refined { parents: aps, .. } if aps.len() == parents.len() => {
-                    for (p, a) in parents.iter().zip(aps) {
-                        if let Some(t) = unify_one_precise(st, tp, p, a) {
-                            return Some(t);
-                        }
-                    }
-                }
-                _ => {
-                    for p in parents {
-                        if let Some(t) = unify_one_precise(st, tp, p, actual) {
-                            return Some(t);
-                        }
-                    }
+            for p in parents {
+                if let Some(t) = unify_one_precise(st, tp, p, actual) {
+                    return Some(t);
                 }
             }
             for decl in decls {
