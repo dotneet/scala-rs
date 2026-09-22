@@ -89,10 +89,6 @@ pub(crate) fn add_ordering_instance(
 ) {
     let m = module(st, ord_cls, name, jvm);
     st.get_mut(m).flags = st.get(m).flags.with(Flags::IMPLICIT);
-    st.get_mut(m).ty = Type::Class {
-        sym: ordering,
-        args: vec![arg.clone()],
-    };
     let cls = st.module_class_of(m);
     st.get_mut(cls).parents = vec![Type::Class {
         sym: ordering,

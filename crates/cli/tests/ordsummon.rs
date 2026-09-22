@@ -222,7 +222,7 @@ fn os2_summon_bad_is_rejected() {
     assert!(!ok, "expected os2_summon_bad to be rejected, got:\n{msgs}");
     for needle in [
         "type mismatch; found: Ordering$  required: Ordering[Int]",
-        "type mismatch; found: Ordering[Int]  required: Ordering[Option[Int]]",
+        "type mismatch; found: Int$  required: Ordering[Option[Int]]",
         "value Foo is not a member of Ordering$",
         "value Int is not a member of Numeric$",
         "could not find implicit value of type Ordering[AnyRef]",
@@ -420,4 +420,77 @@ fn alias_module_keeps_the_pickled_overloads() {
     );
     assert_eq!(run_main(&out, Some(&jar)), "3\n2\n4.25\n6\n0.5\n7\n");
     let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn tuple2_reverse_ordering_matches_scalac() {
+    let (Some(jar), Some(scalac), true) = (scala_library_jar(), find_scalac(), java_available())
+    else {
+        return;
+    };
+    let source = r#"
+object Main {
+  val first: Ordering[Int] = Ordering.Int.reverse
+  val second: Ordering[Int] = Ordering.Int.reverse
+  val explicit: Ordering[(Int, Int)] =
+    Ordering.Tuple2[Int, Int](Ordering.Int.reverse, Ordering.Int.reverse)
+  val inferred: Ordering[(Int, Int)] =
+    Ordering.Tuple2(Ordering.Int.reverse, Ordering.Int.reverse)
+  val values = Seq((1, 2), (3, 4))
+  val explicitSorted = values.sortBy(identity)(explicit)
+  val inferredSorted = values.sortBy(identity)(inferred)
+  val directSorted = values.sortBy(identity)(
+    Ordering.Tuple2(Ordering.Int.reverse, Ordering.Int.reverse)
+  )
+
+  def main(args: Array[String]): Unit = {
+    println(first.compare(2, 1))
+    println(second.compare(2, 1))
+    println(explicitSorted.mkString("|"))
+    println(inferredSorted.mkString("|"))
+    println(directSorted.mkString("|"))
+  }
+}
+"#;
+    let dir = tmp_dir("os2-tuple2-reverse");
+    let source_path = dir.join("Main.scala");
+    let oracle_out = dir.join("oracle");
+    let native_out = dir.join("native");
+    fs::create_dir_all(&oracle_out).unwrap();
+    fs::create_dir_all(&native_out).unwrap();
+    fs::write(&source_path, source).unwrap();
+
+    let oracle = Command::new(&scalac)
+        .args(["-classpath", jar.to_str().unwrap()])
+        .args(["-d", oracle_out.to_str().unwrap()])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+    assert!(
+        oracle.status.success(),
+        "scalac failed: {}{}",
+        String::from_utf8_lossy(&oracle.stderr),
+        String::from_utf8_lossy(&oracle.stdout)
+    );
+
+    let native = Command::new(bin())
+        .arg("compile")
+        .arg(&source_path)
+        .args(["-d", native_out.to_str().unwrap()])
+        .args(["--scala-library", jar.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        native.status.success(),
+        "scala-rs failed: {}{}",
+        String::from_utf8_lossy(&native.stderr),
+        String::from_utf8_lossy(&native.stdout)
+    );
+
+    let expected = "-1\n-1\n(3,4)|(1,2)\n(3,4)|(1,2)\n(3,4)|(1,2)\n";
+    let oracle_stdout = run_main(&oracle_out, Some(&jar));
+    let native_stdout = run_main(&native_out, Some(&jar));
+    assert_eq!(oracle_stdout, expected);
+    assert_eq!(native_stdout, oracle_stdout);
+    let _ = fs::remove_dir_all(&dir);
 }
