@@ -813,7 +813,7 @@ impl Typer {
                         .iter()
                         .map(|ps| {
                             ps.iter()
-                                .map(|t| crate::symbol::subst_tparams_slice(&tps, &to, t))
+                                .map(|t| self.st.rename_type_params(&tps, &own, t))
                                 .collect()
                         })
                         .collect();
@@ -876,14 +876,13 @@ impl Typer {
             })
             .collect();
         // An F-bound (`C[T <: Ordered[T]]`) names the parameters being copied.
-        let to: Vec<Type> = out.iter().map(|t| Type::TypeParam(*t)).collect();
         for (i, tp) in src.iter().enumerate() {
             let hi = self.st.get(*tp).bound_hi.clone();
             let lo = self.st.get(*tp).bound_lo.clone();
-            self.st.get_mut(out[i]).bound_hi =
-                hi.map(|t| crate::symbol::subst_tparams_slice(src, &to, &t));
-            self.st.get_mut(out[i]).bound_lo =
-                lo.map(|t| crate::symbol::subst_tparams_slice(src, &to, &t));
+            let hi = hi.map(|t| self.st.rename_type_params(src, &out, &t));
+            let lo = lo.map(|t| self.st.rename_type_params(src, &out, &t));
+            self.st.get_mut(out[i]).bound_hi = hi;
+            self.st.get_mut(out[i]).bound_lo = lo;
         }
         out
     }

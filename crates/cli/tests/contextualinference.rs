@@ -8,6 +8,17 @@ use std::{
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 
 #[test]
+fn synthetic_case_apply_keeps_projected_parameter_prefixes() {
+    matrix(
+        &[
+            ("projected_case_apply", true),
+            ("projected_case_apply_bad", false),
+        ],
+        false,
+    );
+}
+
+#[test]
 fn projected_method_and_class_bounds_use_instantiated_receivers() {
     matrix(
         &[

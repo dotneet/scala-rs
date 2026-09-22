@@ -3151,6 +3151,55 @@ impl SymbolTable {
         self.subst_projections(tps, args, &out)
     }
 
+    /// Copy a signature to fresh type parameters without detaching abstract
+    /// projections from their prefixes. Unlike call-site substitution, this
+    /// is an alpha-renaming: `T#Field` must become `U#Field`, not the bare
+    /// declaration of Field, while U is still abstract.
+    pub(crate) fn rename_type_params(
+        &mut self,
+        from: &[SymbolId],
+        to: &[SymbolId],
+        ty: &Type,
+    ) -> Type {
+        fn renamed_prefix(
+            st: &mut SymbolTable,
+            id: SymbolId,
+            from: &[SymbolId],
+            to: &[SymbolId],
+            memo: &mut HashMap<SymbolId, SymbolId>,
+        ) -> SymbolId {
+            if let Some(i) = from.iter().position(|&p| p == id) {
+                return to.get(i).copied().unwrap_or(id);
+            }
+            if let Some(&renamed) = memo.get(&id) {
+                return renamed;
+            }
+            let Some((prefix, decl)) = st.abs_projection(id) else {
+                return id;
+            };
+            let renamed = renamed_prefix(st, prefix, from, to, memo);
+            let result = if renamed == prefix {
+                id
+            } else {
+                st.abstract_projection(renamed, decl)
+            };
+            memo.insert(id, result);
+            result
+        }
+        let args: Vec<_> = to.iter().copied().map(Type::TypeParam).collect();
+        let ty = self.subst_type_params(from, &args, ty);
+        if !self.mentions_abs_projection(&ty) {
+            return ty;
+        }
+        let mut memo = HashMap::default();
+        map_type(&ty, &mut |t| match t {
+            Type::TypeMember(id) => {
+                Type::TypeMember(renamed_prefix(self, *id, from, to, &mut memo))
+            }
+            other => other.clone(),
+        })
+    }
+
     /// Substitute class type arguments into a member type (`List[Int].head` → `Int`).
     pub fn subst_tparams(&self, owner: SymbolId, args: &[Type], ty: &Type) -> Type {
         // Borrowed, not cloned: the common call has no type parameters at all
