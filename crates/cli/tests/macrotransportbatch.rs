@@ -821,6 +821,39 @@ fn compiler_reflection_helpers_preserve_companions_access_and_encoded_names() {
 }
 
 #[test]
+fn constructor_reflection_preserves_multiple_param_lists_and_accessors() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    for producer in [true, false] {
+        let implementation = root.join(format!("constructor-implementation-{producer}"));
+        compile(
+            "macroreflection_constructor_params",
+            producer,
+            &implementation,
+            &base,
+            true,
+        );
+        let cp = format!("{}:{base}", implementation.display());
+        for consumer in [true, false] {
+            let output = root.join(format!("constructor-use-{producer}-{consumer}"));
+            compile(
+                "macroreflection_constructor_params_use",
+                consumer,
+                &output,
+                &cp,
+                true,
+            );
+            assert_eq!(
+                run(&output, &cp),
+                b"ctor=1[false:true]/1[false:false]/1[true:false];apply=1[false:true]/1[false:false]/1[true:false];copy=1[false:Int:true]/1[false:String:true]/1[true:Ordering[Int]:true]\nctor=1[false:true]/2[true:false,true:false];apply=1[false:true]/2[true:false,true:false];copy=1[false:A:true]/2[true:Ordering[A]:true,true:Numeric[A]:true]\n1:body:1\n2\n",
+                "producer={producer} consumer={consumer}"
+            );
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn nested_implicit_macro_derivation_keeps_associated_types_and_stable_symbols() {
     let Some(home) = std::env::var_os("HOME") else {
         return;

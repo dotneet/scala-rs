@@ -459,7 +459,30 @@ impl Typer {
                     && self.st.get(m).name == "copy"
                     && self.st.get(m).flags.contains(Flags::SYNTHETIC)
             }) {
-                let copy_params = self.st.get(copy_id).params.clone();
+                let previous = self.st.get(copy_id).params.clone();
+                let mut copy_params = Vec::new();
+                let first_clause = paramss_ids.first().map(Vec::as_slice).unwrap_or(&[]);
+                for &field in &all_ctor_params {
+                    let source = self.st.get(field).clone();
+                    let param = previous
+                        .iter()
+                        .copied()
+                        .find(|&p| self.st.get(p).name == source.name)
+                        .unwrap_or_else(|| {
+                            self.st
+                                .alloc(&source.name, copy_id, SymKind::Term, Flags::PARAM, "")
+                        });
+                    let flags = self.st.get_mut(param);
+                    flags
+                        .flags
+                        .set(Flags::IMPLICIT, source.flags.contains(Flags::IMPLICIT));
+                    if !first_clause.contains(&field) {
+                        flags.flags.set(Flags::DEFAULTPARAM, false);
+                        flags.default_rhs = None;
+                    }
+                    copy_params.push(param);
+                }
+                self.st.get_mut(copy_id).params = copy_params.clone();
                 if copy_params.len() == all_ctor_param_tys.len() {
                     for (pid, ty) in copy_params.iter().zip(all_ctor_param_tys.iter()) {
                         self.st.get_mut(*pid).ty = ty.clone();

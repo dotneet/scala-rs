@@ -317,7 +317,9 @@ impl Typer {
                     } else {
                         ty.clone()
                     };
-                    let wired = self.type_to_wire(&ty)?;
+                    let wired = self.type_to_wire(&ty).map_err(|e| {
+                        format!("{e} in {} parameter {}", s.name, self.st.get(param).name)
+                    })?;
                     if self.st.get(param).owner != sym {
                         // A parameter whose symbol belongs to something else:
                         // a case class's constructor shares its fields'. It
@@ -325,11 +327,17 @@ impl Typer {
                         // own on the far side, rather than as the field.
                         let mut named = String::from("(argn ");
                         quote_into(&mut named, &self.st.get(param).name);
-                        named.push_str(if self.st.get(param).flags.contains(Flags::DEFAULTPARAM) {
-                            " (f \"PARAM\" \"DEFAULTPARAM\") "
-                        } else {
-                            " (f \"PARAM\") "
-                        });
+                        named.push_str(" (f \"PARAM\"");
+                        for (flag, name) in [
+                            (Flags::DEFAULTPARAM, "DEFAULTPARAM"),
+                            (Flags::IMPLICIT, "IMPLICIT"),
+                        ] {
+                            if self.st.get(param).flags.contains(flag) {
+                                named.push(' ');
+                                quote_into(&mut named, name);
+                            }
+                        }
+                        named.push_str(") ");
                         named.push_str(&wired);
                         named.push(')');
                         args.push(named);

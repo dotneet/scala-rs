@@ -34,7 +34,7 @@
 //! reaches the engine as a question scala-rs cannot answer -- a diagnostic
 //! naming the class and the reason -- never as a declaration list that is
 //! missing something: a nested class or type member, a `val` in a trait, a
-//! case class with a second parameter list, a case class whose synthetic
+//! case class whose synthetic
 //! members could be suppressed by an ancestor this compiler cannot see into.
 
 use scala_rs_parser::{Flags, SymbolId, Type};
@@ -466,15 +466,10 @@ impl Typer {
             s.members.iter().copied().find(|&m| {
                 self.st.get(m).kind == SymKind::Method && self.st.get(m).name == "<init>"
             });
-        if is_case {
-            if let Some(c) = ctor {
-                if self.st.get(c).paramss.len() > 1 {
-                    return Err(format!(
-                        "`{name}` is a case class with more than one parameter list"
-                    ));
-                }
-            }
-        }
+        let first_clause = ctor
+            .and_then(|c| self.st.get(c).paramss.first())
+            .cloned()
+            .unwrap_or_else(|| s.ctor_fields.clone());
         let mut out = Vec::new();
         if is_trait && !self.is_pure_interface(cls) {
             // A trait's initialiser, which nsc's typer declares for every
@@ -493,9 +488,10 @@ impl Typer {
                 ));
             }
             let flags = self.st.get(f).flags;
+            let case_accessor = is_case && first_clause.contains(&f);
             let has_accessor =
-                (is_case && !flags.contains(Flags::LOCAL)) || flags.contains(Flags::ACCESSOR);
-            self.val_views(f, true, is_case, has_accessor, false, &mut out)?;
+                (case_accessor && !flags.contains(Flags::LOCAL)) || flags.contains(Flags::ACCESSOR);
+            self.val_views(f, true, case_accessor, has_accessor, false, &mut out)?;
         }
         // A trait has no constructor in nsc, only the `$init$` above.
         if let Some(c) = ctor.filter(|_| !is_trait) {
@@ -796,55 +792,57 @@ impl Typer {
         Ok(out)
     }
 
-    /// A case companion's `apply`: the class's own constructor parameters,
-    /// defaults and all, returning the class.
+    /// Mirror every constructor clause, including implicit evidence, on the
+    /// synthetic companion factory. Its own parameter symbols may still have
+    /// provisional types while the constructor signature is already complete.
     fn companion_apply_info(&mut self, class: SymbolId, apply: SymbolId) -> Result<String, String> {
-        let ptys = match self.st.get(apply).ty.clone() {
-            Type::Method { paramss, .. } if paramss.len() == 1 => paramss[0].clone(),
-            _ => {
-                return Err(format!(
-                    "the `apply` of `{}` has no single parameter list",
-                    self.st.get(class).name
-                ))
-            }
-        };
-        let fields = self.st.get(class).ctor_fields.clone();
-        if fields.len() != ptys.len() {
-            return Err(format!(
-                "the `apply` of `{}` does not match its constructor",
-                self.st.get(class).name
-            ));
-        }
-        let mut params = Vec::new();
-        for (f, t) in fields.iter().zip(&ptys) {
-            let t = if t.is_no_type() {
-                self.st.get(*f).ty.clone()
-            } else {
-                t.clone()
-            };
-            if t.is_no_type() {
-                return Err(format!(
-                    "the parameter `{}` of `{}` has no type yet",
-                    self.st.get(*f).name,
-                    self.st.get(class).name
+        let ctor = self
+            .st
+            .get(class)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| self.st.get(m).kind == SymKind::Method && self.st.get(m).name == "<init>")
+            .ok_or_else(|| "case class has no constructor".to_string())?;
+        let clauses = self.st.get(ctor).paramss.clone();
+        let tparams = self.st.get(apply).tparams.clone();
+        let type_args: Vec<Type> = tparams.iter().copied().map(Type::TypeParam).collect();
+        let mut info = self.type_to_wire(&Type::Class {
+            sym: class,
+            args: type_args.clone(),
+        })?;
+        for clause in clauses.iter().rev() {
+            let mut params = Vec::new();
+            for &param in clause {
+                let p = self.st.get(param).clone();
+                let ty = self.st.subst_tparams(class, &type_args, &p.ty);
+                let mut flags = vec!["PARAM"];
+                if p.flags.contains(Flags::DEFAULTPARAM) {
+                    flags.push("DEFAULTPARAM");
+                }
+                if p.flags.contains(Flags::IMPLICIT) {
+                    flags.push("IMPLICIT");
+                }
+                params.push(format!(
+                    "(argn {} (f {}) {})",
+                    quoted(&p.name),
+                    flags.into_iter().map(quoted).collect::<Vec<_>>().join(" "),
+                    self.type_to_wire(&ty)?
                 ));
             }
-            let fl = if self.st.get(*f).flags.contains(Flags::DEFAULTPARAM) {
-                "(f \"PARAM\" \"DEFAULTPARAM\")"
-            } else {
-                "(f \"PARAM\")"
-            };
-            params.push(format!(
-                "(argn {} {fl} {})",
-                quoted(&self.st.get(*f).name),
-                self.type_to_wire(&t)?
-            ));
+            info = format!("(method (params {}) {info})", params.join(" "));
         }
-        let class_ty = self.type_to_wire(&Type::Class {
-            sym: class,
-            args: Vec::new(),
-        })?;
-        Ok(format!("(method (params {}) {class_ty})", params.join(" ")))
+        if !tparams.is_empty() {
+            info = format!(
+                "(poly (params {}) {info})",
+                tparams
+                    .iter()
+                    .map(|p| p.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        Ok(info)
     }
 
     /// The info of one view of a `val`: `getter`, `setter` or `field`.

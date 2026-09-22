@@ -3876,7 +3876,10 @@ impl Typer {
             .members
             .iter()
             .copied()
-            .find(|&m| self.st.get(m).name == "<init>" && self.st.get(m).params == fields)
+            .find(|&m| {
+                self.st.get(m).name == "<init>"
+                    && fields.iter().all(|f| self.st.get(m).params.contains(f))
+            })
             .map(|m| self.st.get(m).paramss.clone())
     }
 
@@ -4163,7 +4166,13 @@ impl Typer {
                 return true;
             }
         }
-        let fields = self.st.get(class_id).ctor_fields.clone();
+        // Only the first clause has copy defaults. Later implicit clauses
+        // must be inferred at the call site, not copied from instance fields
+        // and then supplied a second time by constructor adaptation.
+        let fields = self
+            .primary_ctor_paramss(class_id)
+            .and_then(|groups| groups.into_iter().next())
+            .unwrap_or_else(|| self.st.get(class_id).ctor_fields.clone());
         if fields.is_empty() {
             return false;
         }

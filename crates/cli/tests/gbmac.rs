@@ -417,15 +417,14 @@ fn scalac_agrees_gbmac_mirror() {
     );
 }
 
-/// What the mirror cannot translate faithfully is refused by name at the
-/// call site, never answered with a declaration list missing a member.
+/// Previously refused declarations compile; the curried case class's complete
+/// reflected shape must match the compiler oracle.
 #[test]
-fn gbmac_mirror_refusals_are_named() {
+fn gbmac_mirror_supports_extended_declarations() {
     let Some(env) = env("gbmac_decls_bad") else {
         return;
     };
-    let impls = tmp_dir("decls-bad-impl");
-    let uses = tmp_dir("decls-bad-use");
+    let impls = tmp_dir("decls-extended-impl");
     let reflect_cp = env.reflect.display().to_string();
     let o = scala_rs(
         &[fixture("gbmac_decls_impl")],
@@ -435,34 +434,37 @@ fn gbmac_mirror_refusals_are_named() {
     );
     assert!(o.status.success(), "{}", diagnostics(&o));
     let use_cp = join(&[&impls, &env.reflect]);
-    let o = scala_rs(&[fixture("gbmac_decls_bad")], &uses, &use_cp, &env.lib);
-    let text = diagnostics(&o);
-    assert!(
-        !o.status.success(),
-        "scala-rs accepted gbmac_decls_bad:\n{text}"
-    );
-    for want in [
-        "`Inner` is a nested class, which scala-rs cannot describe to the engine",
-        "`Elem` is a type member, which scala-rs cannot describe to the engine",
-        "`TwoLists` is a case class with more than one parameter list",
-        "`h` is accessible within `bad` only",
-    ] {
-        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    let mut oracle = None;
+    for nsc in [true, false] {
+        let uses = tmp_dir("decls-extended-use");
+        let o = if nsc {
+            scalac_compile(&env.scalac, &[fixture("gbmac_decls_bad")], &uses, &use_cp)
+        } else {
+            scala_rs(&[fixture("gbmac_decls_bad")], &uses, &use_cp, &env.lib)
+        };
+        assert!(o.status.success(), "nsc={nsc}: {}", diagnostics(&o));
+        let output = run_main(
+            &join(&[&uses, &impls, &env.lib, &env.reflect]),
+            "gbmac.bad.Main",
+        );
+        // Other declarations retain differences in alias pretty-printing and
+        // empty constructor clauses. Keep this regression on curried cases.
+        let result = output
+            .split("gbmac.bad.TwoLists [case]")
+            .nth(1)
+            .unwrap()
+            .split("gbmac.bad.Guarded []")
+            .next()
+            .unwrap()
+            .to_owned();
+        if let Some(expected) = &oracle {
+            assert_eq!(&result, expected);
+        } else {
+            oracle = Some(result);
+        }
+        fs::remove_dir_all(uses).unwrap();
     }
-    assert_eq!(
-        text.matches("macro expansion is not implemented").count(),
-        4,
-        "every call site must be refused:\n{text}"
-    );
-    // Real scalac compiles and runs the same file: these are scala-rs's limits.
-    let o = scalac_compile(&env.scalac, &[fixture("gbmac_decls_bad")], &uses, &use_cp);
-    assert!(
-        o.status.success(),
-        "real scalac rejected gbmac_decls_bad:\n{}",
-        diagnostics(&o)
-    );
-    let _ = fs::remove_dir_all(&impls);
-    let _ = fs::remove_dir_all(&uses);
+    fs::remove_dir_all(impls).unwrap();
 }
 
 /// `mapToImpl`'s own opening on case classes this run is compiling.

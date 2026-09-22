@@ -1,14 +1,8 @@
-// Classes the engine's mirror cannot describe in nsc's shape, asked about by
-// the same macro as `gbmac_decls_use.scala`. Real scalac 2.13.16 compiles and
-// runs this file; scala-rs refuses each call site, naming the class member it
-// could not translate (`crates/typer/src/expand_mirror.rs`). A declaration
-// list with that member left out would be a different class, and a macro
-// that walks `decls` would act on it.
+// Formerly unsupported reflection shapes, compared with scalac.
 package gbmac
 package bad
 
-// A nested class: nsc lists a class symbol among the declarations, and the
-// mirror has none to offer.
+// A nested class appears among the reflected declarations.
 class Outer {
   class Inner
   def f: Int = 1
@@ -25,7 +19,7 @@ class WithType {
 case class TwoLists(a: Int)(b: String)
 
 // A qualified access boundary: nsc's symbol carries `privateWithin` (the
-// package `bad`) and no PRIVATE flag, which the mirror has no way to say.
+// package `bad`) and no PRIVATE flag.
 class Guarded {
   private[bad] def h: Int = 3
 }
