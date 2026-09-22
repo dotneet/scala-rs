@@ -6472,13 +6472,16 @@ impl PickleSupply {
         // this is; when it cannot be settled here, the member's own qualified
         // name is exactly the answer the reader used to give.
         if let Some((pre, member)) = sym.split_once('#') {
-            // The parameter-path shortcut resolves a nullary member. Applied
+            // The parameter-path shortcut also retains an unapplied abstract
+            // constructor such as evidence.F in a higher-kinded position. Applied
             // aliases need the general projection path to substitute their
             // binders: c.WeakTypeTag[R] must keep R, not the alias's own T.
-            if args.is_empty() && want_arity == 0 {
+            if args.is_empty() {
                 if let Some(t) = self.param_projection(st, bin, pre, member) {
-                    trace(format_args!("projection {sym}: retained parameter path"));
-                    return Some(t);
+                    if st.kind_arity(&t) == want_arity {
+                        trace(format_args!("projection {sym}: retained parameter path"));
+                        return Some(t);
+                    }
                 }
             }
             if let Some(t) = self.conv_projection(st, bin, scope, pre, member, args, d) {

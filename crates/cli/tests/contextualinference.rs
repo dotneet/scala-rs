@@ -6,6 +6,23 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
+
+fn cached_cats() -> Option<Vec<PathBuf>> {
+    let home = std::env::var_os("HOME")?;
+    let mut jars = Vec::new();
+    for artifact in ["cats-core", "cats-kernel"] {
+        let relative = format!(
+            "https/repo1.maven.org/maven2/org/typelevel/{artifact}_2.13/2.11.0/{artifact}_2.13-2.11.0.jar"
+        );
+        let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+            .into_iter()
+            .map(|cache| PathBuf::from(&home).join(cache).join(&relative))
+            .find(|path| path.is_file())?;
+        jars.push(jar);
+    }
+    Some(jars)
+}
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures")
@@ -103,30 +120,26 @@ fn nested_invariant_branch_joins_keep_common_parent_bounds() {
 
 #[test]
 fn partially_applied_factories_keep_fixed_lambda_result_arguments() {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(jars) = cached_cats() else {
+        eprintln!("skip: cats 2.11.0 is not cached");
         return;
     };
-    let mut jars = Vec::new();
-    for artifact in ["cats-core", "cats-kernel"] {
-        let relative = format!(
-            "https/repo1.maven.org/maven2/org/typelevel/{artifact}_2.13/2.11.0/{artifact}_2.13-2.11.0.jar"
-        );
-        let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
-            .into_iter()
-            .map(|cache| PathBuf::from(&home).join(cache).join(&relative))
-            .find(|path| path.is_file());
-        let Some(jar) = jar else {
-            eprintln!("skip: {artifact} 2.11.0 is not cached");
-            return;
-        };
-        jars.push(jar);
-    }
     let cp = format!("{JAR}:{}:{}", jars[0].display(), jars[1].display());
     matrix_cp(
         &[("partial_factory", true), ("partial_factory_bad", false)],
         false,
         &cp,
     );
+}
+
+#[test]
+fn unapplied_higher_kinded_evidence_supports_eithert_parallel() {
+    let Some(jars) = cached_cats() else {
+        eprintln!("skip: cats 2.11.0 is not cached");
+        return;
+    };
+    let cp = format!("{JAR}:{}:{}", jars[0].display(), jars[1].display());
+    matrix_cp(&[("parallel_eithert", true)], false, &cp);
 }
 
 #[test]

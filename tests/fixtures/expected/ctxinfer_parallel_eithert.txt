@@ -1,0 +1,2 @@
+List(Right(3))
+List(Left(Failure))
