@@ -3554,3 +3554,84 @@ object Main {
         "1|,\n2|,\n3.0|,\n4|,\n5|,\nx|,\n7|8\nab\n",
     );
 }
+
+#[test]
+fn stable_patterns_load_binary_wildcard_modules() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("stable-pattern-modules");
+    let library = dir.join("Library.scala");
+    fs::write(
+        &library,
+        r#"
+package enumlib
+sealed trait Kind
+object Kind {
+  case object UNKNOWN extends Kind
+  case object KNOWN extends Kind
+}
+"#,
+    )
+    .unwrap();
+    let source = dir.join("Main.scala");
+    fs::write(
+        &source,
+        r#"
+import enumlib.Kind
+import enumlib.Kind._
+object Main {
+  implicit class ToCode(kind: Kind) {
+    def code: Int = kind match {
+      case UNKNOWN => 0
+      case KNOWN => 1
+    }
+  }
+  def main(args: Array[String]): Unit = println(s"${Kind.UNKNOWN.code}:${Kind.KNOWN.code}")
+}
+"#,
+    )
+    .unwrap();
+    let bad = dir.join("Bad.scala");
+    fs::write(
+        &bad,
+        "object Bad { def value(i: Int): Int = i match { case MISSING => 1 } }",
+    )
+    .unwrap();
+    let compile = |ours: bool, source: &Path, out: &Path, cp: &str| {
+        fs::create_dir_all(out).unwrap();
+        let mut command = Command::new(if ours { bin() } else { scalac.clone() });
+        if ours {
+            command.arg("compile").arg("--scala-library").arg(&jar);
+        }
+        command
+            .arg("-cp")
+            .arg(cp)
+            .arg("-d")
+            .arg(out)
+            .arg(source)
+            .output()
+            .unwrap()
+    };
+    for producer in [false, true] {
+        let lib = dir.join(format!("lib-{producer}"));
+        let p = compile(producer, &library, &lib, jar.to_str().unwrap());
+        assert!(p.status.success(), "{}", String::from_utf8_lossy(&p.stderr));
+        let cp = format!("{}:{}", lib.display(), jar.display());
+        for consumer in [false, true] {
+            let out = dir.join(format!("out-{producer}-{consumer}"));
+            let p = compile(consumer, &source, &out, &cp);
+            assert!(
+                p.status.success(),
+                "producer={producer} consumer={consumer}: {}",
+                String::from_utf8_lossy(&p.stderr)
+            );
+            assert_eq!(run_java(&out, &cp), "0:1\n");
+            let p = compile(consumer, &bad, &out, &cp);
+            assert!(!p.status.success());
+            assert!(String::from_utf8_lossy(&p.stderr).contains("not found: value MISSING"));
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

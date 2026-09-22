@@ -2294,7 +2294,7 @@ impl Typer {
 
     // Lazy completion must ask the namespace the expression uses. A type
     // alias can already be loaded while the same-named object is still lazy.
-    fn expose_unqualified_in(&mut self, name: &str, span: Span, terms_only: bool) {
+    pub(crate) fn expose_unqualified_in(&mut self, name: &str, span: Span, terms_only: bool) {
         if name.is_empty() {
             return;
         }

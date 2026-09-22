@@ -301,6 +301,11 @@ impl Typer {
                 // object such as a generated heterogeneous-list terminator is
                 // mistaken for a fresh method-local binder.
                 let is_varid = !stable_hint && scala_rs_parser::ast::is_variable_name(name);
+                if !is_varid && pat.sym.is_none() {
+                    // A stable pattern is a term reference, including binary
+                    // members exposed lazily by wildcard imports.
+                    self.expose_unqualified_in(name, pat.span, true);
+                }
                 // Stable id vs variable: if name is a known module/val, treat as stable.
                 let mut found = if !is_varid
                     && !pat.sym.is_none()
@@ -408,6 +413,11 @@ impl Typer {
                     // `SymKind::Term`, so the symbol alone cannot say.
                     pat.stable_pat = true;
                 } else {
+                    if !is_varid {
+                        self.error(pat.span, format!("not found: value {name}"));
+                        pat.ty = Type::Error;
+                        return;
+                    }
                     let n = name.clone();
                     let id =
                         self.st
