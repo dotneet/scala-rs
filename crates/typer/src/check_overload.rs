@@ -1780,8 +1780,8 @@ impl Typer {
     /// inner call is ill-typed in nsc too.
     ///
     /// `NoType` unless the callee is one polymorphic method, the formal is not
-    /// a bare type parameter, and the expected type settles at least one of
-    /// the parameters the formal mentions.
+    /// a bare type parameter, and either the expected type settles a parameter
+    /// or the formal already contains a fixed type argument.
     pub(crate) fn lenient_proto_arg_type(
         &self,
         fun_ty: &Type,
@@ -1789,7 +1789,7 @@ impl Typer {
         idx: usize,
         pt: &Type,
     ) -> Type {
-        if sym.is_none() || pt.is_no_type() || pt.is_error() {
+        if sym.is_none() || pt.is_error() {
             return Type::NoType;
         }
         let Type::Method { paramss, ret } = fun_ty else {
@@ -1818,7 +1818,21 @@ impl Typer {
                     && !mentions_tparam(t, &tps)
             })
             .collect();
-        if solved.is_empty() {
+        // A formal may already fix useful arguments through its receiver,
+        // even when the call has no expected result type. For example,
+        // Graph[Input[Element], M] still constrains a nested factory's input
+        // while its materialized result M remains to be inferred.
+        let fixed_argument = match param {
+            Type::Class { args, .. } => args.iter().any(|arg| {
+                !mentions_tparam(arg, &tps)
+                    && !type_has_wildcard(arg)
+                    && !arg.is_no_type()
+                    && !arg.is_error()
+                    && !matches!(arg, Type::Any | Type::Nothing)
+            }),
+            _ => false,
+        };
+        if solved.is_empty() && !fixed_argument {
             return Type::NoType;
         }
         let ids: Vec<SymbolId> = solved.iter().map(|(id, _)| *id).collect();

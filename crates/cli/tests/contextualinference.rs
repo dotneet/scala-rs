@@ -97,6 +97,14 @@ fn matrix_ordered(names: &[(&str, bool)], warm: Option<&str>, cp: &str) {
 }
 
 #[test]
+fn fixed_formal_arguments_reach_nested_factories_without_a_result_prototype() {
+    matrix(
+        &[("fixed_prototype", true), ("fixed_prototype_bad", false)],
+        false,
+    );
+}
+
+#[test]
 fn inferred_override_scope() {
     matrix(
         &[
