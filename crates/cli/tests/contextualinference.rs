@@ -13,6 +13,49 @@ fn conditional_arguments_infer_types_from_both_branches() {
 }
 
 #[test]
+fn binary_nominal_callbacks_infer_lambda_result_types() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("nominal-callback-{stamp}"));
+    fs::create_dir(&root).unwrap();
+    let source = root.join("Callbacks.java");
+    fs::write(
+        &source,
+        r#"
+public class Callbacks {
+  public static <B> scala.collection.immutable.Seq<B> map(scala.Function1<String, B> f) {
+    return new scala.collection.immutable.$colon$colon<B>(f.apply("abc"), scala.collection.immutable.List$.MODULE$.<B>empty());
+  }
+  public static <B> B combine(scala.Function2<String, String, B> f) {
+    return f.apply("ab", "cde");
+  }
+}
+"#,
+    )
+    .unwrap();
+    let result = Command::new("javac")
+        .args(["-cp", JAR, "-d"])
+        .arg(&root)
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let cp = format!("{JAR}:{}", root.display());
+    matrix_cp(
+        &[("nominal_callback", true), ("nominal_callback_bad", false)],
+        false,
+        &cp,
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn nested_static_companions_keep_implicit_helper_paths() {
     let Some(home) = std::env::var_os("HOME") else {
         return;

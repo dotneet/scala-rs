@@ -3845,6 +3845,14 @@ pub(crate) fn unify_one_precise(
         }
         Type::Wildcard => None,
         Type::Class { sym: ps, args: pas } => {
+            // JVM generic signatures spell callbacks as FunctionN classes,
+            // while a typed lambda has the structural function form. Both
+            // carry the same constraints, including the callback's result.
+            if matches!(actual, Type::Function { .. }) {
+                if let Some(function) = st.function_class_shape(*ps, pas) {
+                    return unify_one_precise(st, tp, &function, actual);
+                }
+            }
             // `Tuple2[K, V]` against `(Int, String)`: the tuple sugar and the
             // nominal class denote the same type (`is_sub_type` already treats
             // them as such), so unify positionally when the arity agrees.
