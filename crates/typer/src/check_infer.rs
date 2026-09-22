@@ -2981,7 +2981,12 @@ impl Typer {
                     out.push((tp, self.st.lub(&t, &lo)))
                 }
                 (Some(t), None) => out.push((tp, t)),
-                (None, Some(lo)) => out.push((tp, lo)),
+                // A lower bound inherited from an open factory receiver is
+                // still undetermined even when no argument supplied a type.
+                // Minimizing it lets an expected result or the lambda body
+                // solve the method variable instead of fixing it to the
+                // factory's unrelated, unsolved parameter.
+                (None, Some(lo)) => out.push((tp, self.minimize_undet(&lo))),
                 (None, None) => {}
             }
         }

@@ -97,6 +97,17 @@ fn matrix_ordered(names: &[(&str, bool)], warm: Option<&str>, cp: &str) {
 }
 
 #[test]
+fn open_receiver_lower_bounds_do_not_fix_lambda_result_variables() {
+    matrix(
+        &[
+            ("receiver_lower_bound", true),
+            ("receiver_lower_bound_bad", false),
+        ],
+        false,
+    );
+}
+
+#[test]
 fn fixed_formal_arguments_reach_nested_factories_without_a_result_prototype() {
     matrix(
         &[("fixed_prototype", true), ("fixed_prototype_bad", false)],
