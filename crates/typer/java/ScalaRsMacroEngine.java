@@ -229,6 +229,7 @@ public final class ScalaRsMacroEngine {
                         }
                         cls = defineClass(name, bytes, 0, bytes.length);
                     } else if (name.equals("shapeless.LazyMacros$")
+                            || name.equals("shapeless.LazyMacros$DerivationContext$State$")
                             || name.equals("shapeless.LazyMacros$SubstMessage$1")
                             || name.equals("shapeless.LazyMacros$DerivationContext$StripUnApplyNodes")) {
                         try (java.io.InputStream stream = getParent().getResourceAsStream(name.replace('.', '/') + ".class")) {
@@ -237,7 +238,10 @@ public final class ScalaRsMacroEngine {
                             byte[] buffer = new byte[8192]; int read;
                             while ((read = stream.read(buffer)) != -1) raw.write(buffer, 0, read);
                             byte[] bytes = name.equals("shapeless.LazyMacros$")
-                                ? implicitResetBytes(raw.toByteArray()) : reflectionUniverseBytes(raw.toByteArray());
+                                ? compilerApiBytes(raw.toByteArray(), false)
+                                : name.equals("shapeless.LazyMacros$DerivationContext$State$")
+                                    ? compilerApiBytes(raw.toByteArray(), true)
+                                    : reflectionUniverseBytes(raw.toByteArray());
                             cls = defineClass(name, bytes, 0, bytes.length);
                         } catch (Exception failure) {
                             throw new ClassNotFoundException(name, failure);
@@ -293,9 +297,40 @@ public final class ScalaRsMacroEngine {
         if (!"reset".equals(answer.items.get(1).text())) throw gap("malformed implicit reset answer");
     }
 
-    /** Preserve the macro bytecode except for the exact private-compiler API
-     * sequence universe.asInstanceOf[Global].analyzer.resetImplicits(). */
-    static byte[] implicitResetBytes(byte[] original) throws Exception {
+    /** Read the annotation through the public reflection API. The package
+     * helper uses nsc's analyzer even though only a formatted string is needed. */
+    public static String implicitNotFoundMessage(Object receiver, Object context, Object type) throws Exception {
+        Object symbol = call(type, "typeSymbol", 0);
+        Object annotations = call(call(symbol, "annotations", 0), "iterator", 0);
+        while ((Boolean) call(annotations, "hasNext", 0)) {
+            Object annotation = call(annotations, "next", 0);
+            Object tree = call(annotation, "tree", 0);
+            Object annotationSymbol = call(call(tree, "tpe", 0), "typeSymbol", 0);
+            if (!"scala.annotation.implicitNotFound".equals(call(annotationSymbol, "fullName", 0))) continue;
+            Object arguments = call(tree, "args", 0);
+            if ((Boolean) call(arguments, "isEmpty", 0)) continue;
+            Object argument = call(arguments, "head", 0);
+            if (!isA(argument, "scala.reflect.api.Trees$LiteralApi")) continue;
+            Object value = call(call(argument, "value", 0), "value", 0);
+            if (!(value instanceof String)) continue;
+            String message = (String) value;
+            Object parameters = call(call(symbol, "typeParams", 0), "iterator", 0);
+            Object typeArguments = call(call(type, "typeArgs", 0), "iterator", 0);
+            while ((Boolean) call(parameters, "hasNext", 0)) {
+                String name = call(call(parameters, "next", 0), "name", 0).toString();
+                String shown = (Boolean) call(typeArguments, "hasNext", 0)
+                    ? call(typeArguments, "next", 0).toString() : name;
+                message = message.replace("${" + name + "}", shown);
+            }
+            return message;
+        }
+        return "Implicit value of type " + type + " not found";
+    }
+
+    /** Preserve macro code except for a supported private-compiler call. The
+     * diagnostic bridge consumes the original package receiver as well, so the
+     * invocation keeps the same stack shape and bytecode length. */
+    static byte[] compilerApiBytes(byte[] original, boolean diagnostic) throws Exception {
         java.io.DataInputStream input = new java.io.DataInputStream(new java.io.ByteArrayInputStream(original));
         input.readInt(); input.readUnsignedShort(); input.readUnsignedShort();
         int count = input.readUnsignedShort();
@@ -313,20 +348,25 @@ public final class ScalaRsMacroEngine {
             else throw gap("unsupported macro classfile constant " + tag);
         }
         int poolEnd = original.length - input.available();
-        int universeRef = 0, globalClass = 0, analyzerRef = 0, resetRef = 0;
+        int universeRef = 0, globalClass = 0, analyzerRef = 0, resetRef = 0, messageRef = 0;
         for (int i = 1; i < count; i++) {
             if ("scala/tools/nsc/Global".equals(text[left[i]]) && right[i] == 0) globalClass = i;
             if (right[i] == 0 || left[i] == 0) continue;
             String owner = text[left[left[i]]];
             String name = text[left[right[i]]];
+            String descriptor = text[right[right[i]]];
+            if ("shapeless/package$".equals(owner) && "implicitNotFoundMessage".equals(name)
+                    && "(Lscala/reflect/macros/whitebox/Context;Lscala/reflect/api/Types$TypeApi;)Ljava/lang/String;".equals(descriptor)) messageRef = i;
             if ("scala/reflect/macros/whitebox/Context".equals(owner) && "universe".equals(name)) universeRef = i;
             if ("scala/tools/nsc/Global".equals(owner) && "analyzer".equals(name)) analyzerRef = i;
             if ("scala/tools/nsc/typechecker/Analyzer".equals(owner) && "resetImplicits".equals(name)) resetRef = i;
         }
-        if (universeRef == 0 || globalClass == 0 || analyzerRef == 0 || resetRef == 0)
-            throw gap("macro implicit reset bytecode does not match the supported compiler API");
+        if (diagnostic ? messageRef == 0 : universeRef == 0 || globalClass == 0 || analyzerRef == 0 || resetRef == 0)
+            throw gap("macro bytecode does not match the supported compiler API");
         byte[] patched = original.clone();
-        byte[] pattern = new byte[] {(byte)0xb9, (byte)(universeRef >> 8), (byte)universeRef, 1, 0,
+        byte[] pattern = diagnostic
+            ? new byte[] {(byte)0xb6, (byte)(messageRef >> 8), (byte)messageRef}
+            : new byte[] {(byte)0xb9, (byte)(universeRef >> 8), (byte)universeRef, 1, 0,
             (byte)0xc0, (byte)(globalClass >> 8), (byte)globalClass,
             (byte)0xb6, (byte)(analyzerRef >> 8), (byte)analyzerRef,
             (byte)0xb9, (byte)(resetRef >> 8), (byte)resetRef, 1, 0};
@@ -365,13 +405,14 @@ public final class ScalaRsMacroEngine {
                 }
             }
         }
-        if (changed != 1) throw gap("expected one implicit reset call, found " + changed);
+        if (changed != 1) throw gap("expected one private compiler call, found " + changed);
         java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
         java.io.DataOutputStream d = new java.io.DataOutputStream(bytes);
         d.write(patched, 0, 8); d.writeShort(count + 6);
         d.write(patched, 10, poolEnd - 10);
         utf(d, "ScalaRsMacroEngine"); pair(d, 7, count, 0);
-        utf(d, "resetImplicitCaches"); utf(d, "(Ljava/lang/Object;)V");
+        utf(d, diagnostic ? "implicitNotFoundMessage" : "resetImplicitCaches");
+        utf(d, diagnostic ? "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/String;" : "(Ljava/lang/Object;)V");
         pair(d, 12, count + 2, count + 3); pair(d, 10, count + 1, count + 4);
         d.write(patched, poolEnd, patched.length - poolEnd); d.flush();
         return bytes.toByteArray();

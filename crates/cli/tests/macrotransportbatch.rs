@@ -98,6 +98,16 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
                 error.contains("could not find implicit value") || error.contains("type mismatch")
             } else if name == "macrotransport_bundle_bad" {
                 error.contains("could not find implicit value") || error.contains("type mismatch")
+            } else if name == "macrotransport_lazy_codec_bad" {
+                // Shapeless updates Lazy's runtime annotation before aborting.
+                // That annotation is not yet mirrored back to the native typer;
+                // its original abort must still survive without a JVM failure.
+                !error.contains("ClassCastException")
+                    && if nsc {
+                        error.contains("Missing codec for String")
+                    } else {
+                        error.contains("Unable to derive macrotransport.lazycodec.Codec[String]")
+                    }
             } else if name == "refined_bundle_bad" {
                 error.contains("bundle constructor rejected")
             } else if name == "macroparse_syntax_bad" {
@@ -514,6 +524,50 @@ fn natural_number_bundle_matches_scalac_at_runtime() {
 }
 
 #[test]
+fn shapeless_lazy_failure_does_not_require_compiler_universe() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+        .into_iter()
+        .map(|cache| {
+            PathBuf::from(&home)
+                .join(cache)
+                .join("https/repo1.maven.org/maven2/com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar")
+        })
+        .find(|jar| jar.is_file());
+    let Some(jar) = jar else {
+        eprintln!("skip: shapeless 2.3.13 is not cached");
+        return;
+    };
+    let compiler = "/tmp/scala-2.13.16/lib/scala-compiler.jar";
+    if !Path::new(compiler).is_file() {
+        return;
+    }
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}:{compiler}:{}", jar.display());
+    let producer = root.join("codec-producer");
+    compile(
+        "macrotransport_lazy_codec_impl",
+        true,
+        &producer,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", producer.display());
+    for nsc in [true, false] {
+        compile(
+            "macrotransport_lazy_codec_bad",
+            nsc,
+            &root.join(format!("missing-codec-{nsc}")),
+            &cp,
+            false,
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn binary_parent_loading_preserves_higher_kinded_parameters() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
@@ -814,7 +868,13 @@ fn compiler_reflection_helpers_preserve_companions_access_and_encoded_names() {
         compile("macroreflection_labelled", nsc, &labelled, &base, true);
         assert_eq!(run(&labelled, &base), b"Entry(record,7)\n");
         let companion = root.join(format!("source-companion-{nsc}"));
-        compile("macroreflection_source_companion", nsc, &companion, &base, true);
+        compile(
+            "macroreflection_source_companion",
+            nsc,
+            &companion,
+            &base,
+            true,
+        );
         assert_eq!(run(&companion, &base), b"Entry(42)\n");
     }
     fs::remove_dir_all(root).unwrap();
