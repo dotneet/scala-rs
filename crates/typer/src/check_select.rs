@@ -2044,13 +2044,17 @@ impl Typer {
     /// `<overload (A) => B | (A) => B>` could not be applied at all: cats'
     /// generated `NTupleMonadInstances.scala` reported `no matching overload`
     /// for `ff._1(fa._1)` ten times, once per `FlatMapTupleN`.
+    /// A binary member object can likewise expose both its module symbol and
+    /// a nullary accessor returning that exact module class. Keep the accessor
+    /// so its enclosing instance remains the receiver of the member object.
     fn drop_field_behind_accessor(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         let is_field = |s: SymbolId| {
             let sym = self.st.get(s);
-            sym.kind == SymKind::Term
-                && (self.st.get(sym.owner).ctor_fields.contains(&s)
-                    || sym.via_accessor
-                    || sym.flags.contains(Flags::LAZY))
+            sym.kind == SymKind::Module
+                || sym.kind == SymKind::Term
+                    && (self.st.get(sym.owner).ctor_fields.contains(&s)
+                        || sym.via_accessor
+                        || sym.flags.contains(Flags::LAZY))
         };
         if !found.iter().copied().any(is_field) {
             return found;
@@ -2071,7 +2075,10 @@ impl Typer {
                         && matches!(&self.st.get(o).ty,
                             Type::Method { paramss, ret }
                                 if paramss.iter().all(|c| c.is_empty())
-                                    && ret.as_ref() == field_ty)
+                                    && (ret.as_ref() == field_ty
+                                        || self.st.get(s).kind == SymKind::Module
+                                            && self.st.class_sym_of(ret)
+                                                == Some(self.st.module_class_of(s))))
                 })
             })
             .collect();

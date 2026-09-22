@@ -3678,3 +3678,68 @@ object Main { def main(args: Array[String]): Unit = println(Record().copied.read
         "",
     );
 }
+
+#[test]
+fn binary_member_modules_and_accessors_share_one_factory() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("member-module-factory");
+    let library = dir.join("Library.scala");
+    fs::write(
+        &library,
+        r#"
+package rowlib
+trait Tables { case class Row(id: Int, progress: Option[Float]) }
+object Tables extends Tables
+"#,
+    )
+    .unwrap();
+    let source = dir.join("Main.scala");
+    fs::write(
+        &source,
+        r#"
+import rowlib.Tables.Row
+object Main {
+  def main(args: Array[String]): Unit = {
+    val row = Row(progress = Some(2), id = 1)
+    println(row.id)
+    println(row.progress.get)
+  }
+}
+"#,
+    )
+    .unwrap();
+    let compile = |ours: bool, source: &Path, out: &Path, cp: &str| {
+        fs::create_dir_all(out).unwrap();
+        let mut command = Command::new(if ours { bin() } else { scalac.clone() });
+        if ours {
+            command.arg("compile").arg("--scala-library").arg(&jar);
+        }
+        let p = command
+            .arg("-cp")
+            .arg(cp)
+            .arg("-d")
+            .arg(out)
+            .arg(source)
+            .output()
+            .unwrap();
+        assert!(
+            p.status.success(),
+            "ours={ours}: {}",
+            String::from_utf8_lossy(&p.stderr)
+        );
+    };
+    for producer in [false, true] {
+        let lib = dir.join(format!("lib-{producer}"));
+        compile(producer, &library, &lib, jar.to_str().unwrap());
+        let cp = format!("{}:{}", lib.display(), jar.display());
+        for consumer in [false, true] {
+            let out = dir.join(format!("out-{producer}-{consumer}"));
+            compile(consumer, &source, &out, &cp);
+            assert_eq!(run_java(&out, &cp), "1\n2.0\n");
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
