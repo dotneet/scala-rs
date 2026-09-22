@@ -30,6 +30,8 @@ mod pathdep;
 mod pattern_acceptance;
 #[path = "../pattern_type_binders.rs"]
 mod pattern_type_binders;
+#[path = "../pf_empty_inference.rs"]
+mod pf_empty_inference;
 #[path = "../pfx.rs"]
 mod pfx;
 #[path = "../pickle_lib.rs"]

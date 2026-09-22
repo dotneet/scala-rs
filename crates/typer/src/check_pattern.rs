@@ -45,6 +45,27 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
+            // A branch typed without an expected result is a monomorphic
+            // value before the enclosing call uses it for inference. For
+            // example, `recover { case _ => Seq.empty }` contributes
+            // `Seq[Nothing]`, not the still-open `Seq[A]` from `empty[A]`.
+            // Keep lexical method parameters rigid; only an already applied
+            // method's unbound parameters can be minimized here.
+            if pt.is_no_type() {
+                let mut params = Vec::new();
+                collect_tparams(&c.body.ty, &mut params);
+                params.retain(|&id| {
+                    self.st.get(self.st.get(id).owner).kind == SymKind::Method
+                        && !self.tparam_in_scope(id)
+                });
+                if !params.is_empty() {
+                    let bounds: Vec<Type> = params
+                        .iter()
+                        .map(|&id| self.st.get(id).bound_lo.clone().unwrap_or(Type::Nothing))
+                        .collect();
+                    c.body.ty = crate::symbol::subst_tparams_slice(&params, &bounds, &c.body.ty);
+                }
+            }
             // Library classes complete their parents lazily; a join that
             // fell to `AnyRef` asks for them (`join_branches`).
             res = self.join_branches(&res, &c.body.ty);
