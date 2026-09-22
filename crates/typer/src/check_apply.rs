@@ -1071,6 +1071,12 @@ impl Typer {
         let mut arg_tys = Vec::new();
         let saved_taking_args = std::mem::replace(&mut self.typing_call_args, true);
         let fun_ty_for_pretype = fun.ty.clone();
+        // Nested calls may select the same overloaded declaration through a
+        // different receiver. The shared symbol key must not replace this
+        // call's receiver-substituted alternatives while its arguments type.
+        let argument_overloads = matches!(fun_ty_for_pretype, Type::Overload(_))
+            .then(|| self.overload_member_types.get(&fun.sym.0).cloned())
+            .flatten();
         let nargs = args.len();
         if args
             .iter()
@@ -1121,6 +1127,9 @@ impl Typer {
             _ => false,
         };
         for (ai, a) in args.iter_mut().enumerate() {
+            if let Some(alts) = &argument_overloads {
+                self.overload_member_types.insert(fun.sym.0, alts.clone());
+            }
             if a.byname_thunk {
                 arg_tys.push(a.argument_type());
                 continue;
@@ -1509,6 +1518,9 @@ impl Typer {
             }
         }
         self.typing_call_args = saved_taking_args;
+        if let Some(alts) = argument_overloads {
+            self.overload_member_types.insert(fun.sym.0, alts);
+        }
         // What the arguments left undetermined. Typing them with no expected
         // type is what makes overload resolution possible, and it is also what
         // leaves `Map.empty` as `Map[K, V]`; those parameters are this call's

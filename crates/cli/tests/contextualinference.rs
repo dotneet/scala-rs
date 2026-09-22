@@ -148,6 +148,14 @@ fn residual_overload_clauses() {
 }
 
 #[test]
+fn nested_overloaded_receivers_keep_the_outer_type_arguments() {
+    matrix(
+        &[("chain_nested", true), ("chain_nested_bad", false)],
+        false,
+    );
+}
+
+#[test]
 fn parent_repeated_arguments() {
     matrix(
         &[
