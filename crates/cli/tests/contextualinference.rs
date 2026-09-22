@@ -494,3 +494,11 @@ fn existential_alias_signature_roundtrip_across_compilers() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn unit_adaptation_matches_scalac_and_native() {
+    matrix(
+        &[("unit_adaptation", true), ("unit_adaptation_bad", false)],
+        false,
+    );
+}

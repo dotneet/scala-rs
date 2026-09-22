@@ -3828,7 +3828,23 @@ impl Typer {
             }
         }
         if matches!(pt, Type::Unit) {
-            // value discarded
+            // Discarding a value changes the expression's type, not only
+            // its eventual JVM return instruction. A generic by-name call
+            // must infer Unit from this adapted argument rather than from
+            // the value evaluated for its effects.
+            let inner = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+            let mut unit = Tree::dummy(TreeKind::Literal { lit: Lit::Unit });
+            unit.span = inner.span;
+            unit.ty = Type::Unit;
+            let id = inner.id;
+            let span = inner.span;
+            *tree = Tree::dummy(TreeKind::Block {
+                stats: vec![inner],
+                expr: Box::new(unit),
+            });
+            tree.id = id;
+            tree.span = span;
+            tree.ty = Type::Unit;
             return;
         }
         if matches!(pt, Type::String) && !matches!(tree.ty, Type::String) {
@@ -3894,6 +3910,7 @@ impl Typer {
                     } else {
                         eta_expand(&mut this.st, &mut this.gensym, tree, params, ret);
                     }
+                    this.adapt_function_literal_result(tree, pt);
                 });
                 self.record_open_tparams(msym, &tree.ty);
                 if self.st.is_sub_type(&tree.ty, pt) {
@@ -4330,8 +4347,8 @@ impl Typer {
     /// the expected result. Adapt it here instead.
     ///
     /// Only a literal: `val h: Int => Int = …; fu(h)` stays the mismatch nsc
-    /// reports. And only the result -- the parameters have to be the ones the
-    /// expected type asks for already.
+    /// reports. The expected input types must conform to the literal's
+    /// parameters; the generated function can safely accept wider inputs.
     fn adapt_function_literal_result(&mut self, tree: &mut Tree, pt: &Type) -> bool {
         if !matches!(tree.kind, TreeKind::Function { .. }) {
             return false;
@@ -4352,7 +4369,7 @@ impl Typer {
         if !pt_params
             .iter()
             .zip(&params)
-            .all(|(p, a)| self.st.is_sub_type(p, a) && self.st.is_sub_type(a, p))
+            .all(|(p, a)| self.st.is_sub_type(p, a))
         {
             return false;
         }
