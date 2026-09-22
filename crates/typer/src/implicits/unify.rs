@@ -357,8 +357,10 @@ impl<'a> Unify<'a> {
                 if s1 == s2 && a1.len() == a2.len() {
                     let variances = self.typer.st.get(*s1).tparams.clone();
                     // Invariant positions constrain equality, while variant
-                    // positions only constrain subtyping. Solve the equality
-                    // constraints first: Join[-A, -B, Out] with a witness
+                    // positions only constrain subtyping. Solve concrete
+                    // equality constraints first; open output parameters still
+                    // need their input positions to determine them.
+                    // Join[-A, -B, Out] with a witness
                     // Join[T, T, T] must infer T from Out before checking that
                     // the two inputs conform to it.
                     for invariant_pass in [true, false] {
@@ -367,9 +369,11 @@ impl<'a> Unify<'a> {
                                 .get(i)
                                 .map(|&tp| self.typer.st.get(tp).flags)
                                 .unwrap_or(Flags::EMPTY);
-                            let invariant = !flags.contains(Flags::COVARIANT)
-                                && !flags.contains(Flags::CONTRAVARIANT);
-                            if invariant != invariant_pass {
+                            let fixed = !flags.contains(Flags::COVARIANT)
+                                && !flags.contains(Flags::CONTRAVARIANT)
+                                && !mentions_unknown(y, &self.unknowns)
+                                && !matches!(y, Type::Wildcard | Type::BoundedWildcard { .. });
+                            if fixed != invariant_pass {
                                 continue;
                             }
                             if self.unify_at(x, y, depth + 1) {
