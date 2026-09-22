@@ -581,3 +581,15 @@ fn range_flatmap_uses_its_polymorphic_element_type() {
         false,
     );
 }
+
+#[test]
+fn contravariant_inputs_and_covariant_output_join_from_expected_type() {
+    matrix(
+        &[
+            ("join_lub", true),
+            ("join_lub_bad_reverse", false),
+            ("join_lub_bad_inputs", false),
+        ],
+        false,
+    );
+}
