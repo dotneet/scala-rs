@@ -8,6 +8,18 @@ use std::{
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 
 #[test]
+fn projected_method_and_class_bounds_use_instantiated_receivers() {
+    matrix(
+        &[
+            ("projected_bounds", true),
+            ("projected_bounds_bad", false),
+            ("projected_class_bounds_bad", false),
+        ],
+        false,
+    );
+}
+
+#[test]
 fn conditional_arguments_infer_types_from_both_branches() {
     matrix(&[("branch_wildcard", true)], false);
 }

@@ -3270,7 +3270,7 @@ impl Typer {
                 } else {
                     self.st.subst_tparams(owner, &recv_args, &bound)
                 };
-                let bound = crate::symbol::subst_tparams_slice(&ids, &vals, &bound);
+                let bound = self.st.subst_type_params_projected(&ids, &vals, &bound);
                 if bound.is_error() || bound.is_no_type() || mentions_any_tparam(&bound) {
                     continue;
                 }
@@ -3375,7 +3375,7 @@ impl Typer {
                 // parameter after that belongs to an enclosing scope and is not
                 // this site's to check -- the same rule the method version
                 // draws, with a walk that also reaches inside a `with` type.
-                let bound = crate::symbol::subst_tparams_slice(&tps, targs, &bound);
+                let bound = self.st.subst_type_params_projected(&tps, targs, &bound);
                 if bound.is_error()
                     || bound.is_no_type()
                     || bound_mentions_tparam(&bound)
