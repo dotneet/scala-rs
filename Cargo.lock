@@ -113,6 +113,7 @@ version = "0.1.0"
 dependencies = [
  "mimalloc",
  "scala-rs-driver",
+ "scala-rs-pickle",
  "scala-rs-span",
 ]
 

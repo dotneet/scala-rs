@@ -126,6 +126,9 @@ pub struct BinaryIndex {
     /// directory is not on it, and the macro engine's classes go to a cache
     /// directory of their own.
     class_cache: HashMap<String, Option<Vec<u8>>>,
+    /// Package probes are frequent during implicit search. Directory entries
+    /// need filesystem checks, so remember stable answers just like classes.
+    package_cache: HashMap<String, bool>,
 }
 
 /// One classpath entry, with its archive once something has been looked up in it.
@@ -159,6 +162,7 @@ impl BinaryIndex {
         BinaryIndex {
             paths,
             class_cache: HashMap::default(),
+            package_cache: HashMap::default(),
         }
     }
 
@@ -219,6 +223,24 @@ impl BinaryIndex {
     }
 
     pub fn has_package_prefix(&mut self, prefix: &str) -> bool {
+        if let Some(&found) = self.package_cache.get(prefix) {
+            return found;
+        }
+        let found = self.has_package_prefix_uncached(prefix);
+        // A path that did not exist at startup may become a directory later.
+        // Cache a miss only when every classpath entry was already classified.
+        if found
+            || self
+                .paths
+                .iter()
+                .all(|entry| !matches!(entry.kind, PathKind::Unknown))
+        {
+            self.package_cache.insert(prefix.to_string(), found);
+        }
+        found
+    }
+
+    fn has_package_prefix_uncached(&mut self, prefix: &str) -> bool {
         let dir_rel = prefix.trim_end_matches('/');
         let alt = format!("classes/{prefix}");
         for i in 0..self.paths.len() {
@@ -772,6 +794,21 @@ fn nested_is_static(this: &str, inners: &[JavaInnerClass]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_probe_rechecks_path_created_after_indexing() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-package-probe-{unique}"));
+        let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+        assert!(!index.has_package_prefix("late_package/"));
+        std::fs::create_dir_all(root.join("late_package")).unwrap();
+        assert!(index.has_package_prefix("late_package/"));
+        assert!(index.has_package_prefix("late_package/"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parses_jdk_math_if_present() {
