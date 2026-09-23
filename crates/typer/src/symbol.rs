@@ -6137,8 +6137,11 @@ impl SymbolTable {
             if a == b || matches!(a, Type::Nothing | Type::Error) {
                 return true;
             }
-            if matches!(a, Type::Null) {
-                return self.is_sub_type(a, body);
+            // Literal types are normally widened below before ordinary
+            // subtyping. An existential is handled first so it can keep its
+            // binders correlated; preserve the same widening for `null` here.
+            if matches!(a, Type::Null | Type::Constant(scala_rs_parser::Lit::Null)) {
+                return self.is_sub_type(&Type::Null, body);
             }
             let (actual, captures) = match a {
                 Type::Existential { params, body } => (body.as_ref(), params.as_slice()),
