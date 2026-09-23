@@ -141,3 +141,33 @@ object Main {
 "#,
     );
 }
+
+/// A value-class method's default getter has an `$extension` of its own, and
+/// nsc's erasure looks it up on the companion's pickled members: a scalac
+/// client calling `new Meter(1.5).scale()` crashed with `no extension method
+/// found for: method scale$default$1:Int` when only the classfile had it.
+#[test]
+fn value_class_default_getter_extension_is_pickled() {
+    check_separate(
+        "vc-default-getter",
+        r#"package lib
+class Meter(val v: Double) extends AnyVal {
+  def scale(k: Int = 2): Double = v * k
+  def shift(by: Double)(times: Int = by.toInt + 1): Double = v + by * times
+  def pick[A](xs: List[A], i: Int = 0): A = xs(i)
+}
+final class Box[A](val a: A) extends AnyVal { def or(other: A = a): A = other }
+"#,
+        r#"import lib._
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new Meter(1.5).scale())
+    println(new Meter(1.5).scale(4))
+    println(new Meter(1.0).shift(2.0)())
+    println(new Meter(1.0).pick(List("a", "b")))
+    println(new Box("x").or())
+  }
+}
+"#,
+    );
+}

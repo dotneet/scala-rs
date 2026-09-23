@@ -127,6 +127,23 @@ fn collect_value_classes(tree: &Tree, st: &SymbolTable, out: &mut Vec<(SymbolId,
                 }
                 methods.push(stt.sym);
             }
+            // A default getter is a synthesized *symbol* with no `DefDef` in
+            // the body, but it gets an `$extension` static of its own too
+            // (`gen_object`'s companion forwarders pick it out the same way).
+            // nsc's erasure looks `scale$default$1$extension` up on the
+            // companion for `new Meter(1.5).scale()`, and without the
+            // declaration real scalac died with `no extension method found
+            // for: method scale$default$1:Int`.
+            for &m in &st.get(tree.sym).members {
+                let s = st.get(m);
+                if s.kind == SymKind::Method
+                    && s.name.contains("$default$")
+                    && s.default_rhs.is_some()
+                    && !methods.contains(&m)
+                {
+                    methods.push(m);
+                }
+            }
             out.push((tree.sym, methods));
         }
     }
