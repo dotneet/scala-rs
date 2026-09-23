@@ -1160,7 +1160,7 @@ fn lf2_lift_bad_names_every_hole_it_cannot_lift() {
     let _ = fs::remove_dir_all(&out);
 }
 
-// --- the fresh-name forms (`agent/freshname`, §7.10) ----------------------
+// --- the fresh-name forms (`agent/freshname`, §7.9a) ---------------------
 
 /// Renumber the fresh names in one line of `showRaw` output, in order of first
 /// appearance.

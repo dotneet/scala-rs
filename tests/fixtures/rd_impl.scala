@@ -1,5 +1,5 @@
 // The shape `reify { … }` expands into, written out by hand and expanded for
-// real. `docs/macros.md` §7.13.4, §7.14.
+// real. `docs/macros.md` §7.14.
 //
 // nsc's `-Xprint:typer` for `reify { 42 }` inside a macro implementation is
 //
@@ -8,8 +8,8 @@
 //       $u.Expr.apply[Int]($m, new $treecreator1())($u.TypeTag.apply[Int](…)) }
 //
 // with the tree built inside `$treecreator1.apply[U](m: Mirror[U]): U#Tree`.
-// scala-rs does not *build* that shape yet -- `reify` is still the §7.8
-// diagnostic -- but every piece of it is here, so the machinery is what this
+// scala-rs did not *build* that shape when this was written (§7.15 does
+// now) -- but every piece of it is here, so the machinery is what this
 // file pins: the nested `object Expr` and its `apply` (whose pickled
 // signature says `Mirror[Universe.this.type]` and cannot be converted, so it
 // is written out the way `TypeTag.apply` is), `Mirror[c.universe.type]` as a
@@ -82,7 +82,7 @@ object RdImpl {
     )
   }
 
-  /** The two gaps §7.13.4 names, in the position they are needed: the nested
+  /** The two gaps §7.14 closes, in the position they are needed: the nested
     * `object Expr` reached through the path *and* through the wildcard
     * import, and `c.universe` written as a stable identifier in a type
     * argument. Both were diagnostics ("value Expr is not a member of

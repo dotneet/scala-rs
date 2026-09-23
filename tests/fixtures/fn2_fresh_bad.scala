@@ -1,4 +1,4 @@
-// What is still refused around the fresh-name forms. `docs/macros.md` §7.10.
+// What is still refused around the fresh-name forms. `docs/macros.md` §7.9a.
 //
 // A `_` only stands for a name when something *binds* it: a lambda's parameter
 // list, or the existential an applied type introduces. On its own it binds

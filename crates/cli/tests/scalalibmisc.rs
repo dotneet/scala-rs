@@ -310,8 +310,8 @@ fn scalalib_syntax_fixture() {
 }
 
 /// `@specialized` used to be a diagnostic without `-no-specialization`. It is
-/// now accepted and recorded on the type parameter's symbol (stage 1 of
-/// docs/specialization.md), so the same fixture compiles and runs with or
+/// now accepted and recorded on the type parameter's symbol (docs/specialization.md,
+/// "Accepting and recording the annotation"), so the same fixture compiles and runs with or
 /// without the flag -- including the `@sp` spelling an import rename produces,
 /// which this fixture also writes. What is still missing is the phase: no
 /// `Cell$mcI$sp` is emitted, and `tests/spec_classfiles.sh` measures that gap

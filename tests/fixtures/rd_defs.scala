@@ -18,7 +18,7 @@ object Main {
   val simpleVal = reify { val x = 1; x + 1 }
   // A `val` with an explicit type: `Int` is a monomorphic class, reified as
   // `mkIdent($m.staticClass("scala.Int"))` -- *not* wrapped in `mkTypeTree`,
-  // unlike a type *argument* at a call site (`docs/macros.md` §7.15/7.16).
+  // unlike a type *argument* at a call site (`docs/macros.md` §7.19).
   val typedVal = reify { val x: Int = 1; x + 1 }
   // A `def` with a parameter, whose type is reified the same way.
   val simpleDef = reify { def f(y: Int): Int = y + 1; f(41) }

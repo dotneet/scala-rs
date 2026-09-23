@@ -21,7 +21,7 @@ object RbUse {
   def qualified: Int = macro RbImpl.qualified
   def three: Int = macro RbImpl.three
   // The type argument is written out at every call below: an *inferred* one
-  // is not handed to a macro yet (`docs/macros.md` §7.13, residual 1).
+  // was not handed to a macro when this was written.
   def idOf[T](x: T): T = macro RbImpl.idOf[T]
   def pair[A, B](a: A, b: B): String = macro RbImpl.pair[A, B]
 }

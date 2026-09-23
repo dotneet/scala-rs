@@ -311,8 +311,8 @@ if [[ -n ${KNOWN:-} ]]; then
   for p in "${(@s: :)KNOWN}"; do KNOWN_WHY[$p]="held out by KNOWN="; done
 fi
 # Empty since `agent/rhfix`: `Chains`, `Monoids`, `NaturalTransforms` and
-# `Transformers` all pass. What they were waiting for is in
-# `docs/notes/rh-cats-gitbucket-run.md`, each with its reduced program.
+# `Transformers` all pass. The reduced programs for what they were waiting for
+# are the `rhf_*` fixtures (`crates/cli/tests/rhf.rs`).
 
 PROGS=("$@")
 if [[ ${#PROGS[@]} -eq 0 ]]; then

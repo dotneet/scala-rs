@@ -60,5 +60,5 @@ object DqDefsBad {
 
   // A `_` type argument (`q"def f(x: Bar[_]) = x"`) used to stand here; it is
   // an existential, reified now out of the `freshTypeName` block nsc builds
-  // for it (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
+  // for it (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.9a).
 }

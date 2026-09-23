@@ -304,8 +304,7 @@ impl<'a> Gen<'a> {
             // a separately compiled consumer finds no pickle for the package
             // object at all, and every one of its members is invisible -- real
             // scalac reading a scala-rs build of a package object said `object
-            // twice is not a member of package myp.util` for each of them. See
-            // `docs/notes/companions-and-class-symbols.md`.
+            // twice is not a member of package myp.util` for each of them.
             self.emit_forwarder(&this_name, &forwarded, cls);
         }
     }

@@ -1,4 +1,4 @@
-// `reify { … }` expanded by scala-rs itself (`docs/macros.md` §7.14).
+// `reify { … }` expanded by scala-rs itself (`docs/macros.md` §7.15).
 //
 // `tests/fixtures/rd_impl.scala` writes out, by hand, the tree `reify` has to
 // build; this file writes `reify` and lets the compiler build it. The two

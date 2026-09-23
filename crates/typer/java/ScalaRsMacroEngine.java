@@ -820,7 +820,7 @@ public final class ScalaRsMacroEngine {
     /**
      * Ask scala-rs a question in the middle of an expansion.
      *
-     * This is the reverse direction of the bridge (`docs/macros.md` §7.18).
+     * This is the reverse direction of the bridge (`docs/macros.md` §7.20).
      * The engine writes `(q ...)` on the same stdout the reply goes to, and
      * scala-rs -- which is sitting in its read loop waiting for that reply --
      * recognises the `q`, answers on stdin, and goes back to waiting. So the

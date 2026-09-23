@@ -60,7 +60,7 @@
 //! and checked byte for byte against what real scalac 2.13.16 prints.
 //!
 //! Found in passing and **not** fixed here, both pre-existing and reproducing
-//! on an unpatched binary (see `docs/notes/known-gaps-backlog.md`):
+//! on an unpatched binary:
 //!
 //! * A value class over a *reference* type (`case class WS(s: String) extends
 //!   AnyVal`) is broken well before pattern matching -- `WS("a")` passed as an

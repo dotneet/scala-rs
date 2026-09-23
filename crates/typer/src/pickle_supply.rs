@@ -2347,7 +2347,7 @@ impl PickleSupply {
         // `install_nested_module`); nothing supplied the *type* half before
         // this, so naming the class itself gave "not a member of Universe" /
         // "not found: type ..." even though the classfile genuinely exists on
-        // the classpath. See docs/macros.md, items 4 and 5 of the §7.8 list.
+        // the classpath.
         let class_hit = hits
             .into_iter()
             .find(|h| h.member.kind == MemberKind::Class && h.member.is_public_api())?;
@@ -3502,7 +3502,7 @@ impl PickleSupply {
     /// a `MemberKind::Module` entry was dropped whole: `c.universe.Expr` was
     /// "value Expr is not a member of Universe" and `import c.universe._;
     /// Expr` was "not found: value Expr", both untrue -- the member is right
-    /// there in the pickle (`docs/macros.md` §7.8 residual 5, §7.13.4 gap 1).
+    /// there in the pickle (`docs/macros.md` §7.14).
     ///
     /// The accessor is installed on **`class_sym`**, the receiver the lookup
     /// started from, exactly as `install` does for an inherited `def`. That

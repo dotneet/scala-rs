@@ -118,8 +118,8 @@ impl Reifier<'_> {
     /// A `val` or `def` bound *inside* the `reify { … }` body needs none of
     /// the free-term machinery: real scalac 2.13.16 reifies both the
     /// binding and every reference to it structurally, by name, exactly the
-    /// way a quasiquote would (`docs/macros.md` §7.17, "the `reify` widening
-    /// slice" -- confirmed with `-Ymacro-debug-lite`, which never mentions
+    /// way a quasiquote would (`docs/macros.md` §7.19 -- confirmed with
+    /// `-Ymacro-debug-lite`, which never mentions
     /// `newFreeTerm` for a name the body binds itself). `Reifier::local_bound`
     /// is what tells such a name apart from one that is genuinely free with
     /// respect to this body -- bound *outside* it, which is the shape nsc

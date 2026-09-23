@@ -1,5 +1,5 @@
 // Def macros that are actually *expanded* -- the JVM bridge of
-// `docs/macros.md` §2.2, phase 2. Compiled against `eg_impl.scala`'s class
+// `docs/macros.md` §2.2. Compiled against `eg_impl.scala`'s class
 // files, the way nsc requires (the implementation must come from an earlier
 // compilation run, because expanding means loading and running it).
 //

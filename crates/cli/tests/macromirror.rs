@@ -498,7 +498,7 @@ fn infer_implicit_value_adversarial_queries_fail_closed() {
 /// `Int(1) / Int(1) / Int(1) / caught`); scala-rs answers none of them,
 /// and each refusal says which capability was missing. An approximate answer
 /// would compile here and be wrong, and nothing downstream would notice --
-/// which is exactly what `docs/macros.md` §7.18 warns a half-built mirror
+/// which is exactly what `docs/macros.md` §7.20 warns a half-built mirror
 /// does.
 #[test]
 fn mtc_unanswerable_questions_are_named() {

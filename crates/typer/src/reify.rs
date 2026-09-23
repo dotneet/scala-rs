@@ -156,7 +156,7 @@ pub(crate) struct ReifyCtx<'a> {
     /// The typed body's world: symbols, what the body defines, tags in scope.
     pub(crate) env: ReifyEnv<'a>,
     /// The local the creator binds the mirror to, cast to
-    /// `Mirror[$u.type]` (`docs/macros.md` §7.14, item 3).
+    /// `Mirror[$u.type]` (`docs/macros.md` §7.14, "The upper bound of `u.Mirror`").
     pub(crate) mirror_local: String,
     /// The local the creator binds `$m$untyped.universe` to. `Reifier`'s
     /// `universe` is an `Ident` of it; the name is needed again for the
@@ -439,7 +439,7 @@ impl<'a> Reifier<'a> {
     /// The type argument is written out because `$m`'s own type is
     /// `Mirror[$u.type]` only after the cast the creator makes: the universe's
     /// abstract `Mirror` loses its `api.Mirror[self.type]` bound in the
-    /// pickle (`docs/macros.md` §7.14, item 3).
+    /// pickle (`docs/macros.md` §7.14, "The upper bound of `u.Mirror`").
     fn rebased(&self, ctx: &ReifyCtx, e: &Tree) -> Tree {
         let singleton = self.node(TreeKind::SingletonTypeTree {
             ref_: Box::new(self.local(&ctx.universe_local)),
@@ -460,7 +460,7 @@ impl<'a> Reifier<'a> {
     /// around it. The type argument is written out because `$m`'s own type is
     /// `Mirror[$u.type]` only after the cast the creator makes: the universe's
     /// abstract `Mirror` loses its `api.Mirror[self.type]` bound in the
-    /// pickle (`docs/macros.md` §7.14, item 3).
+    /// pickle (`docs/macros.md` §7.14, "The upper bound of `u.Mirror`").
     fn splice_tree(&self, ctx: &ReifyCtx, e: &Tree) -> Tree {
         self.select(self.rebased(ctx, e), "tree")
     }
@@ -1189,8 +1189,8 @@ impl<'a> Reifier<'a> {
     // -- local scope (reify only) -------------------------------------------
     //
     // A `val` or `def` this `reify { … }` body binds itself, and a `def`'s
-    // own parameters, need none of the free-term machinery §7.17 of
-    // `docs/macros.md` describes: real scalac 2.13.16 reifies both the
+    // own parameters, need none of the free-term machinery (`docs/macros.md`
+    // §7.19): real scalac 2.13.16 reifies both the
     // binding and every reference to it structurally, by name, the same way
     // a quasiquote would (`-Ymacro-debug-lite` on `reify { val x = 1; x + 1
     // }` prints `$u.ValDef.apply($u.NoMods, $u.TermName("x"), ...)` and

@@ -1,7 +1,7 @@
 // Call sites for `rf_impl.scala`. The macro defs live here, in the *second*
-// run, because a macro def scala-rs itself compiled into an earlier run does
-// not carry its implementation binding in the pickle yet -- see
-// `docs/macros.md` §7.17 "What remains".
+// run, because a macro def scala-rs itself compiled into an earlier run did
+// not carry its implementation binding in the pickle when this was written
+// (it does now: `docs/macros.md` §5).
 import scala.language.experimental.macros
 
 object Main {

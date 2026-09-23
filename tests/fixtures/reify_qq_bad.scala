@@ -19,7 +19,7 @@ object Main {
     println(q"if (a) b")
     // `a :: b` and `_.get` used to stand here; both are reified now, out of
     // the `freshTermName` block nsc builds for them
-    // (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
+    // (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.9a).
     // Mixing a splice with ordinary arguments is built now, the way nsc's own
     // `reifyList` builds it (`docs/macros.md` §7.16); the line is kept because
     // the *shape* still has to compile. What is refused is a rank-2

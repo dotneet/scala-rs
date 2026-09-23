@@ -6,7 +6,7 @@
 // into some other tree. `reify { … }` is a compiler-internal macro like the
 // quasiquotes, with no implementation in scala-reflect.jar: saying `value
 // reify is not a member of JavaUniverse` was untrue, the same way `value q is
-// not a member of StringContext` was. It has an expansion now (§7.14), and
+// not a member of StringContext` was. It has an expansion now (§7.15), and
 // what it still refuses it refuses by name.
 import scala.reflect.runtime.universe._
 

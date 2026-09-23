@@ -19,7 +19,7 @@ use std::rc::Rc;
 impl<'a> Gen<'a> {
     /// The concrete half of a trait, emitted **onto the interface itself**,
     /// which is what nsc 2.13 does and what a separately compiled subclass
-    /// expects to find (see `docs/notes/bytecode-and-java-interop.md`).
+    /// expects to find.
     ///
     /// * a concrete `def m` becomes a `default` method holding the body, plus
     ///   `public static m$($this: T, …)` forwarding to it;

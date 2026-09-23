@@ -2,7 +2,7 @@
 //
 // `q"..."` is a compiler-internal macro in nsc: scala-reflect.jar holds no
 // implementation, so scala-rs desugars it itself into the universe calls that
-// build the reflect tree at run time (`docs/macros.md` §6.2, §7.3 B). Every
+// build the reflect tree at run time (`docs/macros.md` §6.2, §7.4). Every
 // line below is checked against real scalac 2.13.16, which prints the same
 // thing -- the trees are the same trees.
 //

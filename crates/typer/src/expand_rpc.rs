@@ -1,5 +1,5 @@
 //! Answering the engine's questions: reverse RPC from the JVM back into the
-//! typer (`docs/macros.md` §7.18, step 1).
+//! typer (`docs/macros.md` §7.20).
 //!
 //! Expansion used to be one line out and one line back. It is now a
 //! conversation. An implementation running inside the engine can stop and ask

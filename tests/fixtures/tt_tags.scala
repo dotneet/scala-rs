@@ -56,8 +56,8 @@ object Main {
     println(show(weakTypeTag[Baz].tpe))
     // `implicitly[TypeTag[Foo]]` is *not* here: naming the tag's type at all
     // -- `TypeTag[Foo]`, `u.TypeTag[Foo]` -- still fails, and for a reason
-    // that has nothing to do with materialisation (`docs/macros.md` §7.10,
-    // residual 2). `typeTag[Foo]` above asks for exactly the same implicit.
+    // that has nothing to do with materialisation (naming the tag's type).
+    // `typeTag[Foo]` above asks for exactly the same implicit.
 
     // Two independently materialised tags describe the same type.
     println(typeOf[Foo] =:= typeOf[Foo])
