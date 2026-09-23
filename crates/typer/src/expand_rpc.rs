@@ -1106,7 +1106,53 @@ impl Typer {
     /// retains a source class or weak type parameter identity. Constant and
     /// structural types use their corresponding reflection representations.
     /// Unsupported shapes are refused rather than widened to another type.
+    /// [`Self::type_to_wire_uncached`], kept for a type made only of
+    /// classes, tuples, functions, arrays and constants.
+    ///
+    /// `c.openImplicits` is asked at every level of a shapeless derivation,
+    /// and its answer spells the type every open implicit wants -- a long
+    /// `Show[Int :: String :: ... :: HNil]` for each, rewritten every time.
+    /// Such a type's wire reads nothing but class names and kinds: no type
+    /// parameter in scope, no alias, no refinement tag, no path. It is kept
+    /// while no class-like symbol changes ([`SymbolTable::graph_gen`]), since
+    /// a class read from its file can be renamed.
     pub(crate) fn type_to_wire(&mut self, ty: &Type) -> Result<String, String> {
+        use scala_rs_parser::TypeFlags as F;
+        let context_free = !ty.flags().contains(
+            F::TYPE_PARAM | F::TYPE_MEMBER | F::REFINED | F::SINGLETON | F::NAMED | F::WILDCARD
+                | F::APPLIED | F::ERROR,
+        ) && !matches!(ty, Type::Refined { .. } | Type::Annotated { .. });
+        if !context_free {
+            return self.type_to_wire_uncached(ty);
+        }
+        let key = {
+            use std::hash::Hasher;
+            let mut h = rustc_hash::FxHasher::default();
+            crate::implicits::hash_type(ty, &mut h);
+            h.finish()
+        };
+        let gen = self.st.graph_gen.get();
+        if self.type_wire_cache.0 != gen {
+            self.type_wire_cache.0 = gen;
+            self.type_wire_cache.1.clear();
+        }
+        if let Some(hit) = self.type_wire_cache.1.get(&key).and_then(|bucket| {
+            bucket.iter().find(|(t, _)| t == ty).map(|(_, w)| w.clone())
+        }) {
+            return Ok(hit);
+        }
+        let wire = self.type_to_wire_uncached(ty)?;
+        if self.st.graph_gen.get() == gen {
+            self.type_wire_cache
+                .1
+                .entry(key)
+                .or_default()
+                .push((ty.clone(), wire.clone()));
+        }
+        Ok(wire)
+    }
+
+    fn type_to_wire_uncached(&mut self, ty: &Type) -> Result<String, String> {
         // An inner class behind a prefix (`prefix.rs`) is the class it views;
         // the engine is handed the class, as for the bare type.
         let ty = crate::prefix::strip_view(ty);

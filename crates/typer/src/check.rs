@@ -574,6 +574,8 @@ pub struct Typer {
     /// Entries of `c.openImplicits` answers the engine already holds, by
     /// their wire text (`answer_open_implicits`).
     pub(crate) open_implicit_handles: rustc_hash::FxHashMap<String, u64>,
+    /// `type_to_wire`'s answers for context-free types, by `graph_gen`.
+    pub(crate) type_wire_cache: (u64, rustc_hash::FxHashMap<u64, Vec<(Type, String)>>),
     /// Why the engine could not be started, once it has failed once.
     pub(crate) macro_engine_error: Option<String>,
     /// What `java` is given as its classpath: the run's own binary path, so
@@ -1243,6 +1245,7 @@ impl Typer {
             macro_engine_pending: None,
             macro_sources_sent: Default::default(),
             open_implicit_handles: Default::default(),
+            type_wire_cache: Default::default(),
             macro_engine_error: None,
             macro_classpath: opts.binary_path.clone(),
             macro_failures: HashMap::new(),

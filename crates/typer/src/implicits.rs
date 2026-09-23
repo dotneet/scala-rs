@@ -291,7 +291,7 @@ fn sym_bit(id: SymbolId) -> u64 {
 /// still compared with `PartialEq` before it is used, so a variant this misses
 /// costs a lookup, never a wrong answer. `Type` cannot derive `Hash` because
 /// `Lit` holds `f64`.
-fn hash_type<H: std::hash::Hasher>(ty: &Type, h: &mut H) {
+pub(crate) fn hash_type<H: std::hash::Hasher>(ty: &Type, h: &mut H) {
     use std::hash::Hash;
     std::mem::discriminant(ty).hash(h);
     let all = |ts: &[Type], h: &mut H| {
