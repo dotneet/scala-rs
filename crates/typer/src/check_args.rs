@@ -786,6 +786,11 @@ impl Typer {
             let mut owners = vec![fun.sym];
             let module_class = self.st.module_class_of(fun.sym);
             if !module_class.is_none() && module_class != fun.sym {
+                // Directory classpaths index nested companions shallowly. The
+                // placeholder can contain only a synthetic case-class apply;
+                // its written overloads and parameter names live in the full
+                // Scala signature and must be adopted before choosing one.
+                self.ensure_java_loaded(module_class, fun.span);
                 owners.push(module_class);
             }
             // Both owners' `apply`s are one overload set: a case class's

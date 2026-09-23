@@ -1,6 +1,9 @@
 //! Aggregated CLI integration tests (alphabetical slice 5/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../support/mod.rs"]
+mod support;
+
 #[path = "../mapkey.rs"]
 mod mapkey;
 #[path = "../mapredirect.rs"]
@@ -61,6 +64,8 @@ mod negchecks;
 mod neglit;
 #[path = "../nelpkg.rs"]
 mod nelpkg;
+#[path = "../nested_companion_named_apply.rs"]
+mod nested_companion_named_apply;
 #[path = "../nested_lambda_result.rs"]
 mod nested_lambda_result;
 #[path = "../nestedcasepickle.rs"]
