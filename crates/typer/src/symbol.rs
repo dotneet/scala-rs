@@ -7574,6 +7574,21 @@ impl SymbolTable {
                         .self_alias_member_at(from, *id)
                         .unwrap_or_else(|| ty.clone());
                 }
+                // Rebind a member only through a class that can implement its
+                // declaration. An explicitly qualified `Record.Tuple` in an
+                // unrelated anonymous class must not become that class's
+                // inherited `Tuple` merely because the names match. Members
+                // of a parent or lexical outer class still use the ordinary
+                // rebind below (including concrete aliases whose bodies name
+                // an overridden abstract member).
+                let declared_in = self.get(*id).owner;
+                let reachable = self
+                    .enclosing_classes(from)
+                    .into_iter()
+                    .any(|cls| cls == declared_in || self.is_ancestor_of(declared_in, cls));
+                if !reachable {
+                    return ty.clone();
+                }
                 let name = self.get(*id).name.clone();
                 // `from` first, then its lexically enclosing classes: an inner
                 // class (`Main.factory: Main.Factory`) sees `Main`'s implementation

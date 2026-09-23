@@ -19,3 +19,12 @@ object BinaryShapeUse {
 
   def parent(shape: binaryshape.RecordShape[Record.Tuple, Record]): Parent = shape
 }
+
+object RecordShapeInstance {
+  implicit object Shape extends binaryshape.RecordShape(
+    new binaryshape.TupledApply[Record.Tuple, Record] {
+      override def tupledApply[F[_]](tuple: Record.Tuple[F]): Record[F] =
+        (Record.apply[F] _).tupled(tuple)
+    }
+  )
+}
