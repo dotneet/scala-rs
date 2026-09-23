@@ -7582,6 +7582,17 @@ impl SymbolTable {
                 // rebind below (including concrete aliases whose bodies name
                 // an overridden abstract member).
                 let declared_in = self.get(*id).owner;
+                // A higher-kinded concrete alias in a lexical outer object is
+                // still a constructor declared by that object. A nested
+                // anonymous class can inherit an unrelated same-named type
+                // parameter; only actual inheritance can override the alias.
+                if !self.is_deferred_type_member(*id)
+                    && !self.get(*id).tparams.is_empty()
+                    && declared_in != from
+                    && !self.is_ancestor_of(declared_in, from)
+                {
+                    return ty.clone();
+                }
                 let reachable = self
                     .enclosing_classes(from)
                     .into_iter()
@@ -8900,6 +8911,14 @@ pub fn apply_type_ctor(ctor: Type, args: Vec<Type>) -> Type {
             tpe: Box::new(apply_type_ctor(*tpe, args)),
             annot,
         },
+        Type::Refined { mut parents, decls }
+            if SymbolTable::as_seen_from_view_decls(&decls)
+                && parents.len() == 1
+                && matches!(parents[0], Type::Class { .. }) =>
+        {
+            parents[0] = apply_type_ctor(parents[0].clone(), args);
+            Type::Refined { parents, decls }
+        }
         other => Type::Applied {
             ctor: Box::new(other),
             args,

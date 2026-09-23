@@ -28,3 +28,26 @@ object RecordShapeInstance {
     }
   )
 }
+
+class NestedShape {
+  case class Entry[F[_]](id: F[Int], label: F[String])
+
+  object Entry {
+    type Tuple[F[_]] = (F[Int], F[String])
+
+    implicit object Shape extends binaryshape.RecordShape(
+      new binaryshape.TupledApply[Tuple, Entry] {
+        override def tupledApply[F[_]](tuple: Tuple[F]): Entry[F] =
+          (Entry.apply[F] _).tupled(tuple)
+      }
+    )
+  }
+
+  val direct: slick.lifted.Shape[
+    slick.lifted.FlatShapeLevel, Entry[Rep], Entry[Id], Entry[Rep]
+  ] = Entry.Shape
+
+  val inferred: slick.lifted.Shape[
+    slick.lifted.FlatShapeLevel, Entry[Rep], Entry[Id], Entry[Rep]
+  ] = implicitly
+}
