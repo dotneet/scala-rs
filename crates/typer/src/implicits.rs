@@ -1118,14 +1118,31 @@ impl Typer {
         if owner.is_none() || !self.st.get(owner).is_class_like() {
             return None;
         }
-        let prefix = self.term_import_prefix_for(owner).map(|q| q.ty.clone())?;
+        let prefix = self.term_import_prefix_for(owner).map(|q| q.ty)?;
         if prefix.is_no_type() || prefix.is_error() {
             return None;
         }
         // Even a non-generic API can mention its outer profile's type
         // family. Read aliases through the actual imported API before
         // substituting the receiver's ordinary type parameters.
-        let expanded = self.st.expand_in_type(&prefix, ty);
+        // With no type member to resolve, a plain class (or a singleton of
+        // one) cannot change this type in `expand_in_type`. Avoid rebuilding
+        // the candidate signature before the as-seen-from substitution below.
+        let plain_prefix = match &prefix {
+            Type::Class { .. } | Type::ModuleRef(_) | Type::ThisType(_) => true,
+            Type::SingleType { sym, .. } => matches!(
+                self.st.singleton_underlying(*sym),
+                Type::Class { .. } | Type::ModuleRef(_) | Type::ThisType(_)
+            ),
+            _ => false,
+        };
+        let expanded = if plain_prefix
+            && !crate::symbol::any_type(ty, &mut |t| matches!(t, Type::TypeMember(_)))
+        {
+            std::borrow::Cow::Borrowed(ty)
+        } else {
+            std::borrow::Cow::Owned(self.st.expand_in_type(&prefix, ty))
+        };
         // The companion of an inner class imported through a path (`import
         // o1.Inner.fromOther`): its members are read as seen from the path
         // (`Inner` is `o1.Inner`, pos/t4947).
@@ -1392,6 +1409,25 @@ impl Typer {
             .unwrap_or(id);
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
+        }
+        // Reading an imported candidate through its prefix can walk and
+        // substitute a large inheritance graph. If its declared result is
+        // already a concrete class that cannot reach the wanted class, that
+        // substitution cannot change the result's class symbol. Reject it
+        // before paying for the as-seen-from view.
+        let declared_result = match &self.st.get(id).ty {
+            Type::Method { ret, .. } => ret.as_ref(),
+            Type::Function { params, ret } if params.is_empty() => ret.as_ref(),
+            ty => ty,
+        };
+        if let (Type::Class { sym, .. }, Type::Class { .. }) = (declared_result, pt) {
+            // An inner class may gain a path prefix when read through the
+            // import; its bare class hierarchy is not enough to reject it.
+            if !self.st.is_inner_class_of_class(*sym)
+                && !self.plausibly_inhabits(declared_result, pt)
+            {
+                return None;
+            }
         }
         let cand_ty = self.implicit_candidate_ty(id);
         // The cheap structural rejection, before anything is unified.
@@ -3512,7 +3548,7 @@ impl Typer {
             let mut hits = Vec::new();
             for id in ids {
                 let owner = self.st.get(id).owner;
-                if let Some(prefix) = self.term_import_prefix_for(owner).map(|q| q.ty.clone()) {
+                if let Some(prefix) = self.term_import_prefix_for(owner).map(|q| q.ty) {
                     let ty = self.st.get(id).ty.clone();
                     self.warm_receiver_type_members(&prefix, &ty);
                 }

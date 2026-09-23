@@ -1189,13 +1189,16 @@ impl Typer {
             );
             return;
         }
+        let timing_slot = self
+            .macro_timing
+            .begin_expansion(|| format!("{}.{}", binding.impl_class, binding.impl_method));
         self.with_macro_context(|this| {
             match this.macro_expansion(tree, &binding) {
                 Ok(mut built) => {
                     let declared = tree.ty.clone();
                     built.span = tree.span;
                     *tree = built;
-                    let retype_started = this.macro_timing.enabled.then(Instant::now);
+                    let retype_started = this.macro_timing.start_stage();
                     let retype_diag_mark = this.diags.len();
                     // A blackbox macro's expansion is typechecked *against the
                     // declared result type* and keeps it, whatever more precise
@@ -1240,10 +1243,9 @@ impl Typer {
                         this.diags.truncate(retype_diag_mark);
                     }
                     if let Some(t) = retype_started {
-                        let elapsed = t.elapsed();
-                        if let Some(slot) = this.macro_timing.expansions.last_mut() {
-                            slot.retype += elapsed;
-                        }
+                        let slot = t.slot;
+                        let elapsed = this.macro_timing.stop_stage(t);
+                        this.macro_timing.expansions[slot].retype += elapsed;
                     }
                     if !tree.ty.is_error() && binding.blackbox {
                         tree.ty = declared;
@@ -1252,6 +1254,7 @@ impl Typer {
                 Err(reason) => this.note_macro_failure(tree.span, reason),
             }
         });
+        self.macro_timing.end_expansion(timing_slot);
     }
 
     /// Run the implementation and rebuild what it returned.
@@ -1302,12 +1305,13 @@ impl Typer {
                 }
             }
         }
-        let timing_start = self.macro_timing.enabled.then(Instant::now);
+        let timing_start = self.macro_timing.start_stage();
         let (request, splices) =
             self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
         if let Some(t) = timing_start {
-            let slot = self.macro_timing_slot(binding);
-            slot.request += t.elapsed();
+            let slot = t.slot;
+            let elapsed = self.macro_timing.stop_stage(t);
+            self.macro_timing.expansions[slot].request += elapsed;
         }
         if let Some(why) = &self.macro_engine_error {
             // Starting it costs a `javac` and a JVM; a run whose first attempt
@@ -1329,7 +1333,7 @@ impl Typer {
                 }
             }
         }
-        let rpc_started = self.macro_timing.enabled.then(Instant::now);
+        let rpc_started = self.macro_timing.start_stage();
         let saved_span = self.macro_rpc_span;
         self.macro_rpc_span = tree.span;
         let reply =
@@ -1340,33 +1344,29 @@ impl Typer {
             Err(payload) => std::panic::resume_unwind(payload),
         };
         if let Some(t) = rpc_started {
-            let elapsed = t.elapsed();
+            let slot = t.slot;
+            let elapsed = self.macro_timing.stop_stage(t);
             let engine = self.engine_timing();
-            let slot = self
-                .macro_timing
-                .expansions
-                .last_mut()
-                .expect("slot made above");
-            slot.rpc += elapsed;
-            slot.engine_invoke += engine.0;
-            slot.engine_wait += engine.1;
-            slot.engine_handle += engine.2;
+            let row = &mut self.macro_timing.expansions[slot];
+            row.rpc += elapsed;
+            row.engine_invoke += engine.0;
+            row.engine_wait += engine.1;
+            row.engine_handle += engine.2;
         }
         let reply = reply?;
         let items = reply.list()?;
         match items.first().and_then(|s| s.atom()) {
             Some("ok") => {
                 self.with_macro_splices(splices.into_iter().map(Some).collect(), |this| {
-                    let rebuild_started = this.macro_timing.enabled.then(Instant::now);
+                    let rebuild_started = this.macro_timing.start_stage();
                     let built = (|| {
                         let expansion = at(items, 1)?;
                         this.tree_from_reply(expansion, tree.span)
                     })();
                     if let Some(t) = rebuild_started {
-                        let elapsed = t.elapsed();
-                        if let Some(slot) = this.macro_timing.expansions.last_mut() {
-                            slot.rebuild += elapsed;
-                        }
+                        let slot = t.slot;
+                        let elapsed = this.macro_timing.stop_stage(t);
+                        this.macro_timing.expansions[slot].rebuild += elapsed;
                     }
                     built
                 })
@@ -1384,24 +1384,6 @@ impl Typer {
             Some("err") => Err(at(items, 1)?.text()),
             _ => Err(format!("the macro engine replied {reply:?}")),
         }
-    }
-
-    /// Open a row for the expansion about to run, so every stage can add to
-    /// the same one (`SCALA_RS_MACRO_TIMING=1`).
-    fn macro_timing_slot(
-        &mut self,
-        binding: &MacroBinding,
-    ) -> &mut crate::expand_timing::ExpansionTiming {
-        self.macro_timing
-            .expansions
-            .push(crate::expand_timing::ExpansionTiming {
-                name: format!("{}.{}", binding.impl_class, binding.impl_method),
-                ..Default::default()
-            });
-        self.macro_timing
-            .expansions
-            .last_mut()
-            .expect("just pushed")
     }
 
     /// Ask the engine for the two numbers only it can see, and reset them:
@@ -1570,20 +1552,20 @@ impl Typer {
                      looping"
                 ));
             }
-            let answer_started = self.macro_timing.enabled.then(Instant::now);
+            let answer_started = self.macro_timing.start_stage();
             let answer = self.answer_query(items);
             if let Some(t) = answer_started {
-                let elapsed = t.elapsed();
+                let slot = t.slot;
+                let elapsed = self.macro_timing.stop_stage(t);
                 let kind = crate::expand_rpc::query_kind(items);
-                if let Some(slot) = self.macro_timing.expansions.last_mut() {
-                    slot.round_trips += 1;
-                    match slot.answers.iter_mut().find(|(k, _, _)| *k == kind) {
-                        Some(entry) => {
-                            entry.1 += 1;
-                            entry.2 += elapsed;
-                        }
-                        None => slot.answers.push((kind, 1, elapsed)),
+                let row = &mut self.macro_timing.expansions[slot];
+                row.round_trips += 1;
+                match row.answers.iter_mut().find(|(k, _, _)| *k == kind) {
+                    Some(entry) => {
+                        entry.1 += 1;
+                        entry.2 += elapsed;
                     }
+                    None => row.answers.push((kind, 1, elapsed)),
                 }
             }
             if trace {
@@ -1625,9 +1607,12 @@ impl Typer {
         // shape here rather than changing ordinary application typing: only a
         // single flattened node, with no repeated parameter, and an exact
         // match for every declared parameter is repartitioned.
-        let argss = repartition_macro_argss(&paramss, argss).unwrap_or_else(|| argss.to_vec());
-        let application_for_wire =
-            rebuild_macro_application(application, &argss).unwrap_or_else(|| application.clone());
+        let repartitioned = repartition_macro_argss(&paramss, argss);
+        let argss = repartitioned.as_deref().unwrap_or(argss);
+        let rebuilt_application = repartitioned
+            .as_ref()
+            .and_then(|_| rebuild_macro_application(application, argss));
+        let application_for_wire = rebuilt_application.as_ref().unwrap_or(application);
         // Typing may auto-apply trailing empty clauses without an Apply node.
         // Nonempty clauses must still be supplied by the typed application.
         if argss.len() > paramss.len()
@@ -1643,7 +1628,7 @@ impl Typer {
         // trees are then written with the symbol table borrowed alone.
         let mut types = WireTypes::default();
         let mut actuals: Vec<String> = Vec::new();
-        for clause in &argss {
+        for clause in argss {
             for arg in clause {
                 self.collect_wire_types(arg, &mut types);
                 actuals.push(self.tag_wire(macro_argument_type(arg))?);
@@ -1658,7 +1643,7 @@ impl Typer {
         if let Some(p) = prefix {
             self.collect_wire_types(p, &mut types);
         }
-        self.collect_wire_types(&application_for_wire, &mut types);
+        self.collect_wire_types(application_for_wire, &mut types);
         // Result attribution is supplementary: many whitebox macros have a
         // provisional/refined result and only inspect the application's tree
         // or position. Do not require a runtime type tag to invoke those.
@@ -1811,7 +1796,7 @@ impl Typer {
         out.push(')');
         out.push_str(" (app ");
         let mut built = String::new();
-        match typed_tree_to_wire(&cx, &application_for_wire, &mut built) {
+        match typed_tree_to_wire(&cx, application_for_wire, &mut built) {
             Err(why) => {
                 out.push_str("(no ");
                 quote_into(&mut out, &why);

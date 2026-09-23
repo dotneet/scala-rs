@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use scala_rs_backend::{emit_opts, emit_runtime, load_classpath_checked, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
@@ -225,6 +226,19 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
 }
 
 fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> CompileResult {
+    let mut phase_start = std::env::var_os("SCALA_RS_PHASE_TIMING").map(|_| Instant::now());
+    macro_rules! phase {
+        ($name:literal) => {
+            if let Some(start) = phase_start {
+                eprintln!(
+                    "[phase timing] {} {:.3} s",
+                    $name,
+                    start.elapsed().as_secs_f64()
+                );
+                phase_start = Some(Instant::now());
+            }
+        };
+    }
     let mut diags = Vec::new();
     let mut sources = Vec::new();
     let mut units = Vec::new();
@@ -265,6 +279,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             }
         }
     }
+    phase!("parse");
 
     if has_errors(&diags) {
         return failed_result(diags, sources);
@@ -301,6 +316,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                 return failed_result(diags, sources);
             }
         };
+        phase!("classpath");
         // One symbol table for the whole run: every unit is named before any
         // is typed, so files can reference each other.
         let mut refs: Vec<(&mut Tree, usize)> = units
@@ -341,6 +357,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             // text rather than a string the quasiquote machinery rebuilt.
             &src_text,
         );
+        phase!("typecheck");
         diags.extend(tdiags);
         for u in units.iter() {
             mains.extend(find_mains(&st, &u.tree));
@@ -450,6 +467,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
         }
         shared_st = Some(st);
     }
+    phase!("lowering");
 
     if opts.typer_dump {
         for u in &units {
@@ -497,6 +515,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
         p.push(j.clone());
         std::rc::Rc::new(scala_rs_backend::BinaryParents::new(p))
     });
+    phase!("backend setup");
 
     // Keep every emitted class in memory until every unit has passed the
     // backend gate. A backend fallback is a compile error, so publishing the
@@ -556,6 +575,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
         });
         emitted_classes.extend(classes);
     }
+    phase!("emit");
     if has_errors(&diags) {
         return CompileResult {
             diags,
@@ -569,6 +589,8 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
         writer.push(emitted_classes);
         writer.finish()
     };
+    phase!("write");
+    let _ = phase_start;
     if let Err(e) = write_result {
         diags.push(Diagnostic::error(
             0,

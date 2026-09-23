@@ -1344,7 +1344,7 @@ pub struct SymbolTable {
 pub(crate) struct BtaCache {
     /// The generation `map` was filled at.
     gen: u64,
-    map: rustc_hash::FxHashMap<u32, Vec<BtaEntry>>,
+    map: rustc_hash::FxHashMap<u32, BtaBucket>,
     /// Total entries, so the cache can be dropped rather than grow without
     /// bound over a long run.
     len: usize,
@@ -1354,9 +1354,13 @@ pub(crate) struct BtaCache {
 /// base-class map that came out.
 type BtaEntry = (Vec<Type>, std::rc::Rc<BaseTypeArgs>);
 
-/// Past this many instantiations of one class the bucket stops growing: the
-/// scan is linear, and a class asked about at hundreds of instantiations is
-/// one the cache cannot help anyway.
+#[derive(Default)]
+struct BtaBucket {
+    entries: Vec<BtaEntry>,
+    next_evict: usize,
+}
+
+/// Keep each class's scan bounded even when it has many instantiations.
 const BTA_BUCKET_MAX: usize = 16;
 /// Past this many entries in total the cache is emptied.
 const BTA_CACHE_MAX: usize = 100_000;
@@ -1953,6 +1957,7 @@ impl SymbolTable {
         cache
             .map
             .get(&sym.0)?
+            .entries
             .iter()
             .find(|(a, _)| a.as_slice() == args)
             .map(|(_, v)| v.clone())
@@ -1971,11 +1976,17 @@ impl SymbolTable {
             cache.len = 0;
         }
         let bucket = cache.map.entry(sym.0).or_default();
-        if bucket.len() >= BTA_BUCKET_MAX || bucket.iter().any(|(a, _)| a.as_slice() == args) {
+        if bucket.entries.iter().any(|(a, _)| a.as_slice() == args) {
             return;
         }
-        bucket.push((args.to_vec(), out.clone()));
-        cache.len += 1;
+        let entry = (args.to_vec(), out.clone());
+        if bucket.entries.len() < BTA_BUCKET_MAX {
+            bucket.entries.push(entry);
+            cache.len += 1;
+        } else {
+            bucket.entries[bucket.next_evict] = entry;
+            bucket.next_evict = (bucket.next_evict + 1) % BTA_BUCKET_MAX;
+        }
     }
 
     /// Copy whatever `@specialized` / `@unspecialized` a definition's
@@ -9201,6 +9212,27 @@ type AncMemo = Vec<(u32, u32, bool)>;
 #[cfg(test)]
 mod api_boundary_tests {
     use super::*;
+
+    #[test]
+    fn full_base_type_bucket_admits_recent_instantiations() {
+        let mut st = SymbolTable::new();
+        let class = st.alloc("Generic", st.root, SymKind::Class, Flags::EMPTY, "Generic");
+        let param = st.alloc("A", class, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(class).tparams.push(param);
+        let arg = |i| vec![Type::Constant(scala_rs_parser::Lit::Int(i))];
+
+        for i in 0..=BTA_BUCKET_MAX as i32 {
+            let answer = st.base_type_args(class, &arg(i));
+            assert_eq!(answer.get(&class.0), Some(&arg(i)));
+        }
+        let cache = st.bta_cache.borrow();
+        let bucket = &cache.map[&class.0].entries;
+        assert_eq!(bucket.len(), BTA_BUCKET_MAX);
+        assert!(!bucket.iter().any(|(args, _)| args == &arg(0)));
+        assert!(bucket
+            .iter()
+            .any(|(args, _)| args == &arg(BTA_BUCKET_MAX as i32)));
+    }
 
     #[test]
     fn phase_metadata_does_not_invalidate_symbol_graph_caches() {

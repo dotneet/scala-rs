@@ -7,15 +7,17 @@
 //! (one line out, one line back, with the engine asking its own questions in
 //! the middle), the macro implementation's own run inside the JVM, and
 //! rebuilding and re-typing the tree it hands back on the Rust side. Each is
-//! timed separately, per expansion and in total, and the engine reports its own
-//! two numbers through a `(timing)` request so the wall time on the pipe can be
-//! split into "the engine was computing" and "we were answering it".
+//! timed separately, per expansion and in total. Nested expansion time is
+//! charged to the child rather than the parent's active stage. The engine
+//! reports its own two numbers through a `(timing)` request so the wall time
+//! on the pipe can be split into "the engine was computing" and "we were
+//! answering it".
 //!
 //! The instrumentation is off unless the environment variable is set: the
-//! per-expansion cost is two `Instant::now()` calls plus one extra round trip,
-//! which is nothing next to an expansion but is not free either.
+//! each stage costs clock reads plus one extra round trip, which is small next
+//! to an expansion but is not free either.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 
@@ -101,7 +103,8 @@ pub(crate) struct ExpansionTiming {
     /// Serialising the request: the argument trees, the type tags and the
     /// receiver (`Typer::expansion_request`).
     pub(crate) request: Duration,
-    /// Wall time between sending the request and reading the final reply.
+    /// Time between sending the request and reading the final reply, excluding
+    /// nested macro expansions.
     pub(crate) rpc: Duration,
     /// How many lines the engine wrote back before the reply (its questions
     /// and its `println` output).
@@ -110,7 +113,7 @@ pub(crate) struct ExpansionTiming {
     pub(crate) answers: Vec<(&'static str, u32, Duration)>,
     /// Rebuilding the reply into a scala-rs tree (`Typer::tree_from_reply`).
     pub(crate) rebuild: Duration,
-    /// Typechecking the expansion at the call site.
+    /// Typechecking the expansion at the call site, excluding nested macros.
     pub(crate) retype: Duration,
     /// Inside `Method.invoke` in the engine -- the implementation's own run,
     /// including the time it spent waiting for our answers.
@@ -151,7 +154,20 @@ pub(crate) struct MacroTiming {
     /// `(ready)`.
     pub(crate) engine_start: Duration,
     pub(crate) expansions: Vec<ExpansionTiming>,
+    active: Vec<ActiveExpansion>,
     implicit_queries: ImplicitQueryStats,
+}
+
+struct ActiveExpansion {
+    slot: usize,
+    started: Instant,
+    direct_children: Duration,
+}
+
+pub(crate) struct TimingSnapshot {
+    pub(crate) slot: usize,
+    started: Instant,
+    direct_children: Duration,
 }
 
 impl MacroTiming {
@@ -169,6 +185,53 @@ impl MacroTiming {
 
     pub(crate) fn record_implicit_query(&mut self, fingerprint: String, summary: String) {
         self.implicit_queries.record(fingerprint, summary);
+    }
+
+    pub(crate) fn begin_expansion(&mut self, name: impl FnOnce() -> String) -> Option<usize> {
+        if !self.enabled {
+            return None;
+        }
+        let slot = self.expansions.len();
+        self.expansions.push(ExpansionTiming {
+            name: name(),
+            ..Default::default()
+        });
+        self.active.push(ActiveExpansion {
+            slot,
+            started: Instant::now(),
+            direct_children: Duration::ZERO,
+        });
+        Some(slot)
+    }
+
+    pub(crate) fn end_expansion(&mut self, slot: Option<usize>) {
+        let Some(slot) = slot else { return };
+        let active = self.active.pop().expect("active macro expansion");
+        assert_eq!(active.slot, slot);
+        if let Some(parent) = self.active.last_mut() {
+            parent.direct_children += active.started.elapsed();
+        }
+    }
+
+    pub(crate) fn start_stage(&self) -> Option<TimingSnapshot> {
+        if !self.enabled {
+            return None;
+        }
+        let active = self.active.last()?;
+        Some(TimingSnapshot {
+            slot: active.slot,
+            started: Instant::now(),
+            direct_children: active.direct_children,
+        })
+    }
+
+    pub(crate) fn stop_stage(&self, snapshot: TimingSnapshot) -> Duration {
+        let active = self.active.last().expect("active macro expansion");
+        assert_eq!(active.slot, snapshot.slot);
+        let children = active
+            .direct_children
+            .saturating_sub(snapshot.direct_children);
+        snapshot.started.elapsed().saturating_sub(children)
     }
 
     /// Write the table on stderr. Markdown, so it can be pasted into
@@ -261,7 +324,7 @@ impl MacroTiming {
             );
         }
         eprintln!(
-            "[macro timing] expansion wall total {:.3} s (engine start-up included: {:.3} s)",
+            "[macro timing] measured exclusive stages {:.3} s (with engine start-up: {:.3} s)",
             secs(sum(ExpansionTiming::total)),
             secs(sum(ExpansionTiming::total) + self.engine_start),
         );
@@ -295,5 +358,53 @@ mod tests {
 
         assert_eq!(stats.total, 0);
         assert!(stats.by_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn nested_expansion_stages_keep_their_slots_and_exclude_direct_children() {
+        let mut timing = MacroTiming {
+            enabled: true,
+            ..Default::default()
+        };
+        let parent = timing.begin_expansion(|| "parent".into());
+        let mut parent_stage = timing.start_stage().unwrap();
+        assert_eq!(parent_stage.slot, parent.unwrap());
+        parent_stage.started = Instant::now() - Duration::from_secs(5);
+
+        let child = timing.begin_expansion(|| "child".into());
+        let mut child_stage = timing.start_stage().unwrap();
+        assert_eq!(child_stage.slot, child.unwrap());
+        child_stage.started = Instant::now() - Duration::from_secs(3);
+        timing.active.last_mut().unwrap().started = child_stage.started;
+
+        let grandchild = timing.begin_expansion(|| "grandchild".into());
+        timing.active.last_mut().unwrap().started = Instant::now() - Duration::from_secs(1);
+        timing.end_expansion(grandchild);
+
+        let child_exclusive = timing.stop_stage(child_stage);
+        assert!(child_exclusive >= Duration::from_millis(1900));
+        assert!(child_exclusive <= Duration::from_millis(2100));
+        timing.end_expansion(child);
+
+        let parent_exclusive = timing.stop_stage(parent_stage);
+        assert!(parent_exclusive >= Duration::from_millis(1900));
+        assert!(parent_exclusive <= Duration::from_millis(2100));
+        assert_eq!(parent, Some(0));
+        assert_eq!(child, Some(1));
+        assert_eq!(grandchild, Some(2));
+        assert_eq!(timing.expansions[0].name, "parent");
+        assert_eq!(timing.expansions[1].name, "child");
+        assert_eq!(timing.expansions[2].name, "grandchild");
+        timing.end_expansion(parent);
+    }
+
+    #[test]
+    fn disabled_timing_does_not_create_rows_or_format_names() {
+        let mut timing = MacroTiming::default();
+        let row = timing.begin_expansion(|| panic!("timing is disabled"));
+        assert_eq!(row, None);
+        assert!(timing.start_stage().is_none());
+        timing.end_expansion(row);
+        assert!(timing.expansions.is_empty());
     }
 }

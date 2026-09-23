@@ -285,6 +285,10 @@ impl Typer {
         if self.take_lazy_done(tree) {
             return;
         }
+        static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let started = TIMING
+            .get_or_init(|| std::env::var_os("SCALA_RS_MEMBER_TIMING").is_some())
+            .then(std::time::Instant::now);
         match &tree.kind {
             TreeKind::ValDef { .. } => self.type_val_body(tree),
             TreeKind::DefDef { .. } => self.type_def_body(tree),
@@ -294,6 +298,18 @@ impl Typer {
             TreeKind::Import { .. } => self.type_import(tree),
             _ => {
                 self.type_stat(tree);
+            }
+        }
+        if let Some(started) = started {
+            let elapsed = started.elapsed();
+            if elapsed.as_millis() >= 100 {
+                eprintln!(
+                    "[scala-rs member timing] body {} {}@{}: {:?}",
+                    self.file_index,
+                    tree.name().unwrap_or("<expr>"),
+                    tree.span.lo.0,
+                    elapsed
+                );
             }
         }
     }

@@ -1107,12 +1107,20 @@ pub fn typecheck_units_src(
     t.inherit_overridden_defaults();
     t.defer_default_rhs = false;
     t.type_pending_defaults();
+    let unit_timing = std::env::var_os("SCALA_RS_UNIT_TIMING").is_some();
     for (tree, file_index) in units.iter_mut() {
+        let started = unit_timing.then(std::time::Instant::now);
         t.file_index = *file_index;
         t.typer(tree);
         t.install_async_return_keys(tree);
         t.report_macro_calls(tree);
         t.strip_macro_defs(tree);
+        if let Some(started) = started {
+            eprintln!(
+                "[scala-rs unit timing] body {file_index}: {:?}",
+                started.elapsed()
+            );
+        }
     }
     for (tree, file_index) in units.iter() {
         t.file_index = *file_index;

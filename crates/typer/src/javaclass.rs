@@ -4,6 +4,7 @@
 // those names with SipHash was measurable. Iteration order is not observable
 // here (the map is only ever looked up by key).
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -136,6 +137,54 @@ struct Entry {
     path: PathBuf,
     kind: PathKind,
     zip: Option<ZipIndex>,
+    /// Directory package existence is shared by many distinct class probes.
+    /// A missing package lets us skip a class-file `stat` for this root.
+    dir_packages: HashMap<String, DirPackage>,
+}
+
+struct DirPackage {
+    exists: bool,
+    /// Exact file names avoid a filesystem probe for every absent class in a
+    /// package that exists in many directory classpath roots.
+    files: Option<HashSet<std::ffi::OsString>>,
+}
+
+impl Entry {
+    fn has_directory_package(&mut self, package: &str) -> bool {
+        if let Some(found) = self.dir_packages.get(package) {
+            return found.exists;
+        }
+        let found = self.path.join(package).is_dir() && path_case_matches(&self.path, package);
+        self.dir_packages.insert(
+            package.to_string(),
+            DirPackage {
+                exists: found,
+                files: None,
+            },
+        );
+        found
+    }
+
+    fn has_directory_class(&mut self, package: &str, file: &str) -> bool {
+        if !self.has_directory_package(package) {
+            return false;
+        }
+        let dir = self.path.join(package);
+        let package_entry = self.dir_packages.get_mut(package).expect("package cached");
+        if package_entry.files.is_none() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                // Preserve the direct probe if listing is unavailable.
+                return dir.join(file).is_file()
+                    && path_case_matches(&self.path, &format!("{package}/{file}"));
+            };
+            package_entry.files = Some(entries.flatten().map(|entry| entry.file_name()).collect());
+        }
+        package_entry
+            .files
+            .as_ref()
+            .is_some_and(|files| files.contains(std::ffi::OsStr::new(file)))
+            && dir.join(file).is_file()
+    }
 }
 
 impl BinaryIndex {
@@ -156,6 +205,7 @@ impl BinaryIndex {
                     path: p,
                     kind,
                     zip: None,
+                    dir_packages: HashMap::default(),
                 }
             })
             .collect();
@@ -178,6 +228,7 @@ impl BinaryIndex {
     fn find_class_uncached(&mut self, internal: &str) -> Result<Option<Vec<u8>>, String> {
         let rel = format!("{internal}.class");
         let alt = format!("classes/{rel}");
+        let package = internal.rsplit_once('/').map(|(package, _)| package);
         for i in 0..self.paths.len() {
             match self.paths[i].kind {
                 PathKind::Zip => {
@@ -209,6 +260,18 @@ impl BinaryIndex {
                 // `Unknown` too: a path that was neither a directory nor an
                 // archive at startup may have become a directory since.
                 PathKind::Dir | PathKind::Unknown => {
+                    if matches!(self.paths[i].kind, PathKind::Dir) {
+                        if let Some(package) = package {
+                            let file = rel.rsplit('/').next().expect("class file name");
+                            if !self.paths[i].has_directory_class(package, file) {
+                                continue;
+                            }
+                            let f = self.paths[i].path.join(&rel);
+                            return std::fs::read(&f)
+                                .map(Some)
+                                .map_err(|e| format!("cannot read {}: {e}", f.display()));
+                        }
+                    }
                     let root = self.paths[i].path.clone();
                     let f = root.join(&rel);
                     if f.is_file() && path_case_matches(&root, &rel) {
@@ -254,7 +317,12 @@ impl BinaryIndex {
                         return true;
                     }
                 }
-                PathKind::Dir | PathKind::Unknown => {
+                PathKind::Dir => {
+                    if self.paths[i].has_directory_package(dir_rel) {
+                        return true;
+                    }
+                }
+                PathKind::Unknown => {
                     if self.paths[i].path.join(dir_rel).is_dir()
                         && path_case_matches(&self.paths[i].path, dir_rel)
                     {
@@ -807,6 +875,42 @@ mod tests {
         std::fs::create_dir_all(root.join("late_package")).unwrap();
         assert!(index.has_package_prefix("late_package/"));
         assert!(index.has_package_prefix("late_package/"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_class_probes_reuse_package_existence() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-directory-package-{unique}"));
+        std::fs::create_dir_all(root.join("present")).unwrap();
+        std::fs::write(root.join("present/Found.class"), b"class bytes").unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+
+        assert_eq!(index.find_class("missing/First").unwrap(), None);
+        assert_eq!(index.find_class("missing/Second").unwrap(), None);
+        assert_eq!(
+            index.find_class("present/Found").unwrap(),
+            Some(b"class bytes".to_vec())
+        );
+        assert_eq!(index.find_class("present/Missing").unwrap(), None);
+        assert_eq!(index.find_class("present/found").unwrap(), None);
+        assert_eq!(index.find_class("Present/Found").unwrap(), None);
+        assert!(!index.has_package_prefix("Present/"));
+        let entry = index.paths.iter().find(|entry| entry.path == root).unwrap();
+        assert!(!entry.dir_packages.get("missing").unwrap().exists);
+        assert!(entry.dir_packages.get("present").unwrap().exists);
+        assert!(entry
+            .dir_packages
+            .get("present")
+            .unwrap()
+            .files
+            .as_ref()
+            .unwrap()
+            .contains(std::ffi::OsStr::new("Found.class")));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
