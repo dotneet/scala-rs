@@ -347,6 +347,58 @@ fn wire_line_payload(line: &str) -> &str {
     line.strip_suffix('\r').unwrap_or(line)
 }
 
+/// A macro engine being started on another thread.
+///
+/// Starting the JVM and its runtime universe takes about 0.4 s of wall clock,
+/// and until this existed the typer sat idle for all of it at the first
+/// expansion. The typer is usually a long way from that expansion when it
+/// starts -- gitbucket's first `TableQuery` is two seconds in -- so the start
+/// runs beside it instead, and the first expansion only waits for what is
+/// left.
+///
+/// Nothing about the engine differs from a synchronous start: the same
+/// command, and the same error, which is only reported if an expansion is
+/// attempted. A pending start that is never joined is detached, and the
+/// engine it produced is dropped (and terminated) by that thread; a process
+/// that exits first closes the engine's stdin, which ends it too.
+pub(crate) struct PendingEngine {
+    handle: std::thread::JoinHandle<Result<MacroEngine, String>>,
+}
+
+impl PendingEngine {
+    fn spawn(classpath: Vec<PathBuf>) -> Option<Self> {
+        std::thread::Builder::new()
+            .name("scala-rs-macro-engine-start".to_string())
+            .spawn(move || start_engine(&classpath))
+            .ok()
+            .map(|handle| PendingEngine { handle })
+    }
+
+    fn join(self) -> Result<MacroEngine, String> {
+        self.handle
+            .join()
+            .unwrap_or_else(|_| Err("starting the macro engine panicked".to_string()))
+    }
+}
+
+impl Typer {
+    /// Start the engine in the background when this run could expand a
+    /// macro at all, which needs scala-reflect.jar on the classpath
+    /// ([`start_engine`] refuses to run without it). A run that never
+    /// expands one pays for a JVM on another core and nothing on this one.
+    /// `SCALA_RS_MACRO_PRESTART=0` turns it off.
+    pub(crate) fn prestart_macro_engine(&mut self) {
+        if self.macro_engine.is_some()
+            || self.macro_engine_pending.is_some()
+            || std::env::var_os("SCALA_RS_MACRO_PRESTART").is_some_and(|v| v == "0")
+            || !self.macro_classpath.iter().any(|p| is_scala_reflect(p))
+        {
+            return;
+        }
+        self.macro_engine_pending = PendingEngine::spawn(self.macro_classpath.clone());
+    }
+}
+
 /// Compile the engine into a cache directory and start it.
 ///
 /// The classpath handed to `java` is the compilation's own binary path: the
@@ -1319,9 +1371,11 @@ impl Typer {
             return Err(why.clone());
         }
         if self.macro_engine.is_none() {
-            let cp = self.macro_classpath.clone();
             let started = Instant::now();
-            let engine = start_engine(&cp);
+            let engine = match self.macro_engine_pending.take() {
+                Some(pending) => pending.join(),
+                None => start_engine(&self.macro_classpath.clone()),
+            };
             if self.macro_timing.enabled {
                 self.macro_timing.engine_start += started.elapsed();
             }

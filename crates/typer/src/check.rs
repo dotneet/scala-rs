@@ -565,6 +565,9 @@ pub struct Typer {
     /// The JVM half of the def-macro expander (`crates/typer/src/expand.rs`),
     /// started on the first expansion and killed when the typer is dropped.
     pub(crate) macro_engine: Option<crate::expand::MacroEngine>,
+    /// The engine being started ahead of the first expansion
+    /// ([`Typer::prestart_macro_engine`]); taken by the first expansion.
+    pub(crate) macro_engine_pending: Option<crate::expand::PendingEngine>,
     /// Why the engine could not be started, once it has failed once.
     pub(crate) macro_engine_error: Option<String>,
     /// What `java` is given as its classpath: the run's own binary path, so
@@ -971,6 +974,7 @@ pub fn typecheck_units_src(
 ) -> (SymbolTable, Vec<Diagnostic>) {
     let first = units.first().map(|(_, i)| *i).unwrap_or(0);
     let mut t = Typer::new(first, opts);
+    t.prestart_macro_engine();
     t.sources = sources
         .iter()
         .map(|s| std::rc::Rc::from(s.as_str()))
@@ -1223,6 +1227,7 @@ impl Typer {
             typing_qualifier: false,
             callee_arity: None,
             macro_engine: None,
+            macro_engine_pending: None,
             macro_engine_error: None,
             macro_classpath: opts.binary_path.clone(),
             macro_failures: HashMap::new(),
