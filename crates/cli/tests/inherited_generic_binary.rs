@@ -137,3 +137,35 @@ object Main {
         assert_eq!(out, "1\n2\n3\n4\n4\n");
     }
 }
+
+#[test]
+fn inner_class_result_through_applied_subclass_reads_the_outer_arguments() {
+    let lib = r#"
+package lib
+class Outer[T](val t: T) { class Inner { def get: T = t } }
+class Sub[U](u: U) extends Outer[List[U]](List(u))
+class Sub2 extends Sub[Int](41)
+trait Holder[K] { def key: K; class Slot { def k: K = key } }
+class StrHolder extends Holder[String] { def key = "kk" }
+object Api {
+  def mk2[U](s: Sub[U]): Sub[U]#Inner = new s.Inner
+  def mk3(s: Sub[String]): Sub[String]#Inner = new s.Inner
+  def mk4(s: Sub2): Sub2#Inner = new s.Inner
+  def slot(h: StrHolder): StrHolder#Slot = new h.Slot
+}
+"#;
+    let client = r#"
+import lib._
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(Api.mk2(new Sub("ab")).get.head.length)
+    println(Api.mk3(new Sub("abc")).get.head.length)
+    println(Api.mk4(new Sub2).get.head + 1)
+    println(Api.slot(new StrHolder).k.length)
+  }
+}
+"#;
+    if let Some(out) = same_as_scalac("inherited-generic-inner-prefix", lib, client) {
+        assert_eq!(out, "2\n3\n42\n2\n");
+    }
+}

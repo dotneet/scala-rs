@@ -4075,6 +4075,49 @@ impl PickleSupply {
         found.then_some(slots)
     }
 
+    /// `ty` seen as an instance of its base class `owner`, with the
+    /// arguments `ty`'s parent clauses pass up to it; `ty` itself when its
+    /// class is `owner`, and `None` when `owner` is not among its bases or
+    /// has no type parameters to read.
+    ///
+    /// A classpath class gets its pickled parents only on demand (see
+    /// [`PickleSupply::ensure_parents`]), and one class at a time, so the
+    /// ancestry is completed here before it is walked.
+    fn base_type_at(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        ty: &Type,
+        owner: SymbolId,
+    ) -> Option<Type> {
+        let cls = st.class_sym_of(ty)?;
+        if cls == owner {
+            return Some(ty.clone());
+        }
+        // Only a class type has parent clauses to read the owner's arguments
+        // off, and only a generic owner has arguments to read. A plain one
+        // gains nothing, and taking it anyway was not harmless: attaching
+        // `JavaUniverse` seen as the non-generic `Exprs` to
+        // `scala.tools.reflect.Eval(expr: JavaUniverse#Expr[T])` made
+        // `reify { v }` come out as `JavaUniverse.this.Expr[A]` rather than
+        // `universe.Expr[A]`.
+        if !matches!(ty, Type::Class { .. }) || st.get(owner).tparams.is_empty() {
+            return None;
+        }
+        let mut pending = vec![cls];
+        let mut seen = HashSet::new();
+        while let Some(c) = pending.pop() {
+            if c == owner || !seen.insert(c) {
+                continue;
+            }
+            self.ensure_parents(st, bin, c);
+            pending.extend(st.get(c).parents.iter().filter_map(|p| st.class_sym_of(p)));
+        }
+        st.base_type_seq(ty)
+            .into_iter()
+            .find(|base| st.class_sym_of(base) == Some(owner))
+    }
+
     /// Whether `anc` is a strict ancestor of `cls`, asked of the *pickle*.
     ///
     /// The symbol table cannot answer it: `scala.collection.MapOps` has no
@@ -4313,18 +4356,29 @@ impl PickleSupply {
         // class separately from its TypeRef prefix. Keep the applied outer
         // type on the result so a later selection can substitute the outer
         // class's parameters in members of the inner class.
+        //
+        // The prefix may also be a *subclass* of the class declaring the
+        // inner one: `def mk[U](s: Sub[U]): Sub[U]#Inner` where `class
+        // Sub[U] extends Outer[List[U]]` and `Inner` is `Outer`'s. `Inner`'s
+        // members are written in `Outer`'s parameters, so what they are read
+        // at is `Sub[U]` seen as an `Outer` -- `Outer[List[U]]` -- and not
+        // `Sub[U]` itself, whose `U` is a different parameter altogether.
+        // Requiring the prefix's class to *be* the owner attached nothing
+        // here, and `mk(s).get` came out as the bare `T`.
         if let (Some(prefix @ SigType::Ref { .. }), Type::Class { sym, .. }) =
             (result_prefix, crate::prefix::strip_view(&ret))
         {
+            let sym = *sym;
             if crate::prefix::view_prefix(&ret).is_none() {
                 if let Some(outer) = self.conv_at(st, bin, &scope, prefix, 0) {
-                    let owner = st.get(*sym).owner;
+                    let owner = st.get(sym).owner;
                     if !owner.is_none()
-                        && st.get(*sym).kind == SymKind::Class
+                        && st.get(sym).kind == SymKind::Class
                         && st.get(owner).kind == SymKind::Class
-                        && st.class_sym_of(&outer) == Some(owner)
                     {
-                        ret = crate::prefix::with_prefix(ret, outer);
+                        if let Some(outer) = self.base_type_at(st, bin, &outer, owner) {
+                            ret = crate::prefix::with_prefix(ret, outer);
+                        }
                     }
                 }
             }
