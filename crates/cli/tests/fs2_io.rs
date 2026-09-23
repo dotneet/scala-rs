@@ -197,3 +197,50 @@ fn higher_kinded_lower_bound_matches_scalac_abi() {
     let _ = fs::remove_dir_all(mine);
     let _ = fs::remove_dir_all(theirs);
 }
+
+/// fs2's `Compiler` priority without fs2: `stream.compile` leaves `G`
+/// undetermined, and `target[F]: Compiler[F, F]` must beat the inherited
+/// `resource[F]` by trait order. Reading `Compiler[F, F]` as `Compiler[_, _]`
+/// made `resource` look more specific by type, cancelling that win.
+#[test]
+fn repeated_type_parameter_keeps_lower_priority_order() {
+    let (Some(library), Some(scalac)) = (scala_library(), scalac()) else {
+        eprintln!("skip compiler priority: scala-library or scalac unavailable");
+        return;
+    };
+    let source = fixture("io_compiler_priority");
+    let mut outputs = Vec::new();
+    for ours in [true, false] {
+        let out = tmp_dir(if ours { "prio-mine" } else { "prio-scalac" });
+        let compiled = if ours {
+            Command::new(bin())
+                .arg("compile")
+                .arg(&source)
+                .args(["--scala-library", library.to_str().unwrap()])
+                .args(["-d", out.to_str().unwrap()])
+                .output()
+                .unwrap()
+        } else {
+            Command::new(&scalac)
+                .arg(&source)
+                .args(["-d", out.to_str().unwrap()])
+                .output()
+                .unwrap()
+        };
+        assert!(
+            compiled.status.success(),
+            "compile (ours={ours}) failed: {}",
+            diagnostics(&compiled)
+        );
+        let classpath = format!("{}:{}", out.display(), library.display());
+        let run = Command::new("java")
+            .args(["-cp", &classpath, "IOCompilerPriority"])
+            .output()
+            .unwrap();
+        assert!(run.status.success(), "run failed: {}", diagnostics(&run));
+        outputs.push(String::from_utf8_lossy(&run.stdout).into_owned());
+        let _ = fs::remove_dir_all(out);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], "target\n");
+}

@@ -3128,18 +3128,41 @@ impl Typer {
             let instantiated = crate::symbol::subst_tparams_slice(tps, &args, &raw_b);
             return self.st.is_sub_type(&raw_a, &instantiated);
         }
+        // nsc compares against `b`'s result abstracted existentially over
+        // its type parameters, so a parameter written twice has to be one
+        // type in both places. Erasing each occurrence to its own `_` loses
+        // that: fs2's `resource[F]: Compiler[F, Resource[F, *]]` conformed
+        // to `target[F]: Compiler[F, F]` read as `Compiler[_, _]`, the type
+        // comparison then cancelled `target`'s lower-priority-trait win, and
+        // `stream.compile` was ambiguous. Instantiate `b` from `a`'s result,
+        // with `a`'s own parameters left abstract, instead.
+        let repeats_tparam = self.st.get(b).tparams.iter().any(|tp| {
+            let mut seen = 0;
+            crate::symbol::any_type(&raw_b, &mut |part| {
+                if matches!(part, Type::TypeParam(p) if p == tp) {
+                    seen += 1;
+                }
+                seen > 1
+            })
+        });
         let ra = self.implicit_result_ty(a);
         let rb = self.implicit_result_ty(b);
-        let conforms = self.st.is_sub_type(&ra, &rb) || {
+        let instantiated_conforms = |a_result: &Type| {
             let tps = &self.st.get(b).tparams;
             let raw = self.implicit_candidate_ty(b).result().clone();
             !tps.is_empty()
-                && self.implicit_targs(b, &raw, &ra).is_some_and(|args| {
+                && self.implicit_targs(b, &raw, a_result).is_some_and(|args| {
                     self.candidate_bounds_hold(tps, &args)
-                        && self
-                            .st
-                            .is_sub_type(&ra, &crate::symbol::subst_tparams_slice(tps, &args, &raw))
+                        && self.st.is_sub_type(
+                            a_result,
+                            &crate::symbol::subst_tparams_slice(tps, &args, &raw),
+                        )
                 })
+        };
+        let conforms = if repeats_tparam {
+            instantiated_conforms(&raw_a)
+        } else {
+            self.st.is_sub_type(&ra, &rb) || instantiated_conforms(&ra)
         };
         if !conforms {
             return false;
