@@ -263,6 +263,7 @@ fn selected_nullary_overload_infers_from_the_expected_result() {
         &[
             ("overloaded_nullary", true),
             ("overloaded_nullary_bad", false),
+            ("overloaded_nullary_function", true),
         ],
         false,
     );

@@ -1171,6 +1171,29 @@ impl Typer {
                 if let [only] = distinct.as_slice() {
                     return self.maybe_auto_apply((*only).clone(), pt);
                 }
+                if matches!(pt, Type::Function { .. }) {
+                    // A parameterless overload can already return the
+                    // expected function. Prefer that value over eta-expanding
+                    // an unrelated overload with explicit arguments.
+                    let value_fits = distinct
+                        .iter()
+                        .any(|a| !matches!(a, Type::Method { .. }) && self.st.is_sub_type(a, pt));
+                    if !value_fits {
+                        let mut matching = distinct.iter().filter_map(|a| match a {
+                            Type::Method { paramss, ret }
+                                if (paramss.is_empty()
+                                    || paramss.iter().all(|clause| clause.is_empty()))
+                                    && self.st.is_sub_type(ret, pt) =>
+                            {
+                                Some(ret.as_ref())
+                            }
+                            _ => None,
+                        });
+                        if let (Some(ret), None) = (matching.next(), matching.next()) {
+                            return ret.clone();
+                        }
+                    }
+                }
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     return ty;
                 }
