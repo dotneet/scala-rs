@@ -1201,22 +1201,19 @@ impl Typer {
             self.insert_apply_on_nullary(fun);
         }
         self.auto_apply_nullary_function(fun, args.len());
-        if let Type::Named { name, args } = &fun.ty {
-            let named = Type::Named {
-                name: name.clone(),
-                args: args.clone(),
-            };
-            self.complete_named_alias_argument(&named, fun.span);
-            if let Type::Named { name, args } = &named {
-                if let Some(expanded) = self
-                    .st
-                    .named_alias_type(name, args)
-                    .map(|(_, ty)| ty)
-                    .or_else(|| self.complete_binary_result_alias(fun.sym, name, args))
-                {
-                    fun.ty = expanded;
-                }
-            }
+        fun.ty = self.expand_binary_method_alias(fun.sym, &fun.ty, fun.span);
+        if let Type::Method { paramss, ret } = fun.ty.clone() {
+            let paramss = paramss
+                .into_iter()
+                .map(|clause| {
+                    clause
+                        .into_iter()
+                        .map(|param| self.expand_binary_method_alias(fun.sym, &param, fun.span))
+                        .collect()
+                })
+                .collect();
+            let ret = Box::new(self.expand_binary_method_alias(fun.sym, &ret, fun.span));
+            fun.ty = Type::Method { paramss, ret };
         }
         let placed = self.reorder_named_args(args, fun);
         self.record_named_arg_order(tree_id);
@@ -1246,13 +1243,6 @@ impl Typer {
         let mut arg_tys = Vec::new();
         let saved_taking_args = std::mem::replace(&mut self.typing_call_args, true);
         let fun_ty_for_pretype = fun.ty.clone();
-        if let Type::Method { paramss, .. } = &fun_ty_for_pretype {
-            if let Some(params) = paramss.first() {
-                for param in params {
-                    self.complete_named_alias_argument(param, fun.span);
-                }
-            }
-        }
         // Nested calls may select the same overloaded declaration through a
         // different receiver. The shared symbol key must not replace this
         // call's receiver-substituted alternatives while its arguments type.

@@ -1566,6 +1566,23 @@ impl Typer {
         Some(self.st.subst_tparams(decl, args, &member.ty))
     }
 
+    pub(crate) fn expand_binary_method_alias(
+        &mut self,
+        method: SymbolId,
+        ty: &Type,
+        span: Span,
+    ) -> Type {
+        let Type::Named { name, args } = ty else {
+            return ty.clone();
+        };
+        self.complete_named_alias_argument(ty, span);
+        self.st
+            .named_alias_type(name, args)
+            .map(|(_, ty)| ty)
+            .or_else(|| self.complete_binary_result_alias(method, name, args))
+            .unwrap_or_else(|| ty.clone())
+    }
+
     fn complete_java_parents(&mut self, class_id: SymbolId, span: Span) {
         let parents = self.st.get(class_id).parents.clone();
         for p in &parents {

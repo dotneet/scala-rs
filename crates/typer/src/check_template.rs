@@ -252,6 +252,10 @@ impl Typer {
     }
 
     pub(crate) fn type_class(&mut self, tree: &mut Tree) {
+        if !tree.sym.is_none() && self.st.get(self.st.get(tree.sym).owner).kind != SymKind::Package
+        {
+            self.resolve_annotation_types(tree);
+        }
         let saved = self.macro_enter_owner(tree.sym);
         self.type_class_with_macro_owner(tree);
         self.macro_lexical_owner = saved;
@@ -888,6 +892,10 @@ impl Typer {
     }
 
     pub(crate) fn type_module(&mut self, tree: &mut Tree) {
+        if !tree.sym.is_none() && self.st.get(self.st.get(tree.sym).owner).kind != SymKind::Package
+        {
+            self.resolve_annotation_types(tree);
+        }
         let saved = self.macro_enter_owner(self.st.module_class_of(tree.sym));
         self.type_module_with_macro_owner(tree);
         self.macro_lexical_owner = saved;

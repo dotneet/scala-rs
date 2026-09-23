@@ -58,6 +58,65 @@ fn imported_annotation_has_qualified_pickle_owner() {
 }
 
 #[test]
+fn imported_annotation_on_nested_template_has_qualified_pickle_owner() {
+    let Some(library) = toolchain().scala_library() else {
+        eprintln!("skip: scala-library is unavailable");
+        return;
+    };
+    let dir = TestDir::new("nested-annotation-import-owner");
+    let marker = dir.join("Marker.scala");
+    let target = dir.join("Target.scala");
+    let classes = dir.join("classes");
+    fs::create_dir(&classes).unwrap();
+    fs::write(
+        &marker,
+        "package sample.marker\nclass Marker extends scala.annotation.StaticAnnotation\n",
+    )
+    .unwrap();
+    fs::write(
+        &target,
+        "package sample\nimport sample.marker.Marker\nobject Host { @Marker class Nested; @Marker object Inner }\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
+        .args(["compile"])
+        .args([&marker, &target])
+        .arg("-cp")
+        .arg(library)
+        .arg("--scala-library")
+        .arg(library)
+        .arg("-d")
+        .arg(&classes)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "compile failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for name in ["Host$Nested.class", "Host$Inner$.class"] {
+        let class = fs::read(classes.join("sample").join(name)).unwrap();
+        let signature = scala_signature_bytes(&class).expect("ScalaSignature");
+        let pickle = read_pickle(&signature).expect("valid ScalaSignature");
+        assert!(
+            pickle.entries.iter().any(|entry| {
+                let Entry::SymAnnot { annot, .. } = entry else {
+                    return false;
+                };
+                let Some(Entry::TypeRefTpe { sym, .. }) = pickle.entry(annot.tpe) else {
+                    return false;
+                };
+                pickle.sym_full_name(*sym).as_deref() == Some("sample.marker.Marker")
+            }),
+            "{name} must refer to sample.marker.Marker"
+        );
+    }
+}
+
+#[test]
 fn imported_binary_annotation_has_qualified_pickle_owner() {
     let Some(library) = toolchain().scala_library() else {
         eprintln!("skip: scala-library is unavailable");

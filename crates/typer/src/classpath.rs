@@ -189,6 +189,7 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                     m.ret.clone(),
                     m.tparams.clone(),
                     m.clause_sizes.clone(),
+                    m.param_flags.clone(),
                     &fallback_names,
                 );
                 if m.is_implicit {
@@ -624,6 +625,7 @@ fn install_ctor(
         ClasspathType::simple("Unit"),
         Vec::new(),
         m.clause_sizes.clone(),
+        m.param_flags.clone(),
         &HashMap::new(),
     );
 }
@@ -810,6 +812,7 @@ fn add_method(
     ret_name: ClasspathType,
     tparams: Vec<ClasspathTypeParam>,
     clause_sizes: Vec<usize>,
+    param_flags: Vec<u64>,
     fallback_names: &HashMap<String, Type>,
 ) -> SymbolId {
     let flags = if name.contains("$default$") {
@@ -839,7 +842,15 @@ fn add_method(
         } else {
             n.clone()
         };
-        let pid = st.alloc(&pname, id, SymKind::Term, Flags::PARAM, "");
+        let raw = param_flags.get(i).copied().unwrap_or_default();
+        let mut flags = Flags::PARAM;
+        if raw & scala_rs_pickle::read::pflags::IMPLICIT != 0 {
+            flags = flags.with(Flags::IMPLICIT);
+        }
+        if raw & scala_rs_pickle::read::pflags::DEFAULTPARAM != 0 {
+            flags = flags.with(Flags::DEFAULTPARAM);
+        }
+        let pid = st.alloc(&pname, id, SymKind::Term, flags, "");
         st.get_mut(pid).ty = ty.clone();
         pids.push(pid);
     }
@@ -3083,6 +3094,40 @@ fn desc_param_count(desc: &str) -> usize {
 #[cfg(test)]
 mod descriptor_semantics_tests {
     use super::*;
+
+    #[test]
+    fn eager_pickle_method_keeps_implicit_parameter_flags() {
+        let mut st = SymbolTable::new();
+        let owner = st.alloc(
+            "Api",
+            st.root,
+            SymKind::ModuleClass,
+            Flags::EMPTY,
+            "sample/Api$",
+        );
+        let method = add_method(
+            &mut st,
+            owner,
+            "make",
+            vec!["value".into(), "evidence".into(), "parallel".into()],
+            vec![
+                ClasspathType::simple("Int"),
+                ClasspathType::simple("Int"),
+                ClasspathType::simple("Int"),
+            ],
+            ClasspathType::simple("Int"),
+            Vec::new(),
+            vec![1, 2],
+            vec![0, 1 << 0, 1 << 0],
+            &HashMap::new(),
+        );
+        let clauses = st.get(method).paramss.clone();
+        assert_eq!(clauses.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2]);
+        assert!(!st.get(clauses[0][0]).flags.contains(Flags::IMPLICIT));
+        assert!(clauses[1]
+            .iter()
+            .all(|&param| st.get(param).flags.contains(Flags::IMPLICIT)));
+    }
 
     #[test]
     fn qualified_pickle_type_resolves_nested_scala_jvm_name() {
