@@ -1154,7 +1154,8 @@ impl Typer {
             let s = found[0];
             tree.sym = s;
             let member_ty = receiver_member_tys[0].1.clone();
-            let ty = expand(subst(member_ty));
+            let ty = expand(subst(member_ty.clone()));
+            let ty = expand_rebound_result_alias(&self.st, &member_ty, ty);
             let ty = self.opaque_projection_params(&qual.ty, ty);
             let ty = self.java_empty_clause_for_eta(s, ty, pt);
             let ty = self.maybe_auto_apply(ty, pt);
@@ -1210,7 +1211,8 @@ impl Typer {
                         .find(|(id, _)| id == s)
                         .map(|(_, ty)| ty.clone())
                         .unwrap_or_else(|| self.st.get(*s).ty.clone());
-                    (*s, expand(subst(ty)))
+                    let seen = expand(subst(ty.clone()));
+                    (*s, expand_rebound_result_alias(&self.st, &ty, seen))
                 })
                 .collect();
             let alts: Vec<(SymbolId, Type)> = alts
@@ -4825,5 +4827,32 @@ mod pickled_copy_tests {
         assert!(!collapsed.contains(&same_copy));
         assert!(!collapsed.contains(&original));
         assert_eq!(collapsed.len(), 3);
+    }
+}
+
+/// A member whose result applies an abstract type constructor of its owner
+/// (`def get[A](a: A): Outer.this.Repr[A]`) comes out of as-seen-from as the
+/// receiver's *alias* applied (`Sub.Repr[A]`). Conformance expands it on
+/// demand, but the backend erases the unexpanded application to `Object` and
+/// omits the `checkcast` to the alias's class, so expand it here -- only when
+/// as-seen-from actually rebound the constructor.
+fn expand_rebound_result_alias(st: &SymbolTable, declared: &Type, seen: Type) -> Type {
+    let (Type::Applied { ctor: before, .. }, Type::Applied { ctor: after, .. }) =
+        (declared.result(), seen.result())
+    else {
+        return seen;
+    };
+    if !matches!(
+        (before.as_ref(), after.as_ref()),
+        (Type::TypeMember(a), Type::TypeMember(b)) if a != b
+    ) {
+        return seen;
+    }
+    match seen {
+        Type::Method { paramss, ret } => Type::Method {
+            paramss,
+            ret: Box::new(st.expand_applied_hk_alias(*ret)),
+        },
+        other => st.expand_applied_hk_alias(other),
     }
 }
