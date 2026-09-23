@@ -54,6 +54,14 @@ every dependency the library needs is already built.
 
 ## The numbers
 
+> **Current status.** The accepted figure in `tests/BASELINE.md` (gate
+> `ff08907d`) is **538 files, 2 errors in 2 files**: both are one
+> unimplemented feature, a local `object` that captures (see
+> [`agent/libfinal`](#agentlibfinal-4--2-errors-and-the-first-look-at-the-backend-2026-09-13)).
+> `tests/verify_merge.sh` requires exactly the errors and files recorded
+> there. The tables below are the historical record of how the number got
+> there; read `tests/BASELINE.md` for the current one.
+
 `tests/scalalib_measure.sh`, on `agent/scalalib`:
 
 | | files | errors | files with errors | classes |
@@ -3968,13 +3976,17 @@ its measurements are the pickle's rather than the typer's.
 
 ```
 SCALALIB_LOG=$MYDIR/measure.txt SCALALIB_RUN=$MYDIR/run \
-  tests/scalalib_measure.sh -no-specialization
+  tests/scalalib_measure.sh
 ```
 
-`SCALALIB_LOG` defaults to a shared path; point it at one of your own.
+The script passes `-no-specialization` itself; extra arguments go to
+scala-rs. `SCALALIB_LOG` and `SCALALIB_RUN` default to per-invocation paths
+under `SCALA_RS_FIXTURE_ROOT`; set them when you want to keep the output.
 `SCALALIB_MODE=jar` switches to `--scala-library`, and `SCALALIB_DIRS` picks a
 different source set. The script clones scala/scala at the pinned revision and
 rebuilds the Java classpath whenever either is missing.
+`tests/scalalib_probe.sh` compiles a writable copy of the library for probing
+(see the `agent/libfinal` section below).
 
 ## The `agent/hkfield` slice: a load whose descriptor is a *bound*, not `Object`
 
