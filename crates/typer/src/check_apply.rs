@@ -1475,9 +1475,41 @@ impl Typer {
                 // fit.
                 let mut lenient = false;
                 let pt_arg = if pt_arg.is_no_type()
-                    && matches!(a.kind, TreeKind::Apply { .. } | TreeKind::TypeApply { .. })
-                {
-                    let l = self.lenient_proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt);
+                    && matches!(
+                        a.kind,
+                        TreeKind::Apply { .. }
+                            | TreeKind::TypeApply { .. }
+                            | TreeKind::Match { .. }
+                    ) {
+                    let mut l = self.lenient_proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt);
+                    // A match argument needs the formal's fixed outer shape
+                    // even when all its type arguments are open. Otherwise
+                    // `Rep[P]` gives it no prototype, a mix of `Boolean` and
+                    // `Rep[Boolean]` branches joins to `Any`, and the view on
+                    // the Boolean branches is never considered. Its result
+                    // can still infer P once the branches have been typed.
+                    if l.is_no_type()
+                        && !fun.sym.is_none()
+                        && matches!(a.kind, TreeKind::Match { .. })
+                    {
+                        if let Type::Method { paramss, .. } = &fun_ty_for_pretype {
+                            if let Some(p @ Type::Class { .. }) =
+                                paramss.first().and_then(|ps| param_at(ps, ai))
+                            {
+                                let open = self.st.get(fun.sym).tparams.clone();
+                                if !open.is_empty()
+                                    && mentions_tparam(p, &open)
+                                    && open.iter().all(|tp| self.st.get(*tp).tparams.is_empty())
+                                {
+                                    l = crate::symbol::subst_tparams_slice(
+                                        &open,
+                                        &vec![Type::Wildcard; open.len()],
+                                        p,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     lenient = !l.is_no_type();
                     l
                 } else {
