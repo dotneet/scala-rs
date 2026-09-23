@@ -240,6 +240,11 @@ fn map_view_collect_keeps_generic_overload_after_plain_map() {
 }
 
 #[test]
+fn flatten_finds_identity_view_through_intersection_parent() {
+    matrix(&[("flatten_intersection", true)], false);
+}
+
+#[test]
 fn lazy_class_tag_factory_preserves_required_evidence() {
     matrix(
         &[

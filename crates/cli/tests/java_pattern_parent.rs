@@ -109,3 +109,50 @@ fn descriptor_stub_keeps_java_error_pattern_compatible_with_throwable() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn throwable_can_match_an_unrelated_open_trait() {
+    let library = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    if !library.is_file() {
+        return;
+    }
+    let root = temp_dir("trait");
+    let source = fixtures_dir().join("throwable_trait_pattern.scala");
+    for (name, compiler) in [
+        ("scala-rs", bin()),
+        ("scalac", PathBuf::from("/tmp/scala-2.13.16/bin/scalac")),
+    ] {
+        if !compiler.is_file() {
+            continue;
+        }
+        let out = root.join(name);
+        fs::create_dir_all(&out).unwrap();
+        let mut command = Command::new(compiler);
+        if name == "scala-rs" {
+            command.arg("compile").arg("--scala-library").arg(&library);
+        }
+        let compiled = command
+            .arg(&source)
+            .arg("-d")
+            .arg(&out)
+            .output()
+            .expect("compile trait pattern");
+        assert!(
+            compiled.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let cp = format!("{}:{}", out.display(), library.display());
+        let run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "Main"])
+            .output()
+            .expect("run trait pattern");
+        assert!(
+            run.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(run.stdout, b"7\n", "{name}");
+    }
+    let _ = fs::remove_dir_all(root);
+}

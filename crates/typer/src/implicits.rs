@@ -2418,6 +2418,13 @@ impl Typer {
                 // the same ordered candidates as adaptation, then verify the
                 // fully instantiated target before committing any bindings.
                 let mut views = vec![from.clone()];
+                // A collection LUB can be an intersection such as
+                // `IterableOnce[A] with Equals`. The identity witness may
+                // widen it to any of its parents before solving `B` in
+                // `flatten[B](implicit A => IterableOnce[B])`.
+                if matches!(from, Type::Refined { .. }) {
+                    views.extend(self.st.base_type_seq(from));
+                }
                 if let Type::Array(elem) = from {
                     views.extend(
                         self.array_wrap_candidates(elem)

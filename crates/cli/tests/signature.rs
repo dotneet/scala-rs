@@ -129,6 +129,39 @@ fn generic_signatures_library_abi() {
     let _ = fs::remove_dir_all(&out);
 }
 
+#[test]
+fn serial_version_annotation_is_loadable_by_scala_reflection() {
+    let Some(library) = scala_library_jar() else {
+        return;
+    };
+    let reflect = Path::new("/tmp/scala-2.13.16/lib/scala-reflect.jar");
+    let scalac = Path::new("/tmp/scala-2.13.16/bin/scalac");
+    if !reflect.is_file() || !scalac.is_file() || !java_available() {
+        return;
+    }
+    let out = compile_fixture_with("sg_sig", &["--scala-library", library.to_str().unwrap()]);
+    let cp = format!(
+        "{}:{}:{}",
+        out.display(),
+        library.display(),
+        reflect.display()
+    );
+    let source = fixtures_dir().join("sg_reflect_serial.scala");
+    let compiled = Command::new(scalac)
+        .args(["-cp", &cp, "-d"])
+        .arg(&out)
+        .arg(&source)
+        .output()
+        .expect("scalac reflection consumer");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert_eq!(run_java(&out, Some(&cp), "CheckSerial"), "sg.Ser\n");
+    let _ = fs::remove_dir_all(out);
+}
+
 /// The other half of the claim: a member that says nothing beyond its
 /// descriptor gets **no** attribute. A `Signature` on every method would pass
 /// the reflection tests above just as well and be pure noise in every class

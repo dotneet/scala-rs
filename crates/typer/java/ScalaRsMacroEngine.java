@@ -1032,7 +1032,7 @@ public final class ScalaRsMacroEngine {
             throw gap("scala-rs returned a malformed c.inferImplicitValue `same` type");
         }
         if (!same && !java.util.Arrays.asList("ty", "src", "cst", "jclass", "mod",
-                "repeated", "refined", "param", "annot").contains(typeTag)) {
+                "repeated", "byname", "refined", "param", "annot").contains(typeTag)) {
             throw gap("scala-rs returned unknown c.inferImplicitValue type tag `"
                 + typeTag + "`");
         }
@@ -1340,6 +1340,12 @@ public final class ScalaRsMacroEngine {
             List<Object> elements = new ArrayList<>();
             elements.add(typeFor(s.items.get(1)));
             return call(universe, "appliedType", 2, repeated, list(elements));
+        }
+        if ("byname".equals(head)) {
+            Object byName = call(call(universe, "definitions", 0), "ByNameParamClass", 0);
+            List<Object> elements = new ArrayList<>();
+            elements.add(typeFor(s.items.get(1)));
+            return call(universe, "appliedType", 2, byName, list(elements));
         }
         if ("param".equals(head)) {
             Object param = structuralParams.get(Long.parseLong(s.items.get(1).text()));
@@ -1861,6 +1867,12 @@ public final class ScalaRsMacroEngine {
         Object sym = call(d, "typeSymbolDirect", 0);
         if (sym == call(call(universe, "definitions", 0), "RepeatedParamClass", 0)) {
             sb.append("(repeated ");
+            serType(call(call(d, "typeArgs", 0), "head", 0), sb);
+            sb.append(')');
+            return;
+        }
+        if (sym == call(call(universe, "definitions", 0), "ByNameParamClass", 0)) {
+            sb.append("(byname ");
             serType(call(call(d, "typeArgs", 0), "head", 0), sb);
             sb.append(')');
             return;

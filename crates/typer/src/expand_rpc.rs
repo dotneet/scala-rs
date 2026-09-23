@@ -1049,6 +1049,9 @@ impl Typer {
         if let Type::Repeated(element) = ty {
             return Ok(format!("(repeated {})", self.type_to_wire(element)?));
         }
+        if let Type::ByName(result) = ty {
+            return Ok(format!("(byname {})", self.type_to_wire(result)?));
+        }
         if matches!(ty, Type::AnyRef) {
             return Ok("(ty \"java.lang.Object\")".into());
         }

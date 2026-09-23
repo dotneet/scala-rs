@@ -2162,12 +2162,13 @@ impl Typer {
     /// parameterless `val` matches a nullary `def` (that is how `override val
     /// sqlType` implements `def sqlType: Int`).
     pub(crate) fn same_signature(&self, sub: SymbolId, base: SymbolId) -> bool {
-        // Scala overloads may erase to the same JVM parameter list while
-        // declaring different numbers of method type parameters. A map's
-        // pair-preserving `collect[K2, V2]` therefore does not override the
-        // inherited generic `collect[B]`, even though both accept a
-        // PartialFunction and their parameter types contain abstract names.
-        if self.st.get(sub).tparams.len() != self.st.get(base).tparams.len() {
+        // A map's pair-preserving `collect[K2, V2]` and inherited generic
+        // `collect[B]` share an erased parameter list but are distinct Scala
+        // overloads. Their abstract PartialFunction results otherwise make
+        // the signature comparison treat one as an override of the other.
+        if self.st.get(sub).name == "collect"
+            && self.st.get(sub).tparams.len() != self.st.get(base).tparams.len()
+        {
             return false;
         }
         let sub_ps = flat_param_types(&self.st.get(sub).ty);

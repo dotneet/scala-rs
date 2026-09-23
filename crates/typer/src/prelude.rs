@@ -111,6 +111,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         &[Type::AnyRef],
     );
     mark_java(st, throwable);
+    st.get_mut(throwable).flags.set(Flags::FINAL, false);
     let throwable_ty = Type::Class {
         sym: throwable,
         args: vec![],
@@ -187,6 +188,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         &[throwable_ty.clone()],
     );
     mark_java(st, exception);
+    st.get_mut(exception).flags.set(Flags::FINAL, false);
     let exception_ty = Type::Class {
         sym: exception,
         args: vec![],
@@ -214,6 +216,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         &[exception_ty],
     );
     mark_java(st, _runtime_ex);
+    st.get_mut(_runtime_ex).flags.set(Flags::FINAL, false);
     let runtime_ex_ty = Type::Class {
         sym: _runtime_ex,
         args: vec![],

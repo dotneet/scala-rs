@@ -1667,6 +1667,12 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         } else if simple == "deprecated" {
             let sc = self.scala_module();
             self.type_ref_in(sc, "deprecated")
+        } else if simple == "SerialVersionUID" {
+            // This annotation is often synthesized with no resolved tree
+            // type. Its pickle must still name scala.SerialVersionUID: a
+            // default-package reference cannot be loaded by runtime mirrors.
+            let sc = self.scala_module();
+            self.type_ref_this_in(sc, "SerialVersionUID")
         } else if simple == "inline" {
             // `inline` is a class directly under scala. Keep the ThisType
             // prefix that nsc writes; the generic fallback would otherwise

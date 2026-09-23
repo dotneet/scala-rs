@@ -914,6 +914,29 @@ fn constructor_reflection_preserves_multiple_param_lists_and_accessors() {
 }
 
 #[test]
+fn source_method_by_name_parameter_reaches_macro_reflection() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    for producer in [true, false] {
+        let implementation = root.join(format!("byname-implementation-{producer}"));
+        compile(
+            "macro_byname_mirror_impl",
+            producer,
+            &implementation,
+            &base,
+            true,
+        );
+        let cp = format!("{}:{base}", implementation.display());
+        for consumer in [true, false] {
+            let output = root.join(format!("byname-use-{producer}-{consumer}"));
+            compile("macro_byname_mirror_use", consumer, &output, &cp, true);
+            assert_eq!(run(&output, &cp), b"by-name\n");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn nested_implicit_macro_derivation_keeps_associated_types_and_stable_symbols() {
     let Some(home) = std::env::var_os("HOME") else {
         return;

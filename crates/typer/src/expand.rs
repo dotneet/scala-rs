@@ -3106,6 +3106,12 @@ impl Typer {
                 tree.ty = Type::Repeated(Box::new(self.tree_to_type(&element)));
                 return Ok(tree);
             }
+            Some("byname") => {
+                let result = self.type_tree_from_wire(at(items, 1)?, span)?;
+                let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
+                tree.ty = Type::ByName(Box::new(self.tree_to_type(&result)));
+                return Ok(tree);
+            }
             Some("mem") => {
                 let ty = self.query_type_from_wire(s, span)?;
                 let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
