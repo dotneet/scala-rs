@@ -893,6 +893,56 @@ impl Typer {
         } else {
             applicable
         };
+        // nsc's `inferMethodAlternative` first keeps the alternatives whose
+        // result is compatible with the expected type, and weighs specificity
+        // among those; only when none is does it retry without `pt`. On a
+        // `Set[X]` checked against `Set[ColOpt]`, `SetOps.++(that:
+        // IterableOnce[X]): Set[X]` is more specific than `IterableOps.++[B >:
+        // X](suffix: IterableOnce[B]): Set[B]`, but its result cannot be a
+        // `Set[ColOpt]` for an invariant `Set`; scalac takes the generic one
+        // (setmap1.scala:32). Only a monomorphic class-typed result is judged
+        // here -- one that still mentions its own type parameters is left to
+        // inference, as is any alternative when the expected type is not a
+        // proper class type.
+        let applicable = if applicable.len() > 1 {
+            let pt_class = match _pt {
+                Type::Class { args, .. }
+                    if !args.iter().any(|a| {
+                        crate::check::type_has_wildcard(a) || crate::check::mentions_any_tparam(a)
+                    }) =>
+                {
+                    Some(_pt)
+                }
+                _ => None,
+            };
+            match pt_class {
+                Some(pt) => {
+                    let fits: Vec<(SymbolId, Vec<Type>, Type)> = applicable
+                        .iter()
+                        .filter(|(sym, _, r)| {
+                            let own = if sym.is_none() {
+                                Vec::new()
+                            } else {
+                                self.st.get(*sym).tparams.clone()
+                            };
+                            !matches!(r, Type::Class { .. })
+                                || mentions_tparam(r, &own)
+                                || crate::check::mentions_any_tparam(r)
+                                || self.st.is_sub_type(r, pt)
+                        })
+                        .cloned()
+                        .collect();
+                    if fits.is_empty() || fits.len() == applicable.len() {
+                        applicable
+                    } else {
+                        fits
+                    }
+                }
+                None => applicable,
+            }
+        } else {
+            applicable
+        };
         // nsc fills a default only when no alternative applies without one
         // (`Infer.inferMethodAlternative`). Applied before the specificity
         // comparison, because the two alternatives it separates are often
