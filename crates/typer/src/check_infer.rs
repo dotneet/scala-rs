@@ -3249,7 +3249,27 @@ impl Typer {
                 // Minimizing it lets an expected result or the lambda body
                 // solve the method variable instead of fixing it to the
                 // factory's unrelated, unsolved parameter.
-                (None, Some(lo)) => out.push((tp, self.minimize_undet(&lo))),
+                //
+                // Not when a *typed* argument fills a parameter that mentions
+                // the variable and merely failed to unify as it stands: that
+                // argument still decides it once a view adapts it. `Map() ++
+                // arr` has `++[V2 >: V](xs: IterableOnce[(K, V2)])` given an
+                // `Array[(Int, String)]`; minimizing `V2 := ?V` to `Nothing`
+                // fixed the parameter at `IterableOnce[(Int, Nothing)]`, which
+                // no wrapping of the array conforms to.
+                (None, Some(lo)) => {
+                    let typed_arg_pending = param_tys.iter().zip(arg_tys).any(|(p, a)| {
+                        type_mentions_tparam(p, tp)
+                            && !a.is_no_type()
+                            && !a.is_error()
+                            && !mentions_no_type(a)
+                    });
+                    if typed_arg_pending {
+                        out.push((tp, lo))
+                    } else {
+                        out.push((tp, self.minimize_undet(&lo)))
+                    }
+                }
                 (None, None) => {}
             }
         }
