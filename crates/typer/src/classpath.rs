@@ -1105,18 +1105,76 @@ fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> boo
     if c.is_module || c.is_interface {
         return false;
     }
-    // A case class `Point.class` sits next to companion `Point$.class`. That is
-    // not a static forwarder: the pickle describes a real class (ctor / vals).
-    if c.pickle
-        .as_ref()
-        .is_some_and(|p| p.iter().any(|m| m.is_ctor || m.is_val))
-    {
+    // The mirror's ScalaSignature can describe the *module's* constructor and
+    // vals even though this JVM class only has static forwarders. A real class
+    // (including a case class beside its companion) has its own JVM <init>.
+    if c.methods.iter().any(|m| m.name == "<init>") {
         return false;
     }
     let dollar = format!("{}$", c.jvm_name);
     classes
         .iter()
         .any(|o| o.is_module && (o.jvm_name == dollar || o.jvm_name == c.jvm_name))
+}
+
+#[cfg(test)]
+mod forwarder_tests {
+    use super::*;
+    use crate::check::ClasspathPickleMethod;
+
+    fn class(name: &str, is_module: bool, methods: Vec<ClasspathMethod>) -> ClasspathClass {
+        ClasspathClass {
+            jvm_name: name.into(),
+            is_module,
+            methods,
+            fields: vec![],
+            pickle: Some(vec![ClasspathPickleMethod {
+                name: "<init>".into(),
+                param_names: vec![],
+                param_types: vec![],
+                clause_sizes: vec![],
+                param_flags: vec![],
+                ret: ClasspathType::simple("Unit"),
+                tparams: vec![],
+                is_val: false,
+                is_ctor: true,
+                is_implicit: false,
+                is_deferred: false,
+                is_mutable: false,
+            }]),
+            type_members: vec![],
+            pickle_tparams: vec![],
+            is_interface: false,
+            super_name: None,
+            interfaces: vec![],
+            extends_anyval: false,
+        }
+    }
+
+    fn method(name: &str) -> ClasspathMethod {
+        ClasspathMethod {
+            access: 0,
+            name: name.into(),
+            desc: "()V".into(),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn mirror_with_module_constructor_in_pickle_is_still_a_forwarder() {
+        let module = class("example/Service$", true, vec![method("<init>")]);
+        let mirror = class("example/Service", false, vec![method("call")]);
+        assert!(is_forwarder_of_module(
+            &[mirror.clone(), module.clone()],
+            &mirror
+        ));
+
+        let real_class = class("example/Service", false, vec![method("<init>")]);
+        assert!(!is_forwarder_of_module(
+            &[real_class.clone(), module],
+            &real_class
+        ));
+    }
 }
 
 fn simple_name(jvm: &str) -> String {
