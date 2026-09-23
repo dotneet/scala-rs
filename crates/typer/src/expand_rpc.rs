@@ -728,6 +728,7 @@ impl Typer {
         rejected: &[(SymbolId, Type)],
     ) -> crate::implicits::ImplicitSearch {
         let saved_open = self.open_implicits.borrow().clone();
+        self.record_macro_implicit_query(pt, depth, &saved_open, rejected);
         self.open_implicits.borrow_mut().extend_from_slice(rejected);
         self.invalidate_implicit_caches();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -746,6 +747,57 @@ impl Typer {
             Ok(search) => search,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+    }
+
+    fn record_macro_implicit_query(
+        &mut self,
+        pt: &Type,
+        depth: usize,
+        open: &[(SymbolId, Type)],
+        rejected: &[(SymbolId, Type)],
+    ) {
+        if !self.macro_timing.implicit_query_stats_enabled() {
+            return;
+        }
+        // Keep the exact structural spelling for identity. `display_type` is
+        // deliberately only the human-readable label: two shadowed symbols
+        // may print alike but have different SymbolIds and must not be merged.
+        // `silent` is intentionally absent: it changes only whether a miss is
+        // diagnosed after the search, never the candidates the search sees.
+        let fingerprint = format!(
+            "context={:?};file={};span={}-{};owner={:?};this={:?};scopes={};depth={};pt={:?};no_macros={};open={:?};rejected={:?};building={:?}",
+            self.macro_context_stack,
+            self.file_index,
+            self.macro_rpc_span.lo.0,
+            self.macro_rpc_span.hi.0,
+            self.st.owner,
+            self.st.this_class,
+            self.st.scopes.len(),
+            depth,
+            pt,
+            self.implicit_macros_disabled,
+            open,
+            rejected,
+            self.building_implicits,
+        );
+        let stack = |entries: &[(SymbolId, Type)]| {
+            entries
+                .iter()
+                .map(|(id, ty)| format!("{}:{}", id.0, self.st.display_type(ty)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let summary = format!(
+            "context={:?} depth={} pt={} no_macros={} open=[{}] rejected=[{}]",
+            self.macro_context_stack,
+            depth,
+            self.st.display_type(pt),
+            self.implicit_macros_disabled,
+            stack(open),
+            stack(rejected),
+        );
+        self.macro_timing
+            .record_implicit_query(fingerprint, summary);
     }
 
     /// Read a type the macro universe asked the call-site typer about.

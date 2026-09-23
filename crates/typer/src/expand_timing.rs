@@ -1,4 +1,6 @@
-//! Where a macro expansion's time goes (`SCALA_RS_MACRO_TIMING=1`).
+//! Where a macro expansion's time goes (`SCALA_RS_MACRO_TIMING=1`), and an
+//! opt-in census of repeated macro implicit queries
+//! (`SCALA_RS_MACRO_IMPLICIT_STATS=1`).
 //!
 //! The bridge has four places a second can hide, and before this module nobody
 //! had measured which: starting the engine JVM, the conversation on the pipe
@@ -14,6 +16,82 @@
 //! which is nothing next to an expansion but is not free either.
 
 use std::time::Duration;
+
+use rustc_hash::FxHashMap;
+
+#[derive(Default)]
+struct ImplicitQueryCount {
+    calls: u64,
+    summary: String,
+}
+
+/// Diagnostic-only counts of identical `c.inferImplicitValue` searches.
+///
+/// This deliberately stores observations rather than answers: the fingerprint
+/// is useful for deciding whether a result cache would pay, but is not yet a
+/// claim that the listed fields are a sufficient cache key.
+#[derive(Default)]
+struct ImplicitQueryStats {
+    enabled: bool,
+    total: u64,
+    by_fingerprint: FxHashMap<String, ImplicitQueryCount>,
+}
+
+impl ImplicitQueryStats {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("SCALA_RS_MACRO_IMPLICIT_STATS").is_some(),
+            ..Default::default()
+        }
+    }
+
+    fn record(&mut self, fingerprint: String, summary: String) {
+        if !self.enabled {
+            return;
+        }
+        self.total = self.total.saturating_add(1);
+        let entry = self.by_fingerprint.entry(fingerprint).or_default();
+        entry.calls = entry.calls.saturating_add(1);
+        if entry.summary.is_empty() {
+            entry.summary = summary;
+        }
+    }
+
+    fn report(&self) {
+        if !self.enabled {
+            return;
+        }
+        let unique = self.by_fingerprint.len() as u64;
+        let repeated = self.total.saturating_sub(unique);
+        let pct = if self.total == 0 {
+            0.0
+        } else {
+            repeated as f64 * 100.0 / self.total as f64
+        };
+        eprintln!(
+            "[macro implicit queries] search attempts {} | unique {} | repeated {} ({pct:.1}%)",
+            self.total, unique, repeated
+        );
+        eprintln!(
+            "[macro implicit queries] context-sensitive lower bound; retries with different rejected candidates are distinct"
+        );
+        let mut top: Vec<(&String, &ImplicitQueryCount)> = self
+            .by_fingerprint
+            .iter()
+            .filter(|(_, count)| count.calls > 1)
+            .collect();
+        top.sort_by(|(ak, a), (bk, b)| b.calls.cmp(&a.calls).then_with(|| ak.cmp(bk)));
+        for (rank, (fingerprint, count)) in top.into_iter().take(20).enumerate() {
+            eprintln!(
+                "[macro implicit queries] #{:<2} {:>7} calls | {} | fingerprint={}",
+                rank + 1,
+                count.calls,
+                count.summary,
+                fingerprint
+            );
+        }
+    }
+}
 
 /// One macro application's breakdown.
 #[derive(Default)]
@@ -73,22 +151,36 @@ pub(crate) struct MacroTiming {
     /// `(ready)`.
     pub(crate) engine_start: Duration,
     pub(crate) expansions: Vec<ExpansionTiming>,
+    implicit_queries: ImplicitQueryStats,
 }
 
 impl MacroTiming {
     pub(crate) fn new() -> Self {
         MacroTiming {
             enabled: std::env::var_os("SCALA_RS_MACRO_TIMING").is_some(),
+            implicit_queries: ImplicitQueryStats::new(),
             ..Default::default()
         }
+    }
+
+    pub(crate) fn implicit_query_stats_enabled(&self) -> bool {
+        self.implicit_queries.enabled
+    }
+
+    pub(crate) fn record_implicit_query(&mut self, fingerprint: String, summary: String) {
+        self.implicit_queries.record(fingerprint, summary);
     }
 
     /// Write the table on stderr. Markdown, so it can be pasted into
     /// `docs/performance.md` as it stands.
     pub(crate) fn report(&self) {
-        if !self.enabled {
-            return;
+        if self.enabled {
+            self.report_timing();
         }
+        self.implicit_queries.report();
+    }
+
+    fn report_timing(&self) {
         let secs = |d: Duration| d.as_secs_f64();
         if self.expansions.is_empty() {
             eprintln!(
@@ -173,5 +265,35 @@ impl MacroTiming {
             secs(sum(ExpansionTiming::total)),
             secs(sum(ExpansionTiming::total) + self.engine_start),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implicit_query_stats_count_total_unique_and_repeated() {
+        let mut stats = ImplicitQueryStats {
+            enabled: true,
+            ..Default::default()
+        };
+        stats.record("same".into(), "first spelling wins".into());
+        stats.record("same".into(), "ignored".into());
+        stats.record("other".into(), "other".into());
+
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.by_fingerprint.len(), 2);
+        assert_eq!(stats.by_fingerprint["same"].calls, 2);
+        assert_eq!(stats.by_fingerprint["same"].summary, "first spelling wins");
+    }
+
+    #[test]
+    fn disabled_implicit_query_stats_do_not_retain_observations() {
+        let mut stats = ImplicitQueryStats::default();
+        stats.record("same".into(), "summary".into());
+
+        assert_eq!(stats.total, 0);
+        assert!(stats.by_fingerprint.is_empty());
     }
 }
