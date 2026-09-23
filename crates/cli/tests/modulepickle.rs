@@ -111,6 +111,107 @@ fn real_scalac_reads_inferred_and_declared_module_singletons() {
 }
 
 #[test]
+fn native_companion_class_remains_a_binary_parent() {
+    let Some(library) = cached_library() else {
+        eprintln!("skip binary module-parent probe: scala-library jar unavailable");
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let root = std::env::temp_dir().join(format!(
+        "scala-rs-module-parent-{}-{stamp}",
+        std::process::id()
+    ));
+    let provider_src = root.join("provider.scala");
+    let consumer_src = root.join("consumer.scala");
+    let provider_out = root.join("provider");
+    let consumer_out = root.join("consumer");
+    fs::create_dir_all(&provider_out).expect("module-parent provider output directory");
+    fs::create_dir_all(&consumer_out).expect("module-parent consumer output directory");
+    fs::write(
+        &provider_src,
+        r#"
+package moduleparent
+sealed abstract class Parent(val value: Int)
+object Parent { def apply(value: Int): Parent = Child }
+case object Child extends Parent(1)
+"#,
+    )
+    .expect("write module-parent provider");
+    fs::write(
+        &consumer_src,
+        r#"
+package moduleparent
+object Main {
+  val result: Parent = Child
+  def main(args: Array[String]): Unit = println(result.value)
+}
+"#,
+    )
+    .expect("write module-parent consumer");
+
+    let native = env!("CARGO_BIN_EXE_scala-rs");
+    let provider = Command::new(native)
+        .args([
+            "compile",
+            provider_src.to_str().unwrap(),
+            "--scala-library",
+            library.to_str().unwrap(),
+            "-d",
+            provider_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs module-parent provider");
+    assert!(
+        provider.status.success(),
+        "scala-rs module-parent provider failed: {}{}",
+        String::from_utf8_lossy(&provider.stdout),
+        String::from_utf8_lossy(&provider.stderr)
+    );
+
+    let classpath = format!("{}:{}", provider_out.display(), library.display());
+    let consumer = Command::new(native)
+        .args([
+            "compile",
+            consumer_src.to_str().unwrap(),
+            "--scala-library",
+            library.to_str().unwrap(),
+            "-cp",
+            &classpath,
+            "-d",
+            consumer_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs module-parent consumer");
+    assert!(
+        consumer.status.success(),
+        "scala-rs could not recover the case object's binary parent: {}{}",
+        String::from_utf8_lossy(&consumer.stdout),
+        String::from_utf8_lossy(&consumer.stderr)
+    );
+
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{classpath}", consumer_out.display()),
+            "moduleparent.Main",
+        ])
+        .output()
+        .expect("run module-parent consumer");
+    assert!(
+        run.status.success(),
+        "module-parent consumer failed verification: {}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1\n");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn native_directory_forwarder_preserves_inherited_higher_kinded_arguments() {
     let Some(library) = cached_library() else {
         return;

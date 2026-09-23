@@ -92,7 +92,11 @@ fn parse_abi_class_with_policy(
                 .ok_or("malformed classfile method descriptor")?,
         )?;
         let signature = method_signature(&mut c, &cp)?;
-        if name != "<init>" && name != "<clinit>" {
+        // Constructors distinguish a real class with a companion object from
+        // the constructor-free static mirror emitted for an object. Preserve
+        // them in the canonical ABI even though ordinary member lookup later
+        // gets the source-level constructor shape from the ScalaSignature.
+        if name != "<clinit>" {
             methods.push(AbiLoadedMethod {
                 flags: JvmMemberFlags::new(JvmMemberKind::Method, access),
                 name: decode_method_name(&name),
@@ -472,6 +476,28 @@ mod tests {
         assert_eq!(loaded.all_methods().count(), 1);
         assert_eq!(loaded.bridge_methods().count(), 1);
         assert_eq!(loaded.scala_visible_methods().count(), 0);
+    }
+
+    #[test]
+    fn loader_retains_jvm_constructors_for_class_identity() {
+        let mut emit = metadata_emit("I", "()V");
+        emit.methods.push(Method {
+            access: 0x0001,
+            name: "<init>".into(),
+            desc: "(I)V".into(),
+            code: None,
+            java_annots: Vec::new(),
+            signature: None,
+            param_names: Vec::new(),
+            param_flags: Vec::new(),
+        });
+        let loaded = parse_abi_class(&emit.write_with_pool(Pool::new()).unwrap()).unwrap();
+        let constructor = loaded
+            .methods
+            .iter()
+            .find(|method| method.name == "<init>")
+            .expect("JVM constructor should remain in the canonical ABI");
+        assert_eq!(constructor.descriptor.as_str(), "(I)V");
     }
 
     #[test]
