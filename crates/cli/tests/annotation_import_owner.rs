@@ -82,7 +82,7 @@ fn imported_binary_annotation_has_qualified_pickle_owner() {
          import java.lang.annotation.RetentionPolicy;\n\
          import java.lang.annotation.Target;\n\
          @Retention(RetentionPolicy.RUNTIME)\n\
-         @Target(ElementType.METHOD)\n\
+         @Target({ElementType.METHOD, ElementType.TYPE})\n\
          public @interface Trace {}\n",
     )
     .unwrap();
@@ -114,7 +114,7 @@ fn imported_binary_annotation_has_qualified_pickle_owner() {
     );
     fs::write(
         &target,
-        "package sample\nimport sample.marker.Trace\nclass Target { @Trace def work = 1 }\n",
+        "package sample\nimport sample.marker.Trace\nclass Target { @Trace def work = 1; @Trace object Nested }\n",
     )
     .unwrap();
 
@@ -169,7 +169,9 @@ fn imported_binary_annotation_has_qualified_pickle_owner() {
           def main(args: Array[String]): Unit = {
             import scala.reflect.runtime.{universe => ru}
             val mirror = ru.runtimeMirror(getClass.getClassLoader)
-            val method = mirror.staticClass("sample.Target").toType.decl(ru.TermName("work"))
+            val target = mirror.staticClass("sample.Target").toType
+            target.members.foreach(_.annotations)
+            val method = target.decl(ru.TermName("work"))
             println(method.annotations.map(_.tree.tpe.typeSymbol.fullName).mkString(","))
           }
         }

@@ -24,6 +24,7 @@
 //! missing class there says nothing about the program.
 
 use crate::check::Typer;
+use crate::symbol::SymKind;
 use scala_rs_parser::ast::*;
 
 impl Typer {
@@ -91,8 +92,19 @@ impl Typer {
         for (sym, index, annot) in &annots {
             if let Some(ty) = self.resolve_one_annotation(annot) {
                 if !sym.is_none() {
-                    if let Some(saved) = self.st.get_mut(*sym).annotations.get_mut(*index) {
-                        saved.ty = ty;
+                    // A source object has two symbols: its stable module and
+                    // the module class that carries the classfile and pickle
+                    // metadata. Namer copies the annotation to both before
+                    // this pass resolves it, so update both copies together.
+                    let targets = if self.st.get(*sym).kind == SymKind::Module {
+                        vec![*sym, self.st.module_class_of(*sym)]
+                    } else {
+                        vec![*sym]
+                    };
+                    for target in targets {
+                        if let Some(saved) = self.st.get_mut(target).annotations.get_mut(*index) {
+                            saved.ty = ty.clone();
+                        }
                     }
                 }
             }
