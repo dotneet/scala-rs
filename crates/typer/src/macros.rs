@@ -130,8 +130,13 @@ pub(crate) fn macro_targ_of_type(
     match ty {
         // A class with no type arguments of its own, and the primitives. nsc
         // takes the written type's *symbol* and then that symbol's own type,
-        // which for these is the same type back again.
-        Type::Class { sym, .. } => MacroTarg::Fixed(st.type_of_class(*sym)),
+        // which for these is the same type back again. A class written *with*
+        // arguments is not one of these: `List[R]` reaches nsc's
+        // implementation as `List[A]`, and it falls through to the refusal
+        // below rather than to `List`'s bare type.
+        Type::Class { sym, args } if args.is_empty() => {
+            MacroTarg::Fixed(st.type_of_class(*sym))
+        }
         Type::TypeMember(id) if st.get(*id).is_type_alias => {
             if let Type::Class { sym, .. } = &st.get(*id).ty {
                 MacroTarg::Fixed(st.type_of_class(*sym))
