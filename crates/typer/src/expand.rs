@@ -347,6 +347,32 @@ fn wire_line_payload(line: &str) -> &str {
     line.strip_suffix('\r').unwrap_or(line)
 }
 
+impl Typer {
+    /// Insert the file's text at `slot` in `(position src <file> <text>?
+    /// <path> <point>)` the first time this engine sees the file, and nothing
+    /// after that.
+    ///
+    /// Every `(expand …)` used to carry the whole text of its file, and the
+    /// engine read and parsed it one character at a time and built a new
+    /// `BatchSourceFile` from it: for a file with a hundred macro calls that
+    /// was a hundred copies, and about a third of the engine's time. The
+    /// engine now keeps each file by index.
+    fn fill_source_text(&mut self, mut request: String, slot: Option<usize>) -> String {
+        let Some(slot) = slot else {
+            return request;
+        };
+        if self.macro_sources_sent.insert(self.file_index) {
+            let mut quoted = String::new();
+            if let Some(source) = self.sources.get(self.file_index) {
+                quote_into(&mut quoted, source);
+            }
+            quoted.push(' ');
+            request.insert_str(slot, &quoted);
+        }
+        request
+    }
+}
+
 /// A macro engine being started on another thread.
 ///
 /// Starting the JVM and its runtime universe takes about 0.4 s of wall clock,
@@ -1358,7 +1384,7 @@ impl Typer {
             }
         }
         let timing_start = self.macro_timing.start_stage();
-        let (request, splices) =
+        let (request, splices, text_slot) =
             self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
         if let Some(t) = timing_start {
             let slot = t.slot;
@@ -1390,6 +1416,7 @@ impl Typer {
         let rpc_started = self.macro_timing.start_stage();
         let saved_span = self.macro_rpc_span;
         self.macro_rpc_span = tree.span;
+        let request = self.fill_source_text(request, text_slot);
         let reply =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.converse(&request)));
         self.macro_rpc_span = saved_span;
@@ -1641,7 +1668,7 @@ impl Typer {
         targs: &[Type],
         prefix: Option<&Tree>,
         application: &Tree,
-    ) -> Result<(String, Vec<Tree>), String> {
+    ) -> Result<(String, Vec<Tree>, Option<usize>), String> {
         let sym = self
             .macro_symbol_of(application)
             .ok_or("macro application lost its symbol")?;
@@ -1815,6 +1842,7 @@ impl Typer {
         // Preserve actual source content and UTF-16 point offsets for macros
         // that inspect the source line, rather than only placing diagnostics.
         out.push_str(" (position ");
+        let mut text_slot = None;
         if let Some(source) = self.sources.get(self.file_index) {
             let mut method = application;
             while let TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } = &method.kind {
@@ -1833,8 +1861,10 @@ impl Typer {
                 .ok_or("macro position splits a UTF-8 character")?
                 .encode_utf16()
                 .count();
-            quote_into(&mut out, source);
-            out.push(' ');
+            // The text itself goes to the engine once per file; see
+            // [`SOURCE_TEXT_SLOT`].
+            out.push_str(&format!("src {} ", self.file_index));
+            text_slot = Some(out.len());
             quote_into(
                 &mut out,
                 self.source_paths
@@ -1875,7 +1905,7 @@ impl Typer {
             quote_into(&mut out, setting);
         }
         out.push_str("))");
-        Ok((out, splices))
+        Ok((out, splices, text_slot))
     }
 
     /// The type descriptor of every *typed leaf* in `t` that has no source
@@ -5121,6 +5151,25 @@ pub(crate) fn quote_into(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file's text goes to the engine with the first request from that
+    /// file only; later requests name it by index.
+    #[test]
+    fn source_text_is_sent_once_per_file() {
+        let mut typer = Typer::new(0, &crate::TypecheckOptions::default());
+        typer.sources = vec![std::rc::Rc::from("a \"b\""), std::rc::Rc::from("c")];
+        let request = |at: &str| format!("(expand (position src 0 {at}\"p.scala\" 3))");
+        let slot = Some("(expand (position src 0 ".len());
+        typer.file_index = 0;
+        assert_eq!(
+            typer.fill_source_text(request(""), slot),
+            request("\"a \\\"b\\\"\" ")
+        );
+        assert_eq!(typer.fill_source_text(request(""), slot), request(""));
+        typer.file_index = 1;
+        assert_eq!(typer.fill_source_text(request(""), slot), request("\"c\" "));
+        assert_eq!(typer.fill_source_text(request(""), None), request(""));
+    }
 
     #[test]
     fn round_trips_a_reply() {

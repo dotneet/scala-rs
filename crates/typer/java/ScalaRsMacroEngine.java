@@ -67,6 +67,10 @@ public final class ScalaRsMacroEngine {
     static ClassLoader macroCl;
     /** Proxies retained only while their expansion is active in the typer. */
     static final java.util.Map<Long, Object> macroContexts = new java.util.HashMap<>();
+    /** The run's source files by file index, sent once each: `(position src
+     *  idx text path point)` defines one, `(position src idx path point)`
+     *  reuses it. */
+    static final java.util.Map<Integer, Object> sourceFiles = new java.util.HashMap<>();
     static List<Object> openMacroContexts = new ArrayList<>();
     /**
      * The pipe, as fields, because expansion is a *conversation* rather than
@@ -568,6 +572,16 @@ public final class ScalaRsMacroEngine {
 
     // ---------------------------------------------------------------- request
 
+    static Object sourceFile(String text, String path) throws Exception {
+        Class<?> virtual = loadClass("scala.reflect.io.VirtualFile");
+        Object file = virtual.getConstructor(String.class, String.class)
+            .newInstance(new java.io.File(path).getName(), path);
+        Class<?> abstractFile = loadClass("scala.reflect.io.AbstractFile");
+        return loadClass("scala.reflect.internal.util.BatchSourceFile")
+            .getConstructor(abstractFile, char[].class)
+            .newInstance(file, text.toCharArray());
+    }
+
     static String handle(String line) throws Exception {
         Sexp req = Sexp.parse(line);
         if (!req.isList() || req.items.isEmpty()) {
@@ -596,6 +610,26 @@ public final class ScalaRsMacroEngine {
             compilerSettings.add(x.text());
         }
 
+        // The file this call sits in. Registered before anything else reads
+        // the request: its text arrives only with the first request that
+        // needs it, whichever branch below that request takes.
+        Sexp position = req.field("position");
+        Object source = null;
+        int positionSize = position.items.size();
+        if (positionSize == 4) {
+            source = sourceFile(position.items.get(1).text(), position.items.get(2).text());
+        } else if ((positionSize == 5 || positionSize == 6)
+                && "src".equals(position.items.get(1).text())) {
+            int index = Integer.parseInt(position.items.get(2).text());
+            if (positionSize == 6) {
+                sourceFiles.put(index, sourceFile(
+                    position.items.get(3).text(), position.items.get(4).text()));
+            }
+            source = sourceFiles.get(index);
+            if (source == null) {
+                return err("macro position names source " + index + ", which was never sent");
+            }
+        }
         Class<?> implCls;
         try {
             implCls = loadClass(className);
@@ -654,20 +688,11 @@ public final class ScalaRsMacroEngine {
             }
             Sexp appType = req.field("appType");
             if (appType.items.size() == 2) call(handler.appTree, "setType", 1, typeFor(appType.items.get(1)));
-            Sexp position = req.field("position");
-            if (position.items.size() == 4) {
-                Class<?> virtual = loadClass("scala.reflect.io.VirtualFile");
-                String path = position.items.get(2).text();
-                Object file = virtual.getConstructor(String.class, String.class)
-                    .newInstance(new java.io.File(path).getName(), path);
-                Class<?> abstractFile = loadClass("scala.reflect.io.AbstractFile");
+            if (source != null) {
                 Class<?> sourceClass = loadClass("scala.reflect.internal.util.SourceFile");
-                Object source = loadClass("scala.reflect.internal.util.BatchSourceFile")
-                    .getConstructor(abstractFile, char[].class)
-                    .newInstance(file, position.items.get(1).text().toCharArray());
                 Object pos = loadClass("scala.reflect.internal.util.OffsetPosition")
                     .getConstructor(sourceClass, int.class)
-                    .newInstance(source, Integer.parseInt(position.items.get(3).text()));
+                    .newInstance(source, Integer.parseInt(position.items.get(positionSize - 1).text()));
                 call(handler.appTree, "setPos", 1, pos);
             }
         }

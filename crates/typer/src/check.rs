@@ -568,6 +568,9 @@ pub struct Typer {
     /// The engine being started ahead of the first expansion
     /// ([`Typer::prestart_macro_engine`]); taken by the first expansion.
     pub(crate) macro_engine_pending: Option<crate::expand::PendingEngine>,
+    /// The files whose text the engine already holds (`fill_source_text` in
+    /// `expand.rs`). There is one engine per typer.
+    pub(crate) macro_sources_sent: rustc_hash::FxHashSet<usize>,
     /// Why the engine could not be started, once it has failed once.
     pub(crate) macro_engine_error: Option<String>,
     /// What `java` is given as its classpath: the run's own binary path, so
@@ -1228,6 +1231,7 @@ impl Typer {
             callee_arity: None,
             macro_engine: None,
             macro_engine_pending: None,
+            macro_sources_sent: Default::default(),
             macro_engine_error: None,
             macro_classpath: opts.binary_path.clone(),
             macro_failures: HashMap::new(),
