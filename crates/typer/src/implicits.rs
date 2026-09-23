@@ -3554,6 +3554,9 @@ impl Typer {
                     let ty = self.st.get(id).ty.clone();
                     self.warm_receiver_type_members(&prefix, &ty);
                 }
+                if !self.view_result_may_have_member(id, name, span) {
+                    continue;
+                }
                 let Some(to) = self.conversion_result(id, from) else {
                     continue;
                 };
@@ -3773,6 +3776,66 @@ impl Typer {
     /// and need no special handling; classfile APIs also expose receiver and
     /// result classes behind abstract members whose upper bound is a nested
     /// class that has not been named directly yet.
+    /// nsc's cheap view filter (`ImplicitComputation.survives`, through
+    /// `isPlausiblyCompatible` and `matchesPt` against `?{def name: ?}`): a
+    /// view whose result class has no member `name` is dropped before its type
+    /// arguments are solved or its implicit clause is searched.
+    ///
+    /// Only a result that is a class as *declared* is judged. Its class does
+    /// not depend on the view's type arguments or on the prefix it was
+    /// imported through, so the test below is the one [`Self::search_extension_in`]
+    /// makes after `conversion_result`, asked earlier: the same non-static
+    /// `lookup_member`, and the same pickle completion, which depends only on
+    /// the class. Anything else -- a type parameter, an abstract type member a
+    /// profile API fixes later, a function -- answers `true` and takes the
+    /// full path.
+    ///
+    /// Without it every select that falls back on a view solved every
+    /// conversion in scope: under `import cats.syntax.all._`, each of cats'
+    /// syntax conversions searched its type class with the constructor still
+    /// undetermined, found every instance, and came out ambiguous -- for a
+    /// name its `Ops` class never declared.
+    fn view_result_may_have_member(&mut self, id: SymbolId, name: &str, span: Span) -> bool {
+        let ret = match &self.st.get(id).ty {
+            Type::Method { paramss, ret } if paramss.first().is_some_and(|ps| ps.len() == 1) => {
+                ret.as_ref()
+            }
+            Type::Function { params, ret } if params.len() == 1 => ret.as_ref(),
+            _ => return true,
+        };
+        let Type::Class { sym: cls, .. } = ret else {
+            return true;
+        };
+        let cls = *cls;
+        if !self.st.get(cls).is_class_like()
+            || self.st.is_array_class(cls)
+            || self.st.function_class_form(ret).is_some()
+        {
+            return true;
+        }
+        // The hand-written prelude (`RichInt`, `StringOps`, `ArrayOps`, the
+        // boxes) is a deliberately partial model, and the loop below only
+        // reads its classes' pickles for a conversion that applies. Asking
+        // them here, for every view in scope, completes members nothing else
+        // would: `RichInt#<` then made `intWrapper` a view to `Ordered[Int]`
+        // for a later `val o: Ordered[Int] = 3`. A prelude result is kept.
+        if cls.0 < self.st.prelude_end {
+            return true;
+        }
+        let non_static = |this: &Self, ms: Vec<SymbolId>| {
+            ms.into_iter()
+                .any(|m| !this.st.get(m).flags.contains(Flags::STATIC))
+        };
+        let ret = ret.clone();
+        self.ensure_java_loaded(cls, span);
+        let declared = self.st.lookup_member(cls, name);
+        if non_static(self, declared) {
+            return true;
+        }
+        let supplied = self.supply_from_pickle(&ret, name);
+        non_static(self, supplied)
+    }
+
     pub(crate) fn class_sym_for_bounded_member_lookup(
         &mut self,
         ty: &Type,
