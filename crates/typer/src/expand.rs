@@ -1662,6 +1662,7 @@ impl Typer {
         // Result attribution is supplementary: many whitebox macros have a
         // provisional/refined result and only inspect the application's tree
         // or position. Do not require a runtime type tag to invoke those.
+        let prefix_type = prefix.and_then(|p| self.tag_wire(&p.ty).ok());
         let application_type = self.tag_wire(&application.ty).ok();
         let cx = WireCx {
             st: &self.st,
@@ -1764,6 +1765,12 @@ impl Typer {
                     }
                 }
             }
+        }
+        out.push(')');
+        out.push_str(" (prefixType");
+        if let Some(prefix_type) = prefix_type {
+            out.push(' ');
+            out.push_str(&prefix_type);
         }
         out.push(')');
         // Preserve actual source content and UTF-16 point offsets for macros
@@ -2082,6 +2089,9 @@ impl Typer {
             out.push(')');
             return Ok(out);
         }
+        if matches!(ty, Type::Wildcard) {
+            return Ok("(wild)".to_string());
+        }
         if let Some((name, args)) = self.applied_tag_shape(ty)? {
             let mut written = Vec::new();
             for a in &args {
@@ -2305,7 +2315,13 @@ impl Typer {
             "Select" => {
                 let qual = self.tree_from_reply(at(kids, 0)?, span)?;
                 let name_wire = at(kids, 1)?;
-                let name = decode_method_name(&name_from(name_wire)?);
+                let mut name = decode_method_name(&name_from(name_wire)?);
+                if let Some(index) = name.strip_prefix("<init>$default$") {
+                    // A typed macro result names a constructor default getter
+                    // the way Scala reflection does. Source companions keep
+                    // the JVM-safe spelling used by their synthesized symbol.
+                    name = format!("$lessinit$greater$default${index}");
+                }
                 let is_type_name = name_wire
                     .list()
                     .ok()
@@ -3109,6 +3125,11 @@ impl Typer {
             Some("cst") => {
                 let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
                 tree.ty = Type::Constant(literal_from(at(items, 1)?)?);
+                return Ok(tree);
+            }
+            Some("wild") => {
+                let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
+                tree.ty = Type::Wildcard;
                 return Ok(tree);
             }
             Some("intersection") => {

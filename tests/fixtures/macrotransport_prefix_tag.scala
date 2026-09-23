@@ -9,6 +9,9 @@ object TaggedOwnerMacros {
     import c.universe._
     assert(c.settings.isEmpty)
     val prefix = c.prefix.tree
+    assert(prefix.tpe != null)
+    assert(prefix.tpe.typeSymbol.name.toString == "TaggedOwner")
+    assert(c.prefix.staticType =:= typeOf[Nothing])
     c.Expr[D](q"""{
       import scala.collection.immutable.{List => DataList, _}
       val owner = $prefix

@@ -629,6 +629,10 @@ public final class ScalaRsMacroEngine {
             handler.prefixWhy = pfx.items.get(1).text();
         } else {
             handler.prefixTree = buildTree(pfx);
+            Sexp prefixType = req.field("prefixType");
+            if (prefixType.items.size() == 2) {
+                call(handler.prefixTree, "setType", 1, typeFor(prefixType.items.get(1)));
+            }
         }
         // `c.macroApplication`: the call as written, carried the same way.
         Sexp app = req.field("app").items.get(1);
@@ -672,9 +676,8 @@ public final class ScalaRsMacroEngine {
         // so a single proxy serves both kinds of implementation. Declaring only
         // the blackbox interface made every whitebox implementation an
         // `IllegalArgumentException: argument type mismatch` from
-        // `Method.invoke`, which is not a diagnostic. The handler answers the
-        // three members whitebox adds the same way it answers any other it does
-        // not implement: by raising a named gap.
+        // `Method.invoke`, which is not a diagnostic. The handler also answers
+        // whitebox-specific context members through this proxy.
         Object ctx = Proxy.newProxyInstance(
             ScalaRsMacroEngine.class.getClassLoader(),
             new Class<?>[]{loadClass("scala.reflect.macros.whitebox.Context")},
@@ -1373,6 +1376,9 @@ public final class ScalaRsMacroEngine {
             return call(call(universe, "internal", 0), "constantType", 1,
                 constant(s.items.get(1)));
         }
+        if ("wild".equals(head)) {
+            return call(universe, "WildcardType", 0);
+        }
         String name = s.items.get(1).text();
         if ("param".equals(head)) {
             Object owner = call(mirror, "staticClass", 1, name);
@@ -1819,6 +1825,10 @@ public final class ScalaRsMacroEngine {
             sb.append("(ty \"\")");
             return;
         }
+        if (tpe == call(universe, "WildcardType", 0)) {
+            sb.append("(wild)");
+            return;
+        }
         if (isA(tpe, "scala.reflect.internal.Types$ConstantType")) {
             sb.append("(cst ");
             serConstant(call(tpe, "value", 0), sb);
@@ -1961,6 +1971,16 @@ public final class ScalaRsMacroEngine {
                     serType(call(it, "next", 0), sb);
                 }
                 sb.append(')');
+                return;
+            }
+        }
+        if (Boolean.TRUE.equals(call(sym, "isModuleClass", 0)) && staticByOwners(sym)) {
+            Object module = call(sym, "sourceModule", 0);
+            if (module != null && module != call(universe, "NoSymbol", 0)
+                    && staticByOwners(module)) {
+                sb.append("(mod ")
+                  .append(Sexp.quote(String.valueOf(call(module, "fullName", 0))))
+                  .append(')');
                 return;
             }
         }
@@ -2917,6 +2937,11 @@ public final class ScalaRsMacroEngine {
                 contexts.add(proxy);
                 contexts.addAll(openMacroContexts);
                 return list(contexts);
+            }
+            if (n.equals("enclosingMacros") && arity == 0) {
+                // The current expansion is the first enclosing macro. Unlike
+                // openMacros, this list does not prepend it a second time.
+                return list(new ArrayList<Object>(openMacroContexts));
             }
             if (n.equals("openImplicits") && arity == 0) {
                 Sexp answer = query("(q openImplicits)");

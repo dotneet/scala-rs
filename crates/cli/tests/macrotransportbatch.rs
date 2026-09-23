@@ -438,6 +438,87 @@ fn inferred_macro_arguments_and_prefix_with_runtime_tag() {
 }
 
 #[test]
+fn macro_type_tags_transport_unbounded_wildcard_arguments() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base_cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_wildcard_tag",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("use-{consumer}"));
+        compile(
+            "macrotransport_wildcard_tag_use",
+            consumer,
+            &output,
+            &cp,
+            true,
+        );
+        assert_eq!(run(&output, &cp), b"WildBox:1\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn macro_results_rebuild_static_module_class_types() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base_cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_module_class_type",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("use-{consumer}"));
+        compile(
+            "macrotransport_module_class_type_use",
+            consumer,
+            &output,
+            &cp,
+            true,
+        );
+        assert_eq!(run(&output, &cp), b"ok\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_macro_results_resolve_same_run_constructor_default_getters() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base_cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_ctor_defaults",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("use-{consumer}"));
+        compile(
+            "macrotransport_ctor_defaults_use",
+            consumer,
+            &output,
+            &cp,
+            true,
+        );
+        assert_eq!(run(&output, &cp), b"SameRunDefaultRow(7,ok)\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn source_nested_declarations_aliases_and_access_boundaries_match_scalac() {
     let root = root();
     let implementation = root.join("implementation");
@@ -726,7 +807,10 @@ fn nested_macro_contexts_preserve_identity_and_restore_the_active_stack() {
     for nsc in [true, false] {
         let out = root.join(format!("use-{nsc}"));
         compile("macrocontexts_use", nsc, &out, &cp, true);
-        assert_eq!(run(&out, &cp), b"inner,inner,outer\ninner,inner\n");
+        assert_eq!(run(&out, &cp), b"inner,inner,outer|inner,outer\n");
+        let standalone = root.join(format!("standalone-{nsc}"));
+        compile("macrocontexts_standalone_use", nsc, &standalone, &cp, true);
+        assert_eq!(run(&standalone, &cp), b"inner,inner|inner\n");
     }
     fs::remove_dir_all(root).unwrap();
 }
