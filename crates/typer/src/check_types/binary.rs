@@ -1588,6 +1588,46 @@ impl Typer {
             .unwrap_or_else(|| ty.clone())
     }
 
+    /// Restore a pickled method result that was widened to an abstract type
+    /// member's upper bound while its declaring trait was installed. The
+    /// pickle retains the original `this.Repr[A]`; after the concrete
+    /// receiver's alias is loaded it can be applied without changing the
+    /// shared method symbol used by other receivers.
+    pub(crate) fn rebind_binary_result_type_member(
+        &mut self,
+        member: SymbolId,
+        recv_ty: &Type,
+        member_ty: &Type,
+    ) -> Type {
+        if !self.library_abi {
+            return member_ty.clone();
+        }
+        let Some((name, args)) = self.pickle.result_type_member_app(member).cloned() else {
+            return member_ty.clone();
+        };
+        let Some(cls) = self.st.class_sym_of(recv_ty) else {
+            return member_ty.clone();
+        };
+        self.pickle
+            .ensure_parents(&mut self.st, &mut self.binary, cls);
+        let Some(ctor) =
+            self.pickle
+                .complete_type_member(&mut self.st, &mut self.binary, cls, &name)
+        else {
+            return member_ty.clone();
+        };
+        let result = self
+            .st
+            .expand_applied_hk_alias(crate::symbol::apply_type_ctor(ctor, args));
+        match member_ty {
+            Type::Method { paramss, .. } => Type::Method {
+                paramss: paramss.clone(),
+                ret: Box::new(result),
+            },
+            _ => result,
+        }
+    }
+
     fn complete_java_parents(&mut self, class_id: SymbolId, span: Span) {
         let parents = self.st.get(class_id).parents.clone();
         for p in &parents {

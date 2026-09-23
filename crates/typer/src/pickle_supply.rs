@@ -157,6 +157,11 @@ pub struct PickleSupply {
     /// `BasicProfile.this.backend` here. The prefix must survive installation
     /// until member selection can map it to the concrete receiver.
     result_prefixes: HashMap<SymbolId, SigType>,
+    /// A pickled method result spelled as a type member of its declaring
+    /// `this` prefix, retained before conversion widens the abstract member to
+    /// its upper bound. Member selection re-applies the concrete receiver's
+    /// override (for example `Repr[O]`) after lazy alias completion.
+    result_type_member_apps: HashMap<SymbolId, (String, Vec<Type>)>,
     /// What [`PickleSupply::complete_type_member`] answered for each
     /// `(class, name)`, so a miss costs one pickle walk and a hit stays
     /// stable. A memo of the *answer*, not just of having asked: a nullary
@@ -220,6 +225,10 @@ impl PickleSupply {
     /// that supplied the selected API.
     pub(crate) fn result_prefix_for(&self, member: SymbolId) -> Option<&SigType> {
         self.result_prefixes.get(&member)
+    }
+
+    pub(crate) fn result_type_member_app(&self, member: SymbolId) -> Option<&(String, Vec<Type>)> {
+        self.result_type_member_apps.get(&member)
     }
 
     /// Try to install `name` on `class_sym` from the library pickles.
@@ -4083,6 +4092,15 @@ impl PickleSupply {
             ));
             return None;
         };
+        let result_type_member_app = match (result_prefix, &shape.ret) {
+            (Some(SigType::This(_)), SigType::Ref { sym, args })
+                if !sym.contains('.') && !scope.contains_key(sym) =>
+            {
+                self.conv_all(st, bin, &scope, args, 0)
+                    .map(|args| (sym.clone(), args))
+            }
+            _ => None,
+        };
         // An inner class may be returned through an applied outer class rather
         // than through `this`: `def ops[T](x: T)(implicit ord: Ordering[T]):
         // Ordering[T]#OrderingOps`. The compact signature stores the result's
@@ -4440,6 +4458,9 @@ impl PickleSupply {
         }
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
+        if let Some(app) = result_type_member_app {
+            self.result_type_member_apps.insert(m, app);
+        }
         Some(m)
     }
 

@@ -557,6 +557,34 @@ impl Typer {
                 found = precise;
             }
         }
+        // A one-argument generic mixin forwarder can also lose a result of
+        // the declaring trait's abstract type constructor (`Repr[A]`) to its
+        // erased upper bound. Ask the pickle for the precise declaration, but
+        // replace the raw forwarder only when that declaration retained such
+        // a result application; ordinary single-argument methods keep the
+        // deferred path above.
+        let nonplatform_binary_receiver = self.st.class_sym_of(&recv_ty).is_some_and(|cls| {
+            let jvm = &self.st.get(cls).jvm_name;
+            !jvm.starts_with("java/") && !jvm.starts_with("javax/") && !jvm.starts_with("scala/")
+        });
+        if nonplatform_binary_receiver
+            && found.iter().any(|m| {
+                let s = self.st.get(*m);
+                m.0 >= self.st.prelude_end
+                    && s.pickled_origin.is_empty()
+                    && s.flags.contains(Flags::JAVA)
+                    && s.jvm_name.starts_with('(')
+                    && !self.st.is_source_owner(s.owner)
+            })
+        {
+            let precise = self.supply_from_pickle(&recv_ty, &name);
+            if precise
+                .iter()
+                .any(|&m| self.pickle.result_type_member_app(m).is_some())
+            {
+                found = precise;
+            }
+        }
         // An abstract type member whose upper bound is a *compound* offers
         // every parent's members, and only the first one had been reachable.
         if found.is_empty() {
@@ -938,6 +966,15 @@ impl Typer {
         for s in found.iter().copied() {
             self.complete_lazy_sig(s, tree.span);
         }
+        let receiver_member_tys: Vec<(SymbolId, Type)> = found
+            .iter()
+            .copied()
+            .map(|s| {
+                let member_ty = self.st.get(s).ty.clone();
+                let ty = self.rebind_binary_result_type_member(s, &member_recv_ty, &member_ty);
+                (s, ty)
+            })
+            .collect();
         if found.len() > 1 {
             self.record_overload_group(&found, &name);
             // `super.m` resolves among the parent linearization's members and
@@ -1116,7 +1153,8 @@ impl Typer {
         if found.len() == 1 {
             let s = found[0];
             tree.sym = s;
-            let ty = expand(subst(self.st.get(s).ty.clone()));
+            let member_ty = receiver_member_tys[0].1.clone();
+            let ty = expand(subst(member_ty));
             let ty = self.opaque_projection_params(&qual.ty, ty);
             let ty = self.java_empty_clause_for_eta(s, ty, pt);
             let ty = self.maybe_auto_apply(ty, pt);
@@ -1166,7 +1204,14 @@ impl Typer {
             // `apply(A): B`).
             let alts: Vec<(SymbolId, Type)> = found
                 .iter()
-                .map(|s| (*s, expand(subst(self.st.get(*s).ty.clone()))))
+                .map(|s| {
+                    let ty = receiver_member_tys
+                        .iter()
+                        .find(|(id, _)| id == s)
+                        .map(|(_, ty)| ty.clone())
+                        .unwrap_or_else(|| self.st.get(*s).ty.clone());
+                    (*s, expand(subst(ty)))
+                })
                 .collect();
             let alts: Vec<(SymbolId, Type)> = alts
                 .into_iter()
