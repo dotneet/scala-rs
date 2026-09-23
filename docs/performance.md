@@ -25,6 +25,11 @@ rather than an absolute benchmark:
 * **gitbucket, 354 sources**: about 20 s on a quiet machine, 2.86e11
   instructions retired, after the linearization / base-type caches of
   2026-09-12 (from 154 s and 2.57e12). Macro expansion is under 1 s of that.
+* **2026-09-24, second pass** (below): slick 5.83e10 -> 4.64e10, gitbucket
+  3.27e11 -> 1.03e11 instructions (19 s -> about 11 s), a one-table slick
+  client with two macro expansions 1.10 s -> 0.63 s wall, a hundred-table
+  one 3.9 s -> 2.6 s. Diagnostics of slick, gitbucket, cats and the library
+  unchanged throughout.
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -148,16 +153,70 @@ receiver, but it does depend on the position, so it cannot outlive the memo
 without keying on the lexical context. `warm_conversion_witnesses` is the
 same loop (about 105 calls, 5 ms each, almost none of which change a symbol).
 
+### View pruning, seen-from caches and the macro engine (2026-09-24)
+
+Measured against the `main` of the morning (5.83e10 slick, 3.27e11
+gitbucket), each step on top of the last:
+
+| change | slick | gitbucket |
+|---|---:|---:|
+| drop a view whose result class lacks the member first (`view_result_may_have_member`) | -9% | -34% |
+| same-named declarations only, value types once (`shadow_inherited_implicits`) | 0 | -14% |
+| import-prefix views kept across searches (`SeenCache`) | 0 | -25% |
+| `SeenCache` keyed by symbol, `ReachCache` on `graph_gen`, self types kept | -1% | -17% |
+| clone and walk trimming (`subst_tparams_cow`, `lub_at`, warm dedupe, one mentions walk) | -9% | -10% |
+
+* **The view prune is nsc's** (`ImplicitComputation.survives`, which checks
+  `?{def name: ?}` against the result before typing the view). It runs the
+  exact test the extension loop already made after `conversion_result`, so
+  it cannot drop a view the loop would have kept -- with one exception it
+  had to learn: asking a hand-written prelude class (`RichInt`) its pickle
+  for every view in scope completes members nothing else would, and made
+  `intWrapper` a view to `Ordered[Int]` (a latent bug, reachable by writing
+  `new RichInt(1) < 2`; the prelude is left out of the prune).
+* **`mutation_gen` moves at nearly every statement.** Typing a body sets the
+  type of every local and method it meets through `get_mut`, so a cache keyed
+  on it is thrown away constantly; gitbucket hands out about 200,000 methods,
+  130,000 terms and 90,000 type parameters against 40,000 classes.
+  `graph_gen` counts only classes, modules, packages and type members, and
+  is the right key for anything that reads parent lists alone.
+* **What `SeenCache` may read.** The substitutions it keeps
+  (`subst_as_seen_from`, `expand_in_type`) read symbols, `abs_projection_of`,
+  the ambient guards and -- through `lookup_type` -- the scopes, for a
+  `Type::Named` and for a `Type::Tuple`'s `TupleN`. Neither of the last two is
+  kept, and nothing on those paths reads `this_class`.
+
+**Macros.** A macro run pays for the engine's JVM and runtime universe once
+(about 0.43 s wall and 0.9 s of CPU); an expansion after that costs 0.3-3 ms,
+about what scalac spends on it. Two changes:
+
+* The engine starts on its own thread when the typer does, whenever
+  scala-reflect.jar is on the classpath (`PendingEngine`); the first
+  expansion waits only for what is left. `SCALA_RS_MACRO_PRESTART=0` turns it
+  off. A run that expands nothing pays for a JVM on another core.
+* Each file's text goes to the engine once (`fill_source_text`); before, every
+  request carried it, and the engine re-read and re-parsed it per call.
+
+AppCDS for the engine would save a further 0.2 s and 0.5 s of CPU per run,
+but it needs a jar-only classpath prefix, and putting scala-library and
+scala-reflect first changes which class wins when the user's classpath
+shadows one.
+
 ### What is left
 
-From the last profiles (slick and gitbucket, 2026-09-12):
+From the profiles of 2026-09-24:
 
-* **Type checking dominates** (well over half of a slick compile), and within
-  it member selection and the implicit-conversion search it falls back on.
-  Pruning conversion candidates by "could the result have a member of this
-  name?" is not obviously safe: the member may exist only in the result
-  class's pickle, and asking for it is the expensive, mutating call the prune
-  was meant to avoid.
+* **Type checking still dominates**, within it the implicit search: views
+  whose result class does declare the member still solve their type
+  arguments against every receiver (`conv_param_matches`), and
+  `implicits_in_scope` walks every scope per search -- nsc caches it per
+  context, which here would need a version counter on `SymbolTable::scopes`
+  (about thirty writers reach into it directly).
+* **The walks that ask "does this type mention X"** (`mentions_abs_projection`,
+  `mentions_path_member`) are the largest self-time entries on slick; they
+  run at every level of every subtype check. Flags cached on the type, as
+  rustc's `TypeFlags`, would make them bit tests, and need the representation
+  change below.
 * **`Type` is deep-cloned and structurally compared everywhere.** `Type::clone`,
   its drop glue, `memmove` and the allocator are spread over the whole
   compile, and gitbucket's remaining profile is flat with no dominator.
