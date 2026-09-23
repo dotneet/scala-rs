@@ -1,6 +1,9 @@
 //! Aggregated CLI integration tests (alphabetical slice 7/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../support/mod.rs"]
+mod support;
+
 #[path = "../fs2_io.rs"]
 mod fs2_io;
 #[path = "../samconv.rs"]
@@ -41,6 +44,8 @@ mod slickddl_classpath;
 mod slickimpl;
 #[path = "../slickimplicit.rs"]
 mod slickimplicit;
+#[path = "../slickoptionmapper.rs"]
+mod slickoptionmapper;
 #[path = "../slickparse.rs"]
 mod slickparse;
 #[path = "../slickrun.rs"]

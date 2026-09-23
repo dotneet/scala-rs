@@ -70,6 +70,100 @@ fn merge_argument_prototypes(left: &Type, right: &Type) -> Option<Type> {
 }
 
 impl Typer {
+    /// Let a uniquely fitting implicit clause settle result parameters before
+    /// the expected result type does. A method such as Slick's `like` has an
+    /// unconstrained `R` in the explicit arguments, a result `Rep[R]`, and an
+    /// implicit `OptionMapper2[..., R]`. When the surrounding expression
+    /// expects `Rep[Option[Boolean]]`, scalac first finds the witness for
+    /// `R = Boolean`, then adapts `Rep[Boolean]` to the expected type. Solving
+    /// `R` from the expected result first asks for an impossible
+    /// `OptionMapper2[..., Option[Boolean]]` instead.
+    fn implicit_tparams_before_expected(
+        &mut self,
+        method: SymbolId,
+        fun_ty: &Type,
+        ret: &Type,
+        pt: &Type,
+        explicit_params: &[Type],
+        inst: Vec<(SymbolId, Type)>,
+    ) -> Vec<(SymbolId, Type)> {
+        if method.is_none() || pt.is_no_type() || pt.is_error() {
+            return inst;
+        }
+        let tparams = self.st.get(method).tparams.clone();
+        if tparams.is_empty() {
+            return inst;
+        }
+        let mut implicit_types = Vec::new();
+        if let Type::Method { paramss, .. } = fun_ty {
+            let declared = &self.st.get(method).paramss;
+            let offset = declared.len().saturating_sub(paramss.len());
+            for (clause, tys) in paramss.iter().enumerate() {
+                let Some(ids) = declared.get(offset + clause) else {
+                    continue;
+                };
+                for (id, ty) in ids.iter().zip(tys) {
+                    if self.st.get(*id).flags.contains(Flags::IMPLICIT) {
+                        implicit_types.push(ty.clone());
+                    }
+                }
+            }
+        }
+        if implicit_types.is_empty() {
+            return inst;
+        }
+        let existing: Vec<SymbolId> = inst.iter().map(|(tp, _)| *tp).collect();
+        let open: Vec<SymbolId> = tparams
+            .into_iter()
+            .filter(|tp| {
+                !existing.contains(tp)
+                    && !explicit_params.iter().any(|p| type_mentions_tparam(p, *tp))
+                    && implicit_types
+                        .iter()
+                        .any(|p| crate::check::type_mentions_tparam_deep(p, *tp))
+            })
+            .collect();
+        if open.is_empty() {
+            return inst;
+        }
+        let known: Vec<Type> = inst.iter().map(|(_, ty)| ty.clone()).collect();
+        let wanted: Vec<Type> = implicit_types
+            .iter()
+            .map(|ty| crate::symbol::subst_tparams_slice(&existing, &known, ty))
+            .filter(|ty| {
+                open.iter()
+                    .any(|tp| crate::check::type_mentions_tparam_deep(ty, *tp))
+            })
+            .collect();
+        for ty in &wanted {
+            self.warm_implicit_scope(ty);
+        }
+        let mut solved = self.retry_whitebox_fits(|this| this.undet_solution(&wanted, &open));
+        if solved.is_none() && self.warm_implicit_candidates(&wanted) {
+            solved = self.retry_whitebox_fits(|this| this.undet_solution(&wanted, &open));
+        }
+        if let Some(solved) = solved {
+            // This is only the right order when the witness's result can
+            // actually adapt to the context. Otherwise the expected type must
+            // still get to choose the parameter, as in
+            // `def make[A](x: String)(implicit ev: Evidence[A]): Box[A]`.
+            let mut candidate = inst.clone();
+            candidate.extend(solved.iter().cloned());
+            let ids: Vec<_> = candidate.iter().map(|(tp, _)| *tp).collect();
+            let tys: Vec<_> = candidate.iter().map(|(_, ty)| ty.clone()).collect();
+            let result = crate::symbol::subst_tparams_slice(&ids, &tys, ret);
+            if !self.st.is_sub_type(&result, pt) && !self.search_conversion(&result, pt).is_found()
+            {
+                return inst;
+            }
+            let mut inst = inst;
+            inst.extend(solved);
+            inst
+        } else {
+            inst
+        }
+    }
+
     /// Every application gets its own set of undetermined type variables: an
     /// argument of *this* call is typed by a nested `type_apply`, whose
     /// variables must not still be in scope when this one weighs its own
@@ -1909,6 +2003,9 @@ impl Typer {
                             // before the implicit clauses are filled: slick's
                             // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
                             // gets `T` from nowhere else.
+                            let inst = self.implicit_tparams_before_expected(
+                                sym, &fun.ty, &ret, pt, &param_tys, inst,
+                            );
                             let inst = self.add_expected_constraints(sym, &ret, pt, inst);
                             // nsc reads the expected type *after* the arguments
                             // are typed. Here the pass runs first, so a solution
