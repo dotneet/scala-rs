@@ -74,6 +74,8 @@ mod stale_term_method;
 mod stmtval;
 #[path = "../strarrayops.rs"]
 mod strarrayops;
+#[path = "../string_generic_flat_map.rs"]
+mod string_generic_flat_map;
 #[path = "../stringops8.rs"]
 mod stringops8;
 #[path = "../subtypeterm.rs"]
