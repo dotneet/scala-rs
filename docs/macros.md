@@ -12,6 +12,13 @@ This document is the **deliverable of phase 0 (investigation and design)**. Even
 implementation is unfinished, the design stays on record. Where something is infeasible or
 unrealistic, it is stated as such.
 
+**Status.** Sections 0–6 are that original design and are kept as written; §7 onward records
+the implementation slice by slice, newest last. The JVM bridge was built as
+`crates/typer/java/ScalaRsMacroEngine.java`, driven from `crates/typer/src/expand*.rs`
+(no separate `crates/macro-engine/` crate was created). Quasiquotes and `reify` are built in
+(from §7.1 on; §7.26 and §7.27 describe the current shape), slick's `mapTo` expands (§7.25), whitebox macros are supported
+(§7.30), and macro bundles expand (see [`refined.md`](refined.md)).
+
 ## Table of contents
 
 - 0. Summary (conclusions first)
@@ -65,7 +72,7 @@ unrealistic, it is stated as such.
   - 7.17 Blocks, and members of static `object`s (the `reify` widening slice)
   - 7.18 A class the current run is compiling, as a type tag (the `agent/macrotag` slice)
   - 7.19 `val` and `def` definitions bound inside a `reify` body (the `agent/reifydefs` slice)
-  - 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
+  - 7.20 Reverse RPC: `c.typecheck`, `c.inferImplicitValue`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
   - 7.21 A type tag that carries type arguments, and the `Expr[Nothing]` nsc really passes (the `agent/gbmapto` slice)
   - 7.22 The type arguments written on the macro implementation reference (the `agent/mapto2` slice)
   - 7.23 Structural transport and source macro integration
@@ -73,6 +80,7 @@ unrealistic, it is stated as such.
   - 7.25 `mapTo` against classes this run is compiling (the `agent/gbmacro` slice)
   - 7.26 `reify { … }` over the typed body (the `agent/reify` slice)
   - 7.27 Quasiquotes in pattern position (the `agent/catszero` slice)
+  - 7.30 Whitebox macros (the `agent/runfail` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -740,9 +748,17 @@ for a long time a whitebox macro def was diagnosed and failed at the binding.
 | Fast track macros (§6.2) | Macros using quasiquotes / reify **cannot be compiled at all** | We have to write the desugarers ourselves. Phase 4 |
 | `MacroImplBinding` pickle compatibility | scalac would no longer be able to read our classfiles | Write the nsc-compatible shape, down to the `macroEngine` string |
 
+This is the phase-0 assessment. Two rows have since been resolved differently: `c.typecheck` and
+`c.inferImplicitValue` are answered over reverse RPC (§7.20), and the fast-track macros are
+implemented as built-ins (§7.26, §7.27).
+
 ---
 
 ## 7. Current state (what actually works on this branch)
+
+*History: this list is the state at the start of §7. Expansion has worked since §7.11, and the
+engine lives in `crates/typer/java/ScalaRsMacroEngine.java` rather than a `crates/macro-engine/`
+crate.*
 
 - `= macro <ref>` **parses**. The old `unimplemented syntax: macros` is gone.
 - The binding is recorded on the macro def's symbol.
@@ -3744,6 +3760,12 @@ The design, the measured walls and what remains, in order, are in
 `tests/fixtures/reify2_*.scala` (`crates/cli/tests/reify2.rs`), each run
 through real scalac 2.13.16 with identical output.
 
+Shapes that earlier sections pin as refused now compile, so their fixtures
+changed in this slice: `rb_bad.scala` became `rb_free.scala`,
+`rd_defs_bad.scala` became `rd_defs_typed.scala`, and `rf_bad.scala` and
+`ex_notag_bad.scala` were removed (their shapes now run in `rf_more.scala`
+and `ex_notag.scala`).
+
 ### 7.27 Quasiquotes in pattern position (the `agent/catszero` slice)
 
 `case q"..." =>` works. It was the last thing standing between cats and zero
@@ -3891,7 +3913,9 @@ both as a macro bundle method reference and a vanilla object method reference". 
 `def foo: Unit`, `pos/macro-bundle-disambiguate-nonbundle` has only the object's fitting,
 `pos/macro-bundle-disambiguate-bundle` only the bundle's, and `neg/macro-bundle-ambiguous` both.
 `Typer::macro_bundle_companion` and `Typer::macro_clause_count` implement that; macro bundles
-themselves are still not expanded.
+themselves were not expanded yet at the time. They expand now (the refined work,
+[`refined.md`](refined.md); `macro_bundle_metadata_and_expansion_interoperate_with_scalac` in
+`crates/cli/tests/macrotransportbatch.rs`).
 
 **What it was worth.** On the corpus subset the `whitebox macros are not implemented` diagnostic
 named (40 tests, 14 `pos` and 26 `run`), measured with `CORPUS_KINDS="run pos" CORPUS_SIZE=full`:
