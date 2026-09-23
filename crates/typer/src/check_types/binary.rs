@@ -1540,9 +1540,8 @@ impl Typer {
         }
     }
 
-    /// A binary method's result can refer to an alias in its own class by
-    /// short name. Resolve it against the declaring class when a later
-    /// argument list applies the result.
+    /// A binary method's parameter or result can refer to an alias in its
+    /// own class by short name. Resolve it against the declaring class.
     pub(crate) fn complete_binary_result_alias(
         &mut self,
         method: SymbolId,
@@ -1556,14 +1555,20 @@ impl Typer {
         if !self.st.get(owner).is_class_like() || self.st.get(owner).jvm_name.is_empty() {
             return None;
         }
-        self.pickle
-            .complete_type_member(&mut self.st, &mut self.binary, owner, name)?;
-        let decl = self.pickle.completed_type_member_decl(owner, name)?;
-        let member = self.st.get(decl);
-        if !member.is_type_alias || member.tparams.len() != args.len() {
-            return None;
+        if self
+            .pickle
+            .complete_type_member(&mut self.st, &mut self.binary, owner, name)
+            .is_some()
+        {
+            if let Some(decl) = self.pickle.completed_type_member_decl(owner, name) {
+                let member = self.st.get(decl);
+                if member.is_type_alias && member.tparams.len() == args.len() {
+                    return Some(self.st.subst_tparams(decl, args, &member.ty));
+                }
+            }
         }
-        Some(self.st.subst_tparams(decl, args, &member.ty))
+        self.pickle
+            .expand_declared_method_alias(&mut self.st, &mut self.binary, owner, name, args)
     }
 
     pub(crate) fn expand_binary_method_alias(

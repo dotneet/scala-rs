@@ -2112,6 +2112,60 @@ impl PickleSupply {
         answer
     }
 
+    /// Expand a private alias named by a method declared in the same binary
+    /// class. The method's public signature may use the alias even though a
+    /// caller cannot select it by name. Read its RHS without installing the
+    /// private declaration as a visible member of the receiving class.
+    pub(crate) fn expand_declared_method_alias(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        owner: SymbolId,
+        name: &str,
+        args: &[Type],
+    ) -> Option<Type> {
+        let symbol = st.get(owner);
+        if !symbol.is_class_like() {
+            return None;
+        }
+        let internal = symbol.jvm_name.clone();
+        let is_module = symbol.kind == SymKind::ModuleClass;
+        let full = self.pickled_full_name(bin, &internal, is_module)?;
+        let sig = self
+            .sigs
+            .class_sig(&mut BinSource(bin), &full, is_module)
+            .ok()?;
+        let alias = sig
+            .members
+            .iter()
+            .find(|member| member.name == name && member.kind == MemberKind::TypeAlias)?;
+        let (tparams, rhs) = match &alias.ty {
+            SigType::Poly { tparams, result } => (tparams.as_slice(), result.as_ref()),
+            other => (&[][..], other),
+        };
+        if tparams.len() != args.len() {
+            return None;
+        }
+        let owner_tparams = st.get(owner).tparams.clone();
+        let mut scope: HashMap<String, Type> = owner_tparams
+            .iter()
+            .map(|&id| (st.get(id).name.clone(), Type::TypeParam(id)))
+            .collect();
+        scope.extend(
+            tparams
+                .iter()
+                .zip(args)
+                .map(|(param, ty)| (param.name.clone(), ty.clone())),
+        );
+        let outer = self.self_ty.replace(Type::Class {
+            sym: owner,
+            args: owner_tparams.into_iter().map(Type::TypeParam).collect(),
+        });
+        let expanded = self.conv_at(st, bin, &scope, rhs, 0);
+        self.self_ty = outer;
+        expanded
+    }
+
     /// Return the declaration selected by [`complete_type_member`], including
     /// the synthetic declaration retained for a transparent alias.
     pub(crate) fn completed_type_member_decl(
