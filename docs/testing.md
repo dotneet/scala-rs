@@ -19,6 +19,29 @@ commands such as `cargo test --test vcbridge` are no longer valid Cargo target
 names; use `tests/cli_test.sh` for focused work and
 `tests/workspace_tests.sh` for the parallel full workspace suite.
 
+`crates/cli/Cargo.toml` sets `autotests = false`, so Cargo discovers nothing
+in `crates/cli/tests/` by itself. The only targets are `cli_shard_01` …
+`cli_shard_08`, whose sources are `crates/cli/tests/shards/shard_NN.rs`. A new
+test file `crates/cli/tests/<name>.rs` must be registered in exactly one shard
+with a `#[path = "../<name>.rs"] mod <name>;` pair (the shards are kept in
+alphabetical order), or it is never compiled. `tests/cli_test.sh` refuses a
+module that is registered in no shard or in more than one.
+
+The full workspace suite is not guaranteed to be green on `main`: on
+2026-09-23 a full run on `main` had 47 failing tests that predate the work
+being tested. Before attributing a failure to a change, run the same suite
+(or the same `tests/cli_test.sh` modules) on the base commit and compare the
+failing test *names*, rather than assuming the base passes everything.
+
+Tests are pinned to **JDK 17** (Temurin 17.0.3 on the reference machine).
+Checked-in data depends on it: `crates/pickle/src/java_identifier_parts.rs`
+and `crates/lexer/src/unicode_symbols.rs` are generated with JDK 17, and
+`tests/fixtures/expected/numt.txt` records JDK 17's `Float` / `Double`
+`toString` spelling. On a newer JDK,
+`names_match_released_scala_for_bmp_and_escape_sequences` and the `numtower`
+tests fail without any compiler change. Check `java -version` before
+debugging those, and never regenerate these files with another JDK.
+
 The workspace runner applies an 1800-second wall-clock limit to each test
 binary. A timeout kills the binary's process group (including compiler/JVM
 children), records a deterministic `workspace_tests: TIMEOUT` marker, and is
@@ -35,6 +58,31 @@ no classes fail the measurement. These are not zero-error results.
 `slick_run.sh` additionally requires the compilation itself to succeed and
 propagates structural lint failures through its output pipeline.
 
+Compiling without errors does not show that the output runs. `tests/slick_run.sh`,
+`tests/cats_run.sh` and `tests/gitbucket_run.sh` are the differential
+*execution* harnesses: each compiles its project with scala-rs and with real
+scalac, compiles the client programs in `tests/slick_progs/`, `tests/catsrun/`
+or `tests/gbrun/` with real scalac, runs them against both builds and
+compares their stdout. `cats_run.sh` and `gitbucket_run.sh` compile each
+client against both builds, which separates a codegen defect from a pickle
+defect; `slick_run.sh` compiles each client once (`MODE` picks the build on
+its compile classpath). Each takes program names as arguments (all programs
+when none are given); the script headers list their environment variables.
+
+The merge gate is `tests/verify_merge.sh`. It builds once, runs the four
+compile measures and `slick_run.sh`, then `slick_subset.sh`, `cats_run.sh`,
+`gitbucket_run.sh`, the workspace suite and the full corpus (concurrently
+unless `GATE_SERIAL=1`), then `cargo fmt --all --check`. It ends with one
+`VERDICT=PASS|FAIL` line and a `DONE` sentinel. Launch it detached with a
+private `GATE_DIR` and wait for the sentinel, as its header shows. `GATE_SKIP`
+names steps to leave out, and a skipped required step makes the verdict FAIL.
+The gate requires zero workspace test failures and the numbers recorded in
+`tests/BASELINE.md`, so on a base that is already red it reports FAIL for
+reasons that are not the branch's (see the base-commit comparison above).
+`tests/verify_merge_test.sh` checks the gate's baseline and environment
+contracts without building anything. The current accepted numbers are the
+latest gate section at the end of `tests/BASELINE.md`.
+
 The external fixture scripts take the Scala 2.13.16 home, library, compiler
 jars, and `scalac` launcher from `[toolchain]` in
 `tests/fixture_manifest.toml`. Relative paths use `/tmp` by default (the
@@ -46,6 +94,18 @@ take precedence, followed by the
 corresponding `JAVA_HOME/bin` tools, then `PATH`; the same selected `java` is
 recorded in cache fingerprints and embedded in the generated `scalac`
 launcher.
+
+With the defaults that means `/tmp/scala-2.13.16` (the `scalac` launcher and
+the compiler, reflect and launcher-library jars) and
+`/tmp/scala-rs-lib/scala-library-2.13.16.jar`. Both are wiped by a reboot.
+`tests/slick_measure.sh` rebuilds them from the Coursier cache when they are
+missing, and `crates/cli/tests/e2e.rs` downloads the Scala 2.13.16
+distribution into `/tmp` when no `scalac` is found — but only when that test
+runs, so tests that run earlier fail with missing-file errors. Restore the
+toolchain *before* a full suite run (running `tests/slick_measure.sh` once is
+enough), and check `ls /tmp/scala-2.13.16/bin/scalac` first when many
+scalac-comparison tests fail at once. Project checkouts and caches live under
+`SCALA_RS_FIXTURE_ROOT` (default `${TMPDIR:-/tmp}/scala-rs-fixtures`).
 
 `tests/verify_all.sh` reports `verify_loaded` and `verify_incomplete` as well
 as `verify_classes` and `verify_failures`. Missing dependencies and failed
@@ -69,7 +129,7 @@ involved, and are invisible to any reduction written outside it; see
 [scala-library.md](scala-library.md).
 
 `bash tests/measurement_harness_test.sh` checks these result classifications
-with 16 shell cases and five small JVM cases, without rebuilding scala-rs or
+with 16 shell cases and six small `verify_all.sh` cases, without rebuilding scala-rs or
 rerunning the corpus. See [development-plan.md](development-plan.md) for the
 integration gates and isolated-worktree workflow.
 
