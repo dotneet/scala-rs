@@ -9,11 +9,13 @@
 //! * `comparing values of types A and B using `==` will always yield
 //!   true/false` -- the value-class half of `checkSensibleEquals`.
 //!
-//! Our typer does not rewrite a value discarded in a `Unit` position into
-//! nsc's `{ e; () }` (codegen pops it instead), so the pass reconstructs
+//! The typer rewrites a value discarded in a `Unit` position into nsc's
+//! `{ e; () }` only where its own `adapt` runs, so the pass reconstructs
 //! where nsc's `adapt` would have: the leaves (not blocks, ifs, matches or
 //! trys, which pass the expected type on) of an expression typed against
-//! `Unit` whose own type does not conform to `Unit`.
+//! `Unit` whose own type does not conform to `Unit`. A `{ e; () }` the typer
+//! did synthesize is read back as the bare `e` it discards (see
+//! [`discarded_value`]), so both shapes warn alike.
 
 use crate::check::Typer;
 use crate::symbol::{SymKind, SymbolTable};
@@ -67,6 +69,26 @@ fn conforms_to_unit(ty: &Type) -> bool {
         Type::Error | Type::NoType | Type::Method { .. } | Type::Overload(_) => true,
         Type::Annotated { tpe, .. } => conforms_to_unit(tpe),
         _ => false,
+    }
+}
+
+/// The `e` of a `{ e; () }` that the typer's `adapt` synthesized to discard
+/// `e` in a `Unit` position. Its block and its `()` take `e`'s own span, which
+/// a block written in the source never does.
+fn discarded_value(t: &Tree) -> Option<&Tree> {
+    let TreeKind::Block { stats, expr } = &t.kind else {
+        return None;
+    };
+    match stats.as_slice() {
+        [inner]
+            if is_unit_literal(expr)
+                && !t.span.is_dummy()
+                && inner.span == t.span
+                && expr.span == t.span =>
+        {
+            Some(inner)
+        }
+        _ => None,
     }
 }
 
@@ -283,6 +305,9 @@ impl<'a> Refchecks<'a> {
 
     /// Visit `t`, typed against `Unit` when `unit_pt`.
     fn tree(&mut self, t: &Tree, unit_pt: bool) {
+        if let Some(inner) = discarded_value(t) {
+            return self.tree(inner, true);
+        }
         match &t.kind {
             TreeKind::PackageDef { stats, .. } => {
                 for s in stats {
@@ -535,6 +560,7 @@ impl<'a> Refchecks<'a> {
                 self.in_args = saved;
             }
             TreeKind::Return { expr } => {
+                let expr = discarded_value(expr).unwrap_or(expr);
                 let (name, unit) = self.meths.last().cloned().unwrap_or_default();
                 if unit && !conforms_to_unit(&expr.ty) {
                     if let Some(tp) = nsc_type_string(expr) {
@@ -584,6 +610,10 @@ impl<'a> Refchecks<'a> {
     fn block(&mut self, stats: &[Tree], expr: &Tree, unit_pt: bool) {
         // nsc: `count` is 0 when the block ends in `()`, and the result
         // expression is the discarded one when it is `{ e; () }`.
+        let (expr, unit_pt) = match discarded_value(expr) {
+            Some(inner) => (inner, true),
+            None => (expr, unit_pt),
+        };
         let adapted = unit_pt && is_adaptable_leaf(expr) && !conforms_to_unit(&expr.ty);
         let count: usize = if is_unit_literal(expr) { 0 } else { 1 };
         let multiline = stats.len() > 1 - count;
