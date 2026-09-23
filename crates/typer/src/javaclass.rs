@@ -140,6 +140,9 @@ struct Entry {
     /// Directory package existence is shared by many distinct class probes.
     /// A missing package lets us skip a class-file `stat` for this root.
     dir_packages: HashMap<String, DirPackage>,
+    /// Exact names in each directory already traversed for case-sensitive
+    /// package lookup. A deep package otherwise rereads every ancestor.
+    dir_children: HashMap<String, Option<HashSet<std::ffi::OsString>>>,
 }
 
 struct DirPackage {
@@ -150,11 +153,35 @@ struct DirPackage {
 }
 
 impl Entry {
+    fn directory_case_matches(&mut self, rel: &str) -> bool {
+        let mut at = self.path.clone();
+        let mut prefix = String::new();
+        for comp in rel.split('/').filter(|part| !part.is_empty()) {
+            let children = self.dir_children.entry(prefix.clone()).or_insert_with(|| {
+                std::fs::read_dir(&at)
+                    .ok()
+                    .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+            });
+            if !children
+                .as_ref()
+                .is_some_and(|names| names.contains(std::ffi::OsStr::new(comp)))
+            {
+                return false;
+            }
+            at.push(comp);
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(comp);
+        }
+        true
+    }
+
     fn has_directory_package(&mut self, package: &str) -> bool {
         if let Some(found) = self.dir_packages.get(package) {
             return found.exists;
         }
-        let found = self.path.join(package).is_dir() && path_case_matches(&self.path, package);
+        let found = self.path.join(package).is_dir() && self.directory_case_matches(package);
         self.dir_packages.insert(
             package.to_string(),
             DirPackage {
@@ -175,7 +202,7 @@ impl Entry {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 // Preserve the direct probe if listing is unavailable.
                 return dir.join(file).is_file()
-                    && path_case_matches(&self.path, &format!("{package}/{file}"));
+                    && self.directory_case_matches(&format!("{package}/{file}"));
             };
             package_entry.files = Some(entries.flatten().map(|entry| entry.file_name()).collect());
         }
@@ -206,6 +233,7 @@ impl BinaryIndex {
                     kind,
                     zip: None,
                     dir_packages: HashMap::default(),
+                    dir_children: HashMap::default(),
                 }
             })
             .collect();
@@ -911,6 +939,24 @@ mod tests {
             .unwrap()
             .contains(std::ffi::OsStr::new("Found.class")));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_package_case_checks_reuse_ancestor_listings() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-directory-ancestors-{unique}"));
+        std::fs::create_dir_all(root.join("present/deep/one")).unwrap();
+        std::fs::create_dir_all(root.join("present/deep/two")).unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+        assert!(index.has_package_prefix("present/deep/one/"));
+        assert!(index.has_package_prefix("present/deep/two/"));
+        assert!(!index.has_package_prefix("present/Deep/one/"));
+        let entry = index.paths.iter().find(|entry| entry.path == root).unwrap();
+        assert_eq!(entry.dir_children.len(), 3);
         std::fs::remove_dir_all(root).unwrap();
     }
 
