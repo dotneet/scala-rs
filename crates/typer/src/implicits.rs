@@ -181,6 +181,15 @@ pub(crate) struct SeenCache {
     len: usize,
 }
 
+/// SLS 7.2's base and enclosing classes for one class symbol. Unlike a whole
+/// implicit search, this depends only on the settled class graph, so it can
+/// be reused across searches while that graph's generation is unchanged.
+#[derive(Default)]
+pub(crate) struct ImplicitClassParts {
+    gen: u64,
+    map: rustc_hash::FxHashMap<u32, std::rc::Rc<Vec<SymbolId>>>,
+}
+
 /// Which view a [`SeenCache`] entry holds.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SeenKind {
@@ -1103,28 +1112,72 @@ impl Typer {
         out: &mut Vec<SymbolId>,
         seen: &mut rustc_hash::FxHashSet<u32>,
     ) {
-        if id.is_none() || !seen.insert(id.0) {
+        if id.is_none() || seen.contains(&id.0) {
             return;
+        }
+        let gen = self.st.graph_gen.get();
+        let cached = {
+            let cache = self.implicit_class_parts.borrow();
+            (cache.gen == gen)
+                .then(|| cache.map.get(&id.0).cloned())
+                .flatten()
+        };
+        let parts = if let Some(parts) = cached {
+            parts
+        } else {
+            let mut parts = Vec::new();
+            let mut local_seen = rustc_hash::FxHashSet::default();
+            let settled =
+                self.collect_class_and_enclosing_uncached(id, &mut parts, &mut local_seen);
+            let parts = std::rc::Rc::new(parts);
+            if settled && self.st.graph_gen.get() == gen {
+                let mut cache = self.implicit_class_parts.borrow_mut();
+                if cache.gen != gen {
+                    cache.gen = gen;
+                    cache.map.clear();
+                }
+                cache.map.insert(id.0, parts.clone());
+            }
+            parts
+        };
+        for &part in parts.iter() {
+            if seen.insert(part.0) {
+                out.push(part);
+            }
+        }
+    }
+
+    fn collect_class_and_enclosing_uncached(
+        &self,
+        id: SymbolId,
+        out: &mut Vec<SymbolId>,
+        seen: &mut rustc_hash::FxHashSet<u32>,
+    ) -> bool {
+        if id.is_none() || !seen.insert(id.0) {
+            return true;
         }
         out.push(id);
         // SLS 7.2: the implicit scope of `T` also holds the companions of `T`'s
         // base classes. `=:=` has no companion object of its own, so its only
         // witness (`<:<.refl`) is reachable only through the `<:<` it extends.
+        let mut settled = true;
         for p in &self.st.get(id).parents {
+            settled &= crate::lin::parent_names_its_class(p);
             if let Some(ps) = self.st.class_sym_of(p) {
-                self.collect_class_and_enclosing(ps, out, seen);
+                settled &= self.collect_class_and_enclosing_uncached(ps, out, seen);
             }
         }
         let owner = self.st.get(id).owner;
         if owner.is_none() {
-            return;
+            return settled;
         }
         match self.st.get(owner).kind {
             SymKind::Class | SymKind::ModuleClass | SymKind::Module => {
-                self.collect_class_and_enclosing(owner, out, seen);
+                settled &= self.collect_class_and_enclosing_uncached(owner, out, seen);
             }
             _ => {}
         }
+        settled
     }
 
     /// The classes whose companions form `ty`'s implicit scope (SLS 7.2):
@@ -5578,6 +5631,86 @@ fn unwrap_byname(t: &Type) -> Type {
 mod memo_tests {
     use super::*;
     use crate::check::TypecheckOptions;
+
+    #[test]
+    fn implicit_class_parts_survive_method_changes_but_not_parent_changes() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let base = typer
+            .st
+            .alloc("Base", root, SymKind::Class, Flags::EMPTY, "Base");
+        let leaf = typer
+            .st
+            .alloc("Leaf", root, SymKind::Class, Flags::EMPTY, "Leaf");
+        typer.st.get_mut(leaf).parents.push(Type::Class {
+            sym: base,
+            args: vec![],
+        });
+        let wanted = Type::Class {
+            sym: leaf,
+            args: vec![],
+        };
+        assert_eq!(typer.implicit_scope_classes(&wanted), vec![leaf, base]);
+        let cached = typer.implicit_class_parts.borrow().map[&leaf.0].clone();
+
+        let method = typer
+            .st
+            .alloc("f", leaf, SymKind::Method, Flags::EMPTY, "f");
+        typer.st.get_mut(method).ty = Type::Int;
+        assert_eq!(typer.implicit_scope_classes(&wanted), vec![leaf, base]);
+        assert!(std::rc::Rc::ptr_eq(
+            &cached,
+            &typer.implicit_class_parts.borrow().map[&leaf.0]
+        ));
+
+        let grand = typer
+            .st
+            .alloc("Grand", root, SymKind::Class, Flags::EMPTY, "Grand");
+        typer.st.get_mut(base).parents.push(Type::Class {
+            sym: grand,
+            args: vec![],
+        });
+        assert_eq!(
+            typer.implicit_scope_classes(&wanted),
+            vec![leaf, base, grand]
+        );
+    }
+
+    #[test]
+    fn unresolved_implicit_class_parent_is_not_cached() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let base = typer.st.alloc(
+            "UnresolvedBase",
+            root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "UnresolvedBase",
+        );
+        let leaf = typer.st.alloc(
+            "UnresolvedLeaf",
+            root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "UnresolvedLeaf",
+        );
+        typer.st.get_mut(leaf).parents.push(Type::Named {
+            name: "UnresolvedBase".into(),
+            args: vec![],
+        });
+        let wanted = Type::Class {
+            sym: leaf,
+            args: vec![],
+        };
+        assert_eq!(typer.implicit_scope_classes(&wanted), vec![leaf]);
+        assert!(!typer
+            .implicit_class_parts
+            .borrow()
+            .map
+            .contains_key(&leaf.0));
+        typer.st.enter_in_current("UnresolvedBase", base);
+        assert_eq!(typer.implicit_scope_classes(&wanted), vec![leaf, base]);
+    }
 
     #[test]
     fn macro_disabled_mode_is_part_of_the_memo_key() {
