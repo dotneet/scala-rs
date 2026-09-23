@@ -1602,18 +1602,26 @@ impl Typer {
         if !self.library_abi {
             return member_ty.clone();
         }
-        let Some((name, args)) = self.pickle.result_type_member_app(member).cloned() else {
+        let Some(cls) = self.st.class_sym_of(recv_ty) else {
             return member_ty.clone();
         };
-        let Some(cls) = self.st.class_sym_of(recv_ty) else {
+        let recorded = self.pickle.result_type_member_app(member).cloned();
+        // A source receiver has no pickle of its own, so nothing warms the
+        // alias its binary ancestors fix: `class Mine extends Flow2[Boolean,
+        // String]` selecting the inherited `Mixed#twice: Repr[Out]` kept
+        // `Ops#Repr` deferred and the result became the path type
+        // `m.Repr[String]`. The declaration kept its `Repr[Y]` result, so
+        // read the application off the member type itself.
+        let Some((name, args)) = recorded.or_else(|| {
+            (!self.is_binary_class(cls))
+                .then(|| self.deferred_result_member_app(member_ty))
+                .flatten()
+        }) else {
             return member_ty.clone();
         };
         self.pickle
             .ensure_parents(&mut self.st, &mut self.binary, cls);
-        let Some(ctor) =
-            self.pickle
-                .complete_type_member(&mut self.st, &mut self.binary, cls, &name)
-        else {
+        let Some(ctor) = self.complete_type_member_through_bases(cls, &name) else {
             return member_ty.clone();
         };
         let result = self
@@ -1626,6 +1634,65 @@ impl Typer {
             },
             _ => result,
         }
+    }
+
+    /// Read from the classpath: the eager scan, or a class file loaded since.
+    fn is_binary_class(&self, cls: SymbolId) -> bool {
+        cls.0 < self.st.source_start || self.st.binary_read.contains(&cls.0)
+    }
+
+    /// `name` and arguments of a method result that applies a deferred
+    /// type member (`Ops#Repr[Y]`), the shape a pickled declaration keeps for
+    /// `def twice(x: Int): Repr[Out]`.
+    fn deferred_result_member_app(&self, member_ty: &Type) -> Option<(String, Vec<Type>)> {
+        let Type::Method { ret, .. } = member_ty else {
+            return None;
+        };
+        let Type::Applied { ctor, args } = ret.as_ref() else {
+            return None;
+        };
+        let Type::TypeMember(id) = ctor.as_ref() else {
+            return None;
+        };
+        self.st
+            .is_deferred_type_member(*id)
+            .then(|| (self.st.get(*id).name.clone(), args.clone()))
+    }
+
+    /// The type member `name` as `cls` sees it. A binary class answers from
+    /// its own pickle's linearisation. A source class answers only with what
+    /// is already installed -- its own definition, or a deferred declaration
+    /// -- so unless that is a definition, ask its binary base classes, most
+    /// derived first: the first one to answer is the definition `cls`
+    /// inherits (`Flow#Repr` for a source subclass of `Flow2`). The answer is
+    /// in that base class's vocabulary (`Flow[X, O]`), which the selection's
+    /// as-seen-from then reads through the receiver, exactly as for a binary
+    /// receiver.
+    fn complete_type_member_through_bases(&mut self, cls: SymbolId, name: &str) -> Option<Type> {
+        let own = self
+            .pickle
+            .complete_type_member(&mut self.st, &mut self.binary, cls, name);
+        let deferred = |st: &crate::symbol::SymbolTable, t: &Option<Type>| match t {
+            Some(Type::TypeMember(id)) => st.is_deferred_type_member(*id),
+            _ => false,
+        };
+        if self.is_binary_class(cls) || (own.is_some() && !deferred(&self.st, &own)) {
+            return own;
+        }
+        for base in crate::lin::linearize(&self.st, cls).into_iter().skip(1) {
+            if !self.is_binary_class(base) {
+                continue;
+            }
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, base);
+            let answer =
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, base, name);
+            if answer.is_some() && !deferred(&self.st, &answer) {
+                return answer;
+            }
+        }
+        own
     }
 
     fn complete_java_parents(&mut self, class_id: SymbolId, span: Span) {

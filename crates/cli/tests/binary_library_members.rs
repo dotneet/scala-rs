@@ -101,3 +101,43 @@ object Main {
         "6\n",
     );
 }
+
+/// A source subclass of a binary class inherits the higher-kinded alias its
+/// binary ancestor fixes (`Flow#Repr[+O] = Flow[X, O]`). The source class has
+/// no pickle to answer for it, so `m.twice(1)` used to keep `Ops#Repr`
+/// deferred and type as the path type `m.Repr[String]`.
+#[test]
+fn source_subclass_reads_the_binary_ancestors_higher_kinded_alias() {
+    agrees_on_both_classpaths(
+        "binary-hk-alias-source-subclass",
+        r#"
+package lib
+trait Ops[+Out] {
+  type Repr[+O] <: Ops[O]
+  def first(x: Int): Repr[Out]
+}
+class Flow[X, +Y](val xs: List[Y], val tag: X) extends Ops[Y] {
+  type Repr[+O] = Flow[X, O]
+  def first(x: Int): Flow[X, Y] = new Flow(xs.take(x), tag)
+}
+trait Mixed[+Out] extends Ops[Out] {
+  def twice(x: Int): Repr[Out] = first(x * 2)
+}
+class Flow2[X, +Y](xs0: List[Y], tag0: X) extends Flow[X, Y](xs0, tag0) with Mixed[Y]
+"#,
+        r#"
+import lib._
+class Mine(xs: List[String]) extends Flow2[Boolean, String](xs, true)
+class Gen[Z](xs: List[Z]) extends Flow2[Int, Z](xs, 7)
+object Main {
+  def main(args: Array[String]): Unit = {
+    val m = new Mine(List("a", "bb", "ccc"))
+    val g: Flow[Boolean, String] = m.twice(1)
+    val h: Flow[Int, Char] = new Gen(List('x', 'y', 'z')).twice(1)
+    println((g.xs, g.tag, h.xs, h.tag))
+  }
+}
+"#,
+        "(List(a, bb),true,List(x, y),7)\n",
+    );
+}
