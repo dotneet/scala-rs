@@ -118,11 +118,12 @@ if [[ ${SCALALIB_MODE:-nolib} == jar ]]; then
 else
   "$BIN" compile "${FILES[@]}" -d "$OUT" -cp "$JAVACP" -no-specialization --no-scala-library "$@" > "$LOG" 2>&1 || COMPILER_EXIT=$?
 fi
-# `-no-specialization` is nsc's own flag. The library annotates with
-# `@specialized` everywhere, we reject that annotation without the flag, and a
-# single parse error aborts the run before any file is typechecked -- so the
-# count collapses to the parse errors alone (84) and says nothing about type
-# checking. Same trap as tests/cats_measure.sh; see docs/scala-library.md.
+# `-no-specialization` is nsc's own flag: ignore `@specialized`. The library
+# annotates with it everywhere. The annotation is accepted either way now, and
+# the flag no longer changes the error count; it is passed because this
+# measures type checking, not whether the `$sp` ABI is nsc's (that is
+# tests/spec_classfiles.sh). Same choice as tests/cats_measure.sh; see
+# docs/scala-corpus.md#why-pos-does-not-pass--no-specialization.
 ERRORS=$(grep -c '^error' "$LOG" || true)
 CLASSES=$(find "$OUT" -name '*.class' | wc -l | tr -d ' ')
 # Cascades inflate the raw count; files-with-errors is the honest metric.

@@ -19,13 +19,16 @@
 # time) is the number to compare across commits; wall time is reported too so a
 # run taken on a loaded machine is visible as such. Even `user` moves by 20-30%
 # with load, so take the before and the after back to back.
+#
+# Work files go to BENCH_DIR and the slick checkout to SLICK_FIXTURE_DIR, by
+# default below SCALA_RS_FIXTURE_ROOT (see tests/fixture_cache.sh).
 set -e
-SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad
-BENCH=${BENCH_DIR:-$SP/bench}
-SLICKSP=$SP/slick
+ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
+source "$ROOT/tests/fixture_cache.sh"
+BENCH=${BENCH_DIR:-$(fixture_path bench)}
+SLICKSP=${SLICK_FIXTURE_DIR:-$(fixture_path slick)}
 SLICK_REV=475fc6e7719867025e832fa0e6ac7fb21b36bbc3
 CCACHE=$HOME/Library/Caches/Coursier/v1/https/repo1.maven.org/maven2
-ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 
 # --- self-restore (same contract as slick_measure.sh) -----------------------
 if [[ ! -f /tmp/scala-rs-lib/scala-library-2.13.16.jar ]]; then

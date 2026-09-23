@@ -183,11 +183,10 @@ LOG=${CATS_LOG:-$FIXTURE_ROOT/logs/cats/measure-$$.txt}
 # better-monadic-for 0.3.1. We have neither, so every `λ[...]` type lambda in
 # the source is ours to handle.
 # `-no-specialization` is nsc's own flag ("Ignore @specialize annotations").
-# cats writes `import scala.{specialized => sp}` and annotates with `@sp`, which
-# we reject without this flag -- and a single parse error aborts the run before
-# any file is typechecked, so the count collapses to the parse errors alone and
-# says nothing about type checking. Real scalac runs specialization instead; we
-# ignore the annotation, which changes the ABI but not what typechecks.
+# cats writes `import scala.{specialized => sp}` and annotates with `@sp`. The
+# annotation is accepted either way now; the flag is passed because this
+# measures type checking, not the `$sp` ABI. Real scalac runs specialization
+# instead; ignoring the annotation changes the ABI but not what typechecks.
 # `-Ykind-projector` is on by default here because cats *cannot be built without
 # the plugin*: `λ[α => …]` and `F[A, *]` are kind-projector syntax, and real
 # scalac rejects them too when the plugin is absent. Measuring without it

@@ -34,7 +34,8 @@
 #   CORPUS_LOG=$MYDIR/corpus.tsv tests/scala_corpus.sh
 #
 # Environment:
-#   CORPUS_LOG      result TSV (default: shared scratchpad path -- override it)
+#   CORPUS_LOG      result TSV (default: $SCALA_RS_FIXTURE_ROOT/scalacorpus/
+#                   corpus.tsv; see tests/fixture_cache.sh)
 #   CORPUS_KINDS    space-separated subset of "pos neg run" (default: all three)
 #   CORPUS_SIZE     "sample" (default) or "full".  `sample` takes an evenly
 #                   spaced, deterministic CORPUS_SAMPLE tests per category, so
@@ -48,7 +49,9 @@
 #   SCALA_RS        use this binary instead of building target/release/scala-rs
 set -e
 
-SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/scalacorpus
+ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
+source "$ROOT/tests/fixture_cache.sh"
+SP=$(fixture_path scalacorpus)
 # v2.13.16 -- the same release as the real scalac the conform suite dual-runs
 # against, so a disagreement is about us and not about a version skew.
 SCALA_REV=3f6bdaeafde17d790023cc3f299b81eaaf876ca3
@@ -354,7 +357,6 @@ if [[ $have != $SCALA_REV ]]; then
   exit 2
 fi
 
-ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 export SCALA_RS=${SCALA_RS:-$ROOT/target/release/scala-rs}
 if [[ ! -x $SCALA_RS ]] || [[ -z ${SCALA_RS_PREBUILT:-} ]]; then
   (cd "$ROOT" && cargo build -p scala-rs-cli --release) >/dev/null 2>/tmp/scala_corpus_build.log \

@@ -32,7 +32,8 @@ BIN=${SCALA_RS:-$ROOT/target/release/scala-rs}
 WORK=${SCALALIB_PROBE_DIR:-/private/tmp/scala-rs-libprobe}
 # The pristine sources and the 33 Java classfiles, both laid down by
 # `tests/scalalib_measure.sh`; run that once first if they are missing.
-SP=${SCALALIB_SRC_DIR:-/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/scalalib}
+source "$ROOT/tests/fixture_cache.sh"
+SP=${SCALALIB_SRC_DIR:-${SCALALIB_FIXTURE_DIR:-$(fixture_path scalalib)}}
 SRC=$SP/scala/src/library
 JAVACP=$SP/javacp/keep
 MODE=${1:-run}

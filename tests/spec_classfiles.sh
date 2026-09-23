@@ -28,14 +28,17 @@
 #   SPEC_FILTER=simple tests/spec_classfiles.sh
 #
 # Environment:
-#   SPEC_LOG      per-test TSV (default: a shared scratchpad path -- override it)
+#   SPEC_LOG      per-test TSV (default: $SCALA_RS_FIXTURE_ROOT/specclasses/
+#                 ledger.tsv; see tests/fixture_cache.sh)
 #   SPEC_FILTER   substring of the test name to restrict to
 #   SPEC_JOBS     parallel workers (default 6)
 #   SCALAC        real scalac (default /tmp/scala-2.13.16/bin/scalac)
 #   SCALA_RS      use this binary instead of building target/release/scala-rs
 set -e
 
-SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/specclasses
+ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
+source "$ROOT/tests/fixture_cache.sh"
+SP=$(fixture_path specclasses)
 # v2.13.16 -- the same release as the scalac we diff against, so a difference
 # is about this compiler and not about a version skew.
 SCALA_REV=3f6bdaeafde17d790023cc3f299b81eaaf876ca3
@@ -120,7 +123,6 @@ if [[ ! -x $SCALAC ]]; then
   exit 1
 fi
 
-ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 export SCALA_RS=${SCALA_RS:-$ROOT/target/release/scala-rs}
 # The release binary is not what `cargo test` builds; measuring a stale one
 # silently reports the previous commit's numbers.

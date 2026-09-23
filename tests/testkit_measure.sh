@@ -18,7 +18,9 @@
 #         still fails: `test` on its own has nothing to link against.
 #
 # Env:
-#   TESTKIT_DIR      scratch root (default .../scratchpad/testkit)
+#   TESTKIT_DIR      scratch root (default $SCALA_RS_FIXTURE_ROOT/testkit;
+#                    see tests/fixture_cache.sh)
+#   SLICK_FIXTURE_DIR  slick checkout and deps.cp, as for slick_measure.sh
 #   SLICK_CLASSES    dir with slick's 184 main sources already compiled.
 #                    Compiled here when unset -- that costs 4.5 minutes, so
 #                    pass the directory `slick_measure.sh` left behind
@@ -31,8 +33,8 @@
 set -e
 ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 source "$ROOT/tests/fixture_cache.sh"
-SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slick
-TK=${TESTKIT_DIR:-/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/testkit}
+SP=${SLICK_FIXTURE_DIR:-$(fixture_path slick)}
+TK=${TESTKIT_DIR:-$(fixture_path testkit)}
 STAGE=${1:-main}
 if [[ $STAGE == main || $STAGE == test || $STAGE == all || $STAGE == both ]]; then shift; else STAGE=main; fi
 BIN=${SCALA_RS:-$ROOT/target/release/scala-rs}
