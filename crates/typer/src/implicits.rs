@@ -717,17 +717,32 @@ impl Typer {
         // A non-implicit override removes the inherited implicit too. Looking
         // only at implicit candidates left abstract `implicit def algebra`
         // visible behind an ordinary implementing val in an anonymous class.
+        // Only a same-named declaration can hide a candidate, so the others
+        // are not collected: a controller mixing in a dozen traits has
+        // thousands of members and a handful of implicit names.
+        let names: rustc_hash::FxHashSet<&str> =
+            cands.iter().map(|&c| self.st.get(c).name.as_str()).collect();
         let declarations: Vec<SymbolId> = lin
             .iter()
             .flat_map(|id| self.st.get(*id).members.iter().copied())
+            .filter(|&m| names.contains(self.st.get(m).name.as_str()))
             .collect();
         let receiver = self.st.self_type_of_class(self.st.this_class);
-        let value_type = |id: SymbolId| {
+        // Once per symbol: the comparison below asks it for every pair, and
+        // each answer is an as-seen-from substitution over the whole type.
+        let value_types: std::cell::RefCell<rustc_hash::FxHashMap<SymbolId, std::rc::Rc<Type>>> =
+            Default::default();
+        let value_type = |id: SymbolId| -> std::rc::Rc<Type> {
+            if let Some(hit) = value_types.borrow().get(&id) {
+                return hit.clone();
+            }
             let ty = self.st.subst_as_seen_from(&receiver, &self.st.get(id).ty);
-            match ty {
+            let ty = std::rc::Rc::new(match ty {
                 Type::Method { paramss, ret } if paramss.is_empty() => *ret,
                 other => other,
-            }
+            });
+            value_types.borrow_mut().insert(id, ty.clone());
+            ty
         };
         let rank = |owner: SymbolId| lin.iter().position(|&b| b == owner);
         cands
