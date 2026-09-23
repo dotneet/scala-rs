@@ -726,7 +726,22 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                     .cloned()
                     .or_else(|| st.value_class_underlying(*sym))
                 {
-                    Some(u) => erase_ty(&st.subst_tparams(*sym, args, &u), st),
+                    Some(u) => {
+                        let e = erase_ty(&st.subst_tparams(*sym, args, &u), st);
+                        // nsc's `eraseDerivedValueClassRef`: an underlying
+                        // type that is *not* primitive as declared but
+                        // becomes one through the type arguments stays
+                        // boxed. `class Wrap[A](val a: A)` at `Wrap[Int]` is
+                        // `Ljava/lang/Integer;`, the same representation the
+                        // class's own `get$extension(Object)` works on --
+                        // erasing it to `int` gave `wrapped()I` against
+                        // scalac's `()Ljava/lang/Integer;`.
+                        if is_primitive(&e) && !is_primitive(&erase_ty(&u, st)) {
+                            boxed_primitive(&e, st).unwrap_or(Type::Any)
+                        } else {
+                            e
+                        }
+                    }
                     None => Type::Any,
                 },
             }
@@ -920,6 +935,33 @@ fn bound_erasure(e: Type) -> Type {
         Type::Constant(lit) => bound_erasure(Type::lit_underlying(&lit)),
         e => e,
     }
+}
+
+/// The JVM box a primitive erasure stands for when it has to be a
+/// reference: `java.lang.Integer` for `Int`, `BoxedUnit` for `Unit`.
+fn boxed_primitive(ty: &Type, st: &SymbolTable) -> Option<Type> {
+    let jvm = match ty {
+        Type::Int => "java/lang/Integer",
+        Type::Long => "java/lang/Long",
+        Type::Double => "java/lang/Double",
+        Type::Float => "java/lang/Float",
+        Type::Boolean => "java/lang/Boolean",
+        Type::Byte => "java/lang/Byte",
+        Type::Short => "java/lang/Short",
+        Type::Char => "java/lang/Character",
+        // No `BoxedUnit` symbol is entered, but `scala.Unit`'s JVM name is
+        // that class, which is all a descriptor needs.
+        Type::Unit => {
+            return Some(Type::Class {
+                sym: st.unit_sym,
+                args: vec![],
+            })
+        }
+        Type::Constant(lit) => return boxed_primitive(&Type::lit_underlying(lit), st),
+        _ => return None,
+    };
+    let sym = st.find_class_by_jvm(jvm)?;
+    Some(Type::Class { sym, args: vec![] })
 }
 
 fn is_primitive(ty: &Type) -> bool {
