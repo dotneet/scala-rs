@@ -180,15 +180,31 @@ fn actual_gitbucket_java_patch_helper_executes() {
     // Keep this probe on the same fixture root as the GitBucket measurement
     // scripts.  The old session-specific scratchpad path was deleted after
     // the probe was recorded, making this test fail before javac was invoked.
-    let base = std::env::var_os("GITBUCKET_FIXTURE_DIR")
+    let configured_base = std::env::var_os("GITBUCKET_FIXTURE_DIR")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("SCALA_RS_FIXTURE_ROOT")
                 .map(PathBuf::from)
                 .map(|root| root.join("gitbucket"))
-        })
+        });
+    let base = configured_base
+        .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("scala-rs-fixtures/gitbucket"));
     let source = base.join("gitbucket/src/main/java/gitbucket/core/util");
+    let helper = source.join("PatchUtil.java");
+    let deps = base.join("deps.cp");
+    if !helper.is_file() || !deps.is_file() {
+        assert!(
+            configured_base.is_none(),
+            "configured external fixture is incomplete: {}",
+            base.display()
+        );
+        eprintln!(
+            "skip external Java helper probe: fixture is not prepared at {}",
+            base.display()
+        );
+        return;
+    }
     let out = std::env::temp_dir().join(format!(
         "collection-gitbucket-java-{}-{}",
         std::process::id(),
@@ -198,12 +214,12 @@ fn actual_gitbucket_java_patch_helper_executes() {
             .as_nanos()
     ));
     fs::create_dir(&out).unwrap();
-    let deps = fs::read_to_string(base.join("deps.cp")).unwrap();
+    let deps = fs::read_to_string(deps).unwrap();
     let cp = format!("{}:{JAR}", deps.trim());
     let p = Command::new("javac")
         .args(["-cp", &cp, "-d"])
         .arg(&out)
-        .arg(source.join("PatchUtil.java"))
+        .arg(helper)
         .output()
         .unwrap();
     assert!(p.status.success(), "{}", String::from_utf8_lossy(&p.stderr));
