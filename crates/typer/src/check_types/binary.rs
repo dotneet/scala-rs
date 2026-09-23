@@ -752,12 +752,12 @@ impl Typer {
         cands.sort_unstable_by_key(|id| id.0);
         cands.dedup_by_key(|id| id.0);
         for &id in &cands {
-            let before = self.st.get(id).ty.clone();
-            let unknown = match &before {
+            let unknown = match &self.st.get(id).ty {
                 Type::Method { ret, .. } => ret.is_no_type(),
                 ty => ty.is_no_type(),
             };
             if unknown && !self.lazy_completing.contains(&id) {
+                let before = self.st.get(id).ty.clone();
                 self.complete_lazy_sig(id, Span::DUMMY);
                 completed |= self.st.get(id).ty != before;
             }

@@ -1316,17 +1316,19 @@ impl Typer {
     /// the declaration selected for code generation. Divergence and memo masks
     /// continue to use the original declaration identity.
     pub(crate) fn prepare_implicit_instances(&mut self, id: SymbolId, depth_limit: usize) -> bool {
-        let source = self.st.get(id).clone();
-        if source.tparams.is_empty() || !self.only_implicit_clauses(id) {
+        if self.st.get(id).tparams.is_empty() || !self.only_implicit_clauses(id) {
             return false;
         }
         if self
             .implicit_instances
             .get(&id)
-            .is_some_and(|(ty, instances)| *ty == source.ty && instances.len() > depth_limit)
+            .is_some_and(|(ty, instances)| {
+                *ty == self.st.get(id).ty && instances.len() > depth_limit
+            })
         {
             return false;
         }
+        let source = self.st.get(id).clone();
         let mut instances = self
             .implicit_instances
             .get(&id)
