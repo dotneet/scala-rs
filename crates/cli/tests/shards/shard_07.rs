@@ -8,6 +8,8 @@ mod support;
 mod fs2_io;
 #[path = "../samconv.rs"]
 mod samconv;
+#[path = "../scalac_client_pickle.rs"]
+mod scalac_client_pickle;
 #[path = "../scalalibmisc.rs"]
 mod scalalibmisc;
 #[path = "../secondaryctor.rs"]

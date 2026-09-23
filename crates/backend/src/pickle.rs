@@ -2200,6 +2200,20 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         }
     }
 
+    /// The module term whose class is `class_id` (`object Tag`'s value for
+    /// its `Tag$` class), found among the class's owner's members.
+    fn module_term_of_class(&self, class_id: SymbolId) -> Option<SymbolId> {
+        let owner = self.facts.get(class_id).owner;
+        if owner.is_none() {
+            return None;
+        }
+        self.facts.get(owner).members.iter().copied().find(|&m| {
+            m != class_id
+                && self.facts.get(m).kind == SymKind::Module
+                && self.facts.module_class_of(m) == class_id
+        })
+    }
+
     fn pickle_term_ref(&mut self, id: SymbolId) -> u32 {
         if let Some(&i) = self.sym_index.get(&id.0) {
             return i;
@@ -2888,7 +2902,16 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             let mn = self.symbol_term_name(&raw_name);
             let mbody =
                 self.symbol_info_with_private_within(mn, owner, mflags, private_within, mtpe);
-            self.add(MODULESYM, mbody);
+            let msym = self.add(MODULESYM, mbody);
+            // This entry *is* the module term. A later `Tag.type` in a
+            // signature reaches the term through `pickle_term_ref`; unless
+            // the term's id maps here, that wrote a second `object Tag`
+            // symbol, and nsc bound `S.Tag` to the copy without the MODULE
+            // class behind it (a scalac client then called a `Tag()`
+            // accessor the class file does not have).
+            if let Some(term) = self.module_term_of_class(class_id) {
+                self.sym_index.entry(term.0).or_insert(msym);
+            }
         } else if let Some(mod_id) = self.facts.companion_module(class_id) {
             // nsc `enterClassAndModule` completes term `Point` from MODULESYM
             // in `Point.class`, not from `Point$.class`.
@@ -5738,6 +5761,44 @@ object Lib {
             .expect("usesAlias");
         assert_eq!(u.param_types, vec!["Int".to_string()]);
         assert_eq!(u.ret, "Int");
+    }
+
+    #[test]
+    fn pickle_nested_module_singleton_reuses_module_symbol() {
+        // `Tag.type` in `tag`'s signature names the term the MODULEsym
+        // entry already declares; a second `object Tag` shadowed it in nsc.
+        let src = r#"
+object S {
+  object Tag { override def toString = "Tag!" }
+  val tag: Tag.type = Tag
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let s = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "S" && s.kind == scala_rs_typer::SymKind::Module)
+            .map(|s| s.id)
+            .expect("S module");
+        let raw = pickle_class(&st, st.module_class_of(s));
+        let parsed = scala_rs_pickle::read_pickle(&raw).expect("read S pickle");
+        let tag_terms = (0..parsed.entries.len() as u32)
+            .filter(|&i| {
+                matches!(
+                    parsed.entry(i),
+                    Some(
+                        scala_rs_pickle::read::Entry::ModuleSym { .. }
+                            | scala_rs_pickle::read::Entry::ValSym { .. }
+                    )
+                ) && parsed.sym_name(i) == Some("Tag")
+            })
+            .count();
+        assert_eq!(tag_terms, 1, "term Tag must be pickled once");
     }
 
     #[test]
