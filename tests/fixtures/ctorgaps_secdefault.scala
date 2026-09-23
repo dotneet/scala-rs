@@ -8,7 +8,7 @@
 // Every case prints the value the default actually produced -- a getter that
 // answers with the wrong expression is invisible to an error count.
 
-// The reduction from `docs/not-implemented.md`.
+// The reduced constructor-default interoperability case.
 class Deft(val p: Int, val q: String) {
   def this(p: String, q: String = "dq") = this(p.length, q)
 }

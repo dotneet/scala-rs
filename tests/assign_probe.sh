@@ -100,8 +100,8 @@ case_ b21_object_itself    'object O
 object M { def f(): Unit = { O = null } }'
 case_ b22_param_in_ctor    'class C(a: Int) { a = 3 }'
 case_ b23_unknown_name     'object M { def f(): Unit = { nosuch = 2 } }'
-# Known disagreement, kept so it cannot be forgotten: scalac reads this as a
-# call to the hand-written setter. See docs/not-implemented.md.
+# scalac reads this as a call to the hand-written setter; so does scala-rs
+# now (it used to report `reassignment to val`).
 case_ b24_setter_only      'class C { val v = 1; def v_=(x: Int): Unit = () }
 object M { def f(): Unit = { val c = new C; c.v = 2 } }'
 

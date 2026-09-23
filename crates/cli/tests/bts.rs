@@ -169,10 +169,10 @@ fn most_derived_base_type_matches_scalac() {
 /// 2.13.16 accepts it, which [`most_derived_base_type_matches_scalac`] pins for
 /// the source-built form of the same hierarchy.
 ///
-/// `TreeMap` looks like this shape and is *not* covered here: it still fails,
-/// for a different reason (`immutable.SortedMapOps` overrides `updatedWith`
-/// with the sorted `CC` and that override is not the one selected). See
-/// `docs/not-implemented.md`.
+/// `TreeMap` looks like this shape and is *not* covered here: its result
+/// comes from a different rule (`immutable.SortedMapOps` overrides
+/// `updatedWith` with the sorted `CC`, and that override has to be the one
+/// selected).
 #[test]
 fn updated_with_keeps_the_receivers_own_type() {
     let Some(jar) = scala_library_jar() else {
