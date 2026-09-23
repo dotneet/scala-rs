@@ -8166,7 +8166,11 @@ fn parent_args(t: &Type) -> Vec<Type> {
 
 /// Whether `cls` already has `target` somewhere above it.
 pub(crate) fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -> bool {
-    inherits_matching(st, cls, |c| c == target)
+    st.cached_reach(crate::symbol::Reach::InheritsFrom, cls, target, || {
+        let mut keep = true;
+        let found = inherits_walk(st, cls, |c| c == target, &mut keep);
+        (Some(found), keep)
+    }) == Some(true)
 }
 
 /// Whether `cls` or a reachable parent matches a predicate. Keep the same
@@ -8175,7 +8179,18 @@ pub(crate) fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -
 pub(crate) fn inherits_matching(
     st: &SymbolTable,
     cls: SymbolId,
+    matches: impl FnMut(SymbolId) -> bool,
+) -> bool {
+    inherits_walk(st, cls, matches, &mut true)
+}
+
+/// [`inherits_matching`], clearing `keep` when a parent it followed had to be
+/// resolved through the scopes ([`crate::lin::parent_names_its_class`]).
+fn inherits_walk(
+    st: &SymbolTable,
+    cls: SymbolId,
     mut matches: impl FnMut(SymbolId) -> bool,
+    keep: &mut bool,
 ) -> bool {
     let mut seen: Vec<u32> = Vec::new();
     let mut work = vec![cls];
@@ -8188,6 +8203,7 @@ pub(crate) fn inherits_matching(
         }
         seen.push(c.0);
         for p in &st.get(c).parents {
+            *keep &= crate::lin::parent_names_its_class(p);
             if let Some(ps) = st.class_sym_of(p) {
                 work.push(ps);
             }

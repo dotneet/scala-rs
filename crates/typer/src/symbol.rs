@@ -1323,6 +1323,9 @@ pub struct SymbolTable {
     /// [`SymbolTable::base_type_args`]'s answers for the current
     /// `mutation_gen`.
     pub(crate) bta_cache: std::cell::RefCell<BtaCache>,
+    /// [`SymbolTable::class_reaches`]'s answers for the current
+    /// `mutation_gen`.
+    pub(crate) reach_cache: std::cell::RefCell<ReachCache>,
     /// The answer for a receiver that names no class, handed out by reference
     /// so the hot path never allocates for it.
     pub(crate) empty_base_type_args: std::rc::Rc<BaseTypeArgs>,
@@ -1357,6 +1360,36 @@ type BtaEntry = (Vec<Type>, std::rc::Rc<BaseTypeArgs>);
 const BTA_BUCKET_MAX: usize = 16;
 /// Past this many entries in total the cache is emptied.
 const BTA_CACHE_MAX: usize = 100_000;
+
+/// Memo for the ancestry walks -- [`SymbolTable::class_reaches`],
+/// [`SymbolTable::is_ancestor_of`] and `pickle_supply::inherits_from` -- with
+/// the same validity rule as [`LinCache`]: an entry lives until any symbol is
+/// handed out for mutation.
+///
+/// Implicit search asks them once per candidate pair, subtype check and
+/// import prefix, over the same few classes, and every answer is a walk over
+/// the whole ancestry: together they were over a tenth of a slick profile.
+/// The two walks that resolve parents through `class_sym_of` can see a
+/// truncated alias under an ambient expansion guard, so those are neither
+/// read from nor written to the cache while one is active
+/// ([`SymbolTable::has_ambient_type_context`]).
+#[derive(Default)]
+pub(crate) struct ReachCache {
+    /// The generation `map` was filled at.
+    gen: u64,
+    map: rustc_hash::FxHashMap<(Reach, u32, u32), Option<bool>>,
+}
+
+/// Which walk a [`ReachCache`] entry answers.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Reach {
+    ClassReaches,
+    SubtypeReaches,
+    AncestorOf,
+    InheritsFrom,
+}
+
+const REACH_CACHE_MAX: usize = 100_000;
 
 /// Memo for [`crate::lin::linearize`], shared by every call made while the
 /// symbol graph stands still.
@@ -1449,6 +1482,7 @@ impl SymbolTable {
             mutation_gen: std::cell::Cell::new(0),
             lin_cache: std::cell::RefCell::new(LinCache::default()),
             bta_cache: std::cell::RefCell::new(BtaCache::default()),
+            reach_cache: std::cell::RefCell::new(ReachCache::default()),
             empty_base_type_args: std::rc::Rc::new(BaseTypeArgs::default()),
             symbols: vec![Symbol {
                 id: SymbolId(0),
@@ -4345,6 +4379,16 @@ impl SymbolTable {
     }
 
     pub fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
+        self.cached_reach(Reach::AncestorOf, anc, cls, || {
+            let (r, keep) = self.is_ancestor_of_uncached(anc, cls);
+            (Some(r), keep)
+        }) == Some(true)
+    }
+
+    /// The walk behind [`Self::is_ancestor_of`], and whether every parent it
+    /// followed named its class outright.
+    fn is_ancestor_of_uncached(&self, anc: SymbolId, cls: SymbolId) -> (bool, bool) {
+        let mut keep = true;
         let mut work = vec![cls];
         let mut seen = rustc_hash::FxHashSet::default();
         while let Some(c) = work.pop() {
@@ -4352,18 +4396,20 @@ impl SymbolTable {
                 continue;
             }
             if c == anc {
-                return true;
+                return (true, keep);
             }
             for p in &self.get(c).parents {
+                keep &= crate::lin::parent_names_its_class(p);
                 if let Some(ps) = self.class_sym_of(p) {
                     work.push(ps);
                 }
             }
             if let Some(st) = &self.get(c).self_type {
+                keep = false;
                 work.extend(self.self_type_classes(st));
             }
         }
-        false
+        (false, keep)
     }
 
     /// Substitute inherited member types using applied parents (`Functor[Id].map`).
@@ -6008,6 +6054,82 @@ impl SymbolTable {
     /// `Any` / `AnyVal`, which the real walk answers `false` for against any
     /// class and which are where most hierarchies end.
     pub(crate) fn class_reaches(&self, start: SymbolId, target: SymbolId) -> Option<bool> {
+        self.cached_reach(Reach::ClassReaches, start, target, || {
+            (self.class_reaches_uncached(start, target), true)
+        })
+    }
+
+    /// `walk(a, b)` through [`ReachCache`]. `walk` also says whether its
+    /// answer may be kept: a walk that resolved a parent through the scopes
+    /// ([`crate::lin::parent_names_its_class`]) is a function of more than the
+    /// symbol graph, and is answered afresh every time.
+    pub(crate) fn cached_reach(
+        &self,
+        kind: Reach,
+        a: SymbolId,
+        b: SymbolId,
+        walk: impl FnOnce() -> (Option<bool>, bool),
+    ) -> Option<bool> {
+        if matches!(kind, Reach::AncestorOf | Reach::InheritsFrom)
+            && self.has_ambient_type_context()
+        {
+            return walk().0;
+        }
+        let gen = self.mutation_gen.get();
+        let key = (kind, a.0, b.0);
+        {
+            let cache = self.reach_cache.borrow();
+            if cache.gen == gen {
+                if let Some(&hit) = cache.map.get(&key) {
+                    return hit;
+                }
+            }
+        }
+        let (out, keep) = walk();
+        // The walk itself may have completed a symbol.
+        if !keep || self.mutation_gen.get() != gen {
+            return out;
+        }
+        let mut cache = self.reach_cache.borrow_mut();
+        if cache.gen != gen || cache.map.len() >= REACH_CACHE_MAX {
+            cache.gen = gen;
+            cache.map.clear();
+        }
+        cache.map.insert(key, out);
+        out
+    }
+
+    /// [`Self::class_reaches`] for the symbol-level "no" of
+    /// [`Self::is_sub_type`], which also walks *through* a function parent.
+    ///
+    /// `class_reaches` gives up at one, and `Seq` reaches `Function1` through
+    /// `PartialFunction`: every `Seq`, `List`, `Map` or `PartialFunction`
+    /// asked about an unrelated class took the full substituting walk, and
+    /// that was most of the four million parent walks of a slick build. The
+    /// subtype walk reads a function parent structurally, and a structural
+    /// function conforms to a class only when that class is itself a
+    /// `FunctionN`, so for any other target the parent is just the
+    /// `FunctionN` class, whose own parents the walk also follows through its
+    /// prefixed-parent arm.
+    pub(crate) fn subtype_class_reaches(&self, start: SymbolId, target: SymbolId) -> Option<bool> {
+        if self.get(target).jvm_name.starts_with("scala/Function") {
+            return self.class_reaches(start, target);
+        }
+        self.cached_reach(Reach::SubtypeReaches, start, target, || {
+            (self.class_reaches_walk(start, target, true), true)
+        })
+    }
+
+    fn class_reaches_uncached(&self, start: SymbolId, target: SymbolId) -> Option<bool> {
+        self.class_reaches_walk(start, target, false)
+    }
+
+    fn class_reaches_walk(
+        &self,
+        start: SymbolId,
+        target: SymbolId,
+        through_functions: bool,
+    ) -> Option<bool> {
         // Hierarchies are tens of nodes, so a scanned `Vec` beats a hash set.
         let mut seen: Vec<u32> = Vec::with_capacity(32);
         let mut work: Vec<SymbolId> = Vec::with_capacity(16);
@@ -6020,7 +6142,7 @@ impl SymbolTable {
                         if *sym == target {
                             return Some(true);
                         }
-                        if self.is_function_class_shape(*sym, args) {
+                        if !through_functions && self.is_function_class_shape(*sym, args) {
                             return None;
                         }
                         if !seen.contains(&sym.0) {
@@ -6031,6 +6153,19 @@ impl SymbolTable {
                     // `is_sub_type` has no arm for these against a class, so
                     // the real walk stops here too.
                     Type::AnyRef | Type::Any | Type::AnyVal => {}
+                    Type::Function { params, .. } if through_functions => {
+                        let sym = crate::classpath::find_by_jvm(
+                            self,
+                            &format!("scala/Function{}", params.len()),
+                        )?;
+                        if sym == target {
+                            return Some(true);
+                        }
+                        if !seen.contains(&sym.0) {
+                            seen.push(sym.0);
+                            work.push(sym);
+                        }
+                    }
                     _ => return None,
                 }
             }
@@ -6092,6 +6227,25 @@ impl SymbolTable {
     /// can *grow* a type argument (`F[F[A]]`), so the set of distinct questions
     /// is not guaranteed finite, and neither the path nor the memo would bound
     /// a walk that keeps inventing new ones.
+    /// The symbol-level "no" of [`Self::is_sub_type`] (see the comment on its
+    /// use there), taken before the arms that rewrite a type without changing
+    /// its class: alias members, path members and abstract projections only
+    /// ever touch the arguments of a proper `Class`, and a higher-kinded
+    /// comparison needs an unapplied constructor. Answering first spares those
+    /// whole-type traversals on the question implicit search asks most.
+    /// `Array` is left out because it is re-spelled as `Type::Array` first.
+    fn classes_unrelated(&self, a: &Type, b: &Type) -> bool {
+        let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, .. }) = (a, b) else {
+            return false;
+        };
+        s1 != s2
+            && *s1 != self.array_sym
+            && *s2 != self.array_sym
+            && self.class_tparam_count(*s1) <= a1.len()
+            && !self.is_function_class_shape(*s1, a1)
+            && self.subtype_class_reaches(*s1, *s2) == Some(false)
+    }
+
     fn walk_parents(&self, a: &Type, b: &Type, f: impl FnOnce() -> bool) -> bool {
         let Some(_depth) = enter_depth() else {
             return false;
@@ -6200,6 +6354,9 @@ impl SymbolTable {
         }
         if a == b {
             return true;
+        }
+        if self.classes_unrelated(a, b) {
+            return false;
         }
         if let Type::Named { name, args } = a {
             if let Some((id, expanded)) = self.named_alias_type(name, args) {
@@ -6387,7 +6544,7 @@ impl SymbolTable {
         if let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, .. }) = (a, b) {
             if s1 != s2
                 && !self.is_function_class_shape(*s1, a1)
-                && self.class_reaches(*s1, *s2) == Some(false)
+                && self.subtype_class_reaches(*s1, *s2) == Some(false)
             {
                 return false;
             }
@@ -9181,5 +9338,105 @@ mod api_boundary_tests {
             ),
             Type::String
         );
+    }
+}
+
+#[cfg(test)]
+mod reach_cache_tests {
+    use super::*;
+
+    fn class(st: &mut SymbolTable, name: &str, jvm: &str) -> SymbolId {
+        st.alloc(name, st.root, SymKind::Class, Flags::EMPTY, jvm)
+    }
+
+    fn extend(st: &mut SymbolTable, child: SymbolId, parent: Type) {
+        st.get_mut(child).parents.push(parent);
+    }
+
+    fn bare(sym: SymbolId) -> Type {
+        Type::Class { sym, args: vec![] }
+    }
+
+    /// Every ancestry walk is served from `reach_cache` while no symbol has
+    /// changed, and a new parent has to be seen by the next question.
+    #[test]
+    fn a_new_parent_is_not_served_from_the_reach_cache() {
+        let mut st = SymbolTable::new();
+        let base = class(&mut st, "Base", "Base");
+        let mid = class(&mut st, "Mid", "Mid");
+        let leaf = class(&mut st, "Leaf", "Leaf");
+        extend(&mut st, leaf, bare(mid));
+        assert_eq!(st.class_reaches(leaf, base), Some(false));
+        assert!(!st.is_ancestor_of(base, leaf));
+        assert!(!crate::pickle_supply::inherits_from(&st, leaf, base));
+        extend(&mut st, mid, bare(base));
+        assert_eq!(st.class_reaches(leaf, base), Some(true));
+        assert!(st.is_ancestor_of(base, leaf));
+        assert!(crate::pickle_supply::inherits_from(&st, leaf, base));
+    }
+
+    /// A parent that is still a name is resolved through the scopes, which
+    /// change without any symbol changing, so a walk that read one must not
+    /// be remembered.
+    #[test]
+    fn a_walk_through_an_unresolved_parent_is_not_remembered() {
+        let mut st = SymbolTable::new();
+        let base = class(&mut st, "Base", "Base");
+        let leaf = class(&mut st, "Leaf", "Leaf");
+        extend(
+            &mut st,
+            leaf,
+            Type::Named {
+                name: "Base".into(),
+                args: vec![],
+            },
+        );
+        assert!(!st.is_ancestor_of(base, leaf));
+        assert!(!crate::pickle_supply::inherits_from(&st, leaf, base));
+        st.enter_in_current("Base", base);
+        assert!(st.is_ancestor_of(base, leaf));
+        assert!(crate::pickle_supply::inherits_from(&st, leaf, base));
+    }
+
+    /// `Seq` reaches `Function1` through `PartialFunction`. `class_reaches`
+    /// gives up at the function parent; the subtype walk's own question walks
+    /// through it, so an unrelated class is a symbol-level "no" and
+    /// `is_sub_type` does not have to substitute its way through the whole
+    /// hierarchy to find that out.
+    #[test]
+    fn the_subtype_reach_walks_through_a_function_parent() {
+        let mut st = SymbolTable::new();
+        let t = st.alloc("T", st.root, SymKind::TypeParam, Flags::EMPTY, "");
+        let r = st.alloc("R", st.root, SymKind::TypeParam, Flags::EMPTY, "");
+        let function1 = class(&mut st, "Function1", "scala/Function1");
+        st.get_mut(function1).tparams = vec![t, r];
+        let partial = class(&mut st, "PartialFunction", "scala/PartialFunction");
+        let seq = class(&mut st, "Seq", "scala/collection/Seq");
+        let option = class(&mut st, "Option", "scala/Option");
+        extend(
+            &mut st,
+            partial,
+            Type::Class {
+                sym: function1,
+                args: vec![Type::Int, Type::String],
+            },
+        );
+        extend(&mut st, seq, bare(partial));
+        assert_eq!(st.class_reaches(seq, option), None);
+        assert_eq!(st.subtype_class_reaches(seq, option), Some(false));
+        assert!(!st.is_sub_type(&bare(seq), &bare(option)));
+        // A `FunctionN` target keeps the conservative answer: a structural
+        // function parent conforms to it by shape, not by symbol.
+        assert_eq!(
+            st.subtype_class_reaches(seq, function1),
+            st.class_reaches(seq, function1)
+        );
+        assert!(st.is_sub_type(
+            &bare(seq),
+            &Type::Class {
+                sym: function1,
+                args: vec![Type::Int, Type::String],
+            }
+        ));
     }
 }

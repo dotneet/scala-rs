@@ -2834,14 +2834,18 @@ impl Typer {
             let Some(param) = self.conversion_arg_ty(id) else {
                 continue;
             };
-            if !self.conv_param_matches(id, from, &param) {
-                continue;
-            }
-            let wanted: Vec<Type> = self
-                .conv_implicit_params(id, from, &Type::NoType)
-                .into_iter()
-                .flatten()
-                .collect();
+            // One memo for both questions: they solve the same type
+            // arguments from the same witnesses.
+            let wanted: Vec<Type> = {
+                let _live = self.memo_scope();
+                if !self.conv_param_matches(id, from, &param) {
+                    continue;
+                }
+                self.conv_implicit_params(id, from, &Type::NoType)
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
             for want in &wanted {
                 self.warm_implicit_scope(want);
             }
@@ -4409,7 +4413,7 @@ impl Typer {
     }
 
     pub(crate) fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
-        let _prefixes = self.import_prefix_scope();
+        let _live = self.memo_scope();
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }

@@ -16,6 +16,12 @@ rather than an absolute benchmark:
 
 * **slick, 184 sources**: 3.06 s wall, 2.80 s user CPU, 1504 class files
   (medians of eight alternating pairs, 2026-09-12).
+* **slick, 2026-09-24**: main had drifted to 1.24e11 instructions and 6.4 s
+  user CPU by then, and it stops at two type errors (JdbcModelBuilder,
+  Compiled) before code generation, so these figures cover type checking
+  only. The ancestry caches, the function-parent walk and the shared
+  conversion memo below took it to 6.37e10 instructions (-48%) and about
+  3.7 s user, with the same diagnostics.
 * **gitbucket, 354 sources**: about 20 s on a quiet machine, 2.86e11
   instructions retired, after the linearization / base-type caches of
   2026-09-12 (from 154 s and 2.57e12). Macro expansion is under 1 s of that.
@@ -107,6 +113,40 @@ the engine's own compute, the implementation's run, the cost of answering the
 engine's questions, tree rebuilding and re-typing at the call site, as a
 Markdown table on stderr. It costs one extra round trip per expansion and is
 off unless the variable is set.
+
+### Ancestry caches and conversion memo (2026-09-24)
+
+Four changes, each measured on slick in instructions retired (1.236e11 at
+the start, 6.37e10 at the end):
+
+* **The implicit memo spans `conversion_result`** (-27%). It asked
+  `conv_param_matches` and then `instantiate_conv_type`, and both solve the
+  conversion's type arguments from its implicit clause with the same
+  searches; the memo died between them, so every search ran twice. The
+  same pairing in `warm_conversion_witnesses` (`conv_param_matches`, then
+  `conv_implicit_params`) now shares one memo too.
+* **`class_reaches`, `is_ancestor_of` and `inherits_from` are cached**
+  (`ReachCache`, same `mutation_gen` rule as `LinCache`; -13%). The two that
+  resolve parents through `class_sym_of` keep an answer only when every
+  parent they followed named its class outright, and never under an ambient
+  expansion guard, for the reason `lin.rs`'s `parent_names_its_class` gives.
+* **The subtype walk's symbol-level "no" walks through function parents**
+  (`subtype_class_reaches`; -14%). `class_reaches` gives up at a function
+  parent, and `Seq` reaches `Function1` through `PartialFunction`, so every
+  `Seq`/`List`/`Map` asked about an unrelated class took the full
+  substituting walk: 4.1 million parent walks, down to 2.4 million.
+* **That "no" is taken before `hk_alias_sub_type` and the path-member and
+  projection traversals** (`classes_unrelated`; -3%), which only rewrite a
+  proper class's arguments.
+
+What remains on the same profile is the extension search itself. For every
+select that falls back on a view, every conversion in scope is tried, and
+cats' syntax conversions (`toComposeOps[F[_, _], A, B](fab: F[A, B])(implicit
+F: Compose[F])`) each search their witness with `F` undetermined, which fits
+every instance and comes out ambiguous. The answer does not depend on the
+receiver, but it does depend on the position, so it cannot outlive the memo
+without keying on the lexical context. `warm_conversion_witnesses` is the
+same loop (about 105 calls, 5 ms each, almost none of which change a symbol).
 
 ### What is left
 

@@ -98,7 +98,7 @@ fn skip_parent(st: &SymbolTable, p: SymbolId) -> bool {
 /// type whose constructor names its class -- gitbucket's every table is
 /// `extends profile.Table[…]`, so excluding those would have left the cache
 /// doing nothing where it matters most.
-fn parent_names_its_class(p: &Type) -> bool {
+pub(crate) fn parent_names_its_class(p: &Type) -> bool {
     match p {
         // Resolved outright, or to a field of the table that never changes.
         Type::Class { .. }
