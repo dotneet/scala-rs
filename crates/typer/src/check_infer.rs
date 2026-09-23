@@ -2085,6 +2085,14 @@ impl Typer {
             let Some(p) = param_at(params, i) else {
                 break;
             };
+            // A classfile method can retain a qualified alias as `Named`.
+            // Expand it before reading constraints from its type arguments;
+            // conformance alone runs too late to infer this method's variables.
+            let alias = match p {
+                Type::Named { name, args } => self.st.named_alias_type(name, args),
+                _ => None,
+            };
+            let p = alias.as_ref().map_or(p, |(_, ty)| ty);
             // `unify_one` zips type arguments positionally and has no symbol
             // table to ask, so an argument of a *subclass* has to be lined up
             // with the parameter's class first: `def id[R, U](c: RC[R, U])`
@@ -5294,4 +5302,47 @@ fn bound_mentions_tparam(ty: &Type) -> bool {
 enum SingletonRecv<'t> {
     Tree(&'t Tree),
     This(SymbolId),
+}
+
+#[cfg(test)]
+mod qualified_alias_tests {
+    use super::*;
+
+    #[test]
+    fn method_type_inference_reads_a_qualified_binary_alias() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let st = &mut typer.st;
+        let pkg = st.alloc("alias", st.root, SymKind::Package, Flags::EMPTY, "alias");
+        let module = st.alloc(
+            "Types",
+            pkg,
+            SymKind::ModuleClass,
+            Flags::EMPTY,
+            "alias/Types$",
+        );
+        let alias = st.alloc("Fetch", module, SymKind::TypeMember, Flags::EMPTY, "");
+        let element = st.alloc("A", alias, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(alias).tparams.push(element);
+        st.get_mut(alias).is_type_alias = true;
+        st.get_mut(alias).ty = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::TypeParam(element)),
+        };
+        let method = st.alloc("use", module, SymKind::Method, Flags::EMPTY, "");
+        let result = st.alloc("R", method, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(method).tparams.push(result);
+
+        let pattern = Type::Named {
+            name: "alias.Types.Fetch".into(),
+            args: vec![Type::TypeParam(result)],
+        };
+        let actual = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::String),
+        };
+        assert_eq!(
+            typer.infer_method_tparams(method, &[pattern], &[actual]),
+            vec![(result, Type::String)]
+        );
+    }
 }

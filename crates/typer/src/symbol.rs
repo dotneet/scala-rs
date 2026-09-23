@@ -3037,7 +3037,7 @@ impl SymbolTable {
     /// Recover a fully-qualified type alias left as `Named` in a classfile
     /// method signature. The owner may be an object, whose alias is declared
     /// on its module class rather than on the static forwarder class.
-    fn named_alias_type(&self, name: &str, args: &[Type]) -> Option<(SymbolId, Type)> {
+    pub(crate) fn named_alias_type(&self, name: &str, args: &[Type]) -> Option<(SymbolId, Type)> {
         let (owner_path, member_name) = name.rsplit_once('.')?;
         for owner in crate::classpath::classpath_owner_candidates(self, owner_path) {
             for id in self.lookup_type_member(owner, member_name) {

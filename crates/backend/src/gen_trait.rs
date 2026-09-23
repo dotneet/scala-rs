@@ -4502,6 +4502,17 @@ impl<'a> Gen<'a> {
                 continue;
             }
             let desc = format!("(){}", jvm_desc(self.st, &ty));
+            if !stt.sym.is_none() && self.st.get(stt.sym).deferred_val {
+                let method = b.add_abstract(access | ACC_ABSTRACT, name, &desc);
+                b.sign_method_accessor(method, self.sig_of(stt.sym), false);
+                if mods.flags.contains(Flags::MUTABLE) {
+                    let setter = var_setter_name(name);
+                    let sdesc = format!("({})V", jvm_desc_val(self.st, &ty));
+                    let method = b.add_abstract(access | ACC_ABSTRACT, &setter, &sdesc);
+                    b.sign_method_accessor(method, self.sig_of(stt.sym), true);
+                }
+                continue;
+            }
             let fname = name.clone();
             let fdesc = jvm_desc_val(self.st, &ty);
             let ret_ty = ty.clone();

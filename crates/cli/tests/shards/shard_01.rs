@@ -14,6 +14,8 @@ mod absproj;
 mod absresult;
 #[path = "../abstract_pattern_bounds.rs"]
 mod abstract_pattern_bounds;
+#[path = "../abstract_val_classfile.rs"]
+mod abstract_val_classfile;
 #[path = "../accepttoomuch.rs"]
 mod accepttoomuch;
 #[path = "../aliaslookup.rs"]

@@ -567,6 +567,9 @@ impl<'a> Gen<'a> {
         if mods.flags.contains(Flags::FINAL) {
             b.access |= ACC_FINAL;
         }
+        if mods.flags.contains(Flags::ABSTRACT) {
+            b.access |= ACC_ABSTRACT;
+        }
 
         // constructor / body fields
         for (clause_idx, clause) in vparamss.iter().enumerate() {
@@ -618,6 +621,9 @@ impl<'a> Gen<'a> {
         }
         for stt in &impl_.body {
             if let TreeKind::ValDef { name, mods, .. } = &stt.kind {
+                if !stt.sym.is_none() && self.st.get(stt.sym).deferred_val {
+                    continue;
+                }
                 let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
                     self.st.get(stt.sym).ty.clone()
                 } else {

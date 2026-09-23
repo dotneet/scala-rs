@@ -4847,7 +4847,6 @@ pub(crate) fn box_value_class_receiver(
     // takes the underlying value. Handing it the box was a `VerifyError`.
     if matches!(&qual.ty, Type::Class { sym, .. } if *sym == owner)
         && !matches!(qual.kind, TreeKind::This { .. } | TreeKind::Super { .. })
-        && ctx.st.is_source_value_class(owner)
     {
         if let Some(field) = ctx.st.get(owner).ctor_fields.first().copied() {
             let internal = class_internal(ctx.st, owner);

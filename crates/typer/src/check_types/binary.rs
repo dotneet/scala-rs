@@ -1509,6 +1509,63 @@ impl Typer {
         }
     }
 
+    /// A binary method may retain a qualified alias as `Named` even though
+    /// its declaration lives in another object classfile. Load that owner
+    /// before method type inference needs the alias body.
+    pub(crate) fn complete_named_alias_argument(&mut self, ty: &Type, span: Span) {
+        let Type::Named { name, args } = ty else {
+            return;
+        };
+        if self.st.named_alias_type(name, args).is_some() {
+            return;
+        }
+        let Some((owner_path, member_name)) = name.rsplit_once('.') else {
+            return;
+        };
+        for (split, _) in owner_path.match_indices('.').rev() {
+            let package = owner_path[..split].replace('.', "/");
+            let nested = owner_path[split + 1..].replace('.', "$");
+            let jvm = format!("{package}/{nested}$");
+            let owner = crate::classpath::ensure_package(&mut self.st, &package);
+            if !self.load_binary_into(&jvm, owner, span, false) {
+                continue;
+            }
+            if let Some(cls) = crate::classpath::find_by_jvm(&self.st, &jvm) {
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, cls, member_name);
+                if self.st.named_alias_type(name, args).is_some() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A binary method's result can refer to an alias in its own class by
+    /// short name. Resolve it against the declaring class when a later
+    /// argument list applies the result.
+    pub(crate) fn complete_binary_result_alias(
+        &mut self,
+        method: SymbolId,
+        name: &str,
+        args: &[Type],
+    ) -> Option<Type> {
+        if method.is_none() || name.contains('.') {
+            return None;
+        }
+        let owner = self.st.get(method).owner;
+        if !self.st.get(owner).is_class_like() || self.st.get(owner).jvm_name.is_empty() {
+            return None;
+        }
+        self.pickle
+            .complete_type_member(&mut self.st, &mut self.binary, owner, name)?;
+        let decl = self.pickle.completed_type_member_decl(owner, name)?;
+        let member = self.st.get(decl);
+        if !member.is_type_alias || member.tparams.len() != args.len() {
+            return None;
+        }
+        Some(self.st.subst_tparams(decl, args, &member.ty))
+    }
+
     fn complete_java_parents(&mut self, class_id: SymbolId, span: Span) {
         let parents = self.st.get(class_id).parents.clone();
         for p in &parents {
