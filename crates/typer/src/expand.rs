@@ -2939,6 +2939,30 @@ impl Typer {
             }
             "This" => {
                 let qual = name_from(at(kids, 0)?)?;
+                // Reflection represents a reference to a singleton object as
+                // `This` of its module class. Outside that object's body it
+                // is an attributed module value, not an enclosing `this`.
+                // Retain the exact source module so a same-run nested
+                // companion remains reachable in a returned macro tree.
+                if !source_sym.is_none()
+                    && self.st.get(source_sym).kind == SymKind::ModuleClass
+                    && self.st.enclosing_class_named(self.st.this_class, &qual) != Some(source_sym)
+                {
+                    let owner = self.st.get(source_sym).owner;
+                    let module = self.st.get(owner).members.iter().copied().find(|&member| {
+                        self.st.get(member).kind == SymKind::Module
+                            && self.st.module_class_of(member) == source_sym
+                    });
+                    if let Some(module) = module {
+                        let mut reference = node(TreeKind::Ident {
+                            name: self.st.get(module).name.clone(),
+                        });
+                        reference.id = NodeId::PRETYPED_SPLICE;
+                        reference.sym = module;
+                        reference.ty = Type::ModuleRef(source_sym);
+                        return Ok(reference);
+                    }
+                }
                 Ok(node(TreeKind::This {
                     qual: (!qual.is_empty()).then_some(qual),
                 }))

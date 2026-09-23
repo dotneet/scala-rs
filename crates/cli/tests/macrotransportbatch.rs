@@ -982,6 +982,15 @@ fn nested_implicit_macro_derivation_keeps_associated_types_and_stable_symbols() 
         let out = root.join(format!("nested-derivation-{nsc}"));
         compile("macroreflection_nested_derivation", nsc, &out, &cp, true);
         assert_eq!(run(&out, &cp), b"true\n");
+        let alias = root.join(format!("alias-auto-derivation-{nsc}"));
+        compile(
+            "macroreflection_alias_auto_derivation",
+            nsc,
+            &alias,
+            &cp,
+            true,
+        );
+        assert_eq!(run(&alias, &cp), b"true\n");
         let wide = root.join(format!("wide-case-derivation-{nsc}"));
         compile("macroreflection_wide_case", nsc, &wide, &cp, true);
         assert_eq!(run(&wide, &cp), b"true\n");
