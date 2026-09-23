@@ -1648,8 +1648,40 @@ impl Typer {
                         .rsplit('/')
                         .next()
                         .is_some_and(|n| n.starts_with("package$") && n.ends_with('$'));
+                // A wildcard import needs every source member of an object,
+                // including generic methods and vals whose JVM classfile
+                // entries were not loaded yet. Usually another reference has
+                // already caused a module's pickle to be adopted. A preceding
+                // import of a generic companion can leave this module only
+                // partially materialized, though, and lazy name completion
+                // cannot serve its pickle until adoption. Adopt only when the
+                // pickle declares a name absent from the module's current
+                // member list; fully loaded modules keep the cheap path and
+                // avoid re-entering duplicate members.
+                let needs_module_members = self.library_abi
+                    && cur_is_module
+                    && self.st.get(cur).kind == SymKind::ModuleClass
+                    && !self.st.get(cur).jvm_name.starts_with("scala/")
+                    && !self.st.get(cur).jvm_name.starts_with("java/")
+                    && !self.st.get(cur).jvm_name.starts_with("javax/")
+                    && !self.pickle.pickle_readable(&self.st, cur)
+                    && self
+                        .pickle
+                        .pickled_member_names(&self.st, &mut self.binary, cur)
+                        .iter()
+                        .any(|name| {
+                            !self
+                                .st
+                                .get(cur)
+                                .members
+                                .iter()
+                                .any(|&member| self.st.get(member).name == *name)
+                        });
                 if self.library_abi
-                    && (!cur_is_module || needs_source_clauses || needs_package_nested_pickle)
+                    && (!cur_is_module
+                        || needs_source_clauses
+                        || needs_package_nested_pickle
+                        || needs_module_members)
                     && !self.pickle.pickle_readable(&self.st, cur)
                 {
                     self.pickle

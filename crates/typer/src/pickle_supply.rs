@@ -145,6 +145,11 @@ pub struct PickleSupply {
     implicit_names: HashMap<u32, Vec<String>>,
     /// What [`PickleSupply::concrete_method_names`] answered for each class.
     concrete_names: HashMap<u32, Vec<String>>,
+    /// Source-level member names declared in a class's pickle, including vals
+    /// and nested types. Used to tell whether wildcard-importing a binary
+    /// module needs its pickle adopted to expose members the classfile reader
+    /// has not installed yet.
+    pickled_member_names: HashMap<u32, Vec<String>>,
     /// The declaration-side stable prefix attached to a pickled value/method
     /// result. A Scala pickle cannot put `C.this` in the `SigType` of a
     /// method result, so `BasicProfile.API#Database` stores the type as
@@ -1393,6 +1398,47 @@ impl PickleSupply {
             }
         }
         self.concrete_names.insert(class_sym.0, names.clone());
+        names
+    }
+
+    /// Names of source-level members declared directly by a binary class.
+    /// Unlike `concrete_method_names`, this includes vals and nested types as
+    /// well as methods, since all of them can be exposed by a wildcard import.
+    pub(crate) fn pickled_member_names(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> Vec<String> {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return Vec::new();
+        }
+        if let Some(cached) = self.pickled_member_names.get(&class_sym.0) {
+            return cached.clone();
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let mut names = Vec::new();
+        if !internal.is_empty() {
+            if let Some(full) = self.pickled_full_name(bin, &internal, is_module) {
+                let sig = {
+                    let mut src = BinSource(bin);
+                    self.sigs.class_sig(&mut src, &full, is_module)
+                };
+                if let Ok(sig) = sig {
+                    for member in &sig.members {
+                        let name = scala_rs_pickle::names::decode_method_name(&member.name);
+                        if name.is_empty() || name == "<init>" || name.contains('$') {
+                            continue;
+                        }
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        self.pickled_member_names.insert(class_sym.0, names.clone());
         names
     }
 

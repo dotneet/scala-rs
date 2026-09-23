@@ -219,6 +219,59 @@ fn jar_packages_every_selector_shape() {
     check_runs("imports_jar", &["imports_jar"], &["-Xsource:3"]);
 }
 
+/// A preceding import of a generic binary companion must not leave a later
+/// wildcard import with only the JVM's partially loaded member list.
+#[test]
+fn generic_binary_companion_wildcard_import_exposes_all_members() {
+    let Some(scala_library) = scala_library_jar() else {
+        eprintln!("skip generic companion import: scala-library not available");
+        return;
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("skip generic companion import: home directory not available");
+        return;
+    };
+    let cache = PathBuf::from(home).join("Library/Caches/Coursier/v1/https/repo1.maven.org/maven2");
+    let artifacts = [
+        "io/circe/circe-core_2.13/0.14.7/circe-core_2.13-0.14.7.jar",
+        "io/circe/circe-numbers_2.13/0.14.7/circe-numbers_2.13-0.14.7.jar",
+    ];
+    let jars: Vec<PathBuf> = artifacts
+        .into_iter()
+        .map(|artifact| cache.join(artifact))
+        .collect();
+    if jars.iter().any(|jar| !jar.is_file()) {
+        eprintln!("skip generic companion import: dependency jars are not cached");
+        return;
+    }
+    let classpath = jars
+        .iter()
+        .map(|jar| jar.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(":");
+    let out = tmp_dir("generic_companion_import");
+    let output = Command::new(bin())
+        .arg("compile")
+        .arg(fixture("imports_companion_generic"))
+        .args([
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            scala_library.to_str().unwrap(),
+            "-cp",
+            &classpath,
+            "-Xsource:3",
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "generic companion wildcard import failed:\n{}",
+        diagnostics(&output)
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// A renamed selector is excluded from the trailing wildcard. In particular,
 /// `java.sql.{Array => SQLArray, _}` must not make the non-generic JDBC
 /// `java.sql.Array` shadow Scala's generic `scala.Array`.
