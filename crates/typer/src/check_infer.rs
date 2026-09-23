@@ -297,6 +297,75 @@ impl Typer {
         true
     }
 
+    fn method_solution_in_bounds(
+        &self,
+        method: SymbolId,
+        tp: SymbolId,
+        actual: &Type,
+        inst: &[(SymbolId, Type)],
+        recv: Option<&Type>,
+    ) -> bool {
+        if actual.is_error() || actual.is_no_type() {
+            return true;
+        }
+        let owner = self.st.get(method).owner;
+        let recv_args = self.owner_args_as_seen_from(owner, recv);
+        let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        for (bound, upper) in [
+            (self.st.get(tp).bound_hi.clone(), true),
+            (self.st.get(tp).bound_lo.clone(), false),
+        ] {
+            let Some(bound) = bound else { continue };
+            let bound = if recv_args.is_empty() {
+                bound
+            } else {
+                self.st.subst_tparams(owner, &recv_args, &bound)
+            };
+            let bound = self.st.subst_type_params_projected(&ids, &vals, &bound);
+            if bound.is_error() || bound.is_no_type() || mentions_any_tparam(&bound) {
+                continue;
+            }
+            let ok = if upper {
+                self.st.is_sub_type(actual, &bound)
+                    || self.st.hk_ctor_meets_proper_bound(actual, &bound)
+            } else {
+                self.st.is_sub_type(&bound, actual)
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// An invariant expected result may narrow a solution inferred from the
+    /// arguments, but it must not narrow past the method's declared bounds.
+    /// Keep the argument solution in that case; the normal parameter check
+    /// then reports the concrete mismatch after substituting the valid bound.
+    pub(crate) fn restore_bound_valid_argument_solutions(
+        &self,
+        method: SymbolId,
+        argument_inst: &[(SymbolId, Type)],
+        mut inst: Vec<(SymbolId, Type)>,
+        recv: Option<&Type>,
+    ) -> Vec<(SymbolId, Type)> {
+        for i in 0..inst.len() {
+            let (tp, current) = &inst[i];
+            let Some((_, original)) = argument_inst.iter().find(|(id, _)| id == tp) else {
+                continue;
+            };
+            if current == original
+                || self.method_solution_in_bounds(method, *tp, current, &inst, recv)
+                || !self.method_solution_in_bounds(method, *tp, original, argument_inst, recv)
+            {
+                continue;
+            }
+            inst[i].1 = original.clone();
+        }
+        inst
+    }
+
     /// Solve the variables an argument still carries from the parameter it
     /// fills, and rewrite the argument's type to the solution. This is where
     /// nsc's undetermined variables stop being variables: the alternative is

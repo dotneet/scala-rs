@@ -2071,8 +2071,7 @@ impl Typer {
                             let inst = self.implicit_tparams_before_expected(
                                 sym, &fun.ty, &ret, pt, &param_tys, inst,
                             );
-                            let inferred_before_expected: Vec<SymbolId> =
-                                inst.iter().map(|(tp, _)| *tp).collect();
+                            let inferred_before_expected = inst.clone();
                             let inst = self.add_expected_constraints(sym, &ret, pt, inst);
                             // An untyped lambda decides the variables that occur
                             // only in its result. If such a variable is
@@ -2089,37 +2088,38 @@ impl Typer {
                             let inst: Vec<(SymbolId, Type)> = inst
                                 .into_iter()
                                 .filter(|(tp, _)| {
-                                    let defer = !inferred_before_expected.contains(tp)
-                                        && matches!(
-                                            self.tparam_variance_in(&ret, *tp, 1),
-                                            Some(-1)
-                                        )
-                                        && param_tys.iter().zip(&arg_tys).any(|(p, a)| {
-                                            if !mentions_no_type(a) {
-                                                return false;
-                                            }
-                                            let p = match p {
-                                                Type::ByName(inner) | Type::Repeated(inner) => {
-                                                    inner.as_ref()
-                                                }
-                                                other => other,
-                                            };
-                                            let shape = match p {
-                                                Type::Class { sym, args } => self
-                                                    .st
-                                                    .function_class_shape(*sym, args)
-                                                    .unwrap_or_else(|| p.clone()),
-                                                _ => p.clone(),
-                                            };
-                                            matches!(
-                                                shape,
-                                                Type::Function { params, ret }
-                                                    if type_mentions_tparam(&ret, *tp)
-                                                        && !params.iter().any(|p| {
-                                                            type_mentions_tparam(p, *tp)
-                                                        })
+                                    let defer =
+                                        !inferred_before_expected.iter().any(|(id, _)| id == tp)
+                                            && matches!(
+                                                self.tparam_variance_in(&ret, *tp, 1),
+                                                Some(-1)
                                             )
-                                        });
+                                            && param_tys.iter().zip(&arg_tys).any(|(p, a)| {
+                                                if !mentions_no_type(a) {
+                                                    return false;
+                                                }
+                                                let p = match p {
+                                                    Type::ByName(inner) | Type::Repeated(inner) => {
+                                                        inner.as_ref()
+                                                    }
+                                                    other => other,
+                                                };
+                                                let shape = match p {
+                                                    Type::Class { sym, args } => self
+                                                        .st
+                                                        .function_class_shape(*sym, args)
+                                                        .unwrap_or_else(|| p.clone()),
+                                                    _ => p.clone(),
+                                                };
+                                                matches!(
+                                                    shape,
+                                                    Type::Function { params, ret }
+                                                        if type_mentions_tparam(&ret, *tp)
+                                                            && !params.iter().any(|p| {
+                                                                type_mentions_tparam(p, *tp)
+                                                            })
+                                                )
+                                            });
                                     if defer {
                                         deferred_expected_tparams.push(*tp);
                                     }
@@ -2149,6 +2149,12 @@ impl Typer {
                                         })
                                 })
                                 .collect();
+                            let inst = self.restore_bound_valid_argument_solutions(
+                                sym,
+                                &inferred_before_expected,
+                                inst,
+                                recv_ty.as_ref(),
+                            );
                             self.check_tparam_bounds(sym, &inst, recv_ty.as_ref(), tree.span, true);
                             if !inst.is_empty() {
                                 let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();

@@ -839,6 +839,7 @@ impl Typer {
                         false,
                         targs,
                         single_candidate.then_some((ret, _pt)),
+                        !single_candidate,
                     )
                 })
                 .cloned()
@@ -858,6 +859,7 @@ impl Typer {
                                 true,
                                 targs,
                                 single_candidate.then_some((ret, _pt)),
+                                !single_candidate,
                             )
                         })
                         .collect(),
@@ -1166,7 +1168,7 @@ impl Typer {
         }
         values.iter().any(|v| {
             if v.1.len() != arg_tys.len()
-                || !self.is_applicable(v.0, 0, &v.1, arg_tys, with_views, &[], None)
+                || !self.is_applicable(v.0, 0, &v.1, arg_tys, with_views, &[], None, true)
             {
                 return false;
             }
@@ -1384,7 +1386,7 @@ impl Typer {
                 .collect()
         };
         self.with_spec_probe(true, || {
-            self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[], None)
+            self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[], None, true)
                 && self.function_params_conform(&a_ps, &b_ps)
         })
     }
@@ -2387,11 +2389,21 @@ impl Typer {
         allow_widen: bool,
         targs: &[Type],
         expected: Option<(&Type, &Type)>,
+        prune_invalid_bounds: bool,
     ) -> bool {
         // Context may rescue a singleton, but must not discard an ordinarily
         // applicable call before adaptation can diagnose its precise mismatch.
         if expected.is_some()
-            && self.is_applicable(sym, clause, params, args, allow_widen, targs, None)
+            && self.is_applicable(
+                sym,
+                clause,
+                params,
+                args,
+                allow_widen,
+                targs,
+                None,
+                prune_invalid_bounds,
+            )
         {
             return true;
         }
@@ -2417,9 +2429,14 @@ impl Typer {
             } else {
                 inst
             };
-            if inst
-                .iter()
-                .any(|(tp, solution)| !self.undet_solution_in_bounds(*tp, solution))
+            // Bounds distinguish overloaded alternatives, but a singleton
+            // must survive resolution so ordinary application typing can
+            // report its precise bound error (and use the expected result to
+            // reject an otherwise argument-applicable call).
+            if prune_invalid_bounds
+                && inst
+                    .iter()
+                    .any(|(tp, solution)| !self.undet_solution_in_bounds(*tp, solution))
             {
                 return false;
             }
