@@ -1,5 +1,14 @@
 # typelevel/cats
 
+> **Current status.** Per `tests/BASELINE.md` (gate `ff08907d`, 2026-09-14),
+> `tests/cats_measure.sh` compiles all **340 files with 0 errors and emits
+> 2977 class files**, and `tests/cats_run.sh` runs **9/9** client programs
+> with `known_fail=0`. The merge gate requires zero errors and no run failure
+> outside the (empty) known-failure ledger. cats' own test suites are
+> a separate, later measurement; see
+> [`notes/handoff-2026-09-13.md`](notes/handoff-2026-09-13.md). The notes and
+> numbers below are the dated history of how cats got there.
+
 > **Measurement note (2026-09-05).** `tests/cats_measure.sh` passes
 > `-no-specialization`. cats writes `import scala.{specialized => sp}` and
 > annotates with `@sp`; scala-rs used to reject that annotation without the
@@ -75,13 +84,21 @@ CATS_LOG=<your own path> CATS_RUN=<your own path> tests/cats_measure.sh
 Same shape as `tests/slick_measure.sh`: it rebuilds *this* checkout's
 `target/release/scala-rs`, re-fetches the material at the pinned revision when
 `/tmp` or the scratchpad has been wiped, and writes every path per invocation.
-**`CATS_LOG` defaults to a shared file — always set it to a path of your own.**
+`CATS_LOG` and `CATS_RUN` default to per-invocation paths under
+`SCALA_RS_FIXTURE_ROOT`; set them when you want to keep the output. The
+script passes `-Xsource:3 -no-specialization -Ykind-projector` itself.
 
 * `CATS_MODULES=kernel` measures kernel alone; `CATS_MODULES=core` measures
   core alone against the published `cats-kernel` jar; the default is both from
   source.
-* `CATS_EXCLUDE` holds files out. It defaults to `FunctionKMacros.scala`; see
-  below.
+* `CATS_EXCLUDE` holds files out. It defaulted to `FunctionKMacros.scala`
+  until the `agent/catszero` slice (see the end of this page); it now defaults
+  to empty.
+
+`tests/cats_run.sh [prog-name ...]` is the differential execution test: it
+compiles cats with scala-rs and with real scalac, compiles the client
+programs in `tests/catsrun/` with real scalac against both builds, and
+compares their stdout. See its header for the environment variables.
 
 ## The numbers
 
