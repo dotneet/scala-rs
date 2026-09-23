@@ -268,3 +268,8 @@ fn selected_nullary_overload_infers_from_the_expected_result() {
         false,
     );
 }
+
+#[test]
+fn overloaded_eta_supplies_implicit_result_clause() {
+    matrix(&[("overloaded_implicit_eta", true)], false);
+}

@@ -4349,7 +4349,24 @@ impl Typer {
             let Type::Method { paramss, ret } = &ty else {
                 continue;
             };
-            let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+            // A final implicit clause is supplied inside the eta-expanded
+            // function body. It is not part of the function's input arity,
+            // including while choosing among overloaded methods.
+            let declared = &self.st.get(m).paramss;
+            let params: Vec<Type> = if paramss.len() == 2
+                && declared.len() >= 2
+                && !declared[declared.len() - 1].is_empty()
+                && declared[declared.len() - 1]
+                    .iter()
+                    .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+                && declared[declared.len() - 2]
+                    .iter()
+                    .all(|p| !self.st.get(*p).flags.contains(Flags::IMPLICIT))
+            {
+                paramss[0].clone()
+            } else {
+                paramss.iter().flatten().cloned().collect()
+            };
             if params.len() != want_params.len() {
                 continue;
             }
