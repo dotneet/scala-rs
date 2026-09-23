@@ -147,15 +147,30 @@ fn curried_constructor_clauses() {
 #[test]
 fn real_twirl_overloads() {
     // Use the same persistent fixture as the GitBucket measurement scripts.
-    let base = std::env::var_os("GITBUCKET_FIXTURE_DIR")
+    let configured_base = std::env::var_os("GITBUCKET_FIXTURE_DIR")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("SCALA_RS_FIXTURE_ROOT")
                 .map(PathBuf::from)
                 .map(|root| root.join("gitbucket"))
-        })
+        });
+    let base = configured_base
+        .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("scala-rs-fixtures/gitbucket"));
-    let deps = fs::read_to_string(base.join("deps.cp")).unwrap();
+    let deps = base.join("deps.cp");
+    if !deps.is_file() {
+        assert!(
+            configured_base.is_none(),
+            "configured external fixture is incomplete: {}",
+            base.display()
+        );
+        eprintln!(
+            "skip Twirl overload probe: fixture is not prepared at {}",
+            base.display()
+        );
+        return;
+    }
+    let deps = fs::read_to_string(deps).unwrap();
     let cp = format!("{JAR}:{}", deps.trim());
     matrix_cp(&[("twirl", true), ("twirl_null_bad", false)], true, &cp);
 }
