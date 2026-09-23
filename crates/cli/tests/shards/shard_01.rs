@@ -20,6 +20,8 @@ mod accepttoomuch;
 mod aliaslookup;
 #[path = "../ambigmap.rs"]
 mod ambigmap;
+#[path = "../annotation_import_owner.rs"]
+mod annotation_import_owner;
 #[path = "../anonbridge.rs"]
 mod anonbridge;
 #[path = "../anoncap.rs"]

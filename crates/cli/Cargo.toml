@@ -50,3 +50,6 @@ path = "tests/shards/shard_08.rs"
 mimalloc = { version = "0.1", default-features = false }
 scala-rs-driver.workspace = true
 scala-rs-span.workspace = true
+
+[dev-dependencies]
+scala-rs-pickle.workspace = true

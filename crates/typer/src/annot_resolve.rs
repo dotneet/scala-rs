@@ -33,8 +33,8 @@ impl Typer {
         if !self.library_abi || self.sigs_only {
             return;
         }
-        let mut annots: Vec<Tree> = Vec::new();
-        let push_mods = |t: &Tree, out: &mut Vec<Tree>| {
+        let mut annots: Vec<(SymbolId, usize, Tree)> = Vec::new();
+        let push_mods = |t: &Tree, out: &mut Vec<(SymbolId, usize, Tree)>| {
             let mods = match &t.kind {
                 TreeKind::DefDef { mods, .. }
                 | TreeKind::ValDef { mods, .. }
@@ -43,7 +43,13 @@ impl Typer {
                 | TreeKind::TypeDef { mods, .. } => mods,
                 _ => return,
             };
-            out.extend(mods.annotations.iter().cloned());
+            out.extend(
+                mods.annotations
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, annot)| (t.sym, index, annot)),
+            );
         };
         push_mods(tree, &mut annots);
         match &tree.kind {
@@ -82,20 +88,26 @@ impl Typer {
             self.st.this_class = enclosing;
         }
         let saved = std::mem::replace(&mut self.resolving_annot, true);
-        for a in &annots {
-            self.resolve_one_annotation(a);
+        for (sym, index, annot) in &annots {
+            if let Some(ty) = self.resolve_one_annotation(annot) {
+                if !sym.is_none() {
+                    if let Some(saved) = self.st.get_mut(*sym).annotations.get_mut(*index) {
+                        saved.ty = ty;
+                    }
+                }
+            }
         }
         self.resolving_annot = saved;
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
     }
 
-    fn resolve_one_annotation(&mut self, a: &Tree) {
+    fn resolve_one_annotation(&mut self, a: &Tree) -> Option<Type> {
         // Synthesized annotations (`@SerialVersionUID` on a case class
         // companion, `@deprecated` copied onto an accessor) name their class
         // already; only what the source wrote is looked up.
         if a.span.is_dummy() {
-            return;
+            return None;
         }
         let mut fun = a;
         let mut args: Vec<&Tree> = Vec::new();
@@ -109,7 +121,7 @@ impl Typer {
                 args: targs,
             } => {
                 if !matches!(f.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) {
-                    return;
+                    return None;
                 }
                 let mut t = Tree::dummy(TreeKind::AppliedTypeTree {
                     tpt: f.clone(),
@@ -119,15 +131,16 @@ impl Typer {
                 t
             }
             TreeKind::Ident { .. } | TreeKind::Select { .. } => fun.clone(),
-            _ => return,
+            _ => return None,
         };
         let ty = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
         if ty.is_error() {
-            return;
+            return None;
         }
         for arg in args {
             self.resolve_classof_types(arg);
         }
+        Some(ty)
     }
 
     /// The `T` of every `classOf[T]` inside an annotation argument.

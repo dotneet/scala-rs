@@ -1679,8 +1679,14 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             // is not enough; nsc reads pickle).
             let jl = self.java_lang_module();
             self.type_ref_in(jl, "Deprecated")
+        } else if !matches!(annot.ty, Type::NoType) {
+            // The typer resolved this annotation in its import scope. Use
+            // that class, including its package, rather than the spelling
+            // left in the source tree (`@Marker` may be imported).
+            self.pickle_type(&annot.ty)
         } else {
-            // User-defined `@Ann(...)` lives in `<empty>`, not under scala.
+            // Synthetic annotations without a resolved source type retain
+            // the historical default-package encoding.
             let empty = self.empty_package();
             self.type_ref_in(empty, simple)
         };
