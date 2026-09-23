@@ -185,3 +185,115 @@ object Main {
         assert_eq!(stdout.trim(), "Dfltd Impl4 Aux3 0 0 0");
     }
 }
+
+/// nsc's `qualifies`: a wildcard import offers only what the reference site
+/// may access. `private[lib] def pkgOnly` in `Util`, imported from another
+/// package beside `Other`'s public `pkgOnly`, was entered too, and the
+/// reference was "ambiguous" where nsc binds `Other.pkgOnly`.
+#[test]
+fn wildcard_import_skips_inaccessible_qualified_private() {
+    let lib = r#"
+package lib
+object Util {
+  private[lib] def pkgOnly: Int = 7
+  def pub: Int = 1
+}
+object Other { def pkgOnly: Int = 8 }
+"#;
+    let client = r#"
+import lib.Util._
+import lib.Other._
+object Main {
+  def main(args: Array[String]): Unit = println(s"$pub $pkgOnly")
+}
+"#;
+    let Some((dir, outcome)) = compile_against_lib_dir("qualified-private-import", lib, client)
+    else {
+        return;
+    };
+    outcome.assert_success("private[lib] member does not compete");
+    if let Some(stdout) = run_main(&dir) {
+        assert_eq!(stdout.trim(), "1 8");
+    }
+
+    // Alone, the inaccessible member is no binding at all: nsc's "not found".
+    let alone = r#"
+import lib.Util._
+object Main {
+  def main(args: Array[String]): Unit = println(pkgOnly)
+}
+"#;
+    let Some((_dir, outcome)) = compile_against_lib_dir("qualified-private-alone", lib, alone)
+    else {
+        return;
+    };
+    assert!(!outcome.success(), "private[lib] pkgOnly must not be reachable");
+    let diags = outcome.diagnostics();
+    assert!(diags.contains("not found: value pkgOnly"), "{diags}");
+}
+
+/// The same rule for a qualified-private member compiled in this run, and
+/// the member still binds inside its boundary.
+#[test]
+fn wildcard_import_skips_inaccessible_qualified_private_from_source() {
+    let tools = toolchain();
+    let (Some(library), Some(_)) = (tools.scala_library(), tools.java()) else {
+        eprintln!("skip: scala-library or Java is unavailable");
+        return;
+    };
+    let dir = TestDir::new("qualified-private-source");
+    let src = dir.join("Use.scala");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(
+        &src,
+        r#"
+package lib {
+  object Util { private[lib] def pkgOnly: Int = 7 }
+  object Other { def pkgOnly: Int = 8 }
+  object Inside {
+    import Util._
+    def get: Int = pkgOnly
+  }
+}
+package app {
+  import lib.Util._
+  import lib.Other._
+  object Main {
+    def main(args: Array[String]): Unit = println(s"$pkgOnly ${lib.Inside.get}")
+  }
+}
+"#,
+    )
+    .unwrap();
+    CompileCommand::new(&src, &out)
+        .scala_library(library)
+        .run()
+        .assert_success("source private[lib] member does not compete");
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let run = RunCommand::new("app.Main")
+        .classpath(format!("{}{sep}{}", out.display(), library.display()))
+        .run();
+    run.assert_success("run app.Main");
+    assert_eq!(run.stdout_string().trim(), "8 7");
+
+    fs::write(
+        &src,
+        r#"
+package lib {
+  object Util { private[lib] def pkgOnly: Int = 7 }
+}
+package app {
+  import lib.Util._
+  object Main {
+    def main(args: Array[String]): Unit = println(pkgOnly)
+  }
+}
+"#,
+    )
+    .unwrap();
+    let outcome = CompileCommand::new(&src, &out).scala_library(library).run();
+    assert!(!outcome.success(), "private[lib] pkgOnly must not be reachable");
+    let diags = outcome.diagnostics();
+    assert!(diags.contains("not found: value pkgOnly"), "{diags}");
+}

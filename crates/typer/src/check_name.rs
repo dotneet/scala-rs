@@ -1480,6 +1480,18 @@ impl Typer {
         false
     }
 
+    /// Whether `m` is a qualified-private member (`private[p]`, which a
+    /// pickle records as a `private_within` with or without `PRIVATE`) that
+    /// the reference site lies outside the boundary of. `protected[p]` is
+    /// left alone: its subclass access depends on a prefix an import does
+    /// not have.
+    fn private_within_hidden_here(&self, m: SymbolId) -> bool {
+        let s = self.st.get(m);
+        s.private_within.is_some()
+            && !s.flags.contains(Flags::PROTECTED)
+            && !self.accessible(m, None)
+    }
+
     /// Whether `a` and `b` are a class and its companion object, in either
     /// order and whichever of the module and its module class stands for the
     /// object.
@@ -1764,6 +1776,16 @@ impl Typer {
                     if self.st.private_to_owner(m)
                         && (inherited || !self.private_member_visible_here(m))
                     {
+                        continue;
+                    }
+                    // A qualified `private[p]` is the same question with a
+                    // wider boundary: outside `p` the member does not qualify
+                    // either. `import lib.Util._; import lib.Other._` from
+                    // another package, with `private[lib] def pkgOnly` in
+                    // `Util` and a public `pkgOnly` in `Other`, binds
+                    // `Other`'s; entering both reported the reference as
+                    // ambiguous.
+                    if self.private_within_hidden_here(m) {
                         continue;
                     }
                     let n = self.st.get(m).name.clone();
@@ -2645,6 +2667,7 @@ impl Typer {
                 (!terms_only || self.st.is_term_namespace_sym(id))
                     && (!self.st.private_to_owner(id)
                         || (self.st.get(id).owner == owner && self.private_member_visible_here(id)))
+                    && !self.private_within_hidden_here(id)
             });
             if found.is_empty() {
                 continue;
