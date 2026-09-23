@@ -648,6 +648,47 @@ fn shapeless_lazy_failure_does_not_require_compiler_universe() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A shapeless `Generic` + `Lazy` derivation, compiled by scalac and by
+/// scala-rs, has to print the same thing. `Lazy` asks `c.openImplicits` at
+/// every level and spells its expansions from `_root_`, which are what the
+/// engine's per-entry handles and the `_root_` short-cut serve.
+#[test]
+fn shapeless_lazy_derivation_matches_scalac() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+        .into_iter()
+        .map(|cache| {
+            PathBuf::from(&home)
+                .join(cache)
+                .join("https/repo1.maven.org/maven2/com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar")
+        })
+        .find(|jar| jar.is_file());
+    let Some(jar) = jar else {
+        eprintln!("skip: shapeless 2.3.13 is not cached");
+        return;
+    };
+    let compiler = "/tmp/scala-2.13.16/lib/scala-compiler.jar";
+    if !Path::new(compiler).is_file() {
+        return;
+    }
+    let root = root();
+    let cp = format!("{JAR}:{REFLECT}:{compiler}:{}", jar.display());
+    let mut outputs = Vec::new();
+    for nsc in [true, false] {
+        let out = root.join(format!("out-{nsc}"));
+        compile("macrotransport_lazy_derivation", nsc, &out, &cp, true);
+        outputs.push(run(&out, &cp));
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&outputs[0]),
+        String::from_utf8_lossy(&outputs[1])
+    );
+    assert!(outputs[1].starts_with(b"(1,a,)\n"));
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn binary_parent_loading_preserves_higher_kinded_parameters() {
     let Some(home) = std::env::var_os("HOME") else {

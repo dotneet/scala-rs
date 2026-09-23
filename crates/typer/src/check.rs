@@ -571,6 +571,9 @@ pub struct Typer {
     /// The files whose text the engine already holds (`fill_source_text` in
     /// `expand.rs`). There is one engine per typer.
     pub(crate) macro_sources_sent: rustc_hash::FxHashSet<usize>,
+    /// Entries of `c.openImplicits` answers the engine already holds, by
+    /// their wire text (`answer_open_implicits`).
+    pub(crate) open_implicit_handles: rustc_hash::FxHashMap<String, u64>,
     /// Why the engine could not be started, once it has failed once.
     pub(crate) macro_engine_error: Option<String>,
     /// What `java` is given as its classpath: the run's own binary path, so
@@ -779,6 +782,10 @@ pub struct Typer {
     /// Packages whose jar package object's pickled `type` aliases have been
     /// installed (see `install_pickled_package_aliases`). One read per package.
     pub(crate) pkg_aliases_done: HashSet<u32>,
+    /// Package -> (its package object's module class, that class's member
+    /// count, the package's member count) when `package_object_of` last
+    /// folded one into the other.
+    pub(crate) package_objects_folded: rustc_hash::FxHashMap<u32, (SymbolId, usize, usize)>,
     /// `(package, package-object module class)` pairs `namer_module` folded
     /// at namer time, as `(pkg, cls)`. The eager fold there only ever sees
     /// `cls`'s *own* members: `rough_parents`, run within the same namer
@@ -1235,6 +1242,7 @@ impl Typer {
             macro_engine: None,
             macro_engine_pending: None,
             macro_sources_sent: Default::default(),
+            open_implicit_handles: Default::default(),
             macro_engine_error: None,
             macro_classpath: opts.binary_path.clone(),
             macro_failures: HashMap::new(),
@@ -1292,6 +1300,7 @@ impl Typer {
             parent_import_prefixes: HashMap::new(),
             parent_import_names: HashMap::new(),
             pkg_aliases_done: HashSet::new(),
+            package_objects_folded: Default::default(),
             pending_pkg_folds: Vec::new(),
             pkg_alias_gaps: HashMap::new(),
             pending_sigs: HashMap::new(),

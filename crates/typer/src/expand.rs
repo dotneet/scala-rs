@@ -95,6 +95,9 @@ pub(crate) struct MacroEngine {
     /// Temporarily `None` while a timed reader thread owns the pipe. A timeout
     /// poisons the engine, so that thread never has to hand a placeholder back.
     stdout: Option<BufReader<ChildStdout>>,
+    /// The thread that owns the reply pipe once a read has had to be timed;
+    /// see [`ReplyReader`].
+    reader: Option<ReplyReader>,
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_done: Arc<AtomicBool>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
@@ -228,12 +231,22 @@ impl MacroEngine {
             return Err(Self::unavailable_reason());
         }
         let Some(limit) = *budget else {
-            let Some(stdout) = self.stdout.as_mut() else {
-                return self.protocol_failure(
-                    "the macro engine reply pipe is unavailable after a timed read".to_string(),
-                );
+            let line = match (self.stdout.as_mut(), self.reader.as_ref()) {
+                (Some(stdout), _) => read_wire_line_with_limit(stdout, wire_limit),
+                (None, Some(reader)) => match reader.ask.send(wire_limit) {
+                    Ok(()) => reader.lines.recv().unwrap_or_else(|_| {
+                        Err(std::io::Error::other("the macro engine reply reader stopped"))
+                    }),
+                    Err(_) => Err(std::io::Error::other("the macro engine reply reader stopped")),
+                },
+                (None, None) => {
+                    return self.protocol_failure(
+                        "the macro engine reply pipe is unavailable after a timed read"
+                            .to_string(),
+                    );
+                }
             };
-            let result = match read_wire_line_with_limit(stdout, wire_limit) {
+            let result = match line {
                 Ok((0, _)) => Err("the macro engine exited without a reply".to_string()),
                 Ok((_, line)) => Sexp::parse(wire_line_payload(&line)),
                 Err(e) => Err(format!("the macro engine protocol failed ({e})")),
@@ -245,24 +258,25 @@ impl MacroEngine {
         };
 
         // `read_line` cannot be interrupted, so it runs where it can be
-        // abandoned. The reader owns the handle for the duration and gives it
-        // back with the line; on a timeout it is dropped along with the child.
-        let Some(mut stdout) = self.stdout.take() else {
-            return self.protocol_failure(
-                "the macro engine reply pipe is unavailable after a timed read".to_string(),
-            );
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let r = read_wire_line_with_limit(&mut stdout, wire_limit);
-            let _ = tx.send((stdout, r));
-        });
+        // abandoned: on a thread that owns the pipe from the first timed read
+        // on. On a timeout it is left blocked, and killing the child ends it.
+        if self.reader.is_none() {
+            let Some(stdout) = self.stdout.take() else {
+                return self.protocol_failure(
+                    "the macro engine reply pipe is unavailable after a timed read".to_string(),
+                );
+            };
+            self.reader = Some(ReplyReader::spawn(stdout));
+        }
+        let reader = self.reader.as_ref().expect("just made");
+        if reader.ask.send(wire_limit).is_err() {
+            return self.protocol_failure("the macro engine reply reader stopped".to_string());
+        }
         let started = Instant::now();
-        let outcome = rx.recv_timeout(limit);
+        let outcome = reader.lines.recv_timeout(limit);
         *budget = Some(limit.saturating_sub(started.elapsed()));
         match outcome {
-            Ok((stdout, r)) => {
-                self.stdout = Some(stdout);
+            Ok(r) => {
                 let result = match r {
                     Ok((0, _)) => Err("the macro engine exited without a reply".to_string()),
                     Ok((_, line)) => Sexp::parse(wire_line_payload(&line)),
@@ -288,6 +302,36 @@ impl MacroEngine {
                 Err(reason)
             }
         }
+    }
+}
+
+/// The thread that reads the engine's replies, one line per request.
+///
+/// Every timed read used to spawn a thread of its own (a blocked `read`
+/// cannot be interrupted, so the read has to happen somewhere it can be
+/// abandoned). A shapeless derivation makes tens of thousands of round trips,
+/// and the spawns were a twentieth of the compile. The thread is asked for
+/// each line with the limit that read allows, so a line is never read ahead
+/// of a request.
+struct ReplyReader {
+    ask: std::sync::mpsc::Sender<usize>,
+    lines: std::sync::mpsc::Receiver<std::io::Result<(usize, String)>>,
+}
+
+impl ReplyReader {
+    fn spawn(mut stdout: BufReader<ChildStdout>) -> ReplyReader {
+        let (ask, asked) = std::sync::mpsc::channel::<usize>();
+        let (answer, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(limit) = asked.recv() {
+                let line = read_wire_line_with_limit(&mut stdout, limit);
+                let failed = line.is_err();
+                if answer.send(line).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        ReplyReader { ask, lines }
     }
 }
 
@@ -499,6 +543,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         containment,
         stdin,
         stdout: Some(stdout),
+        reader: None,
         stderr,
         stderr_done,
         stderr_thread: Some(stderr_thread),
@@ -5245,6 +5290,7 @@ mod tests {
             containment,
             stdin,
             stdout,
+            reader: None,
             stderr,
             stderr_done,
             stderr_thread: Some(stderr_thread),

@@ -71,6 +71,8 @@ public final class ScalaRsMacroEngine {
      *  idx text path point)` defines one, `(position src idx path point)`
      *  reuses it. */
     static final java.util.Map<Integer, Object> sourceFiles = new java.util.HashMap<>();
+    /** `c.openImplicits` entries by the handle scala-rs gave them. */
+    static final java.util.Map<Long, Sexp> openImplicitEntries = new java.util.HashMap<>();
     static List<Object> openMacroContexts = new ArrayList<>();
     /**
      * The pipe, as fields, because expansion is a *conversation* rather than
@@ -1361,7 +1363,35 @@ public final class ScalaRsMacroEngine {
      * the constant type nsc gives a literal, which `c.typecheck(q"1").tpe`
      * has to be if it is to be the type nsc reports.
      */
+    /**
+     * {@link #typeForUncached} by the type's wire text.
+     *
+     * shapeless asks `c.openImplicits` at every `Lazy` it derives, and the
+     * answer lists every open implicit with its type: rebuilding each one
+     * through reflection, at every level of a deep derivation, was three
+     * quarters of the engine's time. A runtime-universe type is immutable,
+     * and the same text names the same classes, modules and run symbols, so
+     * one answer serves every request. A refinement and a structural type
+     * parameter are built with fresh symbols each time and are not kept.
+     */
+    static final java.util.HashMap<String, Object> typeCache = new java.util.HashMap<>();
+
     static Object typeFor(Sexp s) throws Exception {
+        String key = s.raw();
+        if (key != null) {
+            Object hit = typeCache.get(key);
+            if (hit != null) {
+                return hit;
+            }
+        }
+        Object built = typeForUncached(s);
+        if (key != null && built != null && !key.contains("(refined") && !key.contains("(param")) {
+            typeCache.put(key, built);
+        }
+        return built;
+    }
+
+    static Object typeForUncached(Sexp s) throws Exception {
         String head = s.items.get(0).atom;
         if ("repeated".equals(head)) {
             Object repeated = call(call(universe, "definitions", 0), "RepeatedParamClass", 0);
@@ -2977,6 +3007,18 @@ public final class ScalaRsMacroEngine {
                 Constructor<?> constructor = candidate.getConstructors()[0];
                 for (int i = 2; i < answer.items.size(); i++) {
                     Sexp entry = answer.items.get(i);
+                    // `(d handle pre sym pt tree)` sends an entry once;
+                    // `(h handle)` names one sent before. The candidate is
+                    // still built afresh, so a macro never shares its tree.
+                    if (entry.items.size() == 2 && "h".equals(entry.items.get(0).atom)) {
+                        entry = openImplicitEntries.get(Long.parseLong(entry.items.get(1).text()));
+                        if (entry == null) throw gap("openImplicits named an entry it never sent");
+                    } else if (entry.items.size() == 6 && "d".equals(entry.items.get(0).atom)) {
+                        Sexp body = new Sexp();
+                        body.items = new ArrayList<>(entry.items.subList(2, 6));
+                        openImplicitEntries.put(Long.parseLong(entry.items.get(1).text()), body);
+                        entry = body;
+                    }
                     Sexp pre = entry.items.get(0);
                     Object prefixType = "noprefix".equals(pre.items.get(0).text())
                         ? call(universe, "NoPrefix", 0) : typeFor(pre);
@@ -3128,7 +3170,7 @@ public final class ScalaRsMacroEngine {
             if (fallback == null) {
                 fallback = m;
             }
-            if (accepts(m.getParameterTypes(), args)) {
+            if (accepts(paramTypes(m), args)) {
                 return m.invoke(recv, args);
             }
         }
@@ -3150,7 +3192,26 @@ public final class ScalaRsMacroEngine {
      * own run by two orders of magnitude. The cache preserves the order the
      * scan saw, so the overload this picks is the one it picked before.
      */
-    static final java.util.Map<String, Method[]> overloadCache = new java.util.HashMap<>();
+    /**
+     * By class, then arity, then name. The name is almost always a literal,
+     * whose hash the string keeps; a composite `class#name/arity` key was
+     * built and hashed afresh on every reflective call, which made the lookup
+     * cost more than the call.
+     */
+    static final java.util.IdentityHashMap<Class<?>, java.util.HashMap<String, Method[]>[]> overloadCache =
+        new java.util.IdentityHashMap<>();
+    /** `Method.getParameterTypes()` copies its array on every call. */
+    static final java.util.IdentityHashMap<Method, Class<?>[]> paramTypesCache =
+        new java.util.IdentityHashMap<>();
+
+    static Class<?>[] paramTypes(Method m) {
+        Class<?>[] known = paramTypesCache.get(m);
+        if (known == null) {
+            known = m.getParameterTypes();
+            paramTypesCache.put(m, known);
+        }
+        return known;
+    }
     static final java.util.Map<Class<?>, Method[]> methodsCache = new java.util.HashMap<>();
 
     static Method[] methodsOf(Class<?> c) {
@@ -3162,9 +3223,23 @@ public final class ScalaRsMacroEngine {
         return known;
     }
 
+    @SuppressWarnings("unchecked")
     static Method[] overloads(Class<?> c, String name, int arity) {
-        String key = c.getName() + '#' + name + '/' + arity;
-        Method[] known = overloadCache.get(key);
+        java.util.HashMap<String, Method[]>[] byArity = overloadCache.get(c);
+        if (byArity == null || byArity.length <= arity) {
+            java.util.HashMap<String, Method[]>[] grown = new java.util.HashMap[Math.max(arity + 1, 8)];
+            if (byArity != null) {
+                System.arraycopy(byArity, 0, grown, 0, byArity.length);
+            }
+            byArity = grown;
+            overloadCache.put(c, byArity);
+        }
+        java.util.HashMap<String, Method[]> byName = byArity[arity];
+        if (byName == null) {
+            byName = new java.util.HashMap<>();
+            byArity[arity] = byName;
+        }
+        Method[] known = byName.get(name);
         if (known != null) {
             return known;
         }
@@ -3176,7 +3251,7 @@ public final class ScalaRsMacroEngine {
             }
         }
         Method[] out = found.toArray(new Method[0]);
-        overloadCache.put(key, out);
+        byName.put(name, out);
         return out;
     }
 
@@ -3318,6 +3393,15 @@ public final class ScalaRsMacroEngine {
     static final class Sexp {
         String atom;
         List<Sexp> items;
+        /** For a list: the packet it was parsed from, and where it sits in it. */
+        String src;
+        int start;
+        int end;
+
+        /** A list's text as it arrived, which identifies its content. */
+        String raw() {
+            return src == null ? null : src.substring(start, end);
+        }
 
         boolean isList() {
             return items != null;
@@ -3381,6 +3465,8 @@ public final class ScalaRsMacroEngine {
                 if (depth >= maxDepth) {
                     throw new IllegalArgumentException("macro protocol packet is nested too deeply");
                 }
+                v.src = s;
+                v.start = p[0];
                 p[0]++;
                 v.items = new ArrayList<>();
                 while (true) {
@@ -3396,6 +3482,7 @@ public final class ScalaRsMacroEngine {
                     }
                     v.items.add(parse(s, p, depth + 1, maxDepth));
                 }
+                v.end = p[0];
                 return v;
             }
             if (c == '"') {

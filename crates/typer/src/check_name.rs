@@ -913,12 +913,25 @@ impl Typer {
             .into_iter()
             .find(|&s| matches!(self.st.get(s).kind, SymKind::Module | SymKind::ModuleClass))
         {
+            // Folded already, and neither side has gained a member since:
+            // everything below would find nothing to do. It runs for every
+            // name a lookup cannot find in the package -- a macro expansion
+            // is full of them -- and `scala`'s package object folds hundreds
+            // of members with a linear `contains` each.
+            let mcls = self.st.module_class_of(id);
+            let shape = (
+                mcls,
+                self.st.get(mcls).members.len(),
+                self.st.get(owner).members.len(),
+            );
+            if self.package_objects_folded.get(&owner.0) == Some(&shape) {
+                return Some(mcls);
+            }
             // A member signature can stub `package$` before the package
             // object itself is opened. Load its implementation class now so
             // descriptor-backed accessors remain available when a pickled
             // singleton result cannot be represented by this typer.
             self.load_binary_into(&format!("{pkg_jvm}/package$"), owner, span, true);
-            let mcls = self.st.module_class_of(id);
             self.adopt_cp_module_class(mcls);
             // The module can be discovered from its class file before its
             // Scala signature is adopted. Adoption adds the package object's
@@ -933,6 +946,14 @@ impl Typer {
             // package-alias installation as the load path below.
             self.install_pickled_package_aliases(owner, span);
             self.install_duration_syntax(owner, span);
+            self.package_objects_folded.insert(
+                owner.0,
+                (
+                    mcls,
+                    self.st.get(mcls).members.len(),
+                    self.st.get(owner).members.len(),
+                ),
+            );
             return Some(mcls);
         }
         if !self.load_binary_into(&format!("{pkg_jvm}/package$"), owner, span, true) {
@@ -2443,6 +2464,19 @@ impl Typer {
             // needs a nesting depth on each binding, which `Scope` does not
             // carry. See docs/gitbucket.md.
             Some(BindRank::PackageElsewhere) => return,
+        }
+        // `_root_` names the root package whenever nothing binds it (see
+        // `bind_found`'s fallback); no class file or wildcard is asked for a
+        // member of that name. Macro expansions spell every path from it.
+        if name == "_root_" {
+            return;
+        }
+        // A name `c.freshName` made for this run's own expansions
+        // (`inst$macro$1726`): no class file, import or `Predef` can answer
+        // to it, and being new each time it misses every cache the search
+        // keeps, so each one probed every jar on the classpath.
+        if name.contains("$macro$") {
+            return;
         }
         let from = if !self.st.this_class.is_none() {
             self.st.this_class

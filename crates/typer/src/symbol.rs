@@ -1398,6 +1398,10 @@ pub struct SymbolTable {
     /// [`SymbolTable::class_reaches`]'s answers for the current
     /// `mutation_gen`.
     pub(crate) reach_cache: std::cell::RefCell<ReachCache>,
+    /// [`SymbolTable::companion_module`]'s answers: class -> (the owner's
+    /// member count when it was read, the module).
+    pub(crate) companion_cache:
+        std::cell::RefCell<rustc_hash::FxHashMap<u32, (usize, Option<SymbolId>)>>,
     /// The answer for a receiver that names no class, handed out by reference
     /// so the hot path never allocates for it.
     pub(crate) empty_base_type_args: std::rc::Rc<BaseTypeArgs>,
@@ -1562,6 +1566,7 @@ impl SymbolTable {
             lin_cache: std::cell::RefCell::new(LinCache::default()),
             bta_cache: std::cell::RefCell::new(BtaCache::default()),
             reach_cache: std::cell::RefCell::new(ReachCache::default()),
+            companion_cache: std::cell::RefCell::new(Default::default()),
             empty_base_type_args: std::rc::Rc::new(BaseTypeArgs::default()),
             symbols: vec![Symbol {
                 id: SymbolId(0),
@@ -3232,13 +3237,33 @@ impl SymbolTable {
         if s.kind == SymKind::Module {
             return Some(class_id);
         }
-        let name = s.name.clone();
+        let name = s.name.as_str();
         let owner = s.owner;
-        self.get(owner)
+        let is_companion =
+            |m: SymbolId| self.get(m).kind == SymKind::Module && self.get(m).name == name;
+        // The answer is a scan of the owner's members, which for a class in
+        // a package is every class of the package; implicit search asks it
+        // for every part of every type it looks at. Kept per class with the
+        // member count it was read at: a module found is checked again, and a
+        // miss stands until the owner gains or loses a member.
+        let members = self.get(owner).members.len();
+        if let Some(&(len, known)) = self.companion_cache.borrow().get(&class_id.0) {
+            match known {
+                Some(m) if self.get(m).owner == owner && is_companion(m) => return Some(m),
+                None if len == members => return None,
+                _ => {}
+            }
+        }
+        let found = self
+            .get(owner)
             .members
             .iter()
             .copied()
-            .find(|&m| self.get(m).kind == SymKind::Module && self.get(m).name == name)
+            .find(|&m| is_companion(m));
+        self.companion_cache
+            .borrow_mut()
+            .insert(class_id.0, (members, found));
+        found
     }
 
     /// The companion module *class* of `class_id`, for SLS 7.2's implicit

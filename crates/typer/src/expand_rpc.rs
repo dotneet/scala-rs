@@ -478,7 +478,18 @@ impl Typer {
             if let Err(why) = answer_tree_to_wire(&cx, &reference, &mut tree) {
                 return refusal(&format!("open implicit reference: {why}"));
             }
-            out.push_str(&format!(" ({prefix} {} {wanted} {tree})", origin.0));
+            // The engine keeps every entry it has been sent, by handle: a
+            // deep derivation asks at every level, and the outer entries of
+            // the answer are the same each time.
+            let entry = format!("{prefix} {} {wanted} {tree}", origin.0);
+            let next = self.open_implicit_handles.len() as u64;
+            match self.open_implicit_handles.get(&entry) {
+                Some(handle) => out.push_str(&format!(" (h {handle})")),
+                None => {
+                    out.push_str(&format!(" (d {next} {entry})"));
+                    self.open_implicit_handles.insert(entry, next);
+                }
+            }
         }
         out.push(')');
         out
@@ -1391,7 +1402,7 @@ impl Typer {
     /// same test [`Typer::tag_wire`] makes, and for the same reason.
     pub(crate) fn is_current_run_class(&mut self, sym: SymbolId) -> bool {
         let jvm = self.st.jvm_internal(sym);
-        !jvm.is_empty() && !matches!(self.binary.find_class(&jvm), Ok(Some(_)))
+        !jvm.is_empty() && !matches!(self.binary.has_class(&jvm), Ok(true))
     }
 }
 

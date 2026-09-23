@@ -244,6 +244,15 @@ impl BinaryIndex {
         }
     }
 
+    /// Whether `internal` names a class file on the path, without copying
+    /// the file out of the cache as [`Self::find_class`] does.
+    pub fn has_class(&mut self, internal: &str) -> Result<bool, String> {
+        if let Some(hit) = self.class_cache.get(internal) {
+            return Ok(hit.is_some());
+        }
+        Ok(self.find_class(internal)?.is_some())
+    }
+
     pub fn find_class(&mut self, internal: &str) -> Result<Option<Vec<u8>>, String> {
         if let Some(hit) = self.class_cache.get(internal) {
             return Ok(hit.clone());
