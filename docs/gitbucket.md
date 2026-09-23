@@ -5,12 +5,22 @@ the third real-world benchmark after slick and cats, and the first that is an
 *application* rather than a library. Like `docs/cats.md`, this is a survey: the
 point is to have the number and the symptoms written down.
 
+> **Current status.** Per `tests/BASELINE.md` (gate `ff08907d`, 2026-09-14),
+> `tests/gitbucket_measure.sh` compiles all **354 inputs with 0 errors and
+> emits 1317 class files** (its 3 Java sources are compiled by javac onto the
+> classpath), and `tests/gitbucket_run.sh` runs **6/6** client programs with
+> `known_fail=0`. The merge gate requires zero errors and no run failure
+> outside the (empty) known-failure ledger. gitbucket's own test sources do not compile
+> yet; see [`notes/handoff-2026-09-13.md`](notes/handoff-2026-09-13.md). The
+> tables and root write-ups below are the dated history, including the
+> "remaining" counts, which are the counts of their time.
+
 Two things make gitbucket different from the first two benchmarks:
 
 * **It uses slick.** Not the slick we compile from source — the published
   `slick_2.13-3.4.1.jar`, through `blocking-slick` — so it measures whether
   reading slick's pickles is good enough for a program that actually calls it.
-* **139 of its 354 sources are generated**, by the Twirl template compiler
+* **140 of its 354 sources are generated**, by the Twirl template compiler
   (`sbt-twirl` turns `src/main/twirl/**/*.scala.html` into Scala). Those files
   are machine-written and unlike anything a person types; three of the seven
   roots below only show up in them.
@@ -61,14 +71,22 @@ Same shape as `tests/slick_measure.sh` and `tests/cats_measure.sh`: it rebuilds
 *this* checkout's `target/release/scala-rs`, re-fetches the material at the
 pinned revision when the scratchpad has been wiped, has sbt write the Twirl
 sources and export the dependency classpath, and writes every path per
-invocation. **`GITBUCKET_LOG` defaults to a shared file — always set it to a
-path of your own.**
+invocation. `GITBUCKET_LOG` and `GITBUCKET_RUN` default to per-invocation
+paths under `SCALA_RS_FIXTURE_ROOT`; set them when you want to keep the
+output.
 
 * `GITBUCKET_MODULES=scala` measures the hand-written sources alone;
   `GITBUCKET_MODULES=twirl` the generated ones alone; the default is both.
-* `GITBUCKET_EXCLUDE` holds files out by basename. It defaults to
-  `PullRequestsController.scala` — see "Not fixed" below — the way
-  `tests/cats_measure.sh` holds out `FunctionKMacros.scala`.
+* `GITBUCKET_EXCLUDE` holds files out by basename. It used to default to
+  `PullRequestsController.scala` (see "Not fixed" below, since fixed in the
+  parser); it now defaults to empty and survives only for comparisons against
+  the historical 353-source measurements.
+
+`tests/gitbucket_run.sh [prog-name ...]` is the differential execution test:
+it compiles gitbucket with scala-rs and with real scalac, compiles the client
+programs in `tests/gbrun/` with real scalac against both builds, runs them
+against an in-memory H2 database and compares their stdout. See its header
+for the environment variables.
 
 ## The numbers
 
