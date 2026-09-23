@@ -1694,10 +1694,14 @@ impl Typer {
                 // cannot serve its pickle until adoption. Adopt only when the
                 // pickle declares a name absent from the module's current
                 // member list; fully loaded modules keep the cheap path and
-                // avoid re-entering duplicate members.
+                // avoid re-entering duplicate members. A module compiled from
+                // source in this run is never a candidate: its members are
+                // the source's, and a stale class file of the same name on
+                // `-cp` must not add its pickled members beside them.
                 let needs_module_members = self.library_abi
                     && cur_is_module
                     && self.st.get(cur).kind == SymKind::ModuleClass
+                    && !self.st.is_source_owner(cur)
                     && !self.st.get(cur).jvm_name.starts_with("scala/")
                     && !self.st.get(cur).jvm_name.starts_with("java/")
                     && !self.st.get(cur).jvm_name.starts_with("javax/")

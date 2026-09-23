@@ -1456,7 +1456,13 @@ impl PickleSupply {
                 if let Ok(sig) = sig {
                     for member in &sig.members {
                         let name = scala_rs_pickle::names::decode_method_name(&member.name);
-                        if name.is_empty() || name == "<init>" || name.contains('$') {
+                        // A val's private field is pickled as `answer ` (the
+                        // local suffix); it is never a member an import sees.
+                        if name.is_empty()
+                            || name == "<init>"
+                            || name.contains('$')
+                            || name.ends_with(' ')
+                        {
                             continue;
                         }
                         if !names.contains(&name) {
