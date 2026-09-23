@@ -7182,6 +7182,38 @@ impl PickleSupply {
                     }
                 }
             }
+            // The same mistake the other way round: an abstract prefix (the
+            // alias parameter `T` of `type HeadOf[T <: HList] = T#Head`)
+            // whose unqualified member name was just read as the *receiver's*
+            // concrete alias. An inherited alias is installed on the receiver
+            // (`HCons`), where `Head` is `H`, so `HeadOf[X]` became `H` for
+            // every `X` and `hlist(1)` got the first element's type. Keep the
+            // projection on the prefix when its bound declares the member,
+            // and decline otherwise.
+            if args.is_empty() && !matches!(fallback, Type::TypeMember(_)) {
+                if let Some(p) = Self::abstract_prefix_sym(st, scope, pre) {
+                    let short = member.rsplit_once('.').map(|(_, m)| m).unwrap_or(member);
+                    let decl = st
+                        .get(p)
+                        .bound_hi
+                        .clone()
+                        .and_then(|hi| st.class_sym_of(&hi))
+                        .and_then(|owner| {
+                            st.type_members_named(owner, short)
+                                .into_iter()
+                                .find(|&id| st.is_deferred_type_member(id))
+                        });
+                    let Some(decl) = decl else {
+                        trace(format_args!(
+                            "projection {sym}: abstract prefix, declined the receiver's reading"
+                        ));
+                        return None;
+                    };
+                    let id = st.abstract_projection(p, decl);
+                    trace(format_args!("projection {sym}: kept unreduced on the prefix's bound"));
+                    return Some(Type::TypeMember(id));
+                }
+            }
             trace(format_args!("projection {sym}: prefix does not settle it"));
             return Some(fallback);
         }
