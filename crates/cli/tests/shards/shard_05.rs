@@ -44,6 +44,8 @@ mod mismatch8;
 mod mismatch9;
 #[path = "../mixcg.rs"]
 mod mixcg;
+#[path = "../module_mirror_import.rs"]
+mod module_mirror_import;
 #[path = "../modulepickle.rs"]
 mod modulepickle;
 #[path = "../monadtrans.rs"]

@@ -5522,6 +5522,29 @@ impl PickleSupply {
         r.is_ok()
     }
 
+    /// A Scala object's static-forwarder classfile does not declare a class
+    /// in its ScalaSignature. The JVM view must not be imported as a source
+    /// type when the object itself is already available.
+    pub(crate) fn is_module_only_mirror(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        id: SymbolId,
+    ) -> bool {
+        if st.get(id).kind != SymKind::Class
+            || st.get(id).flags.contains(Flags::JAVA)
+            || st.is_source_class(id)
+        {
+            return false;
+        }
+        let internal = &st.get(id).jvm_name;
+        if internal.is_empty() || internal.ends_with('$') {
+            return false;
+        }
+        let full = internal.replace('/', ".");
+        !self.has_pickle(bin, &full, false) && self.has_pickle(bin, &full, true)
+    }
+
     /// The classfile that really holds `full_name`, or `None` if there is none.
     fn class_file_of(&mut self, bin: &mut BinaryIndex, full_name: &str) -> Option<String> {
         scala_rs_pickle::sym::pickle_files_for(full_name, false)

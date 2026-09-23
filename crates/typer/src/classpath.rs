@@ -2176,7 +2176,7 @@ fn find_singleton_symbol(st: &SymbolTable, name: &str) -> Option<SymbolId> {
 /// Classpath owner candidates for a dotted Scala name. The `$` variants are
 /// tried before their static-forwarder counterparts so a module's members are
 /// recovered from `O$` when both `O.class` and `O$.class` are present.
-fn classpath_owner_candidates(st: &SymbolTable, name: &str) -> Vec<SymbolId> {
+pub(crate) fn classpath_owner_candidates(st: &SymbolTable, name: &str) -> Vec<SymbolId> {
     let mut out = Vec::new();
     let mut push = |jvm: String| {
         if let Some(id) = find_by_jvm(st, &jvm) {

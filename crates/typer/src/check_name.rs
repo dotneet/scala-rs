@@ -1187,6 +1187,26 @@ impl Typer {
                     found.push(m);
                 }
             }
+            // An object-only Scala classfile has a JVM static-forwarder
+            // mirror named like a class. It is not a source type. When the
+            // companion object is available, importing that mirror as a
+            // class would hide a later, same-named type alias inside the
+            // object (`import O; import O.O`). Keep genuine class/object
+            // companions, whose class half has its own pickle declaration.
+            if found
+                .iter()
+                .any(|&m| self.st.get(m).kind == SymKind::Module)
+            {
+                let mirrors: Vec<SymbolId> = found
+                    .iter()
+                    .copied()
+                    .filter(|&m| {
+                        self.pickle
+                            .is_module_only_mirror(&self.st, &mut self.binary, m)
+                    })
+                    .collect();
+                found.retain(|m| !mirrors.contains(m));
+            }
             // Conversely, a class nested in an `object` is recorded by
             // Scala's `InnerClasses` attribute against the object's mirror
             // class. `object SemigroupalTests { trait Isomorphisms[F[_]];

@@ -114,6 +114,8 @@ pub(crate) enum Chase {
     Erase = 2,
     /// `SymbolTable::expand_applied_hk_alias`.
     HkAlias = 3,
+    /// A qualified alias retained by a classfile method signature.
+    NamedAlias = 4,
 }
 
 /// Pops the symbol `enter_chase` pushed.
@@ -3027,6 +3029,25 @@ impl SymbolTable {
             let bound = subst_tparams_slice(&member.tparams, args, &bound);
             if let Some(class) = self.class_sym_of(&bound) {
                 return Some(class);
+            }
+        }
+        None
+    }
+
+    /// Recover a fully-qualified type alias left as `Named` in a classfile
+    /// method signature. The owner may be an object, whose alias is declared
+    /// on its module class rather than on the static forwarder class.
+    fn named_alias_type(&self, name: &str, args: &[Type]) -> Option<(SymbolId, Type)> {
+        let (owner_path, member_name) = name.rsplit_once('.')?;
+        for owner in crate::classpath::classpath_owner_candidates(self, owner_path) {
+            for id in self.lookup_type_member(owner, member_name) {
+                let member = self.get(id);
+                if member.is_type_alias
+                    && member.tparams.len() == args.len()
+                    && !matches!(member.ty, Type::NoType | Type::Error | Type::TypeMember(_))
+                {
+                    return Some((id, self.subst_tparams(id, args, &member.ty)));
+                }
             }
         }
         None
@@ -6177,6 +6198,20 @@ impl SymbolTable {
         if a == b {
             return true;
         }
+        if let Type::Named { name, args } = a {
+            if let Some((id, expanded)) = self.named_alias_type(name, args) {
+                if let Some(_g) = enter_chase(Chase::NamedAlias, id) {
+                    return self.is_sub_type(&expanded, b);
+                }
+            }
+        }
+        if let Type::Named { name, args } = b {
+            if let Some((id, expanded)) = self.named_alias_type(name, args) {
+                if let Some(_g) = enter_chase(Chase::NamedAlias, id) {
+                    return self.is_sub_type(a, &expanded);
+                }
+            }
+        }
         // `A#B` carries what `A` settles as a refinement so member reads can
         // see it, but it *is* `B`: the same class reached by an alias
         // (`type Session = JdbcSessionDef`) carries nothing, and slick passes
@@ -9077,5 +9112,44 @@ mod api_boundary_tests {
             args: vec![Type::Int],
         };
         assert_eq!(st.class_sym_of(&named), Some(action));
+    }
+
+    #[test]
+    fn qualified_module_alias_conforms_to_its_instantiated_body() {
+        let mut st = SymbolTable::new();
+        let pkg = st.alloc("alias", st.root, SymKind::Package, Flags::EMPTY, "alias");
+        let module = st.alloc(
+            "Types",
+            pkg,
+            SymKind::ModuleClass,
+            Flags::EMPTY,
+            "alias/Types$",
+        );
+        let alias = st.alloc("Fetch", module, SymKind::TypeMember, Flags::EMPTY, "");
+        let element = st.alloc("A", alias, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(alias).tparams.push(element);
+        st.get_mut(alias).is_type_alias = true;
+        st.get_mut(alias).ty = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::TypeParam(element)),
+        };
+
+        let named = Type::Named {
+            name: "alias.Types.Fetch".into(),
+            args: vec![Type::String],
+        };
+        let expanded = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::String),
+        };
+        assert!(st.is_sub_type(&expanded, &named));
+        assert!(st.is_sub_type(&named, &expanded));
+        assert!(!st.is_sub_type(
+            &Type::Function {
+                params: vec![Type::Int],
+                ret: Box::new(Type::Int),
+            },
+            &named
+        ));
     }
 }
