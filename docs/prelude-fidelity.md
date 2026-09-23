@@ -74,9 +74,11 @@ list; it is not kept in the tree. Its findings follow.
   **`runtime.LazyRef` declares no type parameter**.
 - **Missing `DEFAULTPARAM`** on `ArrayOps.indexOf`, `ArrayOps.lastIndexOf`
   and `ArrayOps.indexWhere`, and on the constructors of
-  `mutable.ArrayDeque`, `Queue` and `Stack`. For `indexOf` and `lastIndexOf`
-  this rejects a valid program: `Array(1, 2, 1).indexOf(1)` reports
-  `no matching overload for (Int, Int)Int with arguments (1)`.
+  `mutable.ArrayDeque`, `Queue` and `Stack`. The three `ArrayOps` members
+  model the default as a shorter overload that codegen completes, so both
+  spellings compile. `List`
+  declares `indexWhere` and `startsWith` in both arities the same way
+  (`crates/cli/tests/seq_default_args.rs`).
 - **`ArrayOps.mkString`**: the prelude declares it on `ArrayOps`, the library
   reaches `IterableOnceOps.mkString` through `genericWrapArray`, so
   `Array(1, 2, 3).mkString(sep = "|")` reports "named arguments (method

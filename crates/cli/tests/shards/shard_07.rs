@@ -20,6 +20,8 @@ mod selfprefix;
 mod selfrec;
 #[path = "../selfwild.rs"]
 mod selfwild;
+#[path = "../seq_default_args.rs"]
+mod seq_default_args;
 #[path = "../seqfn.rs"]
 mod seqfn;
 #[path = "../seqpat.rs"]

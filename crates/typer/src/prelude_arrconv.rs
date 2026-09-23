@@ -344,7 +344,16 @@ fn add_array_ops_simple_extensions(
         Type::Int,
         Intrinsic::None,
     );
-    // lastIndexOf(elem: A, end: Int): Int
+    // lastIndexOf(elem: A, end: Int = xs.length - 1): Int -- both arities;
+    // codegen fills the missing `end` from `lastIndexOf$default$2$extension`.
+    method(
+        st,
+        aops,
+        "lastIndexOf",
+        vec![ta.clone()],
+        Type::Int,
+        Intrinsic::None,
+    );
     method(
         st,
         aops,

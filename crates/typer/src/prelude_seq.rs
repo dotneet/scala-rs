@@ -709,6 +709,7 @@ fn add_filters_and_slices(st: &mut SymbolTable, env: &Env) {
 /// `foldLeft`/`foldRight:(Object,Function2)Object`,
 /// `IterableOnceOps.count:(Function1)I` / `reduce`/`reduceLeft`/`reduceRight:(Function2)Object`,
 /// `List.scanLeft:(Object,Function2)Object`,
+/// `List.indexWhere:(Function1,I)I`,
 /// `SeqOps.indexOf:(Object)I` / `startsWith:(IterableOnce,I)Z` / `endsWith:(Iterable)Z`.
 fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
     let l = env.list;
@@ -734,6 +735,15 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
     simple(st, l, "size", vec![], Type::Int);
     simple(st, l, "indexOf", vec![ta.clone()], Type::Int);
     simple(st, l, "indexWhere", vec![pred.clone()], Type::Int);
+    // `List.indexWhere(p, from)`: declaring only the one-argument form hid
+    // the pickled two-argument one.
+    simple(
+        st,
+        l,
+        "indexWhere",
+        vec![pred.clone(), Type::Int],
+        Type::Int,
+    );
 
     for name in ["reduce", "reduceLeft", "reduceRight"] {
         simple(
@@ -781,6 +791,20 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
                 sym: ioc,
                 args: vec![t[0].clone()],
             }]],
+            Type::Boolean,
+        )
+    });
+    // `startsWith(that, offset: Int = 0)`: the default is the one-argument
+    // form above, and this is the explicit one.
+    poly(st, l, "startsWith", &["B"], |t| {
+        (
+            vec![vec![
+                Type::Class {
+                    sym: ioc,
+                    args: vec![t[0].clone()],
+                },
+                Type::Int,
+            ]],
             Type::Boolean,
         )
     });

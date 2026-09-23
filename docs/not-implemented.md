@@ -116,10 +116,6 @@ diagnostic or, where marked, is a known divergence. What is supported is in
   overload`), no `Ordering`/`Equiv` companions, no sequence patterns on
   `Seq`/`Array`, and no `scala.specialized` import target. Use the library ABI
   for those.
-- **`ArrayOps.indexOf` / `lastIndexOf` without the `from` argument.**
-  `Array(1, 2, 1).indexOf(1)` reports `no matching overload for (Int, Int)Int
-  with arguments (1)`: the prelude's declaration drops the library's default
-  ([prelude-fidelity.md](prelude-fidelity.md)).
 - **Named arguments on prelude members whose library declaration is
   elsewhere.** `Array(1, 2, 3).mkString(sep = "|")` reports "named arguments
   (method parameters not resolved)": the prelude declares `mkString` on

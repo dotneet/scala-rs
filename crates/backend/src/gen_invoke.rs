@@ -3184,7 +3184,14 @@ pub(crate) fn emit_list_core_member(
             "(Ljava/lang/Object;)Lscala/collection/immutable/List;",
             ListPost::None,
         ),
-        // `indexWhere(p)` is `indexWhere(p, 0)` (a default argument).
+        ("indexWhere", 2) => (
+            false,
+            LIST_CLS,
+            "indexWhere",
+            "(Lscala/Function1;I)I",
+            ListPost::None,
+        ),
+        // `indexWhere(p)` is `indexWhere(p, 0)`.
         ("indexWhere", 1) => {
             asm.iconst(0);
             (
@@ -3536,6 +3543,13 @@ pub(crate) fn emit_list_core_member(
             SEQ_OPS,
             "endsWith",
             "(Lscala/collection/Iterable;)Z",
+            ListPost::None,
+        ),
+        ("startsWith", 2) => (
+            true,
+            SEQ_OPS,
+            "startsWith",
+            "(Lscala/collection/IterableOnce;I)Z",
             ListPost::None,
         ),
         // `startsWith(that)` is `startsWith(that, 0)` (a default argument).

@@ -655,7 +655,8 @@ pub(crate) fn add_array_ops_zip_index_size(st: &mut SymbolTable, aops: SymbolId,
 /// ArrayOps.lengthIs / sizeIs / indexOf / copyToArray / iterator against 2.13.16.
 ///
 /// JVM: `lengthIs$extension` / `sizeIs$extension(Object)I`,
-/// `indexOf$extension(Object, Object, I)I`,
+/// `indexOf$extension(Object, Object, I)I` (the one-argument form passes
+/// `from = 0`),
 /// `copyToArray$extension(Object, Object)I`,
 /// `iterator$extension(Object)Iterator`.
 pub(crate) fn add_array_ops_length_index_copy(
@@ -667,6 +668,17 @@ pub(crate) fn add_array_ops_length_index_copy(
     let ta = Type::TypeParam(a);
     method(st, aops, "lengthIs", vec![], Type::Int, Intrinsic::None);
     method(st, aops, "sizeIs", vec![], Type::Int, Intrinsic::None);
+    // indexOf(elem: A, from: Int = 0): Int -- both arities, as for
+    // `indexWhere`: the prelude has no default arguments, so the default
+    // is a second overload and codegen fills the missing `0`.
+    method(
+        st,
+        aops,
+        "indexOf",
+        vec![ta.clone()],
+        Type::Int,
+        Intrinsic::None,
+    );
     method(
         st,
         aops,

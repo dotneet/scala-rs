@@ -4354,6 +4354,10 @@ pub(crate) fn invoke_value_extension(
             return;
         }
         if s.name == "indexOf" {
+            if param_count(ctx.st, id) < 2 {
+                // 1-arg overload: `from` defaults to 0.
+                asm.iconst(0);
+            }
             asm.invokestatic(
                 "scala/collection/ArrayOps",
                 "indexOf$extension",
@@ -4441,6 +4445,18 @@ pub(crate) fn invoke_value_extension(
             return;
         }
         if s.name == "lastIndexOf" {
+            if param_count(ctx.st, id) < 2 {
+                // 1-arg overload: `end` defaults to `xs.length - 1`, which
+                // nsc reads from the default getter on the receiver. Both
+                // operands are references: [xs, elem] -> [xs, elem, xs].
+                asm.swap();
+                asm.dup_x1();
+                asm.invokestatic(
+                    "scala/collection/ArrayOps",
+                    "lastIndexOf$default$2$extension",
+                    "(Ljava/lang/Object;)I",
+                );
+            }
             asm.invokestatic(
                 "scala/collection/ArrayOps",
                 "lastIndexOf$extension",
