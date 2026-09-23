@@ -9,7 +9,7 @@ scope decisions; their absence must not be confused with a Scala 2.13 pass.
 ## Starting point
 
 `main` at `46a66d0` has the same implementation as the measured `902da04`.
-Only `HANDOFF.md` and `tests/BASELINE.md` differ. Use that table as the
+Only the session handoff notes and `tests/BASELINE.md` differed. Use that table as the
 reference; do not rerun the unchanged baseline. Existing unmerged work is
 preserved on `agent/implicitmemo`, `worktree-agent-a44905be6f76c9f6a`, and
 `agent/catstail3`.
