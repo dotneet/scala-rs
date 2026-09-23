@@ -3623,6 +3623,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         let owner = self.facts.get(id).owner.0;
         let pref = if self.facts.get(SymbolId(owner)).kind == SymKind::ModuleClass
             && self.sym_index.contains_key(&owner)
+            && self.facts.get(id).is_type_alias
         {
             // The locally declared ALIASsym already carries its module-class
             // owner. Prefixing that same symbol with the module singleton
@@ -3630,6 +3631,12 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             // name scalac expects (`Lib.Al`). External members still need the
             // singleton path below because their symbol is not owned by this
             // pickle.
+            //
+            // Only an *alias*: it is read through its right-hand side, so the
+            // prefix is immaterial. An abstract member is its own type, and
+            // its prefix is part of its identity: `ChainImpl.Type[Int]` with
+            // no prefix was a different type to scalac ("found: Type[Int] (in
+            // <none>) required: Type[Int] (in rhf.ChainImpl)").
             self.noprefix
         } else if self.facts.get(SymbolId(owner)).kind == SymKind::ModuleClass {
             // A type member declared in an object is reached through the
