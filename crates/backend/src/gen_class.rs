@@ -1248,7 +1248,7 @@ impl<'a> Gen<'a> {
         if let Some(o) = ctor_outer_ty {
             types.push(Type::Class {
                 sym: o,
-                args: vec![],
+                args: vec![].into(),
             });
         }
         for p in &params {
@@ -1290,7 +1290,7 @@ impl<'a> Gen<'a> {
                 self.st,
                 &Type::Class {
                     sym: o,
-                    args: vec![],
+                    args: vec![].into(),
                 },
             )
         });

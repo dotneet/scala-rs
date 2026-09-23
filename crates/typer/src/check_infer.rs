@@ -813,10 +813,10 @@ impl Typer {
         let same_head = |b: &Type| -> Option<Vec<Type>> {
             match (pt, b) {
                 (Type::Class { sym: s1, .. }, Type::Class { sym: s2, args }) if s1 == s2 => {
-                    Some(args.clone())
+                    Some(args.clone().into_vec())
                 }
                 (Type::Applied { ctor: c1, .. }, Type::Applied { ctor: c2, args }) if c1 == c2 => {
-                    Some(args.clone())
+                    Some(args.clone().into_vec())
                 }
                 // A tuple, spelled structurally or as its `TupleN` class.
                 (Type::Tuple(_), _) => self.as_tuple_args(b),
@@ -846,13 +846,13 @@ impl Typer {
         Some(match pt {
             Type::Class { sym, .. } => Type::Class {
                 sym: *sym,
-                args: out_args,
+                args: out_args.into(),
             },
             Type::Applied { ctor, .. } => Type::Applied {
                 ctor: ctor.clone(),
-                args: out_args,
+                args: out_args.into(),
             },
-            Type::Tuple(_) => Type::Tuple(out_args),
+            Type::Tuple(_) => Type::Tuple(out_args.into()),
             _ => return None,
         })
     }
@@ -922,8 +922,8 @@ impl Typer {
                 if name.starts_with("Function") && name != "Function" && !args.is_empty() =>
             {
                 Some(Type::Function {
-                    params: args[..args.len() - 1].to_vec(),
-                    ret: Box::new(args[args.len() - 1].clone()),
+                    params: args[..args.len() - 1].to_vec().into(),
+                    ret: TyBox::new(args[args.len() - 1].clone()),
                 })
             }
             _ => None,
@@ -944,7 +944,7 @@ impl Typer {
         };
         Type::Function {
             params: params.clone(),
-            ret: Box::new(result),
+            ret: TyBox::new(result),
         }
     }
 
@@ -1665,7 +1665,7 @@ impl Typer {
                         .iter()
                         .all(|arg| matches!(arg, Type::TypeParam(_) | Type::Wildcard)) =>
             {
-                *ctor
+                ctor.clone()
             }
             Type::Class { sym, args }
                 if args.len() == arity
@@ -1673,10 +1673,11 @@ impl Typer {
                         .iter()
                         .all(|arg| matches!(arg, Type::TypeParam(_) | Type::Wildcard)) =>
             {
-                Type::Class {
+                (Type::Class {
                     sym,
-                    args: Vec::new(),
-                }
+                    args: Vec::new().into(),
+                })
+                .into()
             }
             _ => return None,
         };
@@ -2260,8 +2261,8 @@ impl Typer {
                     {
                         eta = paramss.iter().rev().fold((**ret).clone(), |acc, clause| {
                             Type::Function {
-                                params: clause.clone(),
-                                ret: Box::new(acc),
+                                params: clause.clone().into(),
+                                ret: TyBox::new(acc),
                             }
                         });
                         &eta
@@ -2274,7 +2275,7 @@ impl Typer {
                     hi,
                     &Type::Class {
                         sym: self.st.singleton_sym,
-                        args: vec![],
+                        args: vec![].into(),
                     },
                 )
             });
@@ -2290,8 +2291,8 @@ impl Typer {
             if hit.is_none() && matches!(a, Type::Function { .. }) {
                 if let Some(sam) = self.st.sam_sig(p) {
                     let prototype = Type::Function {
-                        params: sam.param_tys,
-                        ret: Box::new(sam.ret_ty),
+                        params: sam.param_tys.into(),
+                        ret: TyBox::new(sam.ret_ty),
                     };
                     hit = unify_one(&self.st, tp, &prototype, a);
                     if self.tparam_variance_in(&prototype, tp, 1) == Some(-1) {
@@ -2789,7 +2790,7 @@ impl Typer {
             {
                 let unapplied = Type::Class {
                     sym: *sym,
-                    args: vec![],
+                    args: vec![].into(),
                 };
                 self.collect_expected(
                     tps,
@@ -2822,7 +2823,7 @@ impl Typer {
                 let captured = pas.len() - ras.len();
                 let head = Type::Class {
                     sym: *sym,
-                    args: pas[..captured].to_vec(),
+                    args: pas[..captured].to_vec().into(),
                 };
                 if !crate::check::ctor_kinds_unify(&self.st, ctor, &head, ras.len()) {
                     return;
@@ -3136,14 +3137,14 @@ impl Typer {
         };
         if let Some(Type::Class { args, .. }) = self.base_type_instance(r, owner, 0) {
             if !args.is_empty() {
-                return args;
+                return args.into_vec();
             }
         }
         match r {
             Type::Class { args, .. }
                 if !args.is_empty() && args.len() == self.st.get(owner).tparams.len() =>
             {
-                args.clone()
+                args.clone().into_vec()
             }
             _ => Vec::new(),
         }
@@ -3436,7 +3437,7 @@ impl Typer {
                 };
                 return Type::Function {
                     params: aps.clone(),
-                    ret: Box::new(self.align_arg_to_param(pr, &ret_arg)),
+                    ret: TyBox::new(self.align_arg_to_param(pr, &ret_arg)),
                 };
             }
         }
@@ -3493,10 +3494,10 @@ impl Typer {
                 )
             }
             (Type::Array(p), Type::Array(a)) => {
-                Type::Array(Box::new(self.align_arg_to_param(p, a)))
+                Type::Array(TyBox::new(self.align_arg_to_param(p, a)))
             }
             (Type::ByName(p), Type::ByName(a)) => {
-                Type::ByName(Box::new(self.align_arg_to_param(p, a)))
+                Type::ByName(TyBox::new(self.align_arg_to_param(p, a)))
             }
             (Type::ByName(p), a) => self.align_arg_to_param(p, a),
             _ => aligned,
@@ -3505,11 +3506,11 @@ impl Typer {
 
     fn as_tuple_args(&self, ty: &Type) -> Option<Vec<Type>> {
         match ty {
-            Type::Tuple(ts) => Some(ts.clone()),
+            Type::Tuple(ts) => Some(ts.clone().into_vec()),
             Type::Class { sym, args } if !args.is_empty() => {
                 let n = self.st.get(*sym).name.clone();
                 (n.starts_with("Tuple") && n[5..].parse::<usize>() == Ok(args.len()))
-                    .then(|| args.clone())
+                    .then(|| args.to_vec())
             }
             _ => None,
         }
@@ -3888,7 +3889,7 @@ impl Typer {
             return None;
         }
         Some(Type::Function {
-            params: paramss[0].clone(),
+            params: paramss[0].clone().into(),
             ret: ret.clone(),
         })
     }
@@ -3957,7 +3958,7 @@ impl Typer {
                 // This is genuine subtyping, not weak numeric conformance:
                 // Int -> Long needs a new thunk that widens each forced value.
                 if self.st.is_sub_type(&source, inner) {
-                    tree.ty = Type::ByName(Box::new(source));
+                    tree.ty = Type::ByName(TyBox::new(source));
                     return;
                 }
                 self.adapt(tree, inner);
@@ -4027,8 +4028,8 @@ impl Typer {
                         body: Box::new(inner_tree),
                     },
                     ty: Type::Function {
-                        params: vec![],
-                        ret: Box::new(ret),
+                        params: vec![].into(),
+                        ret: TyBox::new(ret),
                     },
                     sym: SymbolId::NONE,
                     postfix: false,
@@ -4161,7 +4162,12 @@ impl Typer {
                 // one-clause eta path below already solves these variables
                 // from the expected function type; do the same before the
                 // implicit arguments are filled in the generated body.
-                let (params, ret) = self.solve_eta_tparams(tree.sym, params, *ret, pt);
+                let (params, ret) = self.solve_eta_tparams(
+                    tree.sym,
+                    params.into_vec(),
+                    <scala_rs_parser::Type as Clone>::clone(&*ret),
+                    pt,
+                );
                 let captured = self.capture_eta_receiver(tree);
                 eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
                 if let Some(value) = captured {
@@ -4463,7 +4469,7 @@ impl Typer {
         let pt_params: Vec<Type> = pt_params
             .into_iter()
             .map(|p| match p {
-                Type::ByName(t) => *t,
+                Type::ByName(t) => <scala_rs_parser::Type as Clone>::clone(&*t),
                 p => p,
             })
             .collect();
@@ -4570,8 +4576,8 @@ impl Typer {
             // In particular, Seq.indexOf[B >: A] must accept an A => Int
             // prototype before competing with its two-argument overload.
             let prototype = Type::Function {
-                params: want_params.clone(),
-                ret: Box::new(want_ret.clone()),
+                params: want_params.clone().into(),
+                ret: TyBox::new(want_ret.clone()),
             };
             let raw_params = params.clone();
             let (params, result) = self.solve_eta_tparams(m, params, (**ret).clone(), &prototype);
@@ -4604,14 +4610,14 @@ impl Typer {
                 }
             }
             let as_fn = Type::Function {
-                params: params.clone(),
-                ret: Box::new(result),
+                params: params.clone().into(),
+                ret: TyBox::new(result),
             };
             let fits = self.st.is_sub_type(
                 &as_fn,
                 &Type::Function {
-                    params: want_params.clone(),
-                    ret: Box::new(want_ret.clone()),
+                    params: want_params.clone().into(),
+                    ret: TyBox::new(want_ret.clone()),
                 },
             );
             if !fits {
@@ -4695,7 +4701,7 @@ impl Typer {
         **body = adapted;
         tree.ty = Type::Function {
             params,
-            ret: Box::new(pt_ret),
+            ret: TyBox::new(pt_ret),
         };
         true
     }
@@ -5196,7 +5202,7 @@ impl Typer {
         };
         let ct_ty = Type::Class {
             sym: ct_cls,
-            args: vec![elem.clone()],
+            args: vec![elem.clone()].into(),
         };
         match self.search_implicit(&ct_ty) {
             ImplicitSearch::Found(id) => {
@@ -5365,7 +5371,7 @@ impl Typer {
             fun,
             &Type::Method {
                 paramss: vec![],
-                ret: Box::new(Type::NoType),
+                ret: TyBox::new(Type::NoType),
             },
         );
     }
@@ -5475,8 +5481,8 @@ mod qualified_alias_tests {
         st.get_mut(alias).tparams.push(element);
         st.get_mut(alias).is_type_alias = true;
         st.get_mut(alias).ty = Type::Function {
-            params: vec![Type::Int],
-            ret: Box::new(Type::TypeParam(element)),
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(Type::TypeParam(element)),
         };
         let method = st.alloc("use", module, SymKind::Method, Flags::EMPTY, "");
         let result = st.alloc("R", method, SymKind::TypeParam, Flags::EMPTY, "");
@@ -5484,11 +5490,11 @@ mod qualified_alias_tests {
 
         let pattern = Type::Named {
             name: "alias.Types.Fetch".into(),
-            args: vec![Type::TypeParam(result)],
+            args: vec![Type::TypeParam(result)].into(),
         };
         let actual = Type::Function {
-            params: vec![Type::Int],
-            ret: Box::new(Type::String),
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(Type::String),
         };
         assert_eq!(
             typer.infer_method_tparams(method, &[pattern], &[actual]),
@@ -5513,20 +5519,20 @@ mod qualified_alias_tests {
         st.get_mut(alias).tparams.push(element);
         st.get_mut(alias).is_type_alias = true;
         st.get_mut(alias).ty = Type::Function {
-            params: vec![Type::Int],
-            ret: Box::new(Type::TypeParam(element)),
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(Type::TypeParam(element)),
         };
         let method = st.alloc("use", module, SymKind::Method, Flags::EMPTY, "");
         let result = st.alloc("R", method, SymKind::TypeParam, Flags::EMPTY, "");
         st.get_mut(method).tparams.push(result);
 
         let pattern = Type::Function {
-            params: vec![Type::Int],
-            ret: Box::new(Type::TypeParam(result)),
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(Type::TypeParam(result)),
         };
         let actual = Type::Named {
             name: "alias.Types.Callback".into(),
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         };
         assert_eq!(
             typer.infer_method_tparams(method, &[pattern], &[actual]),

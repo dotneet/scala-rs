@@ -22,6 +22,7 @@
 //! `scala/Predef$.int2Integer`.
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// The eight primitive/wrapper pairs, with the `Predef` conversion names nsc
@@ -81,7 +82,7 @@ pub(crate) fn install(st: &mut SymbolTable) {
         let wrapper = crate::classpath::find_or_stub_java_class(st, jvm);
         let boxed = Type::Class {
             sym: wrapper,
-            args: vec![],
+            args: vec![].into(),
         };
         let prim = primitive_of(jvm);
         let desc = desc_of(jvm);
@@ -149,7 +150,7 @@ fn add_conversion(
     st.get_mut(id).paramss = vec![vec![p]];
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![from]],
-        ret: Box::new(to),
+        ret: TyBox::new(to),
     };
     st.get_mut(id).intrinsic = intrinsic;
     st.get_mut(st.predef).members.push(id);

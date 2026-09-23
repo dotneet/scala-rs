@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, fn_n, iface, mark_java, method, module, type_param};
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// `scala.util.chaining` (`package$chaining$`) + `ChainingOps` against 2.13.16.
@@ -31,7 +32,7 @@ pub(crate) fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(pipe).paramss = vec![vec![f]];
     st.get_mut(pipe).ty = Type::Method {
         paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]],
-        ret: Box::new(Type::TypeParam(b)),
+        ret: TyBox::new(Type::TypeParam(b)),
     };
 
     let tap = method(st, ops, "tap", vec![], Type::Unit, Intrinsic::None);
@@ -43,7 +44,7 @@ pub(crate) fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(tap).paramss = vec![vec![g]];
     st.get_mut(tap).ty = Type::Method {
         paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(u))]],
-        ret: Box::new(ta.clone()),
+        ret: TyBox::new(ta.clone()),
     };
 
     let chaining = module(st, util, "chaining", "scala/util/package$chaining$");
@@ -55,7 +56,7 @@ pub(crate) fn add_chaining(st: &mut SymbolTable) {
         vec![Type::Any],
         Type::Class {
             sym: ops,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::Identity,
     );
@@ -64,9 +65,9 @@ pub(crate) fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(conv).tparams = vec![ca];
     st.get_mut(conv).ty = Type::Method {
         paramss: vec![vec![cta.clone()]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: ops,
-            args: vec![cta],
+            args: vec![cta].into(),
         }),
     };
     st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
@@ -102,7 +103,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
             );
             st.get_mut(close).ty = Type::Method {
                 paramss: Vec::new(),
-                ret: Box::new(Type::Unit),
+                ret: TyBox::new(Type::Unit),
             };
             ac
         });
@@ -122,7 +123,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
     );
     st.get_mut(release).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(r)]],
-        ret: Box::new(Type::Unit),
+        ret: TyBox::new(Type::Unit),
     };
 
     let rel_mod = module(st, using_cls, "Releasable", "scala/util/Using$Releasable$");
@@ -135,7 +136,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
         "scala/util/Using$Releasable$AutoCloseableIsReleasable$",
         Type::Class {
             sym: auto_closeable,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     let mems = st.get(rel_cls).members.clone();
@@ -173,7 +174,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
     );
     st.get_mut(ev).ty = Type::Class {
         sym: releasable,
-        args: vec![r_t.clone()],
+        args: vec![r_t.clone()].into(),
     };
     st.get_mut(res).params = vec![resource, f, ev];
     st.get_mut(res).paramss = vec![vec![resource], vec![f], vec![ev]];
@@ -183,10 +184,10 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
             vec![fn1(r_t.clone(), a_t.clone())],
             vec![Type::Class {
                 sym: releasable,
-                args: vec![r_t],
+                args: vec![r_t].into(),
             }],
         ],
-        ret: Box::new(a_t),
+        ret: TyBox::new(a_t),
     };
 
     let try_c = st
@@ -210,7 +211,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
         Flags::PARAM,
         "",
     );
-    st.get_mut(app_res).ty = Type::ByName(Box::new(ar_t.clone()));
+    st.get_mut(app_res).ty = Type::ByName(TyBox::new(ar_t.clone()));
     let app_f = st.alloc("f", app, crate::symbol::SymKind::Term, Flags::PARAM, "");
     st.get_mut(app_f).ty = fn1(ar_t.clone(), aa2_t.clone());
     let app_ev = st.alloc(
@@ -222,22 +223,22 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
     );
     st.get_mut(app_ev).ty = Type::Class {
         sym: releasable,
-        args: vec![ar_t.clone()],
+        args: vec![ar_t.clone()].into(),
     };
     st.get_mut(app).params = vec![app_res, app_f, app_ev];
     st.get_mut(app).paramss = vec![vec![app_res], vec![app_f], vec![app_ev]];
     st.get_mut(app).ty = Type::Method {
         paramss: vec![
-            vec![Type::ByName(Box::new(ar_t.clone()))],
+            vec![Type::ByName(TyBox::new(ar_t.clone()))],
             vec![fn1(ar_t.clone(), aa2_t.clone())],
             vec![Type::Class {
                 sym: releasable,
-                args: vec![ar_t],
+                args: vec![ar_t].into(),
             }],
         ],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: try_c,
-            args: vec![aa2_t],
+            args: vec![aa2_t].into(),
         }),
     };
     st.get_mut(app).jvm_name =
@@ -257,13 +258,13 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: manager_cls,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
     let mgr_t = Type::Class {
         sym: manager_cls,
-        args: vec![],
+        args: vec![].into(),
     };
 
     let mgr_app = method(
@@ -294,7 +295,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
     );
     st.get_mut(mgr_ev).ty = Type::Class {
         sym: releasable,
-        args: vec![mr_t.clone()],
+        args: vec![mr_t.clone()].into(),
     };
     st.get_mut(mgr_app).params = vec![mgr_res, mgr_ev];
     st.get_mut(mgr_app).paramss = vec![vec![mgr_res], vec![mgr_ev]];
@@ -303,10 +304,10 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
             vec![mr_t.clone()],
             vec![Type::Class {
                 sym: releasable,
-                args: vec![mr_t.clone()],
+                args: vec![mr_t.clone()].into(),
             }],
         ],
-        ret: Box::new(mr_t),
+        ret: TyBox::new(mr_t),
     };
     st.get_mut(mgr_app).jvm_name =
         "(Ljava/lang/Object;Lscala/util/Using$Releasable;)Ljava/lang/Object;".into();
@@ -339,7 +340,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
     );
     st.get_mut(acq_ev).ty = Type::Class {
         sym: releasable,
-        args: vec![acr_t.clone()],
+        args: vec![acr_t.clone()].into(),
     };
     st.get_mut(mgr_acq).params = vec![acq_res, acq_ev];
     st.get_mut(mgr_acq).paramss = vec![vec![acq_res], vec![acq_ev]];
@@ -348,10 +349,10 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
             vec![acr_t.clone()],
             vec![Type::Class {
                 sym: releasable,
-                args: vec![acr_t],
+                args: vec![acr_t].into(),
             }],
         ],
-        ret: Box::new(Type::Unit),
+        ret: TyBox::new(Type::Unit),
     };
     st.set_jvm_name(
         mgr_acq,
@@ -385,13 +386,13 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
         paramss: vec![vec![fn1(
             Type::Class {
                 sym: manager_cls,
-                args: vec![],
+                args: vec![].into(),
             },
             ma_t.clone(),
         )]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: try_c,
-            args: vec![ma_t],
+            args: vec![ma_t].into(),
         }),
     };
     st.set_jvm_name(mobj_app, "(Lscala/Function1;)Lscala/util/Try;");
@@ -436,7 +437,7 @@ fn add_using_resources(st: &mut SymbolTable, using_cls: SymbolId, releasable: Sy
         let ty = if i == 0 {
             base
         } else {
-            Type::ByName(Box::new(base))
+            Type::ByName(TyBox::new(base))
         };
         let p = st.alloc(
             &format!("resource{}", i + 1),
@@ -469,7 +470,7 @@ fn add_using_resources(st: &mut SymbolTable, using_cls: SymbolId, releasable: Sy
         );
         let et = Type::Class {
             sym: releasable,
-            args: vec![Type::TypeParam(*r)],
+            args: vec![Type::TypeParam(*r)].into(),
         };
         st.get_mut(ev).ty = et.clone();
         ev_ids.push(ev);
@@ -483,7 +484,7 @@ fn add_using_resources(st: &mut SymbolTable, using_cls: SymbolId, releasable: Sy
     st.get_mut(m).paramss = vec![p_ids, vec![f], ev_ids];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![p_tys, vec![fn_ty], ev_tys],
-        ret: Box::new(Type::TypeParam(a)),
+        ret: TyBox::new(Type::TypeParam(a)),
     };
     let mut desc = String::from("(Ljava/lang/Object;");
     for _ in 1..n {

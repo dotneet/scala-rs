@@ -272,7 +272,7 @@ impl Typer {
                 parents.push(Type::Class {
                     sym: crate::classpath::find_by_jvm(&self.st, "java/io/Serializable")
                         .ok_or("java.io.Serializable is not loaded")?,
-                    args: Vec::new(),
+                    args: Vec::new().into(),
                 });
             }
         }
@@ -757,7 +757,7 @@ impl Typer {
         if let Some(u) = unapply {
             let class_ty = self.type_to_wire(&Type::Class {
                 sym: class,
-                args: Vec::new(),
+                args: Vec::new().into(),
             })?;
             let ret = match self.st.get(u).ty.clone() {
                 Type::Method { ret, .. } if !ret.is_no_type() => self.type_to_wire(&ret)?,
@@ -809,7 +809,7 @@ impl Typer {
         let type_args: Vec<Type> = tparams.iter().copied().map(Type::TypeParam).collect();
         let mut info = self.type_to_wire(&Type::Class {
             sym: class,
-            args: type_args.clone(),
+            args: type_args.clone().into(),
         })?;
         for clause in clauses.iter().rev() {
             let mut params = Vec::new();
@@ -881,7 +881,9 @@ impl Typer {
             ));
         }
         Ok(match ty {
-            Type::Method { paramss, ret } if paramss.is_empty() => *ret,
+            Type::Method { paramss, ret } if paramss.is_empty() => {
+                <scala_rs_parser::Type as Clone>::clone(&*ret)
+            }
             t => t,
         })
     }

@@ -3,6 +3,7 @@
 
 use crate::prelude::{class, module, prelude_method, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// Highest arity scala-library defines.
@@ -106,7 +107,7 @@ fn add_companion(st: &mut SymbolTable, cls: SymbolId, n: usize) {
     let params: Vec<Type> = tps.iter().map(|t| Type::TypeParam(*t)).collect();
     st.get_mut(apply).ty = Type::Method {
         paramss: vec![params],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: cls,
             args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),
         }),

@@ -752,7 +752,7 @@ impl Typer {
             let applied = self.apply_types(core, args, span);
             return match applied {
                 Type::Class { .. } => Type::Refined {
-                    parents: vec![applied],
+                    parents: vec![applied].into(),
                     decls,
                 },
                 other => other,
@@ -950,7 +950,7 @@ impl Typer {
             return ty;
         };
         if self.st.is_array_class(*sym) && args.len() == 1 {
-            return Type::Array(Box::new(args[0].clone()));
+            return Type::Array(TyBox::new(args[0].clone()));
         }
         let jvm = self.st.get(*sym).jvm_name.as_str();
         if jvm
@@ -959,8 +959,8 @@ impl Typer {
             .is_some_and(|n| n + 1 == args.len())
         {
             return Type::Function {
-                params: args[..args.len() - 1].to_vec(),
-                ret: Box::new(args.last().unwrap().clone()),
+                params: args[..args.len() - 1].to_vec().into(),
+                ret: TyBox::new(args.last().unwrap().clone()),
             };
         }
         if jvm
@@ -1057,8 +1057,8 @@ impl Typer {
                 self.gensym += 1;
                 let ev_name = format!("evidence${}", self.gensym);
                 let ev_ty = Type::Function {
-                    params: vec![Type::TypeParam(tp_id)],
-                    ret: Box::new(view_ty),
+                    params: vec![Type::TypeParam(tp_id)].into(),
+                    ret: TyBox::new(view_ty),
                 };
                 let flags = Flags::IMPLICIT
                     .with(Flags::PARAM)
@@ -1128,7 +1128,7 @@ impl Typer {
             .iter()
             .map(|p| Type::Named {
                 name: p.name().unwrap_or("AnyRef").to_string(),
-                args: vec![],
+                args: vec![].into(),
             })
             .collect()
     }
@@ -1271,7 +1271,7 @@ impl Typer {
         self.st.get_mut(id).paramss = vec![vec![p]];
         self.st.get_mut(id).ty = Type::Method {
             paramss: vec![vec![Type::Any]],
-            ret: Box::new(Type::Boolean),
+            ret: TyBox::new(Type::Boolean),
         };
     }
 
@@ -1301,7 +1301,7 @@ impl Typer {
                 .alloc(name, class_id, SymKind::Method, Flags::SYNTHETIC, "");
             self.st.get_mut(id).ty = Type::Method {
                 paramss: vec![],
-                ret: Box::new(ret),
+                ret: TyBox::new(ret),
             };
         }
         for (name, ret) in [
@@ -1326,7 +1326,7 @@ impl Typer {
             self.st.get_mut(id).paramss = vec![vec![p]];
             self.st.get_mut(id).ty = Type::Method {
                 paramss: vec![vec![Type::Int]],
-                ret: Box::new(ret),
+                ret: TyBox::new(ret),
             };
         }
     }
@@ -1383,7 +1383,7 @@ impl Typer {
         let fields = self.st.get(class_id).ctor_fields.clone();
         let class_ty = Type::Class {
             sym: class_id,
-            args: vec![],
+            args: vec![].into(),
         };
         // A written member named copy suppresses the synthetic method, even
         // when its parameter types differ (nsc Namers.hasCopy). Leaving a
@@ -1439,7 +1439,7 @@ impl Typer {
             self.st.get_mut(copy).paramss = vec![copy_params.clone()];
             self.st.get_mut(copy).ty = Type::Method {
                 paramss: vec![ptys],
-                ret: Box::new(class_ty.clone()),
+                ret: TyBox::new(class_ty.clone()),
             };
             // Field types are not resolved yet at this point in the namer pass;
             // `type_class` re-syncs `copy`'s param types from the real ctor
@@ -1472,7 +1472,7 @@ impl Typer {
             self.st.get_mut(apply).params = fields.clone();
             self.st.get_mut(apply).ty = Type::Method {
                 paramss: vec![fields.iter().map(|_| Type::NoType).collect()],
-                ret: Box::new(class_ty),
+                ret: TyBox::new(class_ty),
             };
             self.st.enter_in_current("apply", apply);
             // also put apply on the module value for Point(1,2)
@@ -1802,7 +1802,7 @@ impl Typer {
                     if sym != id {
                         *slot = Type::Class {
                             sym,
-                            args: Vec::new(),
+                            args: Vec::new().into(),
                         };
                         changed = true;
                     }
@@ -1905,7 +1905,7 @@ impl Typer {
                 self.st.get_mut(mem).paramss = paramss_ids.clone();
                 self.st.get_mut(mem).ty = Type::Method {
                     paramss: paramss_ty.clone(),
-                    ret: Box::new(Type::Unit),
+                    ret: TyBox::new(Type::Unit),
                 };
             }
         }

@@ -167,7 +167,7 @@ impl<'a> Sig<'a> {
             None => return (None, Vec::new()),
         };
         let parts: Vec<Type> = match &hi {
-            Type::Refined { parents, .. } => parents.clone(),
+            Type::Refined { parents, .. } => parents.clone().into_vec(),
             _ => vec![hi.clone()],
         };
         let mut cls = None;
@@ -401,7 +401,7 @@ impl<'a> Sig<'a> {
                 )
             }
             Type::Function { params, ret } => {
-                let mut a: Vec<Type> = params.clone();
+                let mut a: Vec<Type> = params.clone().into_vec();
                 a.push((**ret).clone());
                 format!("Lscala/Function{}{};", params.len(), self.args(&a, depth))
             }
@@ -499,7 +499,7 @@ fn inherits_class(st: &SymbolTable, sub: SymbolId, sup: SymbolId) -> bool {
     }
     let t = Type::Class {
         sym: sub,
-        args: vec![],
+        args: vec![].into(),
     };
     st.base_type_seq(&t)
         .iter()
@@ -543,12 +543,12 @@ fn method_signature(st: &SymbolTable, id: SymbolId) -> Option<GenericSignature> 
     let (paramss, ret) = match &s.ty {
         Type::Method { paramss, ret } => (paramss.iter().flatten().cloned().collect(), ret.clone()),
         Type::Function { params, ret } => (params.clone(), ret.clone()),
-        t => (Vec::new(), Box::new(t.clone())),
+        t => (Vec::new().into(), t.clone().into()),
     };
     let params: Vec<Type> = if paramss.iter().any(|p| p.is_no_type() || p.is_error()) {
         s.params.iter().map(|p| st.get(*p).ty.clone()).collect()
     } else {
-        paramss
+        paramss.into_vec()
     };
     let mut out = sig.formals(&s.tparams);
     out.push('(');

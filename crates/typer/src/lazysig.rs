@@ -736,7 +736,7 @@ impl Typer {
                         };
                         self.st.get_mut(p.getter).ty = Type::Method {
                             paramss,
-                            ret: Box::new(rhs.ty.clone()),
+                            ret: TyBox::new(rhs.ty.clone()),
                         };
                     }
                     self.st.get_mut(p.getter).default_rhs = Some(rhs);
@@ -772,7 +772,7 @@ impl Typer {
         self.st.get_mut(id).ty = match ty {
             Type::Method { paramss, .. } => Type::Method {
                 paramss,
-                ret: Box::new(Type::Error),
+                ret: TyBox::new(Type::Error),
             },
             _ => Type::Error,
         };

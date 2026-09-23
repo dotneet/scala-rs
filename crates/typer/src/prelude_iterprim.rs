@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, iface, method, type_param};
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{SymbolId, Type};
 
 /// `class WithFilter[+A, +CC[_]]`, as 2.13 declares it.
@@ -24,8 +25,8 @@ pub(crate) fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     let ta = Type::TypeParam(a);
     let tcc = Type::TypeParam(cc);
     let applied = |arg: Type| Type::Applied {
-        ctor: Box::new(tcc.clone()),
-        args: vec![arg],
+        ctor: TyBox::new(tcc.clone()),
+        args: vec![arg].into(),
     };
     let m = method(
         st,
@@ -39,7 +40,7 @@ pub(crate) fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]],
-        ret: Box::new(applied(Type::TypeParam(b))),
+        ret: TyBox::new(applied(Type::TypeParam(b))),
     };
     let fm = method(
         st,
@@ -53,7 +54,7 @@ pub(crate) fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     st.get_mut(fm).tparams = vec![fb];
     st.get_mut(fm).ty = Type::Method {
         paramss: vec![vec![fn1(ta.clone(), applied(Type::TypeParam(fb)))]],
-        ret: Box::new(applied(Type::TypeParam(fb))),
+        ret: TyBox::new(applied(Type::TypeParam(fb))),
     };
     method(
         st,
@@ -70,7 +71,7 @@ pub(crate) fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
         vec![fn1(ta, Type::Boolean)],
         Type::Class {
             sym: wf,
-            args: vec![Type::TypeParam(a), tcc],
+            args: vec![Type::TypeParam(a), tcc].into(),
         },
         Intrinsic::None,
     );
@@ -102,18 +103,18 @@ pub(crate) fn complete_with_filter_flat_map(st: &mut SymbolTable, wf: SymbolId) 
         return;
     };
     let result = Type::Applied {
-        ctor: Box::new(Type::TypeParam(cc)),
-        args: vec![Type::TypeParam(b)],
+        ctor: TyBox::new(Type::TypeParam(cc)),
+        args: vec![Type::TypeParam(b)].into(),
     };
     st.get_mut(fm).ty = Type::Method {
         paramss: vec![vec![fn1(
             Type::TypeParam(a),
             Type::Class {
                 sym: iterable_once,
-                args: vec![Type::TypeParam(b)],
+                args: vec![Type::TypeParam(b)].into(),
             },
         )]],
-        ret: Box::new(result),
+        ret: TyBox::new(result),
     };
 }
 pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
@@ -129,7 +130,7 @@ pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
     let ta = Type::TypeParam(a);
     let opt = Type::Class {
         sym: st.option_sym,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     // `def map[B](f: A => B): Option[B]` -- the element type is what `f`
     // returns, not what the filter was applied to.
@@ -145,9 +146,9 @@ pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
     st.get_mut(m).tparams = vec![mb];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(mb))]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: st.option_sym,
-            args: vec![Type::TypeParam(mb)],
+            args: vec![Type::TypeParam(mb)].into(),
         }),
     };
     let fm = method(
@@ -162,11 +163,11 @@ pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
     st.get_mut(fm).tparams = vec![fb];
     let opt_b = Type::Class {
         sym: st.option_sym,
-        args: vec![Type::TypeParam(fb)],
+        args: vec![Type::TypeParam(fb)].into(),
     };
     st.get_mut(fm).ty = Type::Method {
         paramss: vec![vec![fn1(ta.clone(), opt_b.clone())]],
-        ret: Box::new(opt_b),
+        ret: TyBox::new(opt_b),
     };
     let _ = opt;
     method(
@@ -184,7 +185,7 @@ pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
         vec![fn1(ta, Type::Boolean)],
         Type::Class {
             sym: wf,
-            args: vec![Type::TypeParam(a)],
+            args: vec![Type::TypeParam(a)].into(),
         },
         Intrinsic::None,
     );
@@ -197,7 +198,7 @@ pub(crate) fn add_iterator(st: &mut SymbolTable) -> SymbolId {
     let ta = Type::TypeParam(a);
     let it_t = Type::Class {
         sym: it,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(st, it, "hasNext", vec![], Type::Boolean, Intrinsic::None);
     method(st, it, "next", vec![], ta.clone(), Intrinsic::None);

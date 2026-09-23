@@ -569,7 +569,7 @@ fn definitely_different(st: &SymbolTable, a: &Type, b: &Type) -> bool {
     }
     let bare = |s: SymbolId| Type::Class {
         sym: s,
-        args: Vec::new(),
+        args: Vec::new().into(),
     };
     st.is_sub_type(&bare(*x), &bare(*y)) != st.is_sub_type(&bare(*y), &bare(*x))
 }
@@ -643,7 +643,7 @@ fn head_sym(st: &SymbolTable, ty: &Type) -> Option<SymbolId> {
 fn heads_differ(st: &SymbolTable, a: &Type, b: &Type) -> bool {
     let bare = |s: SymbolId| Type::Class {
         sym: s,
-        args: Vec::new(),
+        args: Vec::new().into(),
     };
     match (head_sym(st, a), head_sym(st, b)) {
         (Some(x), Some(y)) => definitely_different(st, &bare(x), &bare(y)),
@@ -1431,7 +1431,7 @@ pub fn check_overrides(
             continue;
         }
         let result = |ty: Type| match ty {
-            Type::Method { ret, .. } => *ret,
+            Type::Method { ret, .. } => <scala_rs_parser::Type as Clone>::clone(&*ret),
             other => other,
         };
         let actual = result(member_type_at(st, cls, child));

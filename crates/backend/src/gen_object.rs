@@ -1406,7 +1406,7 @@ pub(crate) fn emit_case_apply_bridge(
     let tys: Vec<Type> = fields.iter().map(|f| st.get(*f).ty.clone()).collect();
     let ret = Type::Class {
         sym: class_id,
-        args: vec![],
+        args: vec![].into(),
     };
     let target = jvm_method_desc(st, &tys, &ret);
     let bridge = format!(
@@ -1523,7 +1523,7 @@ pub(crate) fn emit_case_apply(
     }
     let ret = Type::Class {
         sym: class_id,
-        args: vec![],
+        args: vec![].into(),
     };
     let desc = jvm_method_desc(st, &params, &ret);
     // The companion's own `apply` of this very signature replaces it.
@@ -1842,7 +1842,7 @@ pub(crate) fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: S
     }
     let ret = Type::Class {
         sym: class_id,
-        args: vec![],
+        args: vec![].into(),
     };
     let desc = jvm_method_desc(st, &params, &ret);
     // `copy` runs on the instance itself, so its own `$outer` is the one the

@@ -5,6 +5,7 @@
 //! (`crate::prelude_text::install`) is wired into `install_prelude`.
 use crate::prelude::{fn1, fn2, method, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -152,7 +153,7 @@ fn add_string_builder_full(st: &mut SymbolTable) {
     }
     let sb_t = Type::Class {
         sym: sb,
-        args: vec![],
+        args: vec![].into(),
     };
 
     // Constructors: (), (Int), (String)
@@ -263,26 +264,26 @@ fn add_range_ops(st: &mut SymbolTable) {
     }
     let range_t = Type::Class {
         sym: range,
-        args: vec![],
+        args: vec![].into(),
     };
     let idx = find(st, st.scala_pkg, "IndexedSeq", SymKind::Class);
     let idx_int = Type::Class {
         sym: idx,
-        args: vec![Type::Int],
+        args: vec![Type::Int].into(),
     };
     let list_int = Type::Class {
         sym: st.list_sym,
-        args: vec![Type::Int],
+        args: vec![Type::Int].into(),
     };
     let vector = find(st, st.scala_pkg, "Vector", SymKind::Class);
     let vector_int = Type::Class {
         sym: vector,
-        args: vec![Type::Int],
+        args: vec![Type::Int].into(),
     };
     let tuple2 = find(st, st.scala_pkg, "Tuple2", SymKind::Class);
     let tuple2_int_int = Type::Class {
         sym: tuple2,
-        args: vec![Type::Int, Type::Int],
+        args: vec![Type::Int, Type::Int].into(),
     };
     // `Range.withFilter(...).map/flatMap(...)` returns `IndexedSeq[Int]`, not
     // `Range` (mirrors `Range.map`'s own erasure/return type below).
@@ -294,9 +295,10 @@ fn add_range_ops(st: &mut SymbolTable) {
             Type::Int,
             Type::Class {
                 sym: idx,
-                args: vec![],
+                args: vec![].into(),
             },
-        ],
+        ]
+        .into(),
     };
 
     // `withFilter` unblocks `for (x <- 1 to 3 if p) yield ...`.
@@ -409,7 +411,7 @@ fn add_range_ops(st: &mut SymbolTable) {
         range,
         "splitAt",
         vec![Type::Int],
-        Type::Tuple(vec![range_t.clone(), range_t.clone()]),
+        Type::Tuple(vec![range_t.clone(), range_t.clone()].into()),
         Intrinsic::None,
     );
 
@@ -458,7 +460,7 @@ fn add_range_ops(st: &mut SymbolTable) {
         .expect("IterableOnce is required for the scala-library Range.flatMap signature");
     let from = Type::Class {
         sym: iterable_once,
-        args: vec![tb.clone()],
+        args: vec![tb.clone()].into(),
     };
     let f = fn1(Type::Int, from);
     let p = st.alloc("f", flat_map, SymKind::Term, Flags::PARAM, "");
@@ -468,9 +470,9 @@ fn add_range_ops(st: &mut SymbolTable) {
     st.get_mut(flat_map).tparams = vec![b];
     st.get_mut(flat_map).ty = Type::Method {
         paramss: vec![vec![f]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: idx,
-            args: vec![tb],
+            args: vec![tb].into(),
         }),
     };
     method(
@@ -480,7 +482,7 @@ fn add_range_ops(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: idx,
-            args: vec![tuple2_int_int],
+            args: vec![tuple2_int_int].into(),
         },
         Intrinsic::None,
     );
@@ -491,7 +493,7 @@ fn add_range_ops(st: &mut SymbolTable) {
         range,
         "toArray",
         vec![],
-        Type::Array(Box::new(Type::Int)),
+        Type::Array(TyBox::new(Type::Int)),
         Intrinsic::None,
     );
 
@@ -513,7 +515,7 @@ fn add_range_ops(st: &mut SymbolTable) {
             vec![tb.clone()],
             vec![fn2(tb.clone(), Type::Int, tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
     let m = method(st, range, "foldRight", vec![], Type::Unit, Intrinsic::None);
     let b = type_param(st, m, "B");
@@ -530,7 +532,7 @@ fn add_range_ops(st: &mut SymbolTable) {
             vec![tb.clone()],
             vec![fn2(Type::Int, tb.clone(), tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
     method(st, range, "sum", vec![], Type::Int, Intrinsic::None);
     method(st, range, "product", vec![], Type::Int, Intrinsic::None);

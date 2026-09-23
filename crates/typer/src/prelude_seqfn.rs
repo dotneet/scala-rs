@@ -52,6 +52,7 @@
 
 use crate::prelude::fn1;
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -78,7 +79,7 @@ fn seq_is_a_partial_function(st: &mut SymbolTable) {
     }
     let parent = Type::Class {
         sym: pf,
-        args: vec![Type::Int, Type::TypeParam(tps[0])],
+        args: vec![Type::Int, Type::TypeParam(tps[0])].into(),
     };
     if st.get(seq).parents.contains(&parent) {
         return;
@@ -106,7 +107,7 @@ fn add_lift_and_or_else(st: &mut SymbolTable) {
     }
     let opt_b = Type::Class {
         sym: st.option_sym,
-        args: vec![tb.clone()],
+        args: vec![tb.clone()].into(),
     };
     crate::prelude::prelude_method(
         st,
@@ -118,7 +119,7 @@ fn add_lift_and_or_else(st: &mut SymbolTable) {
     );
     let pf_ty = Type::Class {
         sym: pf,
-        args: vec![ta, tb],
+        args: vec![ta, tb].into(),
     };
     crate::prelude::prelude_method(
         st,
@@ -158,7 +159,7 @@ fn mutable_array_seq_is_an_indexed_seq(st: &mut SymbolTable) {
     }
     let parent = Type::Class {
         sym: idx,
-        args: vec![Type::TypeParam(tps[0])],
+        args: vec![Type::TypeParam(tps[0])].into(),
     };
     if st
         .get(arrseq)
@@ -216,7 +217,7 @@ fn add_wrap_boolean_array(st: &mut SymbolTable) {
         "scala/collection/mutable/ArraySeq$ofBoolean",
         &[Type::Class {
             sym: arrseq,
-            args: vec![Type::Boolean],
+            args: vec![Type::Boolean].into(),
         }],
     );
     let p = st.predef;
@@ -226,13 +227,13 @@ fn add_wrap_boolean_array(st: &mut SymbolTable) {
     };
     let ret = Type::Class {
         sym: of_bool,
-        args: vec![],
+        args: vec![].into(),
     };
     let m = crate::prelude::prelude_method(
         st,
         owner,
         "wrapBooleanArray",
-        vec![Type::Array(Box::new(Type::Boolean))],
+        vec![Type::Array(TyBox::new(Type::Boolean))],
         ret,
         Intrinsic::None,
     );

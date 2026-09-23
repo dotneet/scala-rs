@@ -850,7 +850,7 @@ fn erased_receiver_ty(ctx: &EmitCtx, cls: SymbolId) -> Type {
     }
     Type::Class {
         sym: cls,
-        args: vec![],
+        args: vec![].into(),
     }
 }
 

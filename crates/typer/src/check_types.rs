@@ -164,7 +164,7 @@ impl Typer {
             // `<repeated>[_]`.  They denote the same type ascription.  The
             // `Typed` expression arm replaces this wildcard with the element
             // type of the sequence expression after typing it.
-            TreeKind::Ident { name } if name == "_*" => Type::Repeated(Box::new(Type::Wildcard)),
+            TreeKind::Ident { name } if name == "_*" => Type::Repeated(TyBox::new(Type::Wildcard)),
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, tpt.span);
                 self.expose_unqualified_type(name, tpt.span);
@@ -257,7 +257,7 @@ impl Typer {
                         _ if id == self.st.string_sym => Type::String,
                         _ => self.module_prefix_view(qual, id).unwrap_or(Type::Class {
                             sym: id,
-                            args: vec![],
+                            args: vec![].into(),
                         }),
                     }
                 } else if self.qualifier_names_nothing(qual) {
@@ -357,7 +357,7 @@ impl Typer {
                     simple = "uncheckedVariance".to_string();
                 }
                 Type::Annotated {
-                    tpe: Box::new(ty),
+                    tpe: TyBox::new(ty),
                     annot: simple,
                 }
             }
@@ -372,17 +372,17 @@ impl Typer {
                 let applied = match tpt.name() {
                     // These are parser markers, not source-level names.
                     Some("<repeated>") => {
-                        Type::Repeated(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
+                        Type::Repeated(TyBox::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
                     Some("<ByName>") if tpt.byname_type_marker => {
-                        Type::ByName(Box::new(as_.first().cloned().unwrap_or(Type::Error)))
+                        Type::ByName(TyBox::new(as_.first().cloned().unwrap_or(Type::Error)))
                     }
-                    Some("<tuple>") => Type::Tuple(as_),
+                    Some("<tuple>") => Type::Tuple(as_.into()),
                     Some(name) if name.starts_with("<Function") && name.ends_with('>') => {
                         let ret = as_.pop().unwrap_or(Type::Error);
                         Type::Function {
-                            params: as_,
-                            ret: Box::new(ret),
+                            params: as_.into(),
+                            ret: TyBox::new(ret),
                         }
                     }
                     Some(_) => {
@@ -392,8 +392,8 @@ impl Typer {
                         // A user declaration with this name is not that symbol.
                         if as_.len() == 2 && self.is_scala_function_module(&ctor) {
                             Type::Function {
-                                params: vec![as_[0].clone()],
-                                ret: Box::new(as_[1].clone()),
+                                params: vec![as_[0].clone()].into(),
+                                ret: TyBox::new(as_[1].clone()),
                             }
                         } else {
                             let applied = self.apply_types(ctor.clone(), as_, span);
@@ -461,8 +461,10 @@ impl Typer {
                         Type::Wildcard
                     } else {
                         Type::BoundedWildcard {
-                            lo: lo.as_ref().map(|t| Box::new(self.tree_to_type(t))),
-                            hi: hi.as_ref().map(|t| Box::new(self.tree_to_type(t))),
+                            lo: (lo.as_ref().map(|t| TyBox::new(self.tree_to_type(t))))
+                                .map(scala_rs_parser::TyBox::from),
+                            hi: (hi.as_ref().map(|t| TyBox::new(self.tree_to_type(t))))
+                                .map(scala_rs_parser::TyBox::from),
                         }
                     }
                 } else if !rhs.is_empty() {
@@ -470,7 +472,7 @@ impl Typer {
                 } else {
                     Type::Named {
                         name: name.clone(),
-                        args: vec![],
+                        args: vec![].into(),
                     }
                 }
             }
@@ -586,8 +588,8 @@ impl Typer {
                             Type::Wildcard
                         } else {
                             Type::BoundedWildcard {
-                                lo: lo.map(Box::new),
-                                hi: hi.map(Box::new),
+                                lo: lo.map(TyBox::new),
+                                hi: hi.map(TyBox::new),
                             }
                         };
                         (id, bounds)
@@ -601,7 +603,7 @@ impl Typer {
             }
             _ => Type::Named {
                 name: tpt.name().unwrap_or("?").to_string(),
-                args: vec![],
+                args: vec![].into(),
             },
         }
     }
@@ -734,7 +736,7 @@ impl Typer {
                         .st
                         .expand_applied_hk_alias(crate::symbol::apply_type_ctor(
                             (**ctor).clone(),
-                            args.clone(),
+                            args.clone().into_vec(),
                         ));
                 }
                 prefix.clone()
@@ -762,7 +764,7 @@ impl Typer {
     fn projected_class_type(&mut self, prefix: &Type, pcls: SymbolId, member: SymbolId) -> Type {
         let base = Type::Class {
             sym: member,
-            args: vec![],
+            args: vec![].into(),
         };
         let decls = self.projection_refinements(prefix, pcls, member);
         let t = Self::as_seen_from(base, decls);
@@ -860,11 +862,11 @@ impl Typer {
                 && !self.st.get(owner).flags.contains(Flags::MODULE);
             return match qpre {
                 Some(p) if per_instance => Type::SingleType {
-                    prefix: Box::new(p),
+                    prefix: TyBox::new(p),
                     sym: mcls,
                 },
                 None if per_instance => Type::SingleType {
-                    prefix: Box::new(Type::ThisType(owner)),
+                    prefix: TyBox::new(Type::ThisType(owner)),
                     sym: mcls,
                 },
                 _ => Type::ModuleRef(mcls),
@@ -886,7 +888,7 @@ impl Typer {
             }
         };
         Type::SingleType {
-            prefix: Box::new(prefix),
+            prefix: TyBox::new(prefix),
             sym,
         }
     }
@@ -1283,7 +1285,7 @@ impl Typer {
             },
         );
         Type::Refined {
-            parents: vec![base],
+            parents: vec![base].into(),
             decls,
         }
     }
@@ -2538,7 +2540,7 @@ impl Typer {
                                 _ => Type::NoType,
                             };
                             return Type::SingleType {
-                                prefix: Box::new(prefix),
+                                prefix: TyBox::new(prefix),
                                 sym,
                             };
                         }
@@ -2723,7 +2725,7 @@ impl Typer {
                         Type::ThisType(owner)
                     };
                 Type::SingleType {
-                    prefix: Box::new(prefix),
+                    prefix: TyBox::new(prefix),
                     sym,
                 }
             }
@@ -3164,7 +3166,10 @@ impl Typer {
             return Type::Error;
         }
         let _ = span;
-        Type::Refined { parents: ps, decls }
+        Type::Refined {
+            parents: ps.into(),
+            decls,
+        }
     }
 
     /// Type a refinement `type` member, including HK `type F[_]` / `type F[X] = Id[X]`
@@ -3199,7 +3204,7 @@ impl Typer {
                         Type::TypeMember(r.sym)
                     } else {
                         Type::Applied {
-                            ctor: Box::new(Type::TypeMember(r.sym)),
+                            ctor: TyBox::new(Type::TypeMember(r.sym)),
                             args: s.tparams[..captured]
                                 .iter()
                                 .copied()
@@ -3331,7 +3336,7 @@ impl Typer {
             Type::TypeMember(id)
         } else {
             Type::Applied {
-                ctor: Box::new(Type::TypeMember(id)),
+                ctor: TyBox::new(Type::TypeMember(id)),
                 args: captured.into_iter().map(Type::TypeParam).collect(),
             }
         };
@@ -3949,7 +3954,7 @@ impl Typer {
                         SymKind::TypeMember => self.type_member_here(id),
                         _ => Type::Class {
                             sym: id,
-                            args: args.to_vec(),
+                            args: args.to_vec().into(),
                         },
                     }
                 } else if let Some(t) = builtin {
@@ -3960,7 +3965,7 @@ impl Typer {
                 } else {
                     Type::Named {
                         name: name.into(),
-                        args: args.to_vec(),
+                        args: args.to_vec().into(),
                     }
                 }
             }

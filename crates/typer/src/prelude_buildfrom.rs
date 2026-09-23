@@ -31,6 +31,7 @@
 //! ClassTag evidence before conversion viability is checked.
 
 use crate::symbol::SymbolTable;
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{SymbolId, Type};
 
 /// `(companion module jvm name, collection class jvm name)`.
@@ -240,7 +241,7 @@ pub(crate) fn link_evidence_factories(st: &mut SymbolTable) {
         };
         let mut args = vec![Type::Class {
             sym: collection,
-            args: Vec::new(),
+            args: Vec::new().into(),
         }];
         if let Some(evidence) = evidence {
             let Some(ev) = crate::classpath::find_by_jvm(st, evidence) else {
@@ -248,10 +249,13 @@ pub(crate) fn link_evidence_factories(st: &mut SymbolTable) {
             };
             args.push(Type::Class {
                 sym: ev,
-                args: Vec::new(),
+                args: Vec::new().into(),
             });
         }
-        let parent = Type::Class { sym: factory, args };
+        let parent = Type::Class {
+            sym: factory,
+            args: args.into(),
+        };
         if !st.get(module).parents.contains(&parent) {
             st.get_mut(module).parents.push(parent);
         }
@@ -277,15 +281,15 @@ fn widen_set_concat(st: &mut SymbolTable) {
     };
     let set_a = Type::Class {
         sym: set,
-        args: vec![Type::TypeParam(a)],
+        args: vec![Type::TypeParam(a)].into(),
     };
     let ioc_a = Type::Class {
         sym: ioc,
-        args: vec![Type::TypeParam(a)],
+        args: vec![Type::TypeParam(a)].into(),
     };
     let wanted = Type::Method {
         paramss: vec![vec![set_a.clone()]],
-        ret: Box::new(set_a.clone()),
+        ret: TyBox::new(set_a.clone()),
     };
     let targets: Vec<SymbolId> = st
         .get(set)
@@ -297,7 +301,7 @@ fn widen_set_concat(st: &mut SymbolTable) {
     for m in targets {
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![ioc_a.clone()]],
-            ret: Box::new(set_a.clone()),
+            ret: TyBox::new(set_a.clone()),
         };
         if let Some(&p) = st.get(m).params.first() {
             st.get_mut(p).ty = ioc_a.clone();
@@ -323,7 +327,7 @@ fn add_mutable_map_removed(st: &mut SymbolTable) {
     let (k, v) = (st.get(map).tparams[0], st.get(map).tparams[1]);
     let map_t = Type::Class {
         sym: map,
-        args: vec![Type::TypeParam(k), Type::TypeParam(v)],
+        args: vec![Type::TypeParam(k), Type::TypeParam(v)].into(),
     };
     crate::prelude::method(
         st,
@@ -414,20 +418,20 @@ fn add_to_factory(st: &mut SymbolTable) {
         st.get_mut(m).tparams = tparams;
         let elem_tys: Vec<Type> = elems.iter().map(|&e| Type::TypeParam(e)).collect();
         let built = Type::Applied {
-            ctor: Box::new(Type::TypeParam(cc)),
-            args: elem_tys.clone(),
+            ctor: TyBox::new(Type::TypeParam(cc)),
+            args: elem_tys.clone().into(),
         };
         let elem = if map_like {
             Type::Class {
                 sym: tuple2.unwrap(),
-                args: elem_tys,
+                args: elem_tys.into(),
             }
         } else {
             elem_tys[0].clone()
         };
         let param = Type::Class {
             sym: fac,
-            args: vec![Type::TypeParam(cc)],
+            args: vec![Type::TypeParam(cc)].into(),
         };
         let p = st.alloc(
             "factory",
@@ -441,9 +445,9 @@ fn add_to_factory(st: &mut SymbolTable) {
         st.get_mut(m).paramss = vec![vec![p]];
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![param]],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: factory,
-                args: vec![elem, built],
+                args: vec![elem, built].into(),
             }),
         };
         let mems = st.get(owner).members.clone();
@@ -484,8 +488,9 @@ fn link(
         sym: factory,
         args: vec![Type::Class {
             sym: cls,
-            args: Vec::new(),
-        }],
+            args: Vec::new().into(),
+        }]
+        .into(),
     };
     if !st.get(module_cls).parents.contains(&parent) {
         st.get_mut(module_cls).parents.push(parent);
@@ -548,22 +553,23 @@ fn add_factory_evidence(st: &mut SymbolTable, module_cls: SymbolId, cls: SymbolI
     let elem = if map_like {
         Type::Class {
             sym: tuple2.unwrap(),
-            args: elem_tys.clone(),
+            args: elem_tys.clone().into(),
         }
     } else {
         elem_tys[0].clone()
     };
     st.get_mut(m).ty = Type::Method {
         paramss: Vec::new(),
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: factory,
             args: vec![
                 elem,
                 Type::Class {
                     sym: cls,
-                    args: elem_tys,
+                    args: elem_tys.into(),
                 },
-            ],
+            ]
+            .into(),
         }),
     };
     let mems = st.get(module_cls).members.clone();

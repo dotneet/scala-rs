@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, iface, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn add_ordered(st: &mut SymbolTable) -> SymbolId {
@@ -16,7 +17,7 @@ pub(crate) fn add_ordered(st: &mut SymbolTable) -> SymbolId {
     let cmp = st.alloc("compare", ordered, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(cmp).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(a)]],
-        ret: Box::new(Type::Int),
+        ret: TyBox::new(Type::Int),
     };
     method(
         st,
@@ -30,7 +31,7 @@ pub(crate) fn add_ordered(st: &mut SymbolTable) -> SymbolId {
         let id = st.alloc(op, ordered, SymKind::Method, Flags::EMPTY, "");
         st.get_mut(id).ty = Type::Method {
             paramss: vec![vec![Type::TypeParam(a)]],
-            ret: Box::new(Type::Boolean),
+            ret: TyBox::new(Type::Boolean),
         };
     }
     ordered
@@ -92,19 +93,19 @@ pub(crate) fn add_ordering_instance(
     let cls = st.module_class_of(m);
     st.get_mut(cls).parents = vec![Type::Class {
         sym: ordering,
-        args: vec![arg],
+        args: vec![arg].into(),
     }];
 }
 fn add_sorted_factory(st: &mut SymbolTable, owner: SymbolId, cls: SymbolId, ordering: SymbolId) {
     let cls_t = Type::Class {
         sym: cls,
-        args: vec![Type::Any],
+        args: vec![Type::Any].into(),
     };
     let apply = method(
         st,
         owner,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         cls_t,
         Intrinsic::None,
     );
@@ -116,7 +117,7 @@ fn add_sorted_factory(st: &mut SymbolTable, owner: SymbolId, cls: SymbolId, orde
         Flags::PARAM,
         "",
     );
-    st.get_mut(xs).ty = Type::Repeated(Box::new(Type::TypeParam(aa)));
+    st.get_mut(xs).ty = Type::Repeated(TyBox::new(Type::TypeParam(aa)));
     let ev = st.alloc(
         "evidence$1",
         apply,
@@ -126,22 +127,22 @@ fn add_sorted_factory(st: &mut SymbolTable, owner: SymbolId, cls: SymbolId, orde
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ordering,
-        args: vec![Type::TypeParam(aa)],
+        args: vec![Type::TypeParam(aa)].into(),
     };
     st.get_mut(apply).tparams = vec![aa];
     st.get_mut(apply).params = vec![xs, ev];
     st.get_mut(apply).paramss = vec![vec![xs], vec![ev]];
     st.get_mut(apply).ty = Type::Method {
         paramss: vec![
-            vec![Type::Repeated(Box::new(Type::TypeParam(aa)))],
+            vec![Type::Repeated(TyBox::new(Type::TypeParam(aa)))],
             vec![Type::Class {
                 sym: ordering,
-                args: vec![Type::TypeParam(aa)],
+                args: vec![Type::TypeParam(aa)].into(),
             }],
         ],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: cls,
-            args: vec![Type::TypeParam(aa)],
+            args: vec![Type::TypeParam(aa)].into(),
         }),
     };
 }
@@ -190,7 +191,7 @@ pub(crate) fn add_sorted_set(st: &mut SymbolTable, ordering: SymbolId) {
         "scala/collection/immutable/TreeSet",
         &[Type::Class {
             sym: ss,
-            args: vec![],
+            args: vec![].into(),
         }],
     );
     let tsa = type_param(st, ts, "A");
@@ -198,7 +199,7 @@ pub(crate) fn add_sorted_set(st: &mut SymbolTable, ordering: SymbolId) {
     let tta = Type::TypeParam(tsa);
     st.get_mut(ts).parents = vec![Type::Class {
         sym: ss,
-        args: vec![tta.clone()],
+        args: vec![tta.clone()].into(),
     }];
     method(
         st,
@@ -233,10 +234,10 @@ fn add_sorted_map_factory(
         st,
         owner,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         Type::Class {
             sym: cls,
-            args: vec![Type::Any, Type::Any],
+            args: vec![Type::Any, Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -244,7 +245,7 @@ fn add_sorted_map_factory(
     let v = type_param(st, apply, "V");
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![Type::TypeParam(k), Type::TypeParam(v)],
+        args: vec![Type::TypeParam(k), Type::TypeParam(v)].into(),
     };
     let xs = st.alloc(
         "elems",
@@ -253,7 +254,7 @@ fn add_sorted_map_factory(
         Flags::PARAM,
         "",
     );
-    st.get_mut(xs).ty = Type::Repeated(Box::new(pair.clone()));
+    st.get_mut(xs).ty = Type::Repeated(TyBox::new(pair.clone()));
     let ev = st.alloc(
         "evidence$1",
         apply,
@@ -263,22 +264,22 @@ fn add_sorted_map_factory(
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ordering,
-        args: vec![Type::TypeParam(k)],
+        args: vec![Type::TypeParam(k)].into(),
     };
     st.get_mut(apply).tparams = vec![k, v];
     st.get_mut(apply).params = vec![xs, ev];
     st.get_mut(apply).paramss = vec![vec![xs], vec![ev]];
     st.get_mut(apply).ty = Type::Method {
         paramss: vec![
-            vec![Type::Repeated(Box::new(pair))],
+            vec![Type::Repeated(TyBox::new(pair))],
             vec![Type::Class {
                 sym: ordering,
-                args: vec![Type::TypeParam(k)],
+                args: vec![Type::TypeParam(k)].into(),
             }],
         ],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: cls,
-            args: vec![Type::TypeParam(k), Type::TypeParam(v)],
+            args: vec![Type::TypeParam(k), Type::TypeParam(v)].into(),
         }),
     };
 }
@@ -304,7 +305,7 @@ pub(crate) fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
     let tv = Type::TypeParam(sv);
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     method(
         st,
@@ -321,7 +322,7 @@ pub(crate) fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
         vec![Type::Any],
         Type::Class {
             sym: st.option_sym,
-            args: vec![tv.clone()],
+            args: vec![tv.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -347,7 +348,7 @@ pub(crate) fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
         );
         st.get_mut(keys).ty = Type::Class {
             sym: sorted_set,
-            args: vec![tk.clone()],
+            args: vec![tk.clone()].into(),
         };
     }
     let sm_mod = module(
@@ -368,7 +369,7 @@ pub(crate) fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
         "scala/collection/immutable/TreeMap",
         &[Type::Class {
             sym: sm,
-            args: vec![],
+            args: vec![].into(),
         }],
     );
     let tmk = type_param(st, tm, "K");
@@ -378,11 +379,11 @@ pub(crate) fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
     let ttv = Type::TypeParam(tmv);
     st.get_mut(tm).parents = vec![Type::Class {
         sym: sm,
-        args: vec![ttk.clone(), ttv.clone()],
+        args: vec![ttk.clone(), ttv.clone()].into(),
     }];
     let tpair = Type::Class {
         sym: tuple2,
-        args: vec![ttk.clone(), ttv.clone()],
+        args: vec![ttk.clone(), ttv.clone()].into(),
     };
     method(
         st,
@@ -399,7 +400,7 @@ pub(crate) fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
         vec![Type::Any],
         Type::Class {
             sym: st.option_sym,
-            args: vec![ttv],
+            args: vec![ttv].into(),
         },
         Intrinsic::None,
     );

@@ -32,6 +32,7 @@
 //! the missing implicit as before. Nothing is accepted that the view search
 //! did not actually witness.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_span::Span;
 
@@ -155,8 +156,8 @@ impl Typer {
                 body: Box::new(ident),
             },
             ty: Type::Function {
-                params: vec![from.clone()],
-                ret: Box::new(to.clone()),
+                params: vec![from.clone()].into(),
+                ret: TyBox::new(to.clone()),
             },
             sym: SymbolId::NONE,
             postfix: false,

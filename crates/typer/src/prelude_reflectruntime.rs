@@ -92,7 +92,7 @@ pub fn install(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: loader,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );

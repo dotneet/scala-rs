@@ -149,7 +149,7 @@ impl Typer {
                     return false;
                 };
                 let fn_ty = Type::Function {
-                    params: paramss[0].clone(),
+                    params: paramss[0].clone().into(),
                     ret: ret.clone(),
                 };
                 self.st.is_sub_type(&fn_ty, pt)

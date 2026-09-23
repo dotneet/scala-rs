@@ -1,4 +1,5 @@
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// `reflect_context_stub` asks for the placeholder `blackbox.Context` /
@@ -114,7 +115,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     st.get_mut(throwable).flags.set(Flags::FINAL, false);
     let throwable_ty = Type::Class {
         sym: throwable,
-        args: vec![],
+        args: vec![].into(),
     };
     // `java.lang.Throwable`'s public constructors and the handful of methods
     // slick code actually calls (`getMessage`, `getCause`, `printStackTrace`).
@@ -191,7 +192,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     st.get_mut(exception).flags.set(Flags::FINAL, false);
     let exception_ty = Type::Class {
         sym: exception,
-        args: vec![],
+        args: vec![].into(),
     };
     for params in [
         vec![],
@@ -219,7 +220,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     st.get_mut(_runtime_ex).flags.set(Flags::FINAL, false);
     let runtime_ex_ty = Type::Class {
         sym: _runtime_ex,
-        args: vec![],
+        args: vec![].into(),
     };
     for params in [
         vec![],
@@ -256,7 +257,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         "scala/Some",
         &[Type::Class {
             sym: st.option_sym,
-            args: vec![],
+            args: vec![].into(),
         }],
     );
     st.none_sym = module_extending(
@@ -266,7 +267,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         "scala/None$",
         Type::Class {
             sym: st.option_sym,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     st.list_sym = class(
@@ -283,7 +284,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         "scala/collection/immutable/Nil$",
         Type::Class {
             sym: st.list_sym,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     st.cons_sym = class(
@@ -293,7 +294,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         "scala/collection/immutable/$colon$colon",
         &[Type::Class {
             sym: st.list_sym,
-            args: vec![],
+            args: vec![].into(),
         }],
     );
     // `::` is the source spelling of `$colon$colon`, not a class of its own.
@@ -369,9 +370,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     st.get_mut(some_apply).tparams = vec![some_a];
     st.get_mut(some_apply).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(some_a)]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: st.some_sym,
-            args: vec![Type::TypeParam(some_a)],
+            args: vec![Type::TypeParam(some_a)].into(),
         }),
     };
     let mems = st.get(some_cls).members.clone();
@@ -393,14 +394,14 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         vec![Type::Any, Type::Any],
         Type::Class {
             sym: tuple2,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
     if let Some(so) = string_ops {
         let pair = Type::Class {
             sym: tuple2,
-            args: vec![Type::String, Type::String],
+            args: vec![Type::String, Type::String].into(),
         };
         method(
             st,
@@ -557,9 +558,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         st.get_mut(pair).tparams = vec![bt];
         st.get_mut(pair).ty = Type::Method {
             paramss: vec![vec![Type::TypeParam(bt)]],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: tuple2,
-                args: vec![Type::TypeParam(at), Type::TypeParam(bt)],
+                args: vec![Type::TypeParam(at), Type::TypeParam(bt)].into(),
             }),
         };
         a
@@ -581,9 +582,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         st.get_mut(pair).tparams = vec![bt];
         st.get_mut(pair).ty = Type::Method {
             paramss: vec![vec![Type::TypeParam(bt)]],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: tuple2,
-                args: vec![Type::TypeParam(at), Type::TypeParam(bt)],
+                args: vec![Type::TypeParam(at), Type::TypeParam(bt)].into(),
             }),
         };
         a
@@ -797,7 +798,7 @@ fn add_java_sam(st: &mut SymbolTable, java: SymbolId, java_lang: SymbolId) {
     let run = st.alloc("run", runnable, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(run).ty = Type::Method {
         paramss: Vec::new(),
-        ret: Box::new(Type::Unit),
+        ret: TyBox::new(Type::Unit),
     };
 
     let util = st.alloc("util", java, SymKind::Package, Flags::PACKAGE, "java/util");
@@ -808,7 +809,7 @@ fn add_java_sam(st: &mut SymbolTable, java: SymbolId, java_lang: SymbolId) {
     let cmp = st.alloc("compare", comparator, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(cmp).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(ct), Type::TypeParam(ct)]],
-        ret: Box::new(Type::Int),
+        ret: TyBox::new(Type::Int),
     };
 
     let fn_pkg = st.alloc(
@@ -826,7 +827,7 @@ fn add_java_sam(st: &mut SymbolTable, java: SymbolId, java_lang: SymbolId) {
     let apply = st.alloc("apply", jfun, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(apply).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(ft)]],
-        ret: Box::new(Type::TypeParam(fr)),
+        ret: TyBox::new(Type::TypeParam(fr)),
     };
 }
 
@@ -856,7 +857,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: annotation,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
@@ -875,7 +876,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
     );
     st.get_mut(static_annot).parents = vec![Type::Class {
         sym: annotation,
-        args: vec![],
+        args: vec![].into(),
     }];
     let _ = abs_class(
         st,
@@ -884,7 +885,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
         "scala/annotation/switch",
         &[Type::Class {
             sym: static_annot,
-            args: vec![],
+            args: vec![].into(),
         }],
     );
     let inf = class(
@@ -894,7 +895,7 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
         "scala/annotation/implicitNotFound",
         &[Type::Class {
             sym: static_annot,
-            args: vec![],
+            args: vec![].into(),
         }],
     );
     let inf_msg = st.alloc("msg", inf, SymKind::Term, Flags::PARAM, "");
@@ -914,12 +915,12 @@ fn add_annotation_pkg(st: &mut SymbolTable) {
         "scala/annotation/unchecked/uncheckedVariance",
         &[Type::Class {
             sym: static_annot,
-            args: vec![],
+            args: vec![].into(),
         }],
     );
     let static_t = Type::Class {
         sym: static_annot,
-        args: vec![],
+        args: vec![].into(),
     };
     // nsc: `scala.inline` / `scala.noinline` / `scala.volatile` / `scala.transient`
     for (name, jvm) in [
@@ -944,7 +945,7 @@ pub(crate) fn class(
     st.get_mut(id).parents = parents.to_vec();
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     id
 }
@@ -960,7 +961,7 @@ pub(crate) fn iface(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str
     st.get_mut(id).parents = vec![Type::AnyRef];
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     id
 }
@@ -1008,7 +1009,7 @@ pub(crate) fn method(
     };
     st.get_mut(id).ty = Type::Method {
         paramss,
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = intrinsic;
     id
@@ -1065,22 +1066,22 @@ fn import_members(st: &mut SymbolTable, owner: SymbolId) {
 
 pub(crate) fn fn1(arg: Type, ret: Type) -> Type {
     Type::Function {
-        params: vec![arg],
-        ret: Box::new(ret),
+        params: vec![arg].into(),
+        ret: TyBox::new(ret),
     }
 }
 
 pub(crate) fn fn2(a: Type, b: Type, ret: Type) -> Type {
     Type::Function {
-        params: vec![a, b],
-        ret: Box::new(ret),
+        params: vec![a, b].into(),
+        ret: TyBox::new(ret),
     }
 }
 
 pub(crate) fn fn_n(params: Vec<Type>, ret: Type) -> Type {
     Type::Function {
-        params,
-        ret: Box::new(ret),
+        params: params.into(),
+        ret: TyBox::new(ret),
     }
 }
 
@@ -1101,7 +1102,7 @@ pub(crate) fn abs_class(
     st.get_mut(id).parents = parents.to_vec();
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     id
 }

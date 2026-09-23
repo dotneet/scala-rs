@@ -101,7 +101,7 @@ impl Typer {
             &mut c.pat,
             &Type::Class {
                 sym: throwable,
-                args: vec![],
+                args: vec![].into(),
             },
         );
         if !c.guard.is_empty() {
@@ -212,7 +212,7 @@ impl Typer {
         // element types are the pattern class's arguments directly.
         if let Type::Tuple(ts) = sel_ty {
             if ts.len() == tps.len() {
-                return ts.clone();
+                return ts.clone().into_vec();
             }
         }
         // A function scrutinee is its `FunctionN` class: cats'
@@ -708,7 +708,7 @@ impl Typer {
                     let cargs = self.pattern_class_args(class_id, sel_ty);
                     let class_ty = Type::Class {
                         sym: class_id,
-                        args: cargs.clone(),
+                        args: cargs.clone().into(),
                     };
                     // nsc's `inferConstructorInstance`: `case I(i)` on an
                     // `E[T]` with `I extends E[Int]` bounds `T` at `Int` for
@@ -723,7 +723,7 @@ impl Typer {
                     self.refine_gadt_bounds(&class_ty, sel_ty, &skolems);
                     for (i, a) in args.iter_mut().enumerate() {
                         let ft = if i + 1 >= fields.len() && repeated_elem.is_some() {
-                            Type::Repeated(Box::new(repeated_elem.clone().unwrap()))
+                            Type::Repeated(TyBox::new(repeated_elem.clone().unwrap()))
                         } else {
                             fields
                                 .get(i)
@@ -749,10 +749,11 @@ impl Typer {
                             Type::Repeated(elem) if pattern_has_star(a) => {
                                 self.seq_of(&elem).unwrap_or(Type::Class {
                                     sym: self.st.list_sym,
-                                    args: vec![*elem],
+                                    args: vec![<scala_rs_parser::Type as Clone>::clone(&*elem)]
+                                        .into(),
                                 })
                             }
-                            Type::Repeated(elem) => *elem,
+                            Type::Repeated(elem) => elem.clone().into_inner(),
                             ft => ft,
                         };
                         self.type_pattern(a, &ft);
@@ -917,7 +918,7 @@ impl Typer {
                     }
                     pat.ty = Type::Class {
                         sym: c,
-                        args: targs,
+                        args: targs.into(),
                     };
                     pat.sym = c;
                 } else {
@@ -1033,7 +1034,7 @@ impl Typer {
         };
         let wanted = Type::Class {
             sym: class_tag,
-            args: vec![target.clone()],
+            args: vec![target.clone()].into(),
         };
         let ImplicitSearch::Found(evidence) = self.search_implicit(&wanted) else {
             return;
@@ -1396,7 +1397,7 @@ impl Typer {
                         // at the actual arguments, e.g. Foo[A] <: A.
                         typer.st.subst_tparams(*id, args, &hi)
                     }
-                    Type::Annotated { tpe, .. } => *tpe,
+                    Type::Annotated { tpe, .. } => <scala_rs_parser::Type as Clone>::clone(&*tpe),
                     // Function syntax and FunctionN classes denote the same
                     // type. Use the class form so abstract arguments on both
                     // sides receive the same instantiation treatment below.
@@ -1415,7 +1416,7 @@ impl Typer {
             match ty {
                 Type::Class { sym, args } => Type::Class {
                     sym: *sym,
-                    args: vec![Type::Wildcard; args.len()],
+                    args: vec![Type::Wildcard; args.len()].into(),
                 },
                 _ => ty.clone(),
             }
@@ -2096,7 +2097,8 @@ impl Typer {
             // bound with the member's arguments substituted; aliases are
             // folded first and recurse normally.
             Type::Applied { ctor, args } => {
-                let folded = crate::symbol::apply_type_ctor((**ctor).clone(), args.clone());
+                let folded =
+                    crate::symbol::apply_type_ctor((**ctor).clone(), args.clone().into_vec());
                 if folded != *ty {
                     return self.base_type_instance(&folded, target, depth + 1);
                 }
@@ -2188,7 +2190,7 @@ impl Typer {
                 if let Some(targs) = bta.get(&target.0) {
                     return Some(Type::Class {
                         sym: target,
-                        args: targs.clone(),
+                        args: targs.clone().into(),
                     });
                 }
             }
@@ -2250,7 +2252,7 @@ impl Typer {
         }
         if sel_sym == cls {
             return if sel_args.len() == tps.len() {
-                sel_args
+                sel_args.into_vec()
             } else {
                 Vec::new()
             };
@@ -2337,7 +2339,7 @@ impl Typer {
             .iter()
             .zip(args)
             .all(|(a, p)| self.st.is_sub_type(a, p))
-            .then(|| args.clone())
+            .then(|| args.to_vec())
     }
 
     /// `pattern_class_targs` one parameter at a time: what the expected type
@@ -2496,12 +2498,12 @@ impl Typer {
     fn unapply_seq_star_type(&self, unapply: SymbolId, elem: &Type) -> Type {
         let fallback = Type::Class {
             sym: self.st.list_sym,
-            args: vec![elem.clone()],
+            args: vec![elem.clone()].into(),
         };
         match self.unapply_extracted_types(unapply).into_iter().next() {
             Some(Type::Class { sym, args }) if args.len() == 1 => Type::Class {
                 sym,
-                args: vec![elem.clone()],
+                args: vec![elem.clone()].into(),
             },
             _ => fallback,
         }
@@ -2919,14 +2921,14 @@ impl Typer {
 
     fn flatten_extract(&self, inner: Type) -> Vec<Type> {
         match inner {
-            Type::Tuple(ts) => ts,
+            Type::Tuple(ts) => ts.into_vec(),
             Type::Class { sym, args } => {
                 let n = self.st.get(sym).name.as_str();
                 if numbered_arity(n, "Tuple").is_some_and(|k| args.is_empty() || k == args.len()) {
                     if args.is_empty() {
                         vec![Type::Any, Type::Any]
                     } else {
-                        args
+                        args.into_vec()
                     }
                 } else {
                     vec![Type::Class { sym, args }]

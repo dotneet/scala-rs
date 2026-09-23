@@ -1899,7 +1899,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                     {
                         self.pickle_type(&Type::Class {
                             sym: id,
-                            args: vec![],
+                            args: vec![].into(),
                         })
                     }
                     other => self.pickle_type(&other),
@@ -2440,7 +2440,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 // a collection or type-class API. `TupleN` was already written
                 // with its arguments; `FunctionN` is the same shape.
                 let name = format!("Function{}", params.len());
-                let mut all: Vec<Type> = params.clone();
+                let mut all: Vec<Type> = params.clone().into_vec();
                 all.push((**ret).clone());
                 // Keep wildcards inside their argument/result types. Hoisting
                 // Iterable[_]'s existential around the entire Function1 makes
@@ -3295,10 +3295,10 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                         {
                             (**fallback).clone()
                         }
-                        _ => *ret,
+                        _ => ret.clone().into_inner(),
                     }
                 } else {
-                    *ret
+                    ret.clone().into_inner()
                 };
                 (paramss, ret)
             }

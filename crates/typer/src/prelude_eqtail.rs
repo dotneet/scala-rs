@@ -194,9 +194,10 @@ fn add_parent(st: &mut SymbolTable, child: SymbolId, parent: SymbolId) {
         Some(tp) if !st.get(parent).tparams.is_empty() => vec![Type::TypeParam(tp)],
         _ => Vec::new(),
     };
-    st.get_mut(child)
-        .parents
-        .push(Type::Class { sym: parent, args });
+    st.get_mut(child).parents.push(Type::Class {
+        sym: parent,
+        args: args.into(),
+    });
 }
 
 /// `object Equiv`'s implicit instances. jar: `scala/math/Equiv$<Name>$`.
@@ -205,12 +206,19 @@ fn add_equiv_instances(st: &mut SymbolTable, equiv: SymbolId) {
         return;
     };
     let equiv_cls = st.module_class_of(equiv_mod);
-    let big_int = crate::classpath::find_by_jvm(st, "scala/math/BigInt")
-        .map(|sym| Type::Class { sym, args: vec![] });
-    let big_dec = crate::classpath::find_by_jvm(st, "scala/math/BigDecimal")
-        .map(|sym| Type::Class { sym, args: vec![] });
-    let symbol = crate::classpath::find_by_jvm(st, "scala/Symbol")
-        .map(|sym| Type::Class { sym, args: vec![] });
+    let big_int = crate::classpath::find_by_jvm(st, "scala/math/BigInt").map(|sym| Type::Class {
+        sym,
+        args: vec![].into(),
+    });
+    let big_dec =
+        crate::classpath::find_by_jvm(st, "scala/math/BigDecimal").map(|sym| Type::Class {
+            sym,
+            args: vec![].into(),
+        });
+    let symbol = crate::classpath::find_by_jvm(st, "scala/Symbol").map(|sym| Type::Class {
+        sym,
+        args: vec![].into(),
+    });
     let table: Vec<(&str, &str, Option<Type>)> = vec![
         ("Unit", "scala/math/Equiv$Unit$", Some(Type::Unit)),
         ("Boolean", "scala/math/Equiv$Boolean$", Some(Type::Boolean)),
@@ -280,7 +288,7 @@ fn add_implicit_instance(
     st.get_mut(m).flags = st.get(m).flags.with(Flags::IMPLICIT);
     let ty = Type::Class {
         sym: equiv,
-        args: vec![arg],
+        args: vec![arg].into(),
     };
     st.get_mut(m).ty = ty.clone();
     st.get_mut(cls).ty = Type::ModuleRef(cls);

@@ -20,6 +20,7 @@
 
 use crate::prelude::{fn1, type_param};
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable) {
@@ -43,7 +44,7 @@ fn retype_try_apply(st: &mut SymbolTable, try_c: SymbolId) {
         return;
     };
     let mcls = st.module_class_of(module);
-    let byname_any = Type::ByName(Box::new(Type::Any));
+    let byname_any = Type::ByName(TyBox::new(Type::Any));
     let apps: Vec<SymbolId> = [module, mcls]
         .iter()
         .flat_map(|&o| st.get(o).members.clone())
@@ -58,7 +59,7 @@ fn retype_try_apply(st: &mut SymbolTable, try_c: SymbolId) {
         return;
     };
     let t = type_param(st, m, "T");
-    let r_ty = Type::ByName(Box::new(Type::TypeParam(t)));
+    let r_ty = Type::ByName(TyBox::new(Type::TypeParam(t)));
     let r = st.alloc("r", m, SymKind::Term, Flags::PARAM, "");
     st.get_mut(r).ty = r_ty.clone();
     st.get_mut(m).tparams = vec![t];
@@ -66,9 +67,9 @@ fn retype_try_apply(st: &mut SymbolTable, try_c: SymbolId) {
     st.get_mut(m).paramss = vec![vec![r]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![r_ty]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: try_c,
-            args: vec![Type::TypeParam(t)],
+            args: vec![Type::TypeParam(t)].into(),
         }),
     };
 }
@@ -103,7 +104,10 @@ fn retype_map(st: &mut SymbolTable, cls: SymbolId, elem: usize, tparam: &str) {
     let x = type_param(st, m, tparam);
     let mut args: Vec<Type> = tps.iter().map(|t| Type::TypeParam(*t)).collect();
     args[elem] = Type::TypeParam(x);
-    let ret = Type::Class { sym: cls, args };
+    let ret = Type::Class {
+        sym: cls,
+        args: args.into(),
+    };
     let f_ty = fn1(Type::TypeParam(elem_tp), Type::TypeParam(x));
     let f = st.alloc("f", m, SymKind::Term, Flags::PARAM, "");
     st.get_mut(f).ty = f_ty.clone();
@@ -112,6 +116,6 @@ fn retype_map(st: &mut SymbolTable, cls: SymbolId, elem: usize, tparam: &str) {
     st.get_mut(m).paramss = vec![vec![f]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![f_ty]],
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
 }

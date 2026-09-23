@@ -53,7 +53,7 @@ fn map_is_a_function(st: &mut SymbolTable) {
         }
         let parent = Type::Class {
             sym: f1,
-            args: vec![Type::TypeParam(tps[0]), Type::TypeParam(tps[1])],
+            args: vec![Type::TypeParam(tps[0]), Type::TypeParam(tps[1])].into(),
         };
         if st.get(map).parents.contains(&parent) {
             continue;

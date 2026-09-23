@@ -28,6 +28,7 @@
 //! alone. The erased descriptor does not change -- `U` erases to `Object` and
 //! the parameter is a `Function1` either way -- so codegen is unaffected.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 use crate::symbol::{SymKind, SymbolTable};
@@ -76,7 +77,7 @@ fn generalize(st: &mut SymbolTable, id: SymbolId) {
     st.get_mut(u).ty = Type::TypeParam(u);
     let fn_ty = Type::Function {
         params,
-        ret: Box::new(Type::TypeParam(u)),
+        ret: TyBox::new(Type::TypeParam(u)),
     };
     if let Some(&p) = st.get(id).params.first() {
         st.get_mut(p).ty = fn_ty.clone();
@@ -84,6 +85,6 @@ fn generalize(st: &mut SymbolTable, id: SymbolId) {
     st.get_mut(id).tparams = vec![u];
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![fn_ty]],
-        ret: Box::new(Type::Unit),
+        ret: TyBox::new(Type::Unit),
     };
 }

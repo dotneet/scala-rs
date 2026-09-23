@@ -2,6 +2,7 @@
 
 use crate::prelude::prelude_method;
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::Type;
 
 pub fn install(st: &mut SymbolTable) {
@@ -16,7 +17,7 @@ pub fn install(st: &mut SymbolTable) {
                 st,
                 so,
                 "format",
-                vec![Type::Repeated(Box::new(Type::Any))],
+                vec![Type::Repeated(TyBox::new(Type::Any))],
                 Type::String,
                 Intrinsic::StringFormat,
             );

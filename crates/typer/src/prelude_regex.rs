@@ -45,7 +45,7 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
     let cs = crate::classpath::find_or_stub_java_class(st, "java/lang/CharSequence");
     let cs_ty = Type::Class {
         sym: cs,
-        args: vec![],
+        args: vec![].into(),
     };
     prelude_method(
         st,
@@ -56,8 +56,9 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
             sym: st.option_sym,
             args: vec![Type::Class {
                 sym: list,
-                args: vec![Type::String],
-            }],
+                args: vec![Type::String].into(),
+            }]
+            .into(),
         },
         Intrinsic::None,
     );

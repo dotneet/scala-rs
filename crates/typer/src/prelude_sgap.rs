@@ -41,6 +41,7 @@
 
 use crate::prelude::{fn1, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, Type};
 
 /// Rebuild `Option.flatMap` with a fresh method type parameter, in place of
@@ -61,7 +62,7 @@ pub fn fix_option_flat_map(st: &mut SymbolTable) {
     let b = type_param(st, flat_map, "B");
     let opt_b = Type::Class {
         sym: option_sym,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     let f = st.alloc("f", flat_map, SymKind::Term, Flags::PARAM, "");
     st.get_mut(f).ty = fn1(ta.clone(), opt_b.clone());
@@ -70,7 +71,7 @@ pub fn fix_option_flat_map(st: &mut SymbolTable) {
     st.get_mut(flat_map).paramss = vec![vec![f]];
     st.get_mut(flat_map).ty = Type::Method {
         paramss: vec![vec![fn1(ta, opt_b.clone())]],
-        ret: Box::new(opt_b),
+        ret: TyBox::new(opt_b),
     };
 }
 
@@ -130,10 +131,10 @@ pub fn add_iterable_apply(st: &mut SymbolTable, library_abi: bool) {
     let a = type_param(st, apply, "A");
     st.get_mut(apply).tparams = vec![a];
     st.get_mut(apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(a)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(a)))]],
+        ret: TyBox::new(Type::Class {
             sym: iterable,
-            args: vec![Type::TypeParam(a)],
+            args: vec![Type::TypeParam(a)].into(),
         }),
     };
     let mems = st.get(mcls).members.clone();

@@ -1,5 +1,6 @@
 use crate::prelude::{method, type_param};
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, Type};
 
 pub(crate) fn add_any_members(st: &mut SymbolTable) {
@@ -52,7 +53,7 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
     st.get_mut(as_instance_of).tparams = vec![aio_t];
     st.get_mut(as_instance_of).ty = Type::Method {
         paramss: Vec::new(),
-        ret: Box::new(Type::TypeParam(aio_t)),
+        ret: TyBox::new(Type::TypeParam(aio_t)),
     };
     let is_instance_of = method(
         st,
@@ -69,15 +70,15 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
         st,
         any,
         "synchronized",
-        vec![Type::ByName(Box::new(Type::Any))],
+        vec![Type::ByName(TyBox::new(Type::Any))],
         Type::Any,
         Intrinsic::Synchronized,
     );
     let t0 = type_param(st, sync, "T0");
     st.get_mut(sync).tparams = vec![t0];
     st.get_mut(sync).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(t0)))]],
-        ret: Box::new(Type::TypeParam(t0)),
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::TypeParam(t0)))]],
+        ret: TyBox::new(Type::TypeParam(t0)),
     };
     let anyref = st.anyref_sym;
     method(
@@ -128,7 +129,7 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
     let cl = method(st, anyref, "clone", vec![], Type::AnyRef, Intrinsic::None);
     st.get_mut(cl).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::AnyRef),
+        ret: TyBox::new(Type::AnyRef),
     };
     st.get_mut(cl).flags.set(Flags::PROTECTED, true);
     st.get_mut(cl).flags.set(Flags::FINAL, false);
@@ -422,7 +423,7 @@ pub(crate) fn add_string_members(st: &mut SymbolTable, library_abi: bool) {
         c,
         "split",
         vec![Type::String],
-        Type::Array(Box::new(Type::String)),
+        Type::Array(TyBox::new(Type::String)),
         Intrinsic::None,
     );
     if !library_abi {
@@ -462,6 +463,6 @@ pub(crate) fn add_array_members(st: &mut SymbolTable) {
     let cl = method(st, c, "clone", vec![], Type::Any, Intrinsic::None);
     st.get_mut(cl).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::Any),
+        ret: TyBox::new(Type::Any),
     };
 }

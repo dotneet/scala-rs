@@ -62,7 +62,10 @@ pub(crate) fn link_string_parents(st: &mut SymbolTable) {
         } else {
             vec![Type::String]
         };
-        let p = Type::Class { sym, args };
+        let p = Type::Class {
+            sym,
+            args: args.into(),
+        };
         if !st.get(string).parents.contains(&p) {
             st.get_mut(string).parents.push(p);
         }

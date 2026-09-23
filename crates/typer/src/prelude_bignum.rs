@@ -11,7 +11,7 @@ pub(crate) fn add_big_int(st: &mut SymbolTable) {
     let cls = class(st, math, "BigInt", "scala/math/BigInt", &[Type::AnyRef]);
     let this_t = Type::Class {
         sym: cls,
-        args: vec![],
+        args: vec![].into(),
     };
     method(
         st,
@@ -71,7 +71,7 @@ pub(crate) fn add_big_decimal(st: &mut SymbolTable) {
     );
     let this_t = Type::Class {
         sym: cls,
-        args: vec![],
+        args: vec![].into(),
     };
     method(
         st,

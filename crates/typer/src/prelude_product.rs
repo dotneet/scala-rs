@@ -69,7 +69,7 @@ pub(crate) fn add_parents(st: &mut SymbolTable, class_id: SymbolId, parents: &[S
         }
         let ty = Type::Class {
             sym: p,
-            args: vec![],
+            args: vec![].into(),
         };
         if !st.get(class_id).parents.contains(&ty) {
             st.get_mut(class_id).parents.push(ty);
@@ -194,15 +194,18 @@ pub(crate) fn link_companion_function(
         if let (Type::Repeated(inner), Some(seq)) = (a.clone(), seq) {
             *a = Type::Class {
                 sym: seq,
-                args: vec![*inner],
+                args: vec![<scala_rs_parser::Type as Clone>::clone(&*inner)].into(),
             };
         }
     }
     args.push(Type::Class {
         sym: class_id,
-        args: vec![],
+        args: vec![].into(),
     });
-    let ty = Type::Class { sym: abs_fn, args };
+    let ty = Type::Class {
+        sym: abs_fn,
+        args: args.into(),
+    };
     let parents = &mut st.get_mut(module_cls).parents;
     // Drop the placeholder `AnyRef` the namer gave it; an `AbstractFunctionN`
     // *is* the superclass, and leaving both would make `AnyRef` win in the

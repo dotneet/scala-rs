@@ -75,6 +75,7 @@
 //! `Ordering$Int$` for `implicitly[Ordering[Int]]`.
 
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -133,16 +134,17 @@ fn add_ordering_option(st: &mut SymbolTable, ordering: SymbolId) {
     st.get_mut(m).tparams = vec![t];
     let param_ty = Type::Class {
         sym: ordering,
-        args: vec![Type::TypeParam(t)],
+        args: vec![Type::TypeParam(t)].into(),
     };
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![param_ty.clone()]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: ordering,
             args: vec![Type::Class {
                 sym: option,
-                args: vec![Type::TypeParam(t)],
-            }],
+                args: vec![Type::TypeParam(t)].into(),
+            }]
+            .into(),
         }),
     };
     // `def Option[T](implicit ord: Ordering[T])` -- the clause is *implicit*,
@@ -187,9 +189,10 @@ fn add_parent(st: &mut SymbolTable, child: SymbolId, parent: SymbolId) {
         Some(tp) if !st.get(parent).tparams.is_empty() => vec![Type::TypeParam(tp)],
         _ => Vec::new(),
     };
-    st.get_mut(child)
-        .parents
-        .push(Type::Class { sym: parent, args });
+    st.get_mut(child).parents.push(Type::Class {
+        sym: parent,
+        args: args.into(),
+    });
 }
 
 /// Provide `trait <name>[T]` in the prelude and make it reachable by its unqualified
@@ -215,7 +218,7 @@ fn ensure_typeclass(st: &mut SymbolTable, jvm: &str, name: &str) -> SymbolId {
             st.get_mut(id).parents = vec![Type::AnyRef];
             st.get_mut(id).ty = Type::Class {
                 sym: id,
-                args: vec![],
+                args: vec![].into(),
             };
             id
         }
@@ -247,10 +250,15 @@ fn retype_numeric_instances(
         return;
     };
     let num_cls = st.module_class_of(num_mod);
-    let big_int = crate::classpath::find_by_jvm(st, "scala/math/BigInt")
-        .map(|sym| Type::Class { sym, args: vec![] });
-    let big_dec = crate::classpath::find_by_jvm(st, "scala/math/BigDecimal")
-        .map(|sym| Type::Class { sym, args: vec![] });
+    let big_int = crate::classpath::find_by_jvm(st, "scala/math/BigInt").map(|sym| Type::Class {
+        sym,
+        args: vec![].into(),
+    });
+    let big_dec =
+        crate::classpath::find_by_jvm(st, "scala/math/BigDecimal").map(|sym| Type::Class {
+            sym,
+            args: vec![].into(),
+        });
     let table: Vec<(&str, &str, SymbolId, Option<Type>)> = vec![
         (
             "IntIsIntegral",
@@ -333,7 +341,7 @@ fn set_instance(
 ) {
     let ty = Type::Class {
         sym: tc,
-        args: vec![arg],
+        args: vec![arg].into(),
     };
     // `add_implicit_instance` **overwrites** the module symbol's `ty` from `ModuleRef`
     // to `Numeric[Int]`, so `module_class_of` can no longer reach the module class.

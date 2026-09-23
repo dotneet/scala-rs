@@ -17,6 +17,7 @@
 //! `value X is not a member of List[A]` comes out (rather than silent acceptance).
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 // ---------------------------------------------------------------------------
@@ -31,15 +32,15 @@ fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
 
 fn fn1(arg: Type, ret: Type) -> Type {
     Type::Function {
-        params: vec![arg],
-        ret: Box::new(ret),
+        params: vec![arg].into(),
+        ret: TyBox::new(ret),
     }
 }
 
 fn fn2(a: Type, b: Type, ret: Type) -> Type {
     Type::Function {
-        params: vec![a, b],
-        ret: Box::new(ret),
+        params: vec![a, b].into(),
+        ret: TyBox::new(ret),
     }
 }
 
@@ -59,7 +60,7 @@ fn simple(
     };
     st.get_mut(id).ty = Type::Method {
         paramss,
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = Intrinsic::None;
     id
@@ -125,7 +126,7 @@ fn poly_in(
     st.get_mut(m).paramss = pss;
     st.get_mut(m).ty = Type::Method {
         paramss,
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     st.get_mut(m).intrinsic = Intrinsic::None;
     m
@@ -178,7 +179,7 @@ fn find_iface(st: &mut SymbolTable, jvm: &str) -> SymbolId {
     st.get_mut(id).parents = vec![Type::AnyRef];
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     id
 }
@@ -235,11 +236,11 @@ fn add_implicit_instance(
     st.get_mut(m).flags = st.get(m).flags.with(Flags::IMPLICIT);
     st.get_mut(m).ty = Type::Class {
         sym: tc,
-        args: vec![arg.clone()],
+        args: vec![arg.clone()].into(),
     };
     st.get_mut(cls).parents = vec![Type::Class {
         sym: tc,
-        args: vec![arg],
+        args: vec![arg].into(),
     }];
 }
 
@@ -271,16 +272,19 @@ impl Env {
     fn list_of(&self, t: Type) -> Type {
         Type::Class {
             sym: self.list,
-            args: vec![t],
+            args: vec![t].into(),
         }
     }
     fn one(&self, sym: SymbolId, t: Type) -> Type {
-        Type::Class { sym, args: vec![t] }
+        Type::Class {
+            sym,
+            args: vec![t].into(),
+        }
     }
     fn two(&self, sym: SymbolId, a: Type, b: Type) -> Type {
         Type::Class {
             sym,
-            args: vec![a, b],
+            args: vec![a, b].into(),
         }
     }
     fn pair(&self, a: Type, b: Type) -> Type {
@@ -366,7 +370,7 @@ fn add_list_core_private(st: &mut SymbolTable, list: SymbolId, a: SymbolId) {
     let ta = Type::TypeParam(a);
     let list_a = Type::Class {
         sym: list,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     let pred = fn1(ta.clone(), Type::Boolean);
     simple(st, list, "length", vec![], Type::Int);
@@ -410,9 +414,10 @@ fn add_parent(st: &mut SymbolTable, cls: SymbolId, parent: SymbolId, nargs: usiz
         .take(nargs)
         .map(Type::TypeParam)
         .collect::<Vec<_>>();
-    st.get_mut(cls)
-        .parents
-        .push(Type::Class { sym: parent, args });
+    st.get_mut(cls).parents.push(Type::Class {
+        sym: parent,
+        args: args.into(),
+    });
 }
 
 /// `scala.math.Numeric` and the implicit instances for `sum` / `product`.
@@ -504,7 +509,10 @@ fn add_ordering_instances(st: &mut SymbolTable, ordering: SymbolId) {
                 ordering,
                 name,
                 jvm,
-                Type::Class { sym, args: vec![] },
+                Type::Class {
+                    sym,
+                    args: vec![].into(),
+                },
             );
         }
     }
@@ -533,7 +541,7 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             vec![vec![fn1(ta.clone(), b.clone())]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -548,12 +556,12 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
                 ta.clone(),
                 Type::Class {
                     sym: ioc,
-                    args: vec![b.clone()],
+                    args: vec![b.clone()].into(),
                 },
             )]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -571,11 +579,11 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             (
                 vec![vec![Type::Class {
                     sym: pf,
-                    args: vec![ta.clone(), b.clone()],
+                    args: vec![ta.clone(), b.clone()].into(),
                 }]],
                 Type::Class {
                     sym: l,
-                    args: vec![b],
+                    args: vec![b].into(),
                 },
             )
         });
@@ -589,7 +597,7 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             vec![vec![b.clone()]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -599,11 +607,11 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
         (
             vec![vec![Type::Class {
                 sym: l,
-                args: vec![b.clone()],
+                args: vec![b.clone()].into(),
             }]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -613,7 +621,7 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             vec![vec![b.clone()]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -623,7 +631,7 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             vec![vec![b.clone()]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -634,11 +642,11 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             (
                 vec![vec![Type::Class {
                     sym: ioc,
-                    args: vec![b.clone()],
+                    args: vec![b.clone()].into(),
                 }]],
                 Type::Class {
                     sym: l,
-                    args: vec![b],
+                    args: vec![b].into(),
                 },
             )
         });
@@ -648,11 +656,11 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
         (
             vec![vec![Type::Class {
                 sym: ioc,
-                args: vec![b.clone()],
+                args: vec![b.clone()].into(),
             }]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -662,7 +670,7 @@ fn make_polymorphic(st: &mut SymbolTable, env: &Env) {
             vec![vec![Type::Int, b.clone()]],
             Type::Class {
                 sym: l,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -779,7 +787,7 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
             vec![vec![b.clone()], vec![fn2(b.clone(), tb.clone(), b.clone())]],
             Type::Class {
                 sym: l2,
-                args: vec![b],
+                args: vec![b].into(),
             },
         )
     });
@@ -789,7 +797,7 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
         (
             vec![vec![Type::Class {
                 sym: ioc,
-                args: vec![t[0].clone()],
+                args: vec![t[0].clone()].into(),
             }]],
             Type::Boolean,
         )
@@ -801,7 +809,7 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
             vec![vec![
                 Type::Class {
                     sym: ioc,
-                    args: vec![t[0].clone()],
+                    args: vec![t[0].clone()].into(),
                 },
                 Type::Int,
             ]],
@@ -813,7 +821,7 @@ fn add_predicates_and_folds(st: &mut SymbolTable, env: &Env) {
         (
             vec![vec![Type::Class {
                 sym: itbl,
-                args: vec![t[0].clone()],
+                args: vec![t[0].clone()].into(),
             }]],
             Type::Boolean,
         )
@@ -843,7 +851,7 @@ fn add_strings_and_aggregates(st: &mut SymbolTable, env: &Env) {
             (
                 vec![vec![Type::Class {
                     sym: numeric,
-                    args: vec![ta2.clone()],
+                    args: vec![ta2.clone()].into(),
                 }]],
                 ta2,
             )
@@ -856,7 +864,7 @@ fn add_strings_and_aggregates(st: &mut SymbolTable, env: &Env) {
             (
                 vec![vec![Type::Class {
                     sym: ordering,
-                    args: vec![ta2.clone()],
+                    args: vec![ta2.clone()].into(),
                 }]],
                 ta2,
             )
@@ -871,7 +879,7 @@ fn add_strings_and_aggregates(st: &mut SymbolTable, env: &Env) {
                     vec![fn1(ta2.clone(), b.clone())],
                     vec![Type::Class {
                         sym: ordering,
-                        args: vec![b],
+                        args: vec![b].into(),
                     }],
                 ],
                 ta2,
@@ -894,7 +902,7 @@ fn add_sorting_and_zips(st: &mut SymbolTable, env: &Env) {
             (
                 vec![vec![Type::Class {
                     sym: ordering,
-                    args: vec![ta2],
+                    args: vec![ta2].into(),
                 }]],
                 ret,
             )
@@ -910,7 +918,7 @@ fn add_sorting_and_zips(st: &mut SymbolTable, env: &Env) {
                     vec![fn1(ta2, b.clone())],
                     vec![Type::Class {
                         sym: ordering,
-                        args: vec![b],
+                        args: vec![b].into(),
                     }],
                 ],
                 ret,
@@ -934,14 +942,15 @@ fn add_sorting_and_zips(st: &mut SymbolTable, env: &Env) {
             (
                 vec![vec![Type::Class {
                     sym: ioc,
-                    args: vec![b.clone()],
+                    args: vec![b.clone()].into(),
                 }]],
                 Type::Class {
                     sym: l,
                     args: vec![Type::Class {
                         sym: tuple2,
-                        args: vec![ta2, b],
-                    }],
+                        args: vec![ta2, b].into(),
+                    }]
+                    .into(),
                 },
             )
         });
@@ -966,9 +975,9 @@ fn add_conversions(st: &mut SymbolTable, env: &Env) {
             (
                 vec![vec![Type::Class {
                     sym: ct,
-                    args: vec![ta2.clone()],
+                    args: vec![ta2.clone()].into(),
                 }]],
-                Type::Array(Box::new(ta2)),
+                Type::Array(TyBox::new(ta2)),
             )
         });
     }
@@ -992,7 +1001,7 @@ fn add_grouping(st: &mut SymbolTable, env: &Env) {
                 vec![vec![fn1(ta2, k.clone())]],
                 Type::Class {
                     sym: map,
-                    args: vec![k, la],
+                    args: vec![k, la].into(),
                 },
             )
         });

@@ -11,6 +11,7 @@ use crate::classfile::{
 };
 use crate::code::Assembler;
 use crate::gen::*;
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{method_overloads, SymKind, SymbolTable};
 use std::collections::HashSet;
@@ -271,7 +272,7 @@ pub(crate) fn method_params_from_sym(st: &SymbolTable, id: SymbolId) -> Vec<Type
                 params
             }
         }
-        Type::Function { params, .. } => params.clone(),
+        Type::Function { params, .. } => params.clone().into_vec(),
         _ => s.params.iter().map(|p| st.get(*p).ty.clone()).collect(),
     }
 }
@@ -443,7 +444,7 @@ pub(crate) fn method_desc_from_sym(st: &SymbolTable, id: SymbolId) -> String {
                     params
                 }
             }
-            Type::Function { params, .. } => params.clone(),
+            Type::Function { params, .. } => params.clone().into_vec(),
             _ => s.params.iter().map(|p| st.get(*p).ty.clone()).collect(),
         };
         return jvm_method_desc(st, &params, &Type::Unit);
@@ -2340,19 +2341,20 @@ pub(crate) fn desc_value_types(st: &SymbolTable, desc: &str) -> Vec<Type> {
 /// [`desc_value_types`] for one field (or return) descriptor.
 pub(crate) fn desc_value_type(st: &SymbolTable, d: &str) -> Type {
     match d.as_bytes().first() {
-        Some(b'[') => Type::Array(Box::new(desc_value_type(st, &d[1..]))),
+        Some(b'[') => Type::Array(TyBox::new(desc_value_type(st, &d[1..]))),
         Some(b'L') if d.ends_with(';') => {
             let inner = &d[1..d.len() - 1];
             match inner {
                 "java/lang/Object" => Type::Any,
                 "java/lang/String" => Type::String,
                 _ => match st.find_class_by_jvm(inner) {
-                    Some(sym) if class_internal(st, sym) == inner => {
-                        Type::Class { sym, args: vec![] }
-                    }
+                    Some(sym) if class_internal(st, sym) == inner => Type::Class {
+                        sym,
+                        args: vec![].into(),
+                    },
                     _ => Type::Named {
                         name: inner.to_string(),
-                        args: vec![],
+                        args: vec![].into(),
                     },
                 },
             }

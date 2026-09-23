@@ -144,7 +144,7 @@ impl Typer {
         let result = |s: SymbolId, t: &Type| {
             let t = self.st.subst_tparams(s, targs, t);
             match t {
-                Type::Method { ret, .. } => *ret,
+                Type::Method { ret, .. } => <scala_rs_parser::Type as Clone>::clone(&*ret),
                 other => other,
             }
         };
@@ -271,7 +271,7 @@ impl Typer {
                 if vals.next().is_some() {
                     return false;
                 }
-                Box::new(only)
+                TyBox::new(only)
             }
             _ => return false,
         };
@@ -350,7 +350,7 @@ impl Typer {
             fun,
             &Type::Method {
                 paramss: vec![],
-                ret: Box::new(Type::NoType),
+                ret: TyBox::new(Type::NoType),
             },
         );
         !fun.ty.is_error() && !fun.ty.is_no_type()
@@ -629,7 +629,7 @@ impl Typer {
                 cands.push((fun_sym, ps, (**ret).clone()));
             }
             Type::Function { params, ret } => {
-                cands.push((fun_sym, params.clone(), (**ret).clone()));
+                cands.push((fun_sym, params.clone().into_vec(), (**ret).clone()));
             }
             Type::Overload(alts) => {
                 for a in alts {
@@ -688,7 +688,11 @@ impl Typer {
                         }
                         if let Type::Function { params, ret } = ty {
                             if self.st.get(m).kind == SymKind::Term {
-                                function_values.push((m, params.clone(), (**ret).clone()));
+                                function_values.push((
+                                    m,
+                                    params.clone().into_vec(),
+                                    (**ret).clone(),
+                                ));
                             }
                         }
                         let module = if self.st.get(m).kind == SymKind::Module {
@@ -707,7 +711,7 @@ impl Typer {
                                     cands.push((
                                         apply,
                                         paramss.first().cloned().unwrap_or_default(),
-                                        *ret,
+                                        <scala_rs_parser::Type as Clone>::clone(&*ret),
                                     ));
                                 }
                             }
@@ -740,7 +744,10 @@ impl Typer {
                     .iter()
                     .map(|t| Type::TypeParam(*t))
                     .collect();
-                let cls = Type::Class { sym: *sym, args };
+                let cls = Type::Class {
+                    sym: *sym,
+                    args: args.into(),
+                };
                 return self
                     .resolve_overload_inner(&cls, fun_sym, arg_tys, _pt, supplied, shapes, targs);
             }
@@ -1391,7 +1398,7 @@ impl Typer {
                 &[],
                 &Type::Method {
                     paramss: paramss[1..].to_vec(),
-                    ret: Box::new(Type::NoType),
+                    ret: TyBox::new(Type::NoType),
                 },
             ),
             _ => Vec::new(),
@@ -1628,7 +1635,7 @@ impl Typer {
             // alternatives never agree.
             let recv = Type::Class {
                 sym: *cls,
-                args: Vec::new(),
+                args: Vec::new().into(),
             };
             // A JVM `static` is no member of the object: twirl's templates are
             // `object edithook extends BaseScalaTemplate(…)`, a case class
@@ -1822,7 +1829,7 @@ impl Typer {
         // as one the argument did not fit. Wrapping in `Function0` is `adapt`'s
         // job, and it still runs on the parameter itself.
         match out {
-            Type::ByName(inner) => *inner,
+            Type::ByName(inner) => <scala_rs_parser::Type as Clone>::clone(&*inner),
             other => other,
         }
     }
@@ -2102,7 +2109,7 @@ impl Typer {
         // costs nothing here, it just moves the SAM-parameter case's real
         // typing to the adapt step instead of the scoring step.
         let alts: Vec<Type> = match fun_ty {
-            Type::Overload(alts) if alts.len() >= 2 => alts.clone(),
+            Type::Overload(alts) if alts.len() >= 2 => alts.clone().into_vec(),
             _ => return None,
         };
         let mut agreed: Option<Vec<Type>> = None;
@@ -2124,8 +2131,8 @@ impl Typer {
                     .function_class_shape(*sym, args)
                     .or_else(|| {
                         self.st.sam_sig(p).map(|sam| Type::Function {
-                            params: sam.param_tys,
-                            ret: Box::new(sam.ret_ty),
+                            params: sam.param_tys.into(),
+                            ret: TyBox::new(sam.ret_ty),
                         })
                     })
                     .unwrap_or_else(|| p.clone()),
@@ -2138,7 +2145,7 @@ impl Typer {
                 return None;
             }
             match &agreed {
-                None => agreed = Some(params),
+                None => agreed = Some(params.into_vec()),
                 Some(prev) if *prev == params => {}
                 Some(_) => return None,
             }
@@ -2186,7 +2193,7 @@ impl Typer {
         let (sym, from) = agreed?;
         Some(Type::Class {
             sym,
-            args: vec![from, Type::Any],
+            args: vec![from, Type::Any].into(),
         })
     }
 
@@ -2412,8 +2419,8 @@ impl Typer {
                                 return true;
                             }
                             let shape_ty = Type::Function {
-                                params: vec![Type::Any; *n],
-                                ret: Box::new(Type::Nothing),
+                                params: vec![Type::Any; *n].into(),
+                                ret: TyBox::new(Type::Nothing),
                             };
                             self.st.is_sub_type(&shape_ty, p)
                         }
@@ -2732,7 +2739,7 @@ impl Typer {
     pub(crate) fn seq_of(&self, elem: &Type) -> Option<Type> {
         self.the_seq_class().map(|sym| Type::Class {
             sym,
-            args: vec![elem.clone()],
+            args: vec![elem.clone()].into(),
         })
     }
 
@@ -2835,8 +2842,8 @@ impl Typer {
             // `Function1` *class* in the prelude's parent chain.
             if let Some((from, to)) = partial_function_type(&self.st, &base) {
                 return Some(Type::Function {
-                    params: vec![from],
-                    ret: Box::new(to),
+                    params: vec![from].into(),
+                    ret: TyBox::new(to),
                 });
             }
             // `MapOps[K, +V, …] extends IterableOps[…] with
@@ -2848,8 +2855,8 @@ impl Typer {
             if let Type::Class { sym, args } = &base {
                 if args.len() == 2 && self.st.get(*sym).jvm_name.ends_with("/Map") {
                     return Some(Type::Function {
-                        params: vec![args[0].clone()],
-                        ret: Box::new(args[1].clone()),
+                        params: vec![args[0].clone()].into(),
+                        ret: TyBox::new(args[1].clone()),
                     });
                 }
             }
@@ -3020,8 +3027,8 @@ impl Typer {
             if matches!(arg, Type::Function { .. }) {
                 if let Some(sam) = self.st.sam_sig(param) {
                     let f = Type::Function {
-                        params: sam.param_tys,
-                        ret: Box::new(sam.ret_ty),
+                        params: sam.param_tys.into(),
+                        ret: TyBox::new(sam.ret_ty),
                     };
                     return self.arg_score(arg, &f);
                 }
@@ -3037,12 +3044,12 @@ impl Typer {
                 .iter()
                 .rev()
                 .fold((**ret).clone(), |acc, clause| Type::Function {
-                    params: clause.clone(),
-                    ret: Box::new(acc),
+                    params: clause.clone().into(),
+                    ret: TyBox::new(acc),
                 });
             let f = if paramss.is_empty() {
                 Type::Function {
-                    params: Vec::new(),
+                    params: Vec::new().into(),
                     ret: ret.clone(),
                 }
             } else {
@@ -3355,7 +3362,7 @@ impl Typer {
         let mut probe = (**fun).clone();
         let dummy_method = Type::Method {
             paramss: vec![],
-            ret: Box::new(Type::NoType),
+            ret: TyBox::new(Type::NoType),
         };
         self.type_expr(&mut probe, &dummy_method);
         self.diags.truncate(mark);
@@ -3562,7 +3569,7 @@ impl Typer {
             (sam.param_tys.clone(), sam.ret_ty.clone())
         } else {
             match pt {
-                Type::Function { params, ret } => (params.clone(), (**ret).clone()),
+                Type::Function { params, ret } => (params.to_vec(), (**ret).clone()),
                 Type::Named { name, args }
                     if name.starts_with("Function") && name != "Function" =>
                 {
@@ -3724,8 +3731,8 @@ impl Typer {
         if let Some((from, _to)) = &pf_result {
             if !self.st.is_sub_type(from, &param_tys[0]) {
                 return Type::Function {
-                    params: param_tys,
-                    ret: Box::new(ret),
+                    params: param_tys.into(),
+                    ret: TyBox::new(ret),
                 };
             }
             let matches_parameter = matches!(&body.kind,
@@ -3759,7 +3766,7 @@ impl Typer {
                 if !body_ty.is_no_type() && !body_ty.is_error() {
                     return Type::Class {
                         sym: *sym,
-                        args: vec![from.clone(), body_ty],
+                        args: vec![from.clone(), body_ty].into(),
                     };
                 }
             }
@@ -3785,8 +3792,8 @@ impl Typer {
             pt.clone()
         } else {
             Type::Function {
-                params: param_tys,
-                ret: Box::new(ret),
+                params: param_tys.into(),
+                ret: TyBox::new(ret),
             }
         }
     }

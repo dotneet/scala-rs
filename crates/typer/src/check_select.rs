@@ -150,7 +150,10 @@ impl Typer {
                 };
                 let bounds = crate::symbol::subst_tparams_slice(&ids, &captured, bounds);
                 let (lo, hi) = match bounds {
-                    Type::BoundedWildcard { lo, hi } => (lo.map(|t| *t), hi.map(|t| *t)),
+                    Type::BoundedWildcard { lo, hi } => (
+                        lo.map(|t| <scala_rs_parser::Type as Clone>::clone(&*t)),
+                        hi.map(|t| <scala_rs_parser::Type as Clone>::clone(&*t)),
+                    ),
                     _ => (None, None),
                 };
                 self.st.get_mut(*id).bound_lo = Some(lo.unwrap_or(Type::Nothing));
@@ -1033,12 +1036,12 @@ impl Typer {
         // that is what this list is for) and `Tuple2._1` kept its declared
         // `T1`, so `referenced.map(_._1)` came out `HashSet[T1]`.
         let subst_args: Vec<Type> = match peel_type_annot(&recv_ty) {
-            Type::Tuple(ts) => ts.clone(),
+            Type::Tuple(ts) => ts.clone().into_vec(),
             // `FunctionN`'s parameters are `T1 … Tn, R`, in that order.
             Type::Function { params, ret } => {
                 let mut a = params.clone();
                 a.push((**ret).clone());
-                a
+                a.into_vec()
             }
             _ => Vec::new(),
         };
@@ -1185,7 +1188,7 @@ impl Typer {
                 if name == "apply" {
                     tree.ty = Type::Method {
                         paramss: vec![vec![Type::Int]],
-                        ret: Box::new((**elem).clone()),
+                        ret: TyBox::new((**elem).clone()),
                     };
                 } else if name == "update" {
                     tree.ty = Type::Method {
@@ -1197,14 +1200,14 @@ impl Typer {
                                 (**elem).clone()
                             },
                         ]],
-                        ret: Box::new(Type::Unit),
+                        ret: TyBox::new(Type::Unit),
                     };
                 } else if name == "clone" && self.st.get(s).owner == self.st.array_sym {
                     // `def clone(): Array[T]` — the element type is the
                     // receiver's, exactly as for `apply`.
                     tree.ty = Type::Method {
                         paramss: vec![vec![]],
-                        ret: Box::new(Type::Array(Box::new((**elem).clone()))),
+                        ret: TyBox::new(Type::Array(Box::new((**elem).clone()).into())),
                     };
                 }
             }
@@ -1333,7 +1336,7 @@ impl Typer {
         if name == "apply" {
             if let Type::Function { params, ret } = &recv_ty {
                 tree.ty = Type::Method {
-                    paramss: vec![params.clone()],
+                    paramss: vec![params.clone().into_vec()],
                     ret: ret.clone(),
                 };
             }
@@ -1386,7 +1389,7 @@ impl Typer {
         } else {
             Type::Class {
                 sym: owner,
-                args: vec![],
+                args: vec![].into(),
             }
         }
     }
@@ -1569,7 +1572,7 @@ impl Typer {
                     }
                     let child = Type::Class {
                         sym: oo,
-                        args: vec![],
+                        args: vec![].into(),
                     };
                     let parent = self.owner_as_type(owner);
                     self.st.is_sub_type(&child, &parent)
@@ -1726,7 +1729,7 @@ impl Typer {
         self.st.is_sub_type(
             &Type::Class {
                 sym: child,
-                args: vec![],
+                args: vec![].into(),
             },
             &self.owner_as_type(parent),
         )
@@ -1864,7 +1867,7 @@ impl Typer {
         {
             return found;
         }
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         found
             .iter()
             .copied()
@@ -2170,7 +2173,7 @@ impl Typer {
                 self.st.get(decl).owner,
                 &Type::Class {
                     sym: owner,
-                    args: vec![],
+                    args: vec![].into(),
                 },
             );
             crate::symbol::subst_tparams_slice(&from, &to, &widened)
@@ -2936,7 +2939,7 @@ impl Typer {
         }
         self.record_overload_group(&found, &name);
         let subst_args: Vec<Type> = match &recv_ty {
-            Type::Class { args, .. } => args.clone(),
+            Type::Class { args, .. } => args.clone().into_vec(),
             _ => Vec::new(),
         };
         let owner = self.st.get(found[0]).owner;
@@ -3756,7 +3759,7 @@ impl Typer {
                     &mut qual,
                     &Type::Method {
                         paramss: vec![],
-                        ret: Box::new(Type::NoType),
+                        ret: TyBox::new(Type::NoType),
                     },
                 );
                 self.typing_callee = saved;
@@ -4833,7 +4836,7 @@ mod pickled_copy_tests {
     fn method_ty(params: Vec<Type>) -> Type {
         Type::Method {
             paramss: vec![params],
-            ret: Box::new(Type::Int),
+            ret: TyBox::new(Type::Int),
         }
     }
 
@@ -4866,12 +4869,12 @@ mod pickled_copy_tests {
         let unresolved = method_ty(vec![
             Type::Named {
                 name: "Profile".into(),
-                args: vec![],
+                args: vec![].into(),
             },
             Type::String,
             Type::Named {
                 name: "Config".into(),
-                args: vec![],
+                args: vec![].into(),
             },
             Type::String,
         ]);
@@ -4880,7 +4883,7 @@ mod pickled_copy_tests {
             Type::String,
             Type::Class {
                 sym: config,
-                args: vec![],
+                args: vec![].into(),
             },
             Type::String,
         ]);
@@ -4951,7 +4954,9 @@ fn expand_rebound_result_alias(st: &SymbolTable, declared: &Type, seen: Type) ->
     match seen {
         Type::Method { paramss, ret } => Type::Method {
             paramss,
-            ret: Box::new(st.expand_applied_hk_alias(*ret)),
+            ret: TyBox::new(
+                st.expand_applied_hk_alias(<scala_rs_parser::Type as Clone>::clone(&*ret)),
+            ),
         },
         other => st.expand_applied_hk_alias(other),
     }

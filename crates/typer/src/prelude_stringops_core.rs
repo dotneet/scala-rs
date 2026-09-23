@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, fn2, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> SymbolId {
@@ -51,7 +52,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         so,
         "split",
         vec![Type::Char],
-        Type::Array(Box::new(Type::String)),
+        Type::Array(TyBox::new(Type::String)),
         Intrinsic::None,
     );
     method(
@@ -77,7 +78,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: iterator,
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         },
         Intrinsic::None,
     );
@@ -88,7 +89,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Int],
+            args: vec![Type::Int].into(),
         },
         Intrinsic::None,
     );
@@ -108,7 +109,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: iterator,
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         },
         Intrinsic::None,
     );
@@ -199,7 +200,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: iterator,
-            args: vec![Type::Char],
+            args: vec![Type::Char].into(),
         },
         Intrinsic::None,
     );
@@ -208,7 +209,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
     // name the element type instead of leaving the parameter raw.
     let seq_char = Type::Class {
         sym: seq,
-        args: vec![Type::Char],
+        args: vec![Type::Char].into(),
     };
     method(
         st,
@@ -224,7 +225,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         "intersect",
         vec![Type::Class {
             sym: seq,
-            args: vec![],
+            args: vec![].into(),
         }],
         Type::String,
         Intrinsic::None,
@@ -265,7 +266,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         st,
         so,
         "copyToArray",
-        vec![Type::Array(Box::new(Type::Char))],
+        vec![Type::Array(TyBox::new(Type::Char))],
         Type::Int,
         Intrinsic::None,
     );
@@ -273,7 +274,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         st,
         so,
         "copyToArray",
-        vec![Type::Array(Box::new(Type::Char)), Type::Int],
+        vec![Type::Array(TyBox::new(Type::Char)), Type::Int],
         Type::Int,
         Intrinsic::None,
     );
@@ -281,7 +282,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         st,
         so,
         "copyToArray",
-        vec![Type::Array(Box::new(Type::Char)), Type::Int, Type::Int],
+        vec![Type::Array(TyBox::new(Type::Char)), Type::Int, Type::Int],
         Type::Int,
         Intrinsic::None,
     );
@@ -312,7 +313,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
     );
     let opt_char = Type::Class {
         sym: st.option_sym,
-        args: vec![Type::Char],
+        args: vec![Type::Char].into(),
     };
     method(
         st,
@@ -354,7 +355,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Boolean],
+            args: vec![Type::Boolean].into(),
         },
         Intrinsic::None,
     );
@@ -368,7 +369,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Byte],
+            args: vec![Type::Byte].into(),
         },
         Intrinsic::None,
     );
@@ -379,7 +380,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Short],
+            args: vec![Type::Short].into(),
         },
         Intrinsic::None,
     );
@@ -390,7 +391,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Float],
+            args: vec![Type::Float].into(),
         },
         Intrinsic::None,
     );
@@ -401,7 +402,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Long],
+            args: vec![Type::Long].into(),
         },
         Intrinsic::None,
     );
@@ -412,7 +413,7 @@ pub(crate) fn add_string_ops(st: &mut SymbolTable, iterator: SymbolId) -> Symbol
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Double],
+            args: vec![Type::Double].into(),
         },
         Intrinsic::None,
     );
@@ -437,7 +438,7 @@ pub(crate) fn add_string_ops_fold_left(st: &mut SymbolTable, so: SymbolId) {
             vec![tb.clone()],
             vec![fn2(tb.clone(), Type::Char, tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
 }
 /// StringOps.foldRight[B](z: B)(op: (Char, B) => B): B and grouped(n): Iterator[String].
@@ -460,7 +461,7 @@ pub(crate) fn add_string_ops_fold_right_and_grouped(st: &mut SymbolTable, so: Sy
             vec![tb.clone()],
             vec![fn2(Type::Char, tb.clone(), tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
     let it = st
         .lookup_member(st.scala_pkg, "Iterator")
@@ -479,7 +480,7 @@ pub(crate) fn add_string_ops_fold_right_and_grouped(st: &mut SymbolTable, so: Sy
         vec![Type::Int],
         Type::Class {
             sym: it,
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         },
         Intrinsic::None,
     );
@@ -575,7 +576,7 @@ pub(crate) fn add_string_ops_iterator_size_appended(
         vec![],
         Type::Class {
             sym: iterator,
-            args: vec![Type::Char],
+            args: vec![Type::Char].into(),
         },
         Intrinsic::None,
     );
@@ -643,7 +644,7 @@ pub(crate) fn add_string_ops_indices_and_r(st: &mut SymbolTable, so: SymbolId) {
         vec![],
         Type::Class {
             sym: range,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
@@ -662,7 +663,7 @@ pub(crate) fn add_string_ops_indices_and_r(st: &mut SymbolTable, so: SymbolId) {
         vec![Type::String],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         },
         Intrinsic::None,
     );
@@ -681,7 +682,7 @@ pub(crate) fn add_string_ops_indices_and_r(st: &mut SymbolTable, so: SymbolId) {
         vec![],
         Type::Class {
             sym: regex,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
@@ -693,7 +694,7 @@ pub(crate) fn add_string_ops_to_array(st: &mut SymbolTable, so: SymbolId, ct: Sy
         so,
         "toArray",
         vec![],
-        Type::Array(Box::new(Type::Char)),
+        Type::Array(TyBox::new(Type::Char)),
         Intrinsic::None,
     );
     let ev = st.alloc(
@@ -705,16 +706,16 @@ pub(crate) fn add_string_ops_to_array(st: &mut SymbolTable, so: SymbolId, ct: Sy
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![Type::Char],
+        args: vec![Type::Char].into(),
     };
     st.get_mut(m).params = vec![ev];
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![Type::Class {
             sym: ct,
-            args: vec![Type::Char],
+            args: vec![Type::Char].into(),
         }]],
-        ret: Box::new(Type::Array(Box::new(Type::Char))),
+        ret: TyBox::new(Type::Array(Box::new(Type::Char).into())),
     };
 }
 /// `StringOps.sorted` with implicit `Ordering[Char]` (`Ordering$Char$.MODULE$`).
@@ -729,16 +730,16 @@ pub(crate) fn add_string_ops_sorted(st: &mut SymbolTable, so: SymbolId, ordering
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ordering,
-        args: vec![Type::Char],
+        args: vec![Type::Char].into(),
     };
     st.get_mut(m).params = vec![ev];
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![Type::Class {
             sym: ordering,
-            args: vec![Type::Char],
+            args: vec![Type::Char].into(),
         }]],
-        ret: Box::new(Type::String),
+        ret: TyBox::new(Type::String),
     };
 }
 /// `StringContext.parts` is a `Seq[String]`; `Seq` only exists once
@@ -755,7 +756,7 @@ pub(crate) fn fix_string_context_parts(st: &mut SymbolTable) {
         if st.get(f).name == "parts" {
             st.get_mut(f).ty = Type::Class {
                 sym: seq,
-                args: vec![Type::String],
+                args: vec![Type::String].into(),
             };
         }
     }
@@ -775,16 +776,16 @@ pub(crate) fn add_string_context(st: &mut SymbolTable) {
     st.get_mut(parts).ty = match seq {
         Some(seq) => Type::Class {
             sym: seq,
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         },
-        None => Type::Repeated(Box::new(Type::String)),
+        None => Type::Repeated(TyBox::new(Type::String)),
     };
     st.get_mut(sc).ctor_fields = vec![parts];
     method(
         st,
         sc,
         "s",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         Type::String,
         Intrinsic::None,
     );
@@ -794,10 +795,10 @@ pub(crate) fn add_string_context(st: &mut SymbolTable) {
         st,
         mc,
         "apply",
-        vec![Type::Repeated(Box::new(Type::String))],
+        vec![Type::Repeated(TyBox::new(Type::String))],
         Type::Class {
             sym: sc,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );

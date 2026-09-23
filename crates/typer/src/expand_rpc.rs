@@ -33,6 +33,7 @@
 //! cannot answer *this* question -- which becomes a compile diagnostic naming
 //! what was missing. A question scala-rs would have to guess at is the third.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::encode_method_name;
 use scala_rs_span::Level;
@@ -286,7 +287,7 @@ impl Typer {
                         .collect(),
                 }
             } else {
-                *ret
+                ret.clone().into_inner()
             };
             if ret.is_no_type() {
                 return Err(format!("recursive method {} needs result type", s.name));
@@ -850,8 +851,8 @@ impl Typer {
             .map(|arg| self.query_type_from_wire(arg, span))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Type::Applied {
-            ctor: Box::new(base),
-            args,
+            ctor: TyBox::new(base),
+            args: args.into(),
         })
     }
 
@@ -1222,12 +1223,12 @@ impl Typer {
         }
         let structural = match ty {
             Type::Function { params, ret } if params.len() <= 22 => {
-                let mut args = params.clone();
+                let mut args = params.to_vec();
                 args.push((**ret).clone());
                 Some((format!("scala.Function{}", params.len()), args))
             }
             Type::Tuple(args) if (1..=22).contains(&args.len()) => {
-                Some((format!("scala.Tuple{}", args.len()), args.clone()))
+                Some((format!("scala.Tuple{}", args.len()), args.to_vec()))
             }
             Type::Array(elem) => Some(("scala.Array".to_string(), vec![(**elem).clone()])),
             _ => None,

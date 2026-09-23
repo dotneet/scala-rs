@@ -673,7 +673,7 @@ impl Lower<'_> {
         match sample {
             Type::Class { sym, .. } => Type::Class {
                 sym: *sym,
-                args: vec![elem.widen_constant()],
+                args: vec![elem.widen_constant()].into(),
             },
             _ => sample.clone(),
         }
@@ -689,7 +689,7 @@ impl Lower<'_> {
         );
         let method_ty = Type::Method {
             paramss: vec![vec![]],
-            ret: Box::new(result_ty.clone()),
+            ret: TyBox::new(result_ty.clone()),
         };
         self.typer.st.get_mut(sym).ty = method_ty.clone();
         self.typer.st.get_mut(sym).paramss = vec![vec![]];

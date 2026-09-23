@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, method, module, type_param};
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{SymbolId, Type};
 
 pub(crate) fn add_array_buffer(st: &mut SymbolTable) {
@@ -16,7 +17,7 @@ pub(crate) fn add_array_buffer(st: &mut SymbolTable) {
     let ta = Type::TypeParam(ba);
     let buf_t = Type::Class {
         sym: buf,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -56,7 +57,7 @@ pub(crate) fn add_array_buffer(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: buf,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -64,17 +65,17 @@ pub(crate) fn add_array_buffer(st: &mut SymbolTable) {
         st,
         buf_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         buf_t.clone(),
         Intrinsic::None,
     );
     let baa = type_param(st, buf_apply, "A");
     st.get_mut(buf_apply).tparams = vec![baa];
     st.get_mut(buf_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(baa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(baa)))]],
+        ret: TyBox::new(Type::Class {
             sym: buf,
-            args: vec![Type::TypeParam(baa)],
+            args: vec![Type::TypeParam(baa)].into(),
         }),
     };
     let mems = st.get(buf_cls).members.clone();
@@ -94,7 +95,7 @@ pub(crate) fn add_list_buffer(st: &mut SymbolTable) {
     let ta = Type::TypeParam(ba);
     let buf_t = Type::Class {
         sym: buf,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -126,7 +127,7 @@ pub(crate) fn add_list_buffer(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: buf,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -134,17 +135,17 @@ pub(crate) fn add_list_buffer(st: &mut SymbolTable) {
         st,
         buf_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         buf_t.clone(),
         Intrinsic::None,
     );
     let baa = type_param(st, buf_apply, "A");
     st.get_mut(buf_apply).tparams = vec![baa];
     st.get_mut(buf_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(baa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(baa)))]],
+        ret: TyBox::new(Type::Class {
             sym: buf,
-            args: vec![Type::TypeParam(baa)],
+            args: vec![Type::TypeParam(baa)].into(),
         }),
     };
     let mems = st.get(buf_cls).members.clone();
@@ -164,7 +165,7 @@ pub(crate) fn add_array_deque(st: &mut SymbolTable) {
     let ta = Type::TypeParam(da);
     let deq_t = Type::Class {
         sym: deq,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -204,7 +205,7 @@ pub(crate) fn add_array_deque(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: deq,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -212,26 +213,26 @@ pub(crate) fn add_array_deque(st: &mut SymbolTable) {
     st.get_mut(deq_empty).tparams = vec![ea];
     st.get_mut(deq_empty).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: deq,
-            args: vec![Type::TypeParam(ea)],
+            args: vec![Type::TypeParam(ea)].into(),
         }),
     };
     let deq_apply = method(
         st,
         deq_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         deq_t.clone(),
         Intrinsic::None,
     );
     let daa = type_param(st, deq_apply, "A");
     st.get_mut(deq_apply).tparams = vec![daa];
     st.get_mut(deq_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(daa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(daa)))]],
+        ret: TyBox::new(Type::Class {
             sym: deq,
-            args: vec![Type::TypeParam(daa)],
+            args: vec![Type::TypeParam(daa)].into(),
         }),
     };
     let mems = st.get(deq_cls).members.clone();
@@ -260,11 +261,11 @@ pub(crate) fn add_hash_map(st: &mut SymbolTable) {
     let tv = Type::TypeParam(mv);
     let hm_t = Type::Class {
         sym: hm,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![tk, tv.clone()],
+        args: vec![tk, tv.clone()].into(),
     };
     method(
         st,
@@ -281,7 +282,7 @@ pub(crate) fn add_hash_map(st: &mut SymbolTable) {
         vec![Type::Any],
         Type::Class {
             sym: st.option_sym,
-            args: vec![tv.clone()],
+            args: vec![tv.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -303,7 +304,7 @@ pub(crate) fn add_hash_map(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: hm,
-            args: vec![Type::Any, Type::Any],
+            args: vec![Type::Any, Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -312,16 +313,16 @@ pub(crate) fn add_hash_map(st: &mut SymbolTable) {
     st.get_mut(hm_empty).tparams = vec![ek, ev];
     st.get_mut(hm_empty).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: hm,
-            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)],
+            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)].into(),
         }),
     };
     let hm_apply = method(
         st,
         hm_cls,
         "apply",
-        vec![Type::Repeated(Box::new(pair.clone()))],
+        vec![Type::Repeated(TyBox::new(pair.clone()))],
         hm_t.clone(),
         Intrinsic::None,
     );
@@ -330,13 +331,13 @@ pub(crate) fn add_hash_map(st: &mut SymbolTable) {
     st.get_mut(hm_apply).tparams = vec![hak, hav];
     let hm_pair = Type::Class {
         sym: tuple2,
-        args: vec![Type::TypeParam(hak), Type::TypeParam(hav)],
+        args: vec![Type::TypeParam(hak), Type::TypeParam(hav)].into(),
     };
     st.get_mut(hm_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(hm_pair))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(hm_pair))]],
+        ret: TyBox::new(Type::Class {
             sym: hm,
-            args: vec![Type::TypeParam(hak), Type::TypeParam(hav)],
+            args: vec![Type::TypeParam(hak), Type::TypeParam(hav)].into(),
         }),
     };
     let mems = st.get(hm_cls).members.clone();
@@ -356,7 +357,7 @@ pub(crate) fn add_hash_set(st: &mut SymbolTable) {
     let ta = Type::TypeParam(sa);
     let hs_t = Type::Class {
         sym: hs,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -376,7 +377,7 @@ pub(crate) fn add_hash_set(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: hs,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -384,26 +385,26 @@ pub(crate) fn add_hash_set(st: &mut SymbolTable) {
     st.get_mut(hs_empty).tparams = vec![ea];
     st.get_mut(hs_empty).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: hs,
-            args: vec![Type::TypeParam(ea)],
+            args: vec![Type::TypeParam(ea)].into(),
         }),
     };
     let hs_apply = method(
         st,
         hs_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         hs_t.clone(),
         Intrinsic::None,
     );
     let haa = type_param(st, hs_apply, "A");
     st.get_mut(hs_apply).tparams = vec![haa];
     st.get_mut(hs_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(haa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(haa)))]],
+        ret: TyBox::new(Type::Class {
             sym: hs,
-            args: vec![Type::TypeParam(haa)],
+            args: vec![Type::TypeParam(haa)].into(),
         }),
     };
     let mems = st.get(hs_cls).members.clone();
@@ -432,11 +433,11 @@ pub(crate) fn add_linked_hash_map(st: &mut SymbolTable) {
     let tv = Type::TypeParam(mv);
     let lhm_t = Type::Class {
         sym: lhm,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![tk, tv.clone()],
+        args: vec![tk, tv.clone()].into(),
     };
     method(
         st,
@@ -484,7 +485,7 @@ pub(crate) fn add_linked_hash_map(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: lhm,
-            args: vec![Type::Any, Type::Any],
+            args: vec![Type::Any, Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -493,16 +494,16 @@ pub(crate) fn add_linked_hash_map(st: &mut SymbolTable) {
     st.get_mut(lhm_empty).tparams = vec![ek, ev];
     st.get_mut(lhm_empty).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: lhm,
-            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)],
+            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)].into(),
         }),
     };
     let lhm_apply = method(
         st,
         lhm_cls,
         "apply",
-        vec![Type::Repeated(Box::new(pair.clone()))],
+        vec![Type::Repeated(TyBox::new(pair.clone()))],
         lhm_t.clone(),
         Intrinsic::None,
     );
@@ -511,13 +512,13 @@ pub(crate) fn add_linked_hash_map(st: &mut SymbolTable) {
     st.get_mut(lhm_apply).tparams = vec![lak, lav];
     let lhm_pair = Type::Class {
         sym: tuple2,
-        args: vec![Type::TypeParam(lak), Type::TypeParam(lav)],
+        args: vec![Type::TypeParam(lak), Type::TypeParam(lav)].into(),
     };
     st.get_mut(lhm_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(lhm_pair))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(lhm_pair))]],
+        ret: TyBox::new(Type::Class {
             sym: lhm,
-            args: vec![Type::TypeParam(lak), Type::TypeParam(lav)],
+            args: vec![Type::TypeParam(lak), Type::TypeParam(lav)].into(),
         }),
     };
     let mems = st.get(lhm_cls).members.clone();
@@ -537,7 +538,7 @@ pub(crate) fn add_linked_hash_set(st: &mut SymbolTable) {
     let ta = Type::TypeParam(sa);
     let lhs_t = Type::Class {
         sym: lhs,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -577,7 +578,7 @@ pub(crate) fn add_linked_hash_set(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: lhs,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -585,26 +586,26 @@ pub(crate) fn add_linked_hash_set(st: &mut SymbolTable) {
     st.get_mut(lhs_empty).tparams = vec![ea];
     st.get_mut(lhs_empty).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: lhs,
-            args: vec![Type::TypeParam(ea)],
+            args: vec![Type::TypeParam(ea)].into(),
         }),
     };
     let lhs_apply = method(
         st,
         lhs_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         lhs_t.clone(),
         Intrinsic::None,
     );
     let haa = type_param(st, lhs_apply, "A");
     st.get_mut(lhs_apply).tparams = vec![haa];
     st.get_mut(lhs_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(haa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(haa)))]],
+        ret: TyBox::new(Type::Class {
             sym: lhs,
-            args: vec![Type::TypeParam(haa)],
+            args: vec![Type::TypeParam(haa)].into(),
         }),
     };
     let mems = st.get(lhs_cls).members.clone();

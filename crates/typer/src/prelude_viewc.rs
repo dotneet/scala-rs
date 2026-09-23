@@ -29,6 +29,7 @@
 //! do nothing.
 
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// `(name, erased argument descriptor, whether the result keeps the element type)`.
@@ -115,7 +116,7 @@ fn add_c_member(
                 &ta,
                 &Type::Class {
                     sym: iterable_once,
-                    args: vec![tb.clone()],
+                    args: vec![tb.clone()].into(),
                 },
             )
         };
@@ -123,9 +124,9 @@ fn add_c_member(
     };
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![param]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: view,
-            args: vec![elem],
+            args: vec![elem].into(),
         }),
     };
     st.set_jvm_name(id, desc.to_string());
@@ -134,8 +135,8 @@ fn add_c_member(
 
 fn fn1(from: &Type, to: &Type) -> Type {
     Type::Function {
-        params: vec![from.clone()],
-        ret: Box::new(to.clone()),
+        params: vec![from.clone()].into(),
+        ret: TyBox::new(to.clone()),
     }
 }
 
@@ -143,7 +144,7 @@ fn partial_fn(st: &SymbolTable, from: &Type, to: &Type) -> Type {
     match crate::classpath::find_by_jvm(st, "scala/PartialFunction") {
         Some(pf) => Type::Class {
             sym: pf,
-            args: vec![from.clone(), to.clone()],
+            args: vec![from.clone(), to.clone()].into(),
         },
         None => fn1(from, to),
     }

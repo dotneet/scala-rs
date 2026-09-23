@@ -19,7 +19,7 @@ fn remaining_application_result(fun_ty: &Type, ret: &Type) -> Type {
     match fun_ty {
         Type::Method { paramss, .. } if paramss.len() > 1 => Type::Function {
             params: paramss.iter().skip(1).flatten().cloned().collect(),
-            ret: Box::new(ret.clone()),
+            ret: TyBox::new(ret.clone()),
         },
         _ => ret.clone(),
     }
@@ -45,7 +45,7 @@ fn merge_argument_prototypes(left: &Type, right: &Type) -> Option<Type> {
                 .iter()
                 .zip(right_args)
                 .map(|(l, r)| merge_argument_prototypes(l, r))
-                .collect::<Option<Vec<_>>>()?,
+                .collect::<Option<Vec<_>>>()?.into(),
         }),
         (
             Type::Applied {
@@ -57,12 +57,12 @@ fn merge_argument_prototypes(left: &Type, right: &Type) -> Option<Type> {
                 args: right_args,
             },
         ) if left_args.len() == right_args.len() => Some(Type::Applied {
-            ctor: Box::new(merge_argument_prototypes(left_ctor, right_ctor)?),
+            ctor: TyBox::new(merge_argument_prototypes(left_ctor, right_ctor)?),
             args: left_args
                 .iter()
                 .zip(right_args)
                 .map(|(l, r)| merge_argument_prototypes(l, r))
-                .collect::<Option<Vec<_>>>()?,
+                .collect::<Option<Vec<_>>>()?.into(),
         }),
         _ if left == right => Some(left.clone()),
         _ => None,
@@ -317,7 +317,7 @@ impl Typer {
             }
             Some(Type::Function {
                 params,
-                ret: Box::new(Type::Wildcard),
+                ret: TyBox::new(Type::Wildcard),
             })
         };
         match fun_ty {
@@ -502,7 +502,7 @@ impl Typer {
                     for a in args.iter_mut() {
                         self.type_expr(a, &Type::Int);
                     }
-                    tree.ty = Type::Array(Box::new(elem));
+                    tree.ty = Type::Array(TyBox::new(elem));
                     tree.sym = fun.sym;
                     return;
                 }
@@ -514,7 +514,7 @@ impl Typer {
                     self.type_expr(a, &Type::Int);
                     self.adapt(a, &Type::Int);
                 }
-                tree.ty = Type::Array(Box::new(elem));
+                tree.ty = Type::Array(TyBox::new(elem));
                 tree.sym = fun.sym;
                 return;
             }
@@ -590,7 +590,7 @@ impl Typer {
                             && !args.is_empty()
                             && (tps.is_empty() || args.len() == tps.len())) =>
                 {
-                    args.clone()
+                    args.clone().into_vec()
                 }
                 _ => Vec::new(),
             };
@@ -747,8 +747,8 @@ impl Typer {
                         continue;
                     }
                     arg_tys.push(Type::Function {
-                        params: vec![Type::NoType; vparams.len()],
-                        ret: Box::new(Type::NoType),
+                        params: vec![Type::NoType; vparams.len()].into(),
+                        ret: TyBox::new(Type::NoType),
                     });
                 } else {
                     let pt_arg = ctor_protos.get(ai).cloned().unwrap_or(Type::NoType);
@@ -935,17 +935,17 @@ impl Typer {
                     inferred_args = explicit;
                     tree.ty = Type::Class {
                         sym: c,
-                        args: inferred_args.clone(),
+                        args: inferred_args.clone().into(),
                     };
                     fun.ty = tree.ty.clone();
                 } else if infer {
                     let pt_args: Vec<Type> = match pt {
-                        Type::Class { args: a, sym } if *sym == c => a.clone(),
+                        Type::Class { args: a, sym } if *sym == c => a.clone().into_vec(),
                         Type::Tuple(ts)
                             if numbered_arity(&self.st.get(c).name, "Tuple") == Some(ts.len())
                                 && ts.len() == tps.len() =>
                         {
-                            ts.clone()
+                            ts.clone().into_vec()
                         }
                         _ => Vec::new(),
                     };
@@ -1005,7 +1005,7 @@ impl Typer {
                     }
                     tree.ty = Type::Class {
                         sym: c,
-                        args: inferred_args.clone(),
+                        args: inferred_args.clone().into(),
                     };
                     fun.ty = tree.ty.clone();
                 } else {
@@ -1017,7 +1017,7 @@ impl Typer {
             if let Some(decls) = head_view {
                 if matches!(tree.ty, Type::Class { .. }) {
                     tree.ty = Type::Refined {
-                        parents: vec![tree.ty.clone()],
+                        parents: vec![tree.ty.clone()].into(),
                         decls,
                     };
                     fun.ty = tree.ty.clone();
@@ -1114,7 +1114,7 @@ impl Typer {
 
         let dummy_method = Type::Method {
             paramss: vec![],
-            ret: Box::new(Type::NoType),
+            ret: TyBox::new(Type::NoType),
         };
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
@@ -1213,7 +1213,7 @@ impl Typer {
                 })
                 .collect();
             let ret = Box::new(self.expand_binary_method_alias(fun.sym, &ret, fun.span));
-            fun.ty = Type::Method { paramss, ret };
+            fun.ty = Type::Method { paramss, ret: ret.into() };
         }
         let placed = self.reorder_named_args(args, fun);
         self.record_named_arg_order(tree_id);
@@ -1256,7 +1256,7 @@ impl Typer {
         {
             let signatures = match &fun_ty_for_pretype {
                 Type::Overload(alts) => alts.clone(),
-                other => vec![other.clone()],
+                other => vec![other.clone()].into(),
             };
             for ty in signatures {
                 if let Type::Method { paramss, .. } = ty {
@@ -1405,16 +1405,16 @@ impl Typer {
                     // pre-typing fixes, the result is whatever the body says
                     // and must not be checked against anything yet.
                     let pt_arg = Type::Function {
-                        params: ps,
-                        ret: Box::new(Type::Wildcard),
+                        params: ps.into(),
+                        ret: TyBox::new(Type::Wildcard),
                     };
                     self.type_expr(a, &pt_arg);
                     arg_tys.push(a.argument_type());
                     continue;
                 }
                 arg_tys.push(Type::Function {
-                    params: vec![Type::NoType; source_arity],
-                    ret: Box::new(Type::NoType),
+                    params: vec![Type::NoType; source_arity].into(),
+                    ret: TyBox::new(Type::NoType),
                 });
             } else {
                 let strict_proto = self.proto_arg_type(
@@ -2361,7 +2361,7 @@ impl Typer {
                                         Type::Wildcard
                                     })
                                 } else {
-                                    fr.clone()
+                                    fr.clone().into()
                                 };
                                 // The first type argument is the element only when
                                 // it is a *proper* type. cats' syntax classes are
@@ -2432,11 +2432,11 @@ impl Typer {
                                 {
                                     vec![elem.clone()]
                                 } else {
-                                    fp.clone()
+                                    fp.clone().into_vec()
                                 };
                                 param_tys[0] = Type::Function {
-                                    params: fparams,
-                                    ret: fret,
+                                    params: fparams.into(),
+                                    ret: fret.into(),
                                 };
                             }
                         }
@@ -2446,7 +2446,7 @@ impl Typer {
                                     let to = args.get(1).cloned().unwrap_or(Type::Any);
                                     param_tys[0] = Type::Class {
                                         sym: *sym,
-                                        args: vec![elem, to],
+                                        args: vec![elem, to].into(),
                                     };
                                 }
                             }
@@ -2491,7 +2491,7 @@ impl Typer {
                             if !params.is_empty() && matches!(ret.as_ref(), Type::TypeParam(_)) {
                                 p = Type::Function {
                                     params: params.clone(),
-                                    ret: Box::new(Type::Wildcard),
+                                    ret: TyBox::new(Type::Wildcard),
                                 };
                             }
                         }
@@ -2551,7 +2551,7 @@ impl Typer {
                                                 &vec![Type::Wildcard; open.len()],
                                                 &args[1],
                                             ),
-                                        ],
+                                        ].into(),
                                     }
                                 }
                                 Type::Function { params, ret } if mentions_tparam(ret, &open) => {
@@ -2571,7 +2571,7 @@ impl Typer {
                                     };
                                     Type::Function {
                                         params: params.clone(),
-                                        ret: Box::new(result),
+                                        ret: TyBox::new(result),
                                     }
                                 }
                                 _ => p.clone(),
@@ -2585,7 +2585,7 @@ impl Typer {
                                 Type::Function { params, ret } => {
                                     match self.undo_eta_param_types(a, params, &open) {
                                         Some(params) => Type::Function {
-                                            params,
+                                            params: params.into(),
                                             ret: ret.clone(),
                                         },
                                         None => relaxed,
@@ -2931,7 +2931,7 @@ impl Typer {
                                     let params = params.clone();
                                     a.ty = Type::Function {
                                         params,
-                                        ret: Box::new(body_ty),
+                                        ret: TyBox::new(body_ty),
                                     };
                                 }
                             }
@@ -3228,7 +3228,7 @@ impl Typer {
                                 };
                                 ret = Type::Class {
                                     sym: t2,
-                                    args: vec![k, a0.ty.widen_constant()],
+                                    args: vec![k, a0.ty.widen_constant()].into(),
                                 };
                             }
                         }
@@ -3237,7 +3237,7 @@ impl Typer {
                         if self.is_array_ops_ty(recv_ty.as_ref()) {
                             if let Some(a0) = args.first() {
                                 if let Type::Function { ret: fr, .. } = &a0.ty {
-                                    ret = Type::Array(Box::new(fr.as_ref().widen_constant()));
+                                    ret = Type::Array(TyBox::new(fr.as_ref().widen_constant()));
                                 }
                             }
                         } else if let Some(t) = self.either_map_result(recv_ty.as_ref(), args) {
@@ -3277,7 +3277,7 @@ impl Typer {
                                                     r,
                                                     &Type::Class {
                                                         sym: d,
-                                                        args: vec![fr.as_ref().widen_constant()],
+                                                        args: vec![fr.as_ref().widen_constant()].into(),
                                                     },
                                                 )
                                             },
@@ -3304,7 +3304,7 @@ impl Typer {
                                                     .base_type_instance(
                                                         &Type::Class {
                                                             sym: r,
-                                                            args: vec![],
+                                                            args: vec![].into(),
                                                         },
                                                         d,
                                                         0,
@@ -3336,7 +3336,7 @@ impl Typer {
                                     } else if let Some(cls) = cls {
                                         ret = Type::Class {
                                             sym: cls,
-                                            args: vec![fr.as_ref().widen_constant()],
+                                            args: vec![fr.as_ref().widen_constant()].into(),
                                         };
                                     }
                                 }
@@ -3455,7 +3455,7 @@ impl Typer {
                             };
                             if let Some(to) = to {
                                 if self.is_array_ops_ty(recv_ty.as_ref()) {
-                                    ret = Type::Array(Box::new(to.widen_constant()));
+                                    ret = Type::Array(TyBox::new(to.widen_constant()));
                                 } else if let Some(cls) = self
                                     .receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)
                                     .filter(|&c| self.takes_one_type_parameter(c))
@@ -3473,7 +3473,7 @@ impl Typer {
                                             .base_type_instance(
                                                 &Type::Class {
                                                     sym: *d,
-                                                    args: vec![],
+                                                    args: vec![].into(),
                                                 },
                                                 cls,
                                                 0,
@@ -3484,7 +3484,7 @@ impl Typer {
                                     if !more_specific {
                                         ret = Type::Class {
                                             sym: cls,
-                                            args: vec![to.widen_constant()],
+                                            args: vec![to.widen_constant()].into(),
                                         };
                                     }
                                 } else if let Some(r) =
@@ -3496,7 +3496,7 @@ impl Typer {
                                         Type::Class { sym, args } if args.len() == 1 => {
                                             Some(Type::Class {
                                                 sym: *sym,
-                                                args: vec![to.widen_constant()],
+                                                args: vec![to.widen_constant()].into(),
                                             })
                                         }
                                         _ => None,
@@ -3518,9 +3518,9 @@ impl Typer {
                                         .unwrap_or(Type::Any);
                                     let t2 = self.tuple2_sym();
                                     if !t2.is_none() {
-                                        ret = Type::Array(Box::new(Type::Class {
+                                        ret = Type::Array(TyBox::new(Type::Class {
                                             sym: t2,
-                                            args: vec![a, b.widen_constant()],
+                                            args: vec![a, b.widen_constant()].into(),
                                         }));
                                     }
                                 }
@@ -3553,7 +3553,7 @@ impl Typer {
                                         Type::Array(e) => e.as_ref().clone(),
                                         other => other.clone(),
                                     };
-                                    ret = Type::Array(Box::new(elem.widen_constant()));
+                                    ret = Type::Array(TyBox::new(elem.widen_constant()));
                                 }
                             }
                         } else if let Some(t) =
@@ -3598,7 +3598,7 @@ impl Typer {
                                         let r =
                                             self.receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)?;
                                         (self.st.get(r).tparams.len() == 2)
-                                            .then_some(Type::Class { sym: r, args: pair })
+                                            .then_some(Type::Class { sym: r, args: pair.into() })
                                     });
                                     if let Some(t) = pair_rebuilt {
                                         ret = t;
@@ -3661,12 +3661,12 @@ impl Typer {
                                     args: vec![
                                         args[0].ty.widen_constant(),
                                         args[1].ty.widen_constant(),
-                                    ],
+                                    ].into(),
                                 };
                             } else if n == "Vector" && args.len() >= 2 {
                                 ret = Type::Class {
                                     sym: cls,
-                                    args: vec![args[1].ty.widen_constant()],
+                                    args: vec![args[1].ty.widen_constant()].into(),
                                 };
                             }
                         }
@@ -3676,7 +3676,7 @@ impl Typer {
                                 if let Some(a0) = args.first() {
                                     ret = Type::Class {
                                         sym: cls,
-                                        args: vec![a0.ty.widen_constant()],
+                                        args: vec![a0.ty.widen_constant()].into(),
                                     };
                                 }
                             }
@@ -3713,10 +3713,10 @@ impl Typer {
                                             };
                                             if let Type::Class { args: more, .. } = aty {
                                                 if more.len() == 2 {
-                                                    targs = vec![
+                                                    *targs = vec![
                                                         self.st.lub(&targs[0], &more[0]),
                                                         self.st.lub(&targs[1], &more[1]),
-                                                    ];
+                                                    ].into();
                                                 }
                                             }
                                         }
@@ -3725,10 +3725,10 @@ impl Typer {
                                         {
                                             let targs = self
                                                 .factory_targs_from_pt(map, targs, pt)
-                                                .unwrap_or_else(|| targs.clone());
+                                                .unwrap_or_else(|| targs.clone().into_vec());
                                             ret = Type::Class {
                                                 sym: map,
-                                                args: targs,
+                                                args: targs.into(),
                                             };
                                         }
                                     }
@@ -3765,7 +3765,7 @@ impl Typer {
                                         .unwrap_or_else(|| vec![elem]);
                                     ret = Type::Class {
                                         sym: cls,
-                                        args: args1,
+                                        args: args1.into(),
                                     };
                                 }
                             }
@@ -3796,7 +3796,7 @@ impl Typer {
                                 }) {
                                     ret = Type::Class {
                                         sym: cls,
-                                        args: vec![elem.widen_constant()],
+                                        args: vec![elem.widen_constant()].into(),
                                     };
                                 }
                             }
@@ -4145,7 +4145,7 @@ impl Typer {
             {
                 Type::Function {
                     params: params.clone(),
-                    ret: Box::new(Type::NoType),
+                    ret: TyBox::new(Type::NoType),
                 }
             }
             _ => pt.clone(),
@@ -4228,9 +4228,9 @@ impl Typer {
     fn pair_args(&self, ty: &Type) -> Option<Vec<Type>> {
         match ty {
             Type::Class { sym, args } if args.len() == 2 && self.st.get(*sym).name == "Tuple2" => {
-                Some(args.clone())
+                Some(args.clone().into_vec())
             }
-            Type::Tuple(args) if args.len() == 2 => Some(args.clone()),
+            Type::Tuple(args) if args.len() == 2 => Some(args.clone().into_vec()),
             _ => None,
         }
     }
@@ -4320,13 +4320,13 @@ impl Typer {
         match (rargs.len(), bargs.len()) {
             (1, 1) => Some(Type::Class {
                 sym: *sym,
-                args: vec![join(&rargs[0], &bargs[0])],
+                args: vec![join(&rargs[0], &bargs[0])].into(),
             }),
             // `MapOps.updated[V1 >: V](key: K, value: V1): Map[K, V1]`: the
             // key is the receiver's own.
             (2, 2) if method == "updated" => Some(Type::Class {
                 sym: *sym,
-                args: vec![bargs[0].clone(), join(&rargs[1], &bargs[1])],
+                args: vec![bargs[0].clone(), join(&rargs[1], &bargs[1])].into(),
             }),
             _ => None,
         }
@@ -4349,7 +4349,7 @@ impl Typer {
         self.base_type_instance(
             &Type::Class {
                 sym: recv_root,
-                args: vec![],
+                args: vec![].into(),
             },
             d,
             0,
@@ -4365,7 +4365,7 @@ impl Typer {
             if let Some(pair) = self.pair_args(&dargs[0]) {
                 return Some(Type::Class {
                     sym: recv_root,
-                    args: pair,
+                    args: pair.into(),
                 });
             }
         }
@@ -4396,7 +4396,7 @@ impl Typer {
                     .base_type_instance(
                         &Type::Class {
                             sym: cls,
-                            args: vec![],
+                            args: vec![].into(),
                         },
                         sorted,
                         0,
@@ -4506,7 +4506,7 @@ impl Typer {
                 .base_type_instance(
                     &Type::Class {
                         sym: cls,
-                        args: vec![],
+                        args: vec![].into(),
                     },
                     view,
                     0,
@@ -4578,9 +4578,9 @@ impl Typer {
         Some(match ret {
             Type::Class { sym, .. } => Type::Class {
                 sym: *sym,
-                args: out,
+                args: out.into(),
             },
-            _ => Type::Tuple(out),
+            _ => Type::Tuple(out.into()),
         })
     }
 
@@ -4659,12 +4659,12 @@ impl Typer {
         if is_right_biased_either(&self.st, sym) {
             Some(Type::Class {
                 sym: either,
-                args: vec![targs[0].clone(), to],
+                args: vec![targs[0].clone(), to].into(),
             })
         } else if name == "LeftProjection" {
             Some(Type::Class {
                 sym: either,
-                args: vec![to, targs[1].clone()],
+                args: vec![to, targs[1].clone()].into(),
             })
         } else {
             None
@@ -4748,7 +4748,7 @@ impl Typer {
         let Type::Function { ret, .. } = fun else {
             return None;
         };
-        let elem = if flatten { self.elem_type(&ret)? } else { *ret };
+        let elem = if flatten { self.elem_type(&ret)? } else { ret.clone().into_inner() };
         if self.pair_args(&elem).is_some() {
             return None;
         }
@@ -4757,7 +4757,7 @@ impl Typer {
         };
         Some(Type::Class {
             sym: *ctor,
-            args: vec![elem.widen_constant()],
+            args: vec![elem.widen_constant()].into(),
         })
     }
 
@@ -5048,7 +5048,7 @@ impl Typer {
         }
         Type::Function {
             params,
-            ret: Box::new(Type::Wildcard),
+            ret: TyBox::new(Type::Wildcard),
         }
     }
 

@@ -26,6 +26,7 @@
 //! the prelude provides `scala/collection/Map`. If it is absent, do nothing.
 
 use crate::symbol::SymbolTable;
+use scala_rs_parser::TyBox;
 use scala_rs_parser::Type;
 
 pub(crate) fn install(st: &mut SymbolTable) {
@@ -48,13 +49,13 @@ pub(crate) fn install(st: &mut SymbolTable) {
             vec![Type::Any],
             Type::Class {
                 sym: option,
-                args: vec![tv.clone()],
+                args: vec![tv.clone()].into(),
             },
         ),
         ("contains", vec![Type::Any], Type::Boolean),
         (
             "getOrElse",
-            vec![Type::Any, Type::ByName(Box::new(tv.clone()))],
+            vec![Type::Any, Type::ByName(TyBox::new(tv.clone()))],
             tv.clone(),
         ),
     ];

@@ -4,6 +4,7 @@
 //! single apply. Leftover method types used as values (eta-expansion and
 //! partial application) become `FunctionN` closures.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, Modifiers, SymbolId, Tree, TreeKind, Type};
 
 use crate::symbol::{SymKind, SymbolTable};
@@ -262,7 +263,7 @@ fn eta_fn_param(st: &SymbolTable, pty: &Type) -> Type {
             match crate::classpath::find_by_jvm(st, "scala/collection/immutable/Seq") {
                 Some(seq) => Type::Class {
                     sym: seq,
-                    args: vec![(**elem).clone()],
+                    args: vec![(**elem).clone()].into(),
                 },
                 None => pty.clone(),
             }
@@ -329,7 +330,7 @@ pub(crate) fn eta_expand(
         },
         ty: Type::Function {
             params: fn_params,
-            ret: Box::new(ret),
+            ret: TyBox::new(ret),
         },
         sym: SymbolId::NONE,
         postfix: false,
@@ -591,7 +592,7 @@ pub(crate) fn eta_expand_curried(
         },
         ty: Type::Function {
             params: first.iter().map(|p| eta_fn_param(st, p)).collect(),
-            ret: Box::new(body_ty),
+            ret: TyBox::new(body_ty),
         },
         sym: SymbolId::NONE,
         postfix: false,

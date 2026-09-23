@@ -21,6 +21,7 @@
 //! signature.
 
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{SymbolId, Type};
 
 /// Classes whose `toSeq` is `IterableOnceOps`' -- they are not sequences.
@@ -85,7 +86,7 @@ fn retype_to_seq(st: &mut SymbolTable, cls: SymbolId, head: SymbolId) {
         }
         st.get_mut(m).ty = Type::Method {
             paramss,
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: head,
                 args: args.clone(),
             }),

@@ -128,7 +128,7 @@ impl Typer {
         let class_ty = Type::Class {
             sym: cls,
             args: if targs.len() == s.tparams.len() && !targs.is_empty() {
-                targs.to_vec()
+                targs.to_vec().into()
             } else {
                 s.tparams.iter().map(|t| Type::TypeParam(*t)).collect()
             },

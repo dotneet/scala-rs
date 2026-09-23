@@ -285,7 +285,7 @@ impl<'a> Types<'a> {
         Some(match t {
             NTy::Class(s, args) => {
                 if *s == st.array_sym {
-                    return Some(Type::Array(Box::new(self.to_type(args.first()?)?)));
+                    return Some(Type::Array(TyBox::new(self.to_type(args.first()?)?)));
                 }
                 let prim = [
                     (st.unit_sym, Type::Unit),
@@ -308,7 +308,7 @@ impl<'a> Types<'a> {
                 }
                 Type::Class {
                     sym: *s,
-                    args: targs,
+                    args: targs.into(),
                 }
             }
             NTy::Wild => Type::Wildcard,

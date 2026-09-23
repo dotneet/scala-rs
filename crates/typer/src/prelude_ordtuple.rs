@@ -6,6 +6,7 @@
 
 use crate::prelude::{prelude_method, type_param};
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{ast::Flags, SymbolId, Type};
 
 pub fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -36,14 +37,14 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
             .iter()
             .map(|e| Type::Class {
                 sym: ordering,
-                args: vec![e.clone()],
+                args: vec![e.clone()].into(),
             })
             .collect();
         st.get_mut(m).ty = Type::Method {
             paramss: vec![implicits],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: ordering,
-                args: vec![Type::Tuple(elems)],
+                args: vec![Type::Tuple(elems.into())].into(),
             }),
         };
     }

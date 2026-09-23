@@ -1952,11 +1952,14 @@ pub(crate) fn peel_empty_annot(ty: &Type) -> Type {
 pub(crate) fn fill_empty_annot(ascr: Type, found: &Type) -> Type {
     match ascr {
         Type::Annotated { tpe, annot } if tpe.is_no_type() => Type::Annotated {
-            tpe: Box::new(found.clone()),
+            tpe: TyBox::new(found.clone()),
             annot,
         },
         Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(fill_empty_annot(*tpe, found)),
+            tpe: TyBox::new(fill_empty_annot(
+                <scala_rs_parser::Type as Clone>::clone(&*tpe),
+                found,
+            )),
             annot,
         },
         other => other,
@@ -2069,7 +2072,7 @@ pub(crate) fn annot_first_string(tree: &Tree) -> Option<String> {
 pub(crate) fn method_value_params(ty: &Type) -> Vec<Type> {
     match ty {
         Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-        Type::Function { params, .. } => params.clone(),
+        Type::Function { params, .. } => params.clone().into_vec(),
         _ => Vec::new(),
     }
 }
@@ -2275,7 +2278,7 @@ pub(crate) fn is_inferable_param_pt(pt: &Type) -> bool {
 /// `Function1`/`FunctionN` spellings the typer produces.
 pub(crate) fn function_sig(pt: &Type) -> Option<(Vec<Type>, Type)> {
     match pt {
-        Type::Function { params, ret } => Some((params.clone(), (**ret).clone())),
+        Type::Function { params, ret } => Some((params.clone().into_vec(), (**ret).clone())),
         Type::Class { sym: _, args } if args.len() >= 2 && is_function_pt(pt) => {
             let (last, init) = args.split_last()?;
             Some((init.to_vec(), last.clone()))
@@ -2409,7 +2412,7 @@ pub(crate) fn relax_abstract_targs(ty: &Type) -> Type {
             args: args.iter().map(relax).collect(),
         },
         Type::Tuple(ts) if !ts.is_empty() => Type::Tuple(ts.iter().map(relax).collect()),
-        Type::Array(t) => Type::Array(Box::new(relax(t))),
+        Type::Array(t) => Type::Array(TyBox::new(relax(t))),
         _ => ty.clone(),
     }
 }
@@ -2912,7 +2915,7 @@ pub(crate) fn scala_module_evidence_type(outer: SymbolId, simple: &str) -> Optio
     };
     Some(Type::Class {
         sym: outer,
-        args: vec![arg],
+        args: vec![arg].into(),
     })
 }
 
@@ -2939,7 +2942,7 @@ pub(crate) fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
     match bound {
         Type::Class { sym, args } if args.is_empty() => Type::Class {
             sym,
-            args: vec![Type::TypeParam(tp)],
+            args: vec![Type::TypeParam(tp)].into(),
         },
         // `U: BCT` for an inner trait `BCT` of the enclosing class: the bound
         // carries its prefix (`prefix.rs`), and the argument goes under it.
@@ -2954,7 +2957,7 @@ pub(crate) fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
         }
         Type::Named { name, args } if args.is_empty() => Type::Named {
             name,
-            args: vec![Type::TypeParam(tp)],
+            args: vec![Type::TypeParam(tp)].into(),
         },
         // `U: BaseColumnType` where `BaseColumnType` is a *parameterized type
         // member* (or another type parameter) still means `BaseColumnType[U]`.
@@ -3018,7 +3021,7 @@ pub(crate) fn expand_alias_type(
                 .collect();
             Ok(Type::Class {
                 sym: *sym,
-                args: args?,
+                args: args?.into(),
             })
         }
         Type::Applied { ctor, args } => {
@@ -3029,7 +3032,7 @@ pub(crate) fn expand_alias_type(
                 .collect();
             Ok(st.expand_applied_hk_alias(crate::symbol::apply_type_ctor(ctor, args?)))
         }
-        Type::Array(t) => Ok(Type::Array(Box::new(expand_alias_type(
+        Type::Array(t) => Ok(Type::Array(TyBox::new(expand_alias_type(
             st, t, alias_ids, seen,
         )?))),
         Type::Function { params, ret } => {
@@ -3038,8 +3041,8 @@ pub(crate) fn expand_alias_type(
                 .map(|p| expand_alias_type(st, p, alias_ids, seen))
                 .collect();
             Ok(Type::Function {
-                params: params?,
-                ret: Box::new(expand_alias_type(st, ret, alias_ids, seen)?),
+                params: params?.into(),
+                ret: TyBox::new(expand_alias_type(st, ret, alias_ids, seen)?),
             })
         }
         Type::Tuple(ts) => {
@@ -3047,7 +3050,7 @@ pub(crate) fn expand_alias_type(
                 .iter()
                 .map(|t| expand_alias_type(st, t, alias_ids, seen))
                 .collect();
-            Ok(Type::Tuple(ts?))
+            Ok(Type::Tuple(ts?.into()))
         }
         Type::Named { name, args } => {
             let args: Result<Vec<_>, _> = args
@@ -3056,7 +3059,7 @@ pub(crate) fn expand_alias_type(
                 .collect();
             Ok(Type::Named {
                 name: name.clone(),
-                args: args?,
+                args: args?.into(),
             })
         }
         Type::Refined { parents, decls } => {
@@ -3065,12 +3068,12 @@ pub(crate) fn expand_alias_type(
                 .map(|p| expand_alias_type(st, p, alias_ids, seen))
                 .collect();
             Ok(Type::Refined {
-                parents: parents?,
+                parents: parents?.into(),
                 decls: decls.clone(),
             })
         }
         Type::Annotated { tpe, annot } => Ok(Type::Annotated {
-            tpe: Box::new(expand_alias_type(st, tpe, alias_ids, seen)?),
+            tpe: TyBox::new(expand_alias_type(st, tpe, alias_ids, seen)?),
             annot: annot.clone(),
         }),
         other => Ok(other.clone()),
@@ -3415,17 +3418,17 @@ pub(crate) fn compose_variance(outer: i8, inner: i8) -> i8 {
 pub(crate) fn unarrayify(t: &Type, array_sym: SymbolId) -> Type {
     match t {
         Type::Class { sym, args } if *sym == array_sym && args.len() == 1 => {
-            Type::Array(Box::new(unarrayify(&args[0], array_sym)))
+            Type::Array(TyBox::new(unarrayify(&args[0], array_sym)))
         }
         Type::Class { sym, args } if !args.is_empty() => Type::Class {
             sym: *sym,
             args: args.iter().map(|a| unarrayify(a, array_sym)).collect(),
         },
-        Type::Array(e) => Type::Array(Box::new(unarrayify(e, array_sym))),
+        Type::Array(e) => Type::Array(TyBox::new(unarrayify(e, array_sym))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(|a| unarrayify(a, array_sym)).collect()),
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|a| unarrayify(a, array_sym)).collect(),
-            ret: Box::new(unarrayify(ret, array_sym)),
+            ret: TyBox::new(unarrayify(ret, array_sym)),
         },
         other => other.clone(),
     }
@@ -3559,6 +3562,9 @@ pub(crate) fn mentions_no_type(ty: &Type) -> bool {
 
 /// Whether `ty` mentions any of the method type parameters in `tps`.
 pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
+    if !ty.flags().contains(scala_rs_parser::TypeFlags::TYPE_PARAM) {
+        return false;
+    }
     match ty {
         Type::TypeParam(id) => tps.contains(id),
         Type::Class { args, .. } => args.iter().any(|a| mentions_tparam(a, tps)),
@@ -3706,6 +3712,9 @@ pub(crate) fn type_is_erroneous(ty: &Type) -> bool {
 }
 
 pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
+    if !ty.flags().contains(scala_rs_parser::TypeFlags::TYPE_PARAM) {
+        return false;
+    }
     match ty {
         Type::TypeParam(id) => *id == tp,
         // An inner class behind a prefix (`prefix.rs`) is not a compound
@@ -3756,6 +3765,9 @@ pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
 /// `parUnorderedSequence[T, M, F, A](ta: T[M[A]])(implicit P: Parallel.Aux[M, F])`
 /// mentions `F` nowhere else.
 pub(crate) fn type_mentions_tparam_deep(ty: &Type, tp: SymbolId) -> bool {
+    if !ty.flags().contains(scala_rs_parser::TypeFlags::TYPE_PARAM) {
+        return false;
+    }
     if type_mentions_tparam(ty, tp) {
         return true;
     }
@@ -4128,7 +4140,7 @@ fn unify_applied_class(
     }
     let unapplied = Type::Class {
         sym: *sym,
-        args: vec![],
+        args: vec![].into(),
     };
     partial_unify_applied(st, tp, ctor, pas, unapplied, aas)
 }

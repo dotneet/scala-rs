@@ -24,7 +24,10 @@ mod universe_tests {
             t.st.alloc(jvm, t.st.root, SymKind::Class, Flags::EMPTY, jvm);
         t.st.get_mut(id).parents = parents
             .iter()
-            .map(|&sym| Type::Class { sym, args: vec![] })
+            .map(|&sym| Type::Class {
+                sym,
+                args: vec![].into(),
+            })
             .collect();
         id
     }
@@ -53,7 +56,7 @@ mod universe_tests {
         assert!(!t.is_reflect_universe(child));
         t.st.get_mut(child).parents = vec![Type::Class {
             sym: parent,
-            args: vec![],
+            args: vec![].into(),
         }];
         assert!(!t.is_reflect_universe(child));
         t.st.set_jvm_name(parent, "scala/reflect/api/Universe");
@@ -69,13 +72,13 @@ mod universe_tests {
         let b = class(&mut t, "user/B", &[a]);
         t.st.get_mut(a).parents = vec![Type::Class {
             sym: b,
-            args: vec![],
+            args: vec![].into(),
         }];
         assert!(!t.is_reflect_universe(a));
         let universe = class(&mut t, "scala/reflect/api/Universe", &[]);
         t.st.get_mut(b).parents.push(Type::Class {
             sym: universe,
-            args: vec![],
+            args: vec![].into(),
         });
         assert!(t.is_reflect_universe(a));
     }
@@ -381,7 +384,7 @@ impl Typer {
             };
             tree.ty = Type::Class {
                 sym: expr_cls,
-                args: vec![arg],
+                args: vec![arg].into(),
             };
             self.nested_reifies.insert(tree.id, universe);
             return true;
@@ -531,15 +534,15 @@ impl Typer {
             arg,
             mirror_ty: Type::Class {
                 sym: mirror,
-                args: vec![],
+                args: vec![].into(),
             },
             tree_api: Type::Class {
                 sym: tree_api,
-                args: vec![],
+                args: vec![].into(),
             },
             type_api: Type::Class {
                 sym: type_api,
-                args: vec![],
+                args: vec![].into(),
             },
             universe_local,
             mirror_local,
@@ -824,7 +827,7 @@ impl Typer {
                 .ensure_parents(&mut self.st, &mut self.binary, tag_cls);
             let want = Type::Class {
                 sym: tag_cls,
-                args: vec![flat.clone()],
+                args: vec![flat.clone()].into(),
             };
             let mark = self.diags.len();
             self.warm_implicit_scope(&want);
@@ -1322,7 +1325,10 @@ impl Typer {
                     let owner = crate::classpath::ensure_package(&mut self.st, "scala");
                     self.load_binary_into("scala/Symbol", owner, tree.span, false);
                     if let Some(sym) = crate::classpath::find_by_jvm(&self.st, "scala/Symbol") {
-                        Type::Class { sym, args: vec![] }
+                        Type::Class {
+                            sym,
+                            args: vec![].into(),
+                        }
                     } else {
                         self.error(tree.span, "scala.Symbol is not available on the classpath");
                         Type::Error
@@ -1367,7 +1373,7 @@ impl Typer {
                         let own = self.st.self_type_of_class(id);
                         tree.ty = match self.st.get(id).self_type.clone() {
                             Some(required) => Type::Refined {
-                                parents: vec![own, required],
+                                parents: vec![own, required].into(),
                                 decls: vec![],
                             },
                             None => own,
@@ -1582,7 +1588,9 @@ impl Typer {
                             let recv = self.st.type_of_class(cls);
                             let seen = self.st.subst_as_seen_from(&recv, &raw);
                             base_ty = match seen {
-                                Type::Method { paramss, ret } if paramss.is_empty() => *ret,
+                                Type::Method { paramss, ret } if paramss.is_empty() => {
+                                    <scala_rs_parser::Type as Clone>::clone(&*ret)
+                                }
                                 other => other,
                             };
                             inherited_apply = self.st.get(only).owner != cls
@@ -2309,7 +2317,7 @@ impl Typer {
                     if tpt.ty.is_no_type() {
                         tpt.ty = Type::Class {
                             sym: tpt.sym,
-                            args: vec![],
+                            args: vec![].into(),
                         };
                     }
                     self.type_new_prefix(tpt);
@@ -2356,7 +2364,7 @@ impl Typer {
                         // as the type `In` written there (`prefix.rs`).
                         let ty = self.this_prefixed(Type::Class {
                             sym: id,
-                            args: vec![],
+                            args: vec![].into(),
                         });
                         tpt.ty = self.import_prefixed(&n, ty, tpt.span);
                         // A written `new C1` names the class.
@@ -2431,7 +2439,7 @@ impl Typer {
                         tpt.sym = id;
                         tpt.ty = Type::Class {
                             sym: id,
-                            args: vec![],
+                            args: vec![].into(),
                         };
                     }
                 }
@@ -2479,7 +2487,7 @@ impl Typer {
                             _ => {
                                 tree.ty = Type::Class {
                                     sym: id,
-                                    args: vec![],
+                                    args: vec![].into(),
                                 };
                             }
                         }
@@ -2537,7 +2545,7 @@ impl Typer {
                         Some(found) if !matches!(found, Type::Nothing) => found,
                         _ => self.array_elem_expected(pt).unwrap_or(Type::Nothing),
                     };
-                    tree.ty = Type::Array(Box::new(elem));
+                    tree.ty = Type::Array(TyBox::new(elem));
                     tpt.ty = tree.ty.clone();
                 }
                 // nsc infers `new Q` as `Q[Int]` when the expected type is `Q[Int]`.
@@ -2563,7 +2571,10 @@ impl Typer {
                                 let sym = *sym;
                                 let targs = self.pattern_class_targs(sym, pt);
                                 if !targs.is_empty() {
-                                    tree.ty = Type::Class { sym, args: targs };
+                                    tree.ty = Type::Class {
+                                        sym,
+                                        args: targs.into(),
+                                    };
                                 }
                             }
                         }
@@ -2638,7 +2649,7 @@ impl Typer {
                     }
                     let written_targs = match &tree.ty {
                         Type::Class { args, .. } => args.clone(),
-                        _ => Vec::new(),
+                        _ => Vec::new().into(),
                     };
                     if let Some(msg) = self
                         .st
@@ -2671,7 +2682,7 @@ impl Typer {
                         Type::Array(t) => (**t).clone(),
                         _ => Type::Any,
                     };
-                    tree.ty = Type::Repeated(Box::new(elem));
+                    tree.ty = Type::Repeated(TyBox::new(elem));
                     return;
                 }
                 let pt_inner = peel_empty_annot(&ascr);
@@ -2925,7 +2936,7 @@ impl Typer {
             }
             return Some(Type::Class {
                 sym: *sym,
-                args: vec![],
+                args: vec![].into(),
             });
         }
         let target = self.st.dealias(&Type::TypeMember(alias));

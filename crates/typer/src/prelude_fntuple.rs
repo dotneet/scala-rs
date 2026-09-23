@@ -23,6 +23,7 @@
 
 use crate::prelude::{iface, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// Highest arity scala-library defines.
@@ -91,8 +92,8 @@ fn add_tupled_and_curried(st: &mut SymbolTable, fun: SymbolId, n: usize) {
         return;
     }
     let tupled_ty = Type::Function {
-        params: vec![Type::Tuple(args.clone())],
-        ret: Box::new(ret.clone()),
+        params: vec![Type::Tuple(args.clone().into())].into(),
+        ret: TyBox::new(ret.clone()),
     };
     let t = method(st, fun, "tupled", Vec::new(), tupled_ty, Intrinsic::None);
     st.get_mut(t).flags = Flags::EMPTY;
@@ -101,8 +102,8 @@ fn add_tupled_and_curried(st: &mut SymbolTable, fun: SymbolId, n: usize) {
     let mut curried_ty = ret;
     for a in args.into_iter().rev() {
         curried_ty = Type::Function {
-            params: vec![a],
-            ret: Box::new(curried_ty),
+            params: vec![a].into(),
+            ret: TyBox::new(curried_ty),
         };
     }
     let c = method(st, fun, "curried", Vec::new(), curried_ty, Intrinsic::None);
@@ -131,29 +132,29 @@ fn add_compose(st: &mut SymbolTable, fun: SymbolId, n: usize) {
         let (param, result) = if name == "andThen" {
             (
                 Type::Function {
-                    params: vec![ret.clone()],
-                    ret: Box::new(ta.clone()),
+                    params: vec![ret.clone()].into(),
+                    ret: TyBox::new(ta.clone()),
                 },
                 Type::Function {
-                    params: vec![t1.clone()],
-                    ret: Box::new(ta),
+                    params: vec![t1.clone()].into(),
+                    ret: TyBox::new(ta),
                 },
             )
         } else {
             (
                 Type::Function {
-                    params: vec![ta.clone()],
-                    ret: Box::new(t1.clone()),
+                    params: vec![ta.clone()].into(),
+                    ret: TyBox::new(t1.clone()),
                 },
                 Type::Function {
-                    params: vec![ta],
-                    ret: Box::new(ret.clone()),
+                    params: vec![ta].into(),
+                    ret: TyBox::new(ret.clone()),
                 },
             )
         };
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![param]],
-            ret: Box::new(result),
+            ret: TyBox::new(result),
         };
         st.get_mut(m).flags = Flags::EMPTY;
     }
@@ -184,17 +185,17 @@ fn add_function_module(st: &mut SymbolTable) {
         let args: Vec<Type> = tps[..n].iter().map(|&t| Type::TypeParam(t)).collect();
         let ret = Type::TypeParam(tps[n]);
         let param = Type::Function {
-            params: vec![Type::Tuple(args.clone())],
-            ret: Box::new(ret.clone()),
+            params: vec![Type::Tuple(args.clone().into())].into(),
+            ret: TyBox::new(ret.clone()),
         };
         // The result is an n-ary function type, so it erases to
         // `scala/FunctionN` -- which is the only thing that tells this
         // overload's JVM signature from its siblings'.
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![param]],
-            ret: Box::new(Type::Function {
-                params: args,
-                ret: Box::new(ret),
+            ret: TyBox::new(Type::Function {
+                params: args.into(),
+                ret: Box::new(ret).into(),
             }),
         };
     }

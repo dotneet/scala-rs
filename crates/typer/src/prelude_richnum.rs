@@ -52,7 +52,7 @@ pub(crate) fn add_rich_int_and_range(st: &mut SymbolTable) -> SymbolId {
     method(st, ri, "min", vec![Type::Int], Type::Int, Intrinsic::None);
     let range_t = Type::Class {
         sym: range,
-        args: vec![],
+        args: vec![].into(),
     };
     method(
         st,
@@ -86,7 +86,7 @@ pub(crate) fn add_rich_long_double_char(st: &mut SymbolTable) -> (SymbolId, Symb
         .expect("NumericRange");
     let nr_l = Type::Class {
         sym: nr,
-        args: vec![Type::Long],
+        args: vec![Type::Long].into(),
     };
     method(
         st,
@@ -120,7 +120,7 @@ pub(crate) fn add_rich_long_double_char(st: &mut SymbolTable) -> (SymbolId, Symb
     method(st, rc, "toInt", vec![], Type::Int, Intrinsic::None);
     let nr_c = Type::Class {
         sym: nr,
-        args: vec![Type::Char],
+        args: vec![Type::Char].into(),
     };
     method(
         st,
@@ -199,7 +199,7 @@ pub(crate) fn add_rich_byte_short_boolean(st: &mut SymbolTable) -> (SymbolId, Sy
         .expect("NumericRange");
     let nr_t = Type::Class {
         sym: nr,
-        args: vec![Type::Byte],
+        args: vec![Type::Byte].into(),
     };
     method(
         st,
@@ -230,7 +230,7 @@ pub(crate) fn add_rich_byte_short_boolean(st: &mut SymbolTable) -> (SymbolId, Sy
     );
     let nr_s = Type::Class {
         sym: nr,
-        args: vec![Type::Short],
+        args: vec![Type::Short].into(),
     };
     method(
         st,

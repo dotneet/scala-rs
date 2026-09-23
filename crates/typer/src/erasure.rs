@@ -2,6 +2,7 @@
 //! `Object`, wrap by-name as `Function0`, and insert box/unbox trees so the
 //! backend does not have to guess at call sites.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 
 use crate::symbol::{Intrinsic, SymbolTable};
@@ -19,7 +20,7 @@ pub fn erase(tree: &mut Tree, st: &mut SymbolTable) {
     for (p, c) in &boxed_params {
         st.get_mut(*p).ty = Type::Class {
             sym: *c,
-            args: vec![],
+            args: vec![].into(),
         };
     }
     // These writes are the one thing that can make the next unit's
@@ -518,11 +519,11 @@ fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {
         match erased {
             Type::Method { paramss, .. } => Type::Method {
                 paramss,
-                ret: Box::new(ov_ret),
+                ret: TyBox::new(ov_ret),
             },
             Type::Function { params, .. } => Type::Function {
                 params,
-                ret: Box::new(ov_ret),
+                ret: TyBox::new(ov_ret),
             },
             other => other,
         }
@@ -625,7 +626,7 @@ pub fn erase_type(ty: &Type) -> Type {
         Type::Applied { .. } => Type::Any,
         Type::Class { sym, .. } => Type::Class {
             sym: *sym,
-            args: vec![],
+            args: vec![].into(),
         },
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             let e = erase_type(&args[0]);
@@ -634,44 +635,44 @@ pub fn erase_type(ty: &Type) -> Type {
             {
                 Type::Any
             } else {
-                Type::Array(Box::new(e))
+                Type::Array(TyBox::new(e))
             }
         }
         Type::Named { name, .. } => Type::Named {
             name: name.clone(),
-            args: vec![],
+            args: vec![].into(),
         },
         Type::Array(t) => {
             let e = erase_type(t);
             if array_elem_is_abstract(t) && matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
                 Type::Any
             } else {
-                Type::Array(Box::new(e))
+                Type::Array(TyBox::new(e))
             }
         }
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(erase_type).collect(),
-            ret: Box::new(erase_type(ret)),
+            ret: TyBox::new(erase_type(ret)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(erase_type).collect())
                 .collect(),
-            ret: Box::new(erase_type(ret)),
+            ret: TyBox::new(erase_type(ret)),
         },
         Type::ByName(t) => Type::Function {
-            params: vec![],
-            ret: Box::new(erase_type(t)),
+            params: vec![].into(),
+            ret: TyBox::new(erase_type(t)),
         },
-        Type::Repeated(t) => Type::Repeated(Box::new(erase_type(t))),
+        Type::Repeated(t) => Type::Repeated(TyBox::new(erase_type(t))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(erase_type).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(erase_type).collect()),
         Type::Wildcard | Type::BoundedWildcard { .. } => Type::Any,
         Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {
             sym: *s,
-            args: vec![],
+            args: vec![].into(),
         },
         Type::SingleType { prefix, .. } => erase_type(prefix),
         Type::Annotated { tpe, .. } => erase_type(tpe),
@@ -698,7 +699,7 @@ fn erase_elem_ty(ty: &Type, st: &SymbolTable) -> Type {
     match value_class_of(ty, st) {
         Some(c) => Type::Class {
             sym: c,
-            args: vec![],
+            args: vec![].into(),
         },
         None => erase_ty(ty, st),
     }
@@ -768,7 +769,7 @@ fn inherits_class(st: &SymbolTable, sub: SymbolId, sup: SymbolId) -> bool {
     }
     let t = Type::Class {
         sym: sub,
-        args: vec![],
+        args: vec![].into(),
     };
     st.base_type_seq(&t)
         .iter()
@@ -819,7 +820,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             match crate::symbol::enter_chase(crate::symbol::Chase::Erase, *sym) {
                 None => Type::Class {
                     sym: *sym,
-                    args: vec![],
+                    args: vec![].into(),
                 },
                 Some(_g) => match st
                     .recorded_value_class_underlying(*sym)
@@ -940,7 +941,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         Type::Constant(lit) => Type::lit_underlying(lit),
         Type::ThisType(s) => Type::Class {
             sym: *s,
-            args: vec![],
+            args: vec![].into(),
         },
         Type::SingleType { prefix, sym } => {
             let t = st.singleton_underlying(*sym);
@@ -965,7 +966,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         }
         Type::Class { sym, .. } => Type::Class {
             sym: *sym,
-            args: vec![],
+            args: vec![].into(),
         },
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             let e = erase_elem_ty(&args[0], st);
@@ -974,12 +975,12 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             {
                 Type::Any
             } else {
-                Type::Array(Box::new(e))
+                Type::Array(TyBox::new(e))
             }
         }
         Type::Named { name, .. } => Type::Named {
             name: name.clone(),
-            args: vec![],
+            args: vec![].into(),
         },
         Type::Array(t) => {
             let e = erase_elem_ty(t, st);
@@ -992,25 +993,25 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             {
                 Type::Any
             } else {
-                Type::Array(Box::new(e))
+                Type::Array(TyBox::new(e))
             }
         }
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|p| erase_elem_ty(p, st)).collect(),
-            ret: Box::new(erase_elem_ty(ret, st)),
+            ret: TyBox::new(erase_elem_ty(ret, st)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(|p| erase_ty(p, st)).collect())
                 .collect(),
-            ret: Box::new(erase_ty(ret, st)),
+            ret: TyBox::new(erase_ty(ret, st)),
         },
         Type::ByName(t) => Type::Function {
-            params: vec![],
-            ret: Box::new(erase_ty(t, st)),
+            params: vec![].into(),
+            ret: TyBox::new(erase_ty(t, st)),
         },
-        Type::Repeated(t) => Type::Repeated(Box::new(erase_elem_ty(t, st))),
+        Type::Repeated(t) => Type::Repeated(TyBox::new(erase_elem_ty(t, st))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| erase_ty(t, st)).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(|t| erase_ty(t, st)).collect()),
         other => other.clone(),
@@ -1054,14 +1055,17 @@ fn boxed_primitive(ty: &Type, st: &SymbolTable) -> Option<Type> {
         Type::Unit => {
             return Some(Type::Class {
                 sym: st.unit_sym,
-                args: vec![],
+                args: vec![].into(),
             })
         }
         Type::Constant(lit) => return boxed_primitive(&Type::lit_underlying(lit), st),
         _ => return None,
     };
     let sym = st.find_class_by_jvm(jvm)?;
-    Some(Type::Class { sym, args: vec![] })
+    Some(Type::Class {
+        sym,
+        args: vec![].into(),
+    })
 }
 
 fn is_primitive(ty: &Type) -> bool {
@@ -1367,7 +1371,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 if let Some(c) = value_class_of(&a.ty, st) {
                     a.ty = Type::Class {
                         sym: c,
-                        args: vec![],
+                        args: vec![].into(),
                     };
                     continue;
                 }
@@ -1396,7 +1400,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 let orig = tree.ty.clone();
                 tree.ty = Type::Class {
                     sym: c,
-                    args: vec![],
+                    args: vec![].into(),
                 };
                 adapt_box_unbox(tree, expected, &orig, st);
                 return;
@@ -1490,7 +1494,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 let under = erase_ty(&orig, st);
                 tree.ty = Type::Class {
                     sym: cls,
-                    args: vec![],
+                    args: vec![].into(),
                 };
                 // load_this always supplies the box, including inside an
                 // extension method. Object storage is ambiguous with Any;
@@ -1533,7 +1537,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             if let Some(c) = value_class_of(&tree.ty, st) {
                 tree.ty = Type::Class {
                     sym: c,
-                    args: vec![],
+                    args: vec![].into(),
                 };
                 return;
             }
@@ -1695,8 +1699,8 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         };
         let mut fun = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
         fun.ty = Type::Function {
-            params: vec![],
-            ret: Box::new(inner_ty.clone()),
+            params: vec![].into(),
+            ret: TyBox::new(inner_ty.clone()),
         };
         *tree = Tree {
             id: fun.id,
@@ -1870,7 +1874,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                         });
                     fun_ty = Type::Method {
                         paramss: vec![param_tys.clone()],
-                        ret: Box::new(descriptor_result.unwrap_or_else(|| (**ret).clone())),
+                        ret: TyBox::new(descriptor_result.unwrap_or_else(|| (**ret).clone())),
                     };
                 }
                 _ => {}
@@ -1985,7 +1989,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
 fn flat_params(ty: &Type) -> Vec<Type> {
     match ty {
         Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-        Type::Function { params, .. } => params.clone(),
+        Type::Function { params, .. } => params.clone().into_vec(),
         _ => Vec::new(),
     }
 }
@@ -2016,7 +2020,7 @@ fn vc_arg_expected(st: &SymbolTable, pre: &[Type], declared: &[Type], i: usize) 
     }
     Some(Type::Class {
         sym: c,
-        args: vec![],
+        args: vec![].into(),
     })
 }
 
@@ -2081,7 +2085,7 @@ fn method_param_types(
     // application; use the instantiated function type captured before the
     // callee is erased.
     if let Type::Function { params, .. } = fun_pre_ty {
-        return params.clone();
+        return params.clone().into_vec();
     }
     if !ctor_sym.is_none() && st.get(ctor_sym).name == "<init>" {
         // Parent applications have a type tree as their callee, rather than
@@ -2175,13 +2179,13 @@ fn method_param_types(
                 let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
                 return box_to_descriptor_params(st, fun.sym, params);
             }
-            Type::Function { params, .. } => return params.clone(),
+            Type::Function { params, .. } => return params.clone().into_vec(),
             _ => {}
         }
     }
     match &fun.ty {
         Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-        Type::Function { params, .. } => params.clone(),
+        Type::Function { params, .. } => params.clone().into_vec(),
         _ => Vec::new(),
     }
 }
@@ -2226,12 +2230,14 @@ fn is_abstract_elem_array(ty: &Type, st: &SymbolTable) -> bool {
         return is_abstract_elem_array(tpe, st);
     }
     let elem = match st.dealias(ty) {
-        Type::Array(e) => *e,
-        Type::Class { sym, mut args } if sym == st.array_sym && args.len() == 1 => args.remove(0),
+        Type::Array(e) => e.clone(),
+        Type::Class { sym, mut args } if sym == st.array_sym && args.len() == 1 => {
+            args.remove(0).into()
+        }
         _ => return false,
     };
     matches!(
-        elem,
+        *elem,
         Type::Wildcard | Type::BoundedWildcard { .. } | Type::TypeParam(_) | Type::TypeMember(_)
     )
 }
@@ -2341,7 +2347,7 @@ impl BoxAdapt {
             BoxAdapt::Unbox(to) => to.clone(),
             BoxAdapt::VcBox(c) => Type::Class {
                 sym: *c,
-                args: vec![],
+                args: vec![].into(),
             },
             BoxAdapt::VcUnbox(_, to) => to.clone(),
         }
@@ -2427,7 +2433,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         kind: TreeKind::Ident { name: name.into() },
         ty: Type::Method {
             paramss: vec![vec![param]],
-            ret: Box::new(result.clone()),
+            ret: TyBox::new(result.clone()),
         },
         sym,
         postfix: false,
@@ -2463,7 +2469,7 @@ fn wrap_vc_box(tree: &mut Tree, cls: SymbolId) {
         under,
         Type::Class {
             sym: cls,
-            args: vec![],
+            args: vec![].into(),
         },
     );
 }
@@ -2485,7 +2491,7 @@ fn wrap_box(tree: &mut Tree) {
         },
         ty: Type::Method {
             paramss: vec![vec![orig_ty.clone()]],
-            ret: Box::new(Type::Any),
+            ret: TyBox::new(Type::Any),
         },
         sym: SymbolId::NONE,
         postfix: false,
@@ -2522,7 +2528,7 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         },
         ty: Type::Method {
             paramss: vec![vec![Type::Any]],
-            ret: Box::new(to.clone()),
+            ret: TyBox::new(to.clone()),
         },
         sym: SymbolId::NONE,
         postfix: false,

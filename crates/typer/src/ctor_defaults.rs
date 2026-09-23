@@ -36,6 +36,7 @@
 use crate::check::Typer;
 use crate::symbol::SymKind;
 use scala_rs_parser::ast::Type;
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId};
 use scala_rs_span::Span;
 
@@ -167,7 +168,7 @@ impl Typer {
                     } else {
                         vec![preceding_tys.clone()]
                     },
-                    ret: Box::new(ret.clone()),
+                    ret: TyBox::new(ret.clone()),
                 };
                 self.st.get_mut(gid).params = preceding.clone();
                 self.st.get_mut(gid).paramss = if preceding.is_empty() {

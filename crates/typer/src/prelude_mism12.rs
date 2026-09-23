@@ -22,6 +22,7 @@
 
 use crate::prelude::method;
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::Type;
 
 /// Add the `BigDecimal.apply` overloads the prelude does not already declare.
@@ -34,17 +35,17 @@ pub fn install(st: &mut SymbolTable) {
     };
     let ret = Type::Class {
         sym: cls,
-        args: vec![],
+        args: vec![].into(),
     };
     let mc = Type::Class {
         sym: crate::classpath::find_or_stub_java_class(st, "java/math/MathContext"),
-        args: vec![],
+        args: vec![].into(),
     };
     let big_int = crate::classpath::find_by_jvm(st, "scala/math/BigInt").map(|s| Type::Class {
         sym: s,
-        args: vec![],
+        args: vec![].into(),
     });
-    let chars = Type::Array(Box::new(Type::Char));
+    let chars = Type::Array(TyBox::new(Type::Char));
     let mut sigs: Vec<Vec<Type>> = vec![
         vec![Type::Int, mc.clone()],
         vec![Type::Long],
@@ -97,11 +98,11 @@ pub fn install(st: &mut SymbolTable) {
 fn add_constructors(st: &mut SymbolTable, cls: scala_rs_parser::SymbolId, ret: &Type) {
     let jbd = Type::Class {
         sym: crate::classpath::find_or_stub_java_class(st, "java/math/BigDecimal"),
-        args: vec![],
+        args: vec![].into(),
     };
     let mc = Type::Class {
         sym: crate::classpath::find_or_stub_java_class(st, "java/math/MathContext"),
-        args: vec![],
+        args: vec![].into(),
     };
     for params in [vec![jbd.clone(), mc], vec![jbd]] {
         let already = st.lookup_member(cls, "<init>").into_iter().any(|m| {

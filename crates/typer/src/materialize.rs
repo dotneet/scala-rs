@@ -54,6 +54,7 @@
 //! building the wrong `Type` would be discovered as a wrong answer at run
 //! time, long after the compile.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Template, Tree, TreeKind, Type};
 use scala_rs_span::Span;
 
@@ -338,16 +339,16 @@ pub(crate) fn ensure_tag_module(
         paramss: vec![vec![
             Type::Class {
                 sym: mirror,
-                args: vec![],
+                args: vec![].into(),
             },
             Type::Class {
                 sym: creator,
-                args: vec![],
+                args: vec![].into(),
             },
         ]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: tag_cls,
-            args: vec![Type::TypeParam(t)],
+            args: vec![Type::TypeParam(t)].into(),
         }),
     };
     st.set_jvm_name(ap, format!("(L{MIRROR};L{TYPE_CREATOR};)L{tag_jvm};"));
@@ -385,7 +386,7 @@ pub(crate) fn ensure_tag_module(
         );
         st.get_mut(acc).ty = Type::Method {
             paramss: Vec::new(),
-            ret: Box::new(Type::ModuleRef(mcls)),
+            ret: TyBox::new(Type::ModuleRef(mcls)),
         };
     }
 
@@ -497,9 +498,9 @@ pub(crate) fn ensure_core_tags(st: &mut SymbolTable, tag: Tag, mcls: SymbolId, t
         );
         st.get_mut(acc).ty = Type::Method {
             paramss: Vec::new(),
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: tag_cls,
-                args: vec![core_tag_type(name)],
+                args: vec![core_tag_type(name)].into(),
             }),
         };
         st.get_mut(acc).parameterless_method = Some(true);
@@ -513,7 +514,7 @@ fn resolve_named_tags(st: &mut SymbolTable, tag: Tag, tag_cls: SymbolId) {
     let unresolved = format!("TypeTags${}", tag.simple());
     let real = Type::Class {
         sym: tag_cls,
-        args: vec![],
+        args: vec![].into(),
     };
     for i in 0..st.symbols.len() {
         let id = SymbolId(i as u32);
@@ -531,11 +532,14 @@ fn replace_named(ty: &Type, name: &str, to: &Type) -> Type {
         Type::Named { name: n, args } if n == name => {
             let args: Vec<Type> = args.iter().map(|a| replace_named(a, name, to)).collect();
             match to {
-                Type::Class { sym, .. } => Type::Class { sym: *sym, args },
+                Type::Class { sym, .. } => Type::Class {
+                    sym: *sym,
+                    args: args.into(),
+                },
                 other if args.is_empty() => other.clone(),
                 other => Type::Applied {
-                    ctor: Box::new(other.clone()),
-                    args,
+                    ctor: TyBox::new(other.clone()),
+                    args: args.into(),
                 },
             }
         }
@@ -552,15 +556,15 @@ fn replace_named(ty: &Type, name: &str, to: &Type) -> Type {
                 .iter()
                 .map(|c| c.iter().map(|p| replace_named(p, name, to)).collect())
                 .collect(),
-            ret: Box::new(replace_named(ret, name, to)),
+            ret: TyBox::new(replace_named(ret, name, to)),
         },
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|p| replace_named(p, name, to)).collect(),
-            ret: Box::new(replace_named(ret, name, to)),
+            ret: TyBox::new(replace_named(ret, name, to)),
         },
-        Type::ByName(t) => Type::ByName(Box::new(replace_named(t, name, to))),
-        Type::Repeated(t) => Type::Repeated(Box::new(replace_named(t, name, to))),
-        Type::Array(t) => Type::Array(Box::new(replace_named(t, name, to))),
+        Type::ByName(t) => Type::ByName(TyBox::new(replace_named(t, name, to))),
+        Type::Repeated(t) => Type::Repeated(TyBox::new(replace_named(t, name, to))),
+        Type::Array(t) => Type::Array(TyBox::new(replace_named(t, name, to))),
         other => other.clone(),
     }
 }

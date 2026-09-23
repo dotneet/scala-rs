@@ -315,7 +315,13 @@ impl Typer {
             let Type::Function { params, ret } = fn_ty.clone() else {
                 return;
             };
-            eta_expand(&mut self.st, &mut self.gensym, tree, params, *ret);
+            eta_expand(
+                &mut self.st,
+                &mut self.gensym,
+                tree,
+                params.into_vec(),
+                <scala_rs_parser::Type as Clone>::clone(&*ret),
+            );
             self.type_expr(tree, &fn_ty);
             return;
         }
@@ -339,7 +345,7 @@ impl Typer {
             })
             .collect();
         let (paramss, ret) = if open.is_empty() {
-            (paramss, *ret)
+            (paramss, <scala_rs_parser::Type as Clone>::clone(&*ret))
         } else {
             let nothing = vec![Type::Nothing; open.len()];
             let sub = |t: &Type| crate::symbol::subst_tparams_slice(&open, &nothing, t);

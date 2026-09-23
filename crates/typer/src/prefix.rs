@@ -27,6 +27,7 @@
 //! strips the view for erasure, the pickle and the JVM descriptor.
 
 use crate::symbol::{SymKind, SymbolTable, AS_SEEN_FROM_MARK};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, RefineDecl, SymbolId, Type};
 
 /// The bookkeeping decl carrying a view's prefix. Never a name a program can
@@ -68,7 +69,7 @@ pub fn with_prefix(core: Type, pre: Type) -> Type {
             Type::Refined { parents, decls }
         }
         Type::Class { .. } => Type::Refined {
-            parents: vec![core],
+            parents: vec![core].into(),
             decls: vec![
                 RefineDecl::Type {
                     name: AS_SEEN_FROM_MARK.to_string(),
@@ -174,11 +175,11 @@ impl SymbolTable {
         {
             return false;
         }
-        let simple = s.jvm_name.rsplit('/').next().unwrap_or("");
-        if !simple.contains('$') || simple.ends_with('$') {
+        if self.get(s.owner).kind != SymKind::Class {
             return false;
         }
-        self.get(s.owner).kind == SymKind::Class
+        let simple = s.jvm_name.rsplit('/').next().unwrap_or("");
+        simple.contains('$') && !simple.ends_with('$')
     }
 
     /// A binary class `is_binary_nested_class` cannot judge yet: a stub named
@@ -617,7 +618,7 @@ impl SymbolTable {
                 Type::ModuleRef(sym) if wants(self, *sym) => with_prefix(
                     Type::Class {
                         sym: *sym,
-                        args: vec![],
+                        args: vec![].into(),
                     },
                     pre.clone(),
                 ),
@@ -694,14 +695,14 @@ fn map_views(
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(go).collect()),
         Type::Overload(ts) => Type::Overload(ts.iter().map(go).collect()),
         Type::Applied { ctor, args } => Type::Applied {
-            ctor: Box::new(go(ctor)),
+            ctor: TyBox::new(go(ctor)),
             args: args.iter().map(go).collect(),
         },
-        Type::Array(t) => Type::Array(Box::new(go(t))),
-        Type::ByName(t) => Type::ByName(Box::new(go(t))),
-        Type::Repeated(t) => Type::Repeated(Box::new(go(t))),
+        Type::Array(t) => Type::Array(TyBox::new(go(t))),
+        Type::ByName(t) => Type::ByName(TyBox::new(go(t))),
+        Type::Repeated(t) => Type::Repeated(TyBox::new(go(t))),
         Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(go(tpe)),
+            tpe: TyBox::new(go(tpe)),
             annot: annot.clone(),
         },
         Type::Existential { params, body } => Type::Existential {
@@ -709,29 +710,29 @@ fn map_views(
                 .iter()
                 .map(|(id, bounds)| (*id, go(bounds)))
                 .collect(),
-            body: Box::new(go(body)),
+            body: TyBox::new(go(body)),
         },
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(go).collect(),
-            ret: Box::new(go(ret)),
+            ret: TyBox::new(go(ret)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(go).collect())
                 .collect(),
-            ret: Box::new(go(ret)),
+            ret: TyBox::new(go(ret)),
         },
         Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
-            lo: lo.as_ref().map(|t| Box::new(go(t))),
-            hi: hi.as_ref().map(|t| Box::new(go(t))),
+            lo: (lo.as_ref().map(|t| TyBox::new(go(t)))).map(scala_rs_parser::TyBox::from),
+            hi: (hi.as_ref().map(|t| TyBox::new(go(t)))).map(scala_rs_parser::TyBox::from),
         },
         Type::Named { name, args } => Type::Named {
             name: name.clone(),
             args: args.iter().map(go).collect(),
         },
         Type::SingleType { prefix, sym } => Type::SingleType {
-            prefix: Box::new(go(prefix)),
+            prefix: TyBox::new(go(prefix)),
             sym: *sym,
         },
         other => other.clone(),

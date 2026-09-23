@@ -11,6 +11,7 @@ use crate::classfile::{
 };
 use crate::gen::*;
 use crate::ifacebridge::BridgeKind;
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{method_overloads, method_overrides, SymKind};
 use std::collections::{HashMap, HashSet};
@@ -427,13 +428,13 @@ impl<'a> Gen<'a> {
             return Some(t);
         }
         if let Some(elem) = desc.strip_prefix('[') {
-            return Some(Type::Array(Box::new(self.type_of_field_desc(elem)?)));
+            return Some(Type::Array(TyBox::new(self.type_of_field_desc(elem)?)));
         }
         let cls = desc.strip_prefix('L')?.strip_suffix(';')?;
         let sym = *self.jvm_index.get(cls)?;
         Some(Type::Class {
             sym,
-            args: Vec::new(),
+            args: Vec::new().into(),
         })
     }
 
@@ -2785,7 +2786,7 @@ impl<'a> Gen<'a> {
         };
         let nt = Type::Class {
             sym: ns,
-            args: vec![],
+            args: vec![].into(),
         };
         self.st
             .base_type_seq(&nt)

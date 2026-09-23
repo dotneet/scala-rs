@@ -12,6 +12,7 @@
 
 use crate::prelude::type_param;
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable) {
@@ -58,9 +59,9 @@ pub(crate) fn install(st: &mut SymbolTable) {
         st.get_mut(id).tparams = tps;
         st.get_mut(id).ty = Type::Method {
             paramss: vec![vec![]],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: coll,
-                args: targs,
+                args: targs.into(),
             }),
         };
     }

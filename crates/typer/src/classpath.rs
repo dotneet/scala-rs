@@ -1,5 +1,6 @@
 //! Install symbols recovered from classpath classfiles / ScalaSignature pickles.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 use std::collections::HashMap;
 
@@ -103,7 +104,7 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
             let id = st.alloc(&simple, owner, SymKind::Class, flags, &c.jvm_name);
             st.get_mut(id).ty = Type::Class {
                 sym: id,
-                args: vec![],
+                args: vec![].into(),
             };
             st.get_mut(id).parents = vec![Type::AnyRef];
             if owner == st.root {
@@ -338,7 +339,7 @@ fn attach_classpath_parents(
             }
             let ty = Type::Class {
                 sym: pid,
-                args: vec![],
+                args: vec![].into(),
             };
             if !ps.iter().any(|p| same_class(p, &ty)) {
                 ps.push(ty);
@@ -519,7 +520,7 @@ fn install_java_bounds(st: &mut SymbolTable, id: SymbolId, bounds: Vec<Type>) {
         [] => None,
         [bound] => Some(bound.clone()),
         _ => Some(Type::Refined {
-            parents: bounds.clone(),
+            parents: bounds.clone().into(),
             decls: Vec::new(),
         }),
     };
@@ -676,7 +677,7 @@ fn ensure_interface_ctor(st: &mut SymbolTable, id: SymbolId) {
     let ctor = st.alloc("<init>", id, SymKind::Method, Flags::CONSTRUCTOR, "");
     st.get_mut(ctor).ty = Type::Method {
         paramss: vec![],
-        ret: Box::new(Type::Unit),
+        ret: TyBox::new(Type::Unit),
     };
 }
 
@@ -699,7 +700,7 @@ fn resolve_type_in(
     // pickle reader; retain every parent when rebuilding the semantic type.
     if name == "&" {
         return Type::Refined {
-            parents: args,
+            parents: args.into(),
             decls: Vec::new(),
         };
     }
@@ -725,7 +726,7 @@ fn resolve_type_in(
                     .map(|path| resolve_singleton_prefix(st, path, sym))
                     .unwrap_or_else(|| default_singleton_prefix(st, sym));
                 return Type::SingleType {
-                    prefix: Box::new(prefix),
+                    prefix: TyBox::new(prefix),
                     sym,
                 };
             }
@@ -745,7 +746,10 @@ fn resolve_type_in(
     let mut lexical_name = name;
     if name.contains('.') {
         if let Some(sym) = find_by_fully_qualified_name(st, name) {
-            return Type::Class { sym, args };
+            return Type::Class {
+                sym,
+                args: args.into(),
+            };
         }
         lexical_name = name.rsplit('.').next().unwrap_or(name);
     }
@@ -780,7 +784,10 @@ fn resolve_type_in(
                 // the same inherited member on a path-dependent receiver;
                 // aliases still expose their right-hand side here.
                 SymKind::TypeMember => apply_args(st.type_member_as_seen(id), args),
-                _ => Type::Class { sym: id, args },
+                _ => Type::Class {
+                    sym: id,
+                    args: args.into(),
+                },
             };
         }
         cur = st.get(cur).owner;
@@ -795,8 +802,8 @@ fn apply_args(ctor: Type, args: Vec<Type>) -> Type {
         return ctor;
     }
     Type::Applied {
-        ctor: Box::new(ctor),
-        args,
+        ctor: TyBox::new(ctor),
+        args: args.into(),
     }
 }
 
@@ -881,7 +888,7 @@ fn add_method(
                 Some(clause)
             })
             .collect(),
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     id
 }
@@ -963,7 +970,7 @@ fn collect_jtype_name_fallbacks(
             } else {
                 Type::Class {
                     sym: find_or_stub_java_class(st, jvm),
-                    args: Vec::new(),
+                    args: Vec::new().into(),
                 }
             };
             record_type_name_fallback(out, simple, mapped);
@@ -1017,15 +1024,27 @@ fn replace_named_with_fallback(ty: Type, names: &HashMap<String, Type>) -> Type 
                 .collect::<Vec<_>>();
             if let Some(mapped) = names.get(&name) {
                 match mapped.clone() {
-                    Type::Class { sym, .. } => Type::Class { sym, args },
+                    Type::Class { sym, .. } => Type::Class {
+                        sym,
+                        args: args.into(),
+                    },
                     other if args.is_empty() => other,
-                    _ => Type::Named { name, args },
+                    _ => Type::Named {
+                        name,
+                        args: args.into(),
+                    },
                 }
             } else {
-                Type::Named { name, args }
+                Type::Named {
+                    name,
+                    args: args.into(),
+                }
             }
         }
-        Type::Array(inner) => Type::Array(Box::new(replace_named_with_fallback(*inner, names))),
+        Type::Array(inner) => Type::Array(TyBox::new(replace_named_with_fallback(
+            inner.into_inner(),
+            names,
+        ))),
         Type::Tuple(items) => Type::Tuple(
             items
                 .into_iter()
@@ -1037,7 +1056,7 @@ fn replace_named_with_fallback(ty: Type, names: &HashMap<String, Type>) -> Type 
                 .into_iter()
                 .map(|param| replace_named_with_fallback(param, names))
                 .collect(),
-            ret: Box::new(replace_named_with_fallback(*ret, names)),
+            ret: TyBox::new(replace_named_with_fallback(ret.into_inner(), names)),
         },
         Type::Class { sym, args } => Type::Class {
             sym,
@@ -1056,12 +1075,16 @@ fn replace_named_with_fallback(ty: Type, names: &HashMap<String, Type>) -> Type 
                         .collect()
                 })
                 .collect(),
-            ret: Box::new(replace_named_with_fallback(*ret, names)),
+            ret: TyBox::new(replace_named_with_fallback(ret.into_inner(), names)),
         },
-        Type::ByName(inner) => Type::ByName(Box::new(replace_named_with_fallback(*inner, names))),
-        Type::Repeated(inner) => {
-            Type::Repeated(Box::new(replace_named_with_fallback(*inner, names)))
-        }
+        Type::ByName(inner) => Type::ByName(TyBox::new(replace_named_with_fallback(
+            inner.into_inner(),
+            names,
+        ))),
+        Type::Repeated(inner) => Type::Repeated(TyBox::new(replace_named_with_fallback(
+            inner.into_inner(),
+            names,
+        ))),
         Type::Overload(items) => Type::Overload(
             items
                 .into_iter()
@@ -1069,22 +1092,26 @@ fn replace_named_with_fallback(ty: Type, names: &HashMap<String, Type>) -> Type 
                 .collect(),
         ),
         Type::Applied { ctor, args } => Type::Applied {
-            ctor: Box::new(replace_named_with_fallback(*ctor, names)),
+            ctor: TyBox::new(replace_named_with_fallback(ctor.into_inner(), names)),
             args: args
                 .into_iter()
                 .map(|arg| replace_named_with_fallback(arg, names))
                 .collect(),
         },
         Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
-            lo: lo.map(|inner| Box::new(replace_named_with_fallback(*inner, names))),
-            hi: hi.map(|inner| Box::new(replace_named_with_fallback(*inner, names))),
+            lo: (lo
+                .map(|inner| TyBox::new(replace_named_with_fallback(inner.into_inner(), names))))
+            .map(scala_rs_parser::TyBox::from),
+            hi: (hi
+                .map(|inner| TyBox::new(replace_named_with_fallback(inner.into_inner(), names))))
+            .map(scala_rs_parser::TyBox::from),
         },
         Type::SingleType { prefix, sym } => Type::SingleType {
-            prefix: Box::new(replace_named_with_fallback(*prefix, names)),
+            prefix: TyBox::new(replace_named_with_fallback(prefix.into_inner(), names)),
             sym,
         },
         Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(replace_named_with_fallback(*tpe, names)),
+            tpe: TyBox::new(replace_named_with_fallback(tpe.into_inner(), names)),
             annot,
         },
         Type::Refined { parents, decls } => Type::Refined {
@@ -1290,7 +1317,7 @@ fn add_method_types(
         } else {
             vec![params]
         },
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     id
 }
@@ -1390,32 +1417,34 @@ fn resolve_type_name_args(st: &SymbolTable, name: &str, args: Vec<Type>) -> Type
             let mut args = args;
             let ret = args.pop().unwrap_or(Type::Any);
             return Type::Function {
-                params: args,
-                ret: Box::new(ret),
+                params: args.into(),
+                ret: TyBox::new(ret),
             };
         }
     }
     if let Some(n) = name.strip_prefix("Tuple") {
         if n.parse::<usize>().is_ok() && args.len() > 1 {
-            return Type::Tuple(args);
+            return Type::Tuple(args.into());
         }
     }
     if name == "Array" && args.len() == 1 {
-        return Type::Array(Box::new(args.into_iter().next().unwrap_or(Type::Any)));
+        return Type::Array(TyBox::new(args.into_iter().next().unwrap_or(Type::Any)));
     }
     if name == "<byname>" && args.len() == 1 {
-        return Type::ByName(Box::new(args.into_iter().next().unwrap_or(Type::Any)));
+        return Type::ByName(TyBox::new(args.into_iter().next().unwrap_or(Type::Any)));
     }
     if name == "<repeated>" && args.len() == 1 {
-        return Type::Repeated(Box::new(args.into_iter().next().unwrap_or(Type::Any)));
+        return Type::Repeated(TyBox::new(args.into_iter().next().unwrap_or(Type::Any)));
     }
     match resolve_bare_type_name(st, name) {
-        Type::Class { sym, args: old } if old.is_empty() && !args.is_empty() => {
-            Type::Class { sym, args }
-        }
-        Type::Named { name, args: old } if old.is_empty() && !args.is_empty() => {
-            Type::Named { name, args }
-        }
+        Type::Class { sym, args: old } if old.is_empty() && !args.is_empty() => Type::Class {
+            sym,
+            args: args.into(),
+        },
+        Type::Named { name, args: old } if old.is_empty() && !args.is_empty() => Type::Named {
+            name,
+            args: args.into(),
+        },
         t => t,
     }
 }
@@ -1439,8 +1468,8 @@ fn resolve_bare_type_name(st: &SymbolTable, name: &str) -> Type {
         "Null" => Type::Null,
         "Nothing" => Type::Nothing,
         n if n.starts_with("Function") => Type::Function {
-            params: vec![Type::Any],
-            ret: Box::new(Type::Any),
+            params: vec![Type::Any].into(),
+            ret: TyBox::new(Type::Any),
         },
         n => {
             let found = st.lookup(n);
@@ -1451,7 +1480,7 @@ fn resolve_bare_type_name(st: &SymbolTable, name: &str) -> Type {
             {
                 Type::Class {
                     sym: id,
-                    args: vec![],
+                    args: vec![].into(),
                 }
             } else if let Some(id) = found
                 .iter()
@@ -1462,13 +1491,13 @@ fn resolve_bare_type_name(st: &SymbolTable, name: &str) -> Type {
                     SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                     _ => Type::Class {
                         sym: id,
-                        args: vec![],
+                        args: vec![].into(),
                     },
                 }
             } else {
                 Type::Named {
                     name: n.to_string(),
-                    args: vec![],
+                    args: vec![].into(),
                 }
             }
         }
@@ -1557,7 +1586,7 @@ fn parse_field_ty_with_source(
         // Keep the previous malformed-array behavior (`[Q` became
         // `Array[Any]`) even though the shared scanner rejects `Q`.
         let (inner, len) = parse_field_ty_with_source(st, &input[1..], source);
-        return (Type::Array(Box::new(inner)), len + 1);
+        return (Type::Array(TyBox::new(inner)), len + 1);
     }
     (Type::Any, usize::from(!input.is_empty()))
 }
@@ -1592,7 +1621,7 @@ fn primitive_descriptor_type(primitive: descriptor::Primitive) -> Type {
 fn exact_descriptor_class(st: &mut SymbolTable, internal: &str) -> Type {
     Type::Class {
         sym: find_or_stub_java_class(st, internal),
-        args: vec![],
+        args: vec![].into(),
     }
 }
 
@@ -1600,7 +1629,7 @@ fn scala_pickle_descriptor_type(st: &mut SymbolTable, raw: &descriptor::RawType<
     use descriptor::RawType;
     match raw {
         RawType::Primitive(primitive) => primitive_descriptor_type(*primitive),
-        RawType::Array(inner) => Type::Array(Box::new(scala_pickle_descriptor_type(st, inner))),
+        RawType::Array(inner) => Type::Array(TyBox::new(scala_pickle_descriptor_type(st, inner))),
         RawType::Object(object) => {
             let inner = object.as_str();
             let name = inner.rsplit('/').next().unwrap_or(inner);
@@ -1622,8 +1651,8 @@ fn scala_pickle_descriptor_type(st: &mut SymbolTable, raw: &descriptor::RawType<
             }
             if name.starts_with("Function") {
                 return Type::Function {
-                    params: vec![Type::Any],
-                    ret: Box::new(Type::Any),
+                    params: vec![Type::Any].into(),
+                    ret: TyBox::new(Type::Any),
                 };
             }
             match resolve_type_name(st, name) {
@@ -1638,7 +1667,7 @@ fn scala_erased_descriptor_type(st: &mut SymbolTable, raw: &descriptor::RawType<
     use descriptor::RawType;
     match raw {
         RawType::Primitive(primitive) => primitive_descriptor_type(*primitive),
-        RawType::Array(inner) => Type::Array(Box::new(scala_erased_descriptor_type(st, inner))),
+        RawType::Array(inner) => Type::Array(TyBox::new(scala_erased_descriptor_type(st, inner))),
         RawType::Object(object) => {
             let inner = object.as_str();
             match inner {
@@ -1657,7 +1686,7 @@ fn java_descriptor_type(st: &mut SymbolTable, raw: &descriptor::RawType<'_>) -> 
     use descriptor::RawType;
     match raw {
         RawType::Primitive(primitive) => primitive_descriptor_type(*primitive),
-        RawType::Array(inner) => Type::Array(Box::new(java_descriptor_type(st, inner))),
+        RawType::Array(inner) => Type::Array(TyBox::new(java_descriptor_type(st, inner))),
         RawType::Object(object) => {
             let inner = object.as_str();
             match inner {
@@ -1886,7 +1915,7 @@ pub fn install_java_class_in(
     let id = st.alloc(&simple, owner, SymKind::Class, flags, &c.internal_name);
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     if owner == st.root {
         st.enter_in_current(&simple, id);
@@ -2324,7 +2353,7 @@ fn resolve_singleton_prefix(st: &SymbolTable, path: &str, selected: SymbolId) ->
             .map(|(prefix, _)| resolve_singleton_prefix(st, prefix, value))
             .unwrap_or_else(|| default_singleton_prefix(st, value));
         return Type::SingleType {
-            prefix: Box::new(parent),
+            prefix: TyBox::new(parent),
             sym: value,
         };
     }
@@ -2445,7 +2474,7 @@ fn stub_class_in(
     let id = st.alloc(&simple, owner, SymKind::Class, Flags::JAVA, internal);
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     st.get_mut(id).parents = vec![Type::AnyRef];
     if owner == st.root {
@@ -2548,7 +2577,7 @@ fn java_parents(
         if sup != "java/lang/Object" {
             let ty = Type::Class {
                 sym: find_or_stub_java_class(st, sup),
-                args: vec![],
+                args: vec![].into(),
             };
             if !ps.iter().any(|p| same_class(p, &ty)) {
                 ps.push(ty);
@@ -2558,7 +2587,7 @@ fn java_parents(
     for iface in &c.interfaces {
         let ty = Type::Class {
             sym: find_or_stub_java_class(st, iface),
-            args: vec![],
+            args: vec![].into(),
         };
         if !ps.iter().any(|p| same_class(p, &ty)) {
             ps.push(ty);
@@ -2666,7 +2695,7 @@ fn existing_java_method(
 fn method_params_agree(s: &crate::symbol::Symbol, desc: &str) -> bool {
     let declared: Vec<Type> = match &s.ty {
         Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-        Type::Function { params, .. } => params.clone(),
+        Type::Function { params, .. } => params.clone().into_vec(),
         _ => return false,
     };
     let named = desc_param_descs(desc);
@@ -2936,7 +2965,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         // still boxes its argument.
         for p in params.iter_mut() {
             if let Type::Array(elem) = p {
-                *p = Type::Array(Box::new(java_array_element((**elem).clone())));
+                *p = Type::Array(TyBox::new(java_array_element((**elem).clone())));
             }
         }
         let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
@@ -3050,10 +3079,10 @@ fn jtype_to_type(
         JType::Star => Type::Wildcard,
         JType::Extends(t) => Type::BoundedWildcard {
             lo: None,
-            hi: Some(Box::new(jtype_to_type(st, t, env))),
+            hi: Some(TyBox::new(jtype_to_type(st, t, env))),
         },
         JType::Super(t) => Type::BoundedWildcard {
-            lo: Some(Box::new(jtype_to_type(st, t, env))),
+            lo: Some(TyBox::new(jtype_to_type(st, t, env))),
             hi: None,
         },
         JType::Var(n) => env
@@ -3061,7 +3090,7 @@ fn jtype_to_type(
             .copied()
             .map(Type::TypeParam)
             .unwrap_or(Type::Any),
-        JType::Array(e) => Type::Array(Box::new(jtype_to_type(st, e, env))),
+        JType::Array(e) => Type::Array(TyBox::new(jtype_to_type(st, e, env))),
         JType::Class { jvm, args } => {
             if jvm == "java/lang/Object" {
                 return Type::Any;
@@ -3112,7 +3141,9 @@ fn jtype_to_type(
 fn java_result_obj(t: Type) -> Type {
     match t {
         Type::Any => Type::AnyRef,
-        Type::Array(elem) => Type::Array(Box::new(java_array_element(*elem))),
+        Type::Array(elem) => Type::Array(TyBox::new(java_array_element(
+            <scala_rs_parser::Type as Clone>::clone(&*elem),
+        ))),
         other => other,
     }
 }
@@ -3120,7 +3151,9 @@ fn java_result_obj(t: Type) -> Type {
 fn java_array_element(t: Type) -> Type {
     match t {
         Type::Any => Type::JavaObject,
-        Type::Array(elem) => Type::Array(Box::new(java_array_element(*elem))),
+        Type::Array(elem) => Type::Array(TyBox::new(java_array_element(
+            <scala_rs_parser::Type as Clone>::clone(&*elem),
+        ))),
         other => other,
     }
 }
@@ -3201,7 +3234,7 @@ mod descriptor_semantics_tests {
             ),
             Type::Class {
                 sym: inner,
-                args: Vec::new(),
+                args: Vec::new().into(),
             }
         );
     }
@@ -3244,7 +3277,7 @@ mod descriptor_semantics_tests {
         assert_eq!(
             resolve_type_in(&st, object, &singleton, &[]),
             Type::SingleType {
-                prefix: Box::new(Type::ThisType(object)),
+                prefix: TyBox::new(Type::ThisType(object)),
                 sym: value,
             }
         );
@@ -3273,7 +3306,7 @@ mod descriptor_semantics_tests {
         );
         assert_eq!(
             params[8],
-            Type::Array(Box::new(Type::Array(Box::new(Type::String))))
+            Type::Array(TyBox::new(Type::Array(Box::new(Type::String).into())))
         );
         assert_eq!(params[9], Type::Unit);
         let nested = match &params[10] {
@@ -3320,7 +3353,7 @@ mod descriptor_semantics_tests {
 
         assert_eq!(
             field_ty_from_desc(&mut st, "[Lscala/runtime/BoxedUnit;"),
-            Type::Array(Box::new(Type::Unit))
+            Type::Array(TyBox::new(Type::Unit))
         );
     }
 }

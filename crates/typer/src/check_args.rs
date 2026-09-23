@@ -69,7 +69,7 @@ impl Typer {
         }
         Some(Type::Class {
             sym: cls,
-            args: inferred,
+            args: inferred.into(),
         })
     }
 
@@ -131,7 +131,7 @@ impl Typer {
         });
         let core = Type::Class {
             sym: class_id,
-            args: Vec::new(),
+            args: Vec::new().into(),
         };
         t.ty = match prefix {
             Some(pre) if self.st.is_inner_class_of_class(class_id) => {
@@ -1293,7 +1293,7 @@ impl Typer {
             let ret = self.subst_dependent_paths(&first, args, ret);
             return Some(Type::Method {
                 paramss: rest_tys,
-                ret: Box::new(ret),
+                ret: TyBox::new(ret),
             });
         }
         None
@@ -1459,7 +1459,7 @@ impl Typer {
             .map(|(i, a)| {
                 if matches!(orig_first.get(i), Some(Type::ByName(_))) {
                     match a.argument_type() {
-                        Type::ByName(t) => *t,
+                        Type::ByName(t) => <scala_rs_parser::Type as Clone>::clone(&*t),
                         t => t,
                     }
                 } else {
@@ -1725,7 +1725,7 @@ impl Typer {
         }
         let getter_pt = Type::Method {
             paramss: vec![],
-            ret: Box::new(Type::NoType),
+            ret: TyBox::new(Type::NoType),
         };
         self.type_expr(&mut gfun, &getter_pt);
         // One `Apply` per clause the getter declares. A getter for a *later*
@@ -2566,7 +2566,7 @@ impl Typer {
     fn classtag_sub(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
         let want = Type::Class {
             sym: ct_cls,
-            args: vec![t.clone()],
+            args: vec![t.clone()].into(),
         };
         if let ImplicitSearch::Found(id) = self.search_implicit(&want) {
             let r = self.ref_implicit(id, span);
@@ -2602,7 +2602,7 @@ impl Typer {
             },
             ty: Type::Class {
                 sym: ct_cls,
-                args: vec![Type::Array(Box::new(elem.clone()))],
+                args: vec![Type::Array(TyBox::new(elem.clone()))].into(),
             },
             sym: wrap,
             postfix: false,
@@ -2645,7 +2645,7 @@ impl Typer {
                 let mut tree = self.ref_implicit(id, span);
                 tree.ty = Type::Class {
                     sym: ct_cls,
-                    args: vec![t.clone()],
+                    args: vec![t.clone()].into(),
                 };
                 return Some(tree);
             }
@@ -2741,7 +2741,7 @@ impl Typer {
             },
             ty: Type::Class {
                 sym: ct_cls,
-                args: vec![t.clone()],
+                args: vec![t.clone()].into(),
             },
             sym: apply,
             postfix: false,
@@ -2834,7 +2834,7 @@ impl Typer {
             let _ = self.supply_from_pickle(&universe_ty, &tag_name);
             let want = Type::Class {
                 sym: tag_cls,
-                args: vec![arg.clone()],
+                args: vec![arg.clone()].into(),
             };
             let mut tree = Tree::new(
                 NodeId(0),
@@ -2969,7 +2969,7 @@ impl Typer {
         let creator_name = format!("$typecreator{}", self.gensym);
         let want = Type::Class {
             sym: tag_cls,
-            args: vec![arg.clone()],
+            args: vec![arg.clone()].into(),
         };
         let mut tree = crate::materialize::Materialiser {
             universe: &universe,
@@ -2979,11 +2979,11 @@ impl Typer {
             tag_name,
             mirror_ty: Type::Class {
                 sym: mirror,
-                args: vec![],
+                args: vec![].into(),
             },
             type_api: Type::Class {
                 sym: type_api,
-                args: vec![],
+                args: vec![].into(),
             },
             tag_bindings,
             span,
@@ -3066,7 +3066,7 @@ impl Typer {
                 };
                 let want = Type::Class {
                     sym: tag_cls,
-                    args: vec![flat.clone()],
+                    args: vec![flat.clone()].into(),
                 };
                 self.warm_implicit_scope(&want);
                 match self.search_implicit(&want) {
@@ -3147,8 +3147,8 @@ impl Typer {
                 body: Box::new(ident),
             },
             ty: Type::Function {
-                params: vec![from],
-                ret: Box::new(to.clone()),
+                params: vec![from].into(),
+                ret: TyBox::new(to.clone()),
             },
             sym: SymbolId::NONE,
             postfix: false,
@@ -3176,16 +3176,16 @@ impl Typer {
         if matches!(a0.kind, TreeKind::Function { .. }) && a0.ty.is_no_type() {
             let elem = recv_ty.and_then(|t| self.elem_type(t)).unwrap_or(Type::Any);
             let pt = Type::Function {
-                params: vec![elem.clone()],
-                ret: Box::new(Type::Any),
+                params: vec![elem.clone()].into(),
+                ret: TyBox::new(Type::Any),
             };
             self.type_expr(a0, &pt);
             if let TreeKind::Function { body, .. } = &a0.kind {
                 let body_ty = body.ty.widen_constant();
                 if !body_ty.is_no_type() && !body_ty.is_error() {
                     a0.ty = Type::Function {
-                        params: vec![elem],
-                        ret: Box::new(body_ty),
+                        params: vec![elem].into(),
+                        ret: TyBox::new(body_ty),
                     };
                 }
             }
@@ -3331,8 +3331,8 @@ impl Typer {
                 body: Box::new(body),
             },
             ty: Type::Function {
-                params: vec![from],
-                ret: Box::new(to.clone()),
+                params: vec![from].into(),
+                ret: TyBox::new(to.clone()),
             },
             sym: SymbolId::NONE,
             postfix: false,

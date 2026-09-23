@@ -38,6 +38,7 @@
 //! like `prelude_strmap`, this is installed only under `library_abi`.
 
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -101,11 +102,11 @@ fn add_generic_flat_map(
     let tb = Type::TypeParam(b);
     let io_b = Type::Class {
         sym: io,
-        args: vec![tb.clone()],
+        args: vec![tb.clone()].into(),
     };
     let seq_b = Type::Class {
         sym: idx,
-        args: vec![tb],
+        args: vec![tb].into(),
     };
     set_fn1_method(st, g, "f", Type::Char, io_b, seq_b);
 }
@@ -125,14 +126,14 @@ fn add_collect(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, pf: SymbolId) 
     let p = st.alloc("pf", m, SymKind::Term, Flags::PARAM, "");
     let pf_cc = Type::Class {
         sym: pf,
-        args: vec![Type::Char, Type::Char],
+        args: vec![Type::Char, Type::Char].into(),
     };
     st.get_mut(p).ty = pf_cc.clone();
     st.get_mut(m).params = vec![p];
     st.get_mut(m).paramss = vec![vec![p]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![pf_cc]],
-        ret: Box::new(Type::String),
+        ret: TyBox::new(Type::String),
     };
 
     // The generic one.
@@ -143,7 +144,7 @@ fn add_collect(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, pf: SymbolId) 
     let tb = Type::TypeParam(b);
     let pf_cb = Type::Class {
         sym: pf,
-        args: vec![Type::Char, tb.clone()],
+        args: vec![Type::Char, tb.clone()].into(),
     };
     let gp = st.alloc("pf", g, SymKind::Term, Flags::PARAM, "");
     st.get_mut(gp).ty = pf_cb.clone();
@@ -151,9 +152,9 @@ fn add_collect(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, pf: SymbolId) 
     st.get_mut(g).paramss = vec![vec![gp]];
     st.get_mut(g).ty = Type::Method {
         paramss: vec![vec![pf_cb]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: idx,
-            args: vec![tb],
+            args: vec![tb].into(),
         }),
     };
 }
@@ -170,7 +171,7 @@ fn add_apply(st: &mut SymbolTable, so: SymbolId) {
     st.get_mut(m).paramss = vec![vec![p]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![Type::Int]],
-        ret: Box::new(Type::Char),
+        ret: TyBox::new(Type::Char),
     };
 }
 
@@ -186,7 +187,7 @@ fn add_add_string(st: &mut SymbolTable, so: SymbolId) {
     };
     let sbt = Type::Class {
         sym: sb,
-        args: vec![],
+        args: vec![].into(),
     };
     for extra in 0..3 {
         // arities: (b), (b, sep), (b, start, sep, end)
@@ -209,7 +210,7 @@ fn add_add_string(st: &mut SymbolTable, so: SymbolId) {
         st.get_mut(m).paramss = vec![ps];
         st.get_mut(m).ty = Type::Method {
             paramss: vec![tys],
-            ret: Box::new(sbt.clone()),
+            ret: TyBox::new(sbt.clone()),
         };
     }
 }
@@ -248,7 +249,7 @@ fn add_with_filter(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, io: Option
     st.get_mut(m2).tparams = vec![b2];
     let seq_b2 = Type::Class {
         sym: idx,
-        args: vec![Type::TypeParam(b2)],
+        args: vec![Type::TypeParam(b2)].into(),
     };
     set_fn1_method(st, m2, "f", Type::Char, Type::TypeParam(b2), seq_b2);
 
@@ -263,7 +264,7 @@ fn add_with_filter(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, io: Option
     // withFilter(p: Char => Boolean): WithFilter
     let wfty = Type::Class {
         sym: wf,
-        args: vec![],
+        args: vec![].into(),
     };
     let w2 = st.alloc("withFilter", wf, SymKind::Method, Flags::EMPTY, "");
     set_fn1_method(st, w2, "p", Type::Char, Type::Boolean, wfty.clone());
@@ -276,8 +277,8 @@ fn add_with_filter(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, io: Option
 /// Give `id` the shape `(f: P => R): Ret`, params and all.
 fn set_fn1_method(st: &mut SymbolTable, id: SymbolId, pname: &str, p: Type, r: Type, ret: Type) {
     let fty = Type::Function {
-        params: vec![p],
-        ret: Box::new(r),
+        params: vec![p].into(),
+        ret: TyBox::new(r),
     };
     let a = st.alloc(pname, id, SymKind::Term, Flags::PARAM, "");
     st.get_mut(a).ty = fty.clone();
@@ -285,7 +286,7 @@ fn set_fn1_method(st: &mut SymbolTable, id: SymbolId, pname: &str, p: Type, r: T
     st.get_mut(id).paramss = vec![vec![a]];
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![fty]],
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
 }
 
@@ -296,7 +297,7 @@ fn alloc_class(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> 
     let id = st.alloc(name, owner, SymKind::Class, Flags::EMPTY, jvm);
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     st.get_mut(id).parents = vec![Type::AnyRef];
     id

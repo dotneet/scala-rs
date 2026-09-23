@@ -19,6 +19,7 @@
 //!    miss, cached.
 
 use std::collections::{HashMap, HashSet};
+use scala_rs_parser::TyBox;
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 use scala_rs_pickle::read::pflags;
@@ -999,7 +1000,7 @@ impl PickleSupply {
             }
             let outer = self.self_ty.replace(Type::Class {
                 sym: class_sym,
-                args: Vec::new(),
+                args: Vec::new().into(),
             });
             let conv = self.conv_at(st, bin, &scope, rhs, 0);
             self.self_ty = outer;
@@ -1854,7 +1855,7 @@ impl PickleSupply {
                     return false;
                 };
                 if p.by_name && !matches!(t, Type::ByName(_)) {
-                    t = Type::ByName(Box::new(t));
+                    t = Type::ByName(TyBox::new(t));
                 }
                 let mut flags = if clause.implicit {
                     Flags::PARAM.with(Flags::IMPLICIT)
@@ -1962,7 +1963,7 @@ impl PickleSupply {
             st.get_mut(existing).paramss = source_paramss.clone();
             st.get_mut(existing).ty = Type::Method {
                 paramss: vec![source_param_types.clone()],
-                ret: Box::new(Type::Unit),
+                ret: TyBox::new(Type::Unit),
             };
             return true;
         }
@@ -1971,7 +1972,7 @@ impl PickleSupply {
         st.get_mut(m).paramss = source_paramss;
         st.get_mut(m).ty = Type::Method {
             paramss: vec![source_param_types],
-            ret: Box::new(Type::Unit),
+            ret: TyBox::new(Type::Unit),
         };
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
@@ -2372,7 +2373,7 @@ impl PickleSupply {
         Some(CompletedTypeMember {
             ty: Type::Class {
                 sym,
-                args: Vec::new(),
+                args: Vec::new().into(),
             },
             decl: None,
         })
@@ -2489,7 +2490,7 @@ impl PickleSupply {
             }
             let outer = self.self_ty.replace(Type::Class {
                 sym: owner,
-                args: Vec::new(),
+                args: Vec::new().into(),
             });
             let conv = self.conv_at(st, bin, &scope, &declared.ty, 0);
             self.self_ty = outer;
@@ -2578,7 +2579,7 @@ impl PickleSupply {
         match ty {
             Type::Method { paramss, ret } => Type::Method {
                 paramss,
-                ret: Box::new(crate::prefix::with_prefix(*ret, pre)),
+                ret: TyBox::new(crate::prefix::with_prefix(<scala_rs_parser::Type as Clone>::clone(&*ret), pre)),
             },
             t => crate::prefix::with_prefix(t, pre),
         }
@@ -2673,7 +2674,7 @@ impl PickleSupply {
         if tps.is_empty() {
             let outer = self.self_ty.replace(Type::Class {
                 sym: owner,
-                args: Vec::new(),
+                args: Vec::new().into(),
             });
             let conv = self.conv_at(st, bin, &owner_scope, &rhs, 0);
             self.self_ty = outer;
@@ -2722,7 +2723,7 @@ impl PickleSupply {
         // vocabulary, the same way an abstract member's bound is.
         let outer = self.self_ty.replace(Type::Class {
             sym: owner,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         let conv = self.conv_at(st, bin, &scope, &rhs, 0);
         self.self_ty = outer;
@@ -3246,7 +3247,7 @@ impl PickleSupply {
         }
         let outer = self.self_ty.replace(Type::Class {
             sym: class_sym,
-            args: Vec::new(),
+            args: Vec::new().into(),
         });
         let ret = self.conv_at(st, bin, &HashMap::new(), &shape.ret, 0);
         self.self_ty = outer;
@@ -3259,7 +3260,7 @@ impl PickleSupply {
         let id = st.alloc(name, class_sym, SymKind::Method, Flags::FINAL, "");
         st.get_mut(id).ty = Type::Method {
             paramss: Vec::new(),
-            ret: Box::new(ret),
+            ret: TyBox::new(ret),
         };
         st.get_mut(id).macro_impl = Some(MacroBinding {
             pickle: None,
@@ -3376,7 +3377,7 @@ impl PickleSupply {
                     return None;
                 };
                 if p.by_name && !matches!(t, Type::ByName(_)) {
-                    t = Type::ByName(Box::new(t));
+                    t = Type::ByName(TyBox::new(t));
                 }
                 let flags = if clause.implicit {
                     Flags::PARAM.with(Flags::IMPLICIT)
@@ -3419,7 +3420,7 @@ impl PickleSupply {
         st.get_mut(m).paramss = paramss_sym;
         st.get_mut(m).ty = Type::Method {
             paramss: paramss_ty,
-            ret: Box::new(ret),
+            ret: TyBox::new(ret),
         };
         if shape.implicit {
             let f = st.get(m).flags.with(Flags::IMPLICIT);
@@ -3630,7 +3631,7 @@ impl PickleSupply {
         }
         let want = Type::Method {
             paramss: Vec::new(),
-            ret: Box::new(Type::ModuleRef(mcls)),
+            ret: TyBox::new(Type::ModuleRef(mcls)),
         };
         // An accessor already reachable from here may be **useless**. Reading
         // `Exprs.class` as a plain class file (`adopt_binary_class`) installs
@@ -3761,15 +3762,15 @@ impl PickleSupply {
 
         let mirror_ty = Type::Class {
             sym: mirror,
-            args: vec![],
+            args: vec![].into(),
         };
         let creator_ty = Type::Class {
             sym: creator,
-            args: vec![],
+            args: vec![].into(),
         };
         let tag_ty = Type::Class {
             sym: wtt,
-            args: vec![Type::TypeParam(t)],
+            args: vec![Type::TypeParam(t)].into(),
         };
         let p1 = st.alloc("mirror1", ap, SymKind::Term, Flags::PARAM, "");
         st.get_mut(p1).ty = mirror_ty.clone();
@@ -3790,9 +3791,9 @@ impl PickleSupply {
         st.get_mut(ap).paramss = vec![vec![p1, p2], vec![p3]];
         st.get_mut(ap).ty = Type::Method {
             paramss: vec![vec![mirror_ty, creator_ty], vec![tag_ty]],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: expr,
-                args: vec![Type::TypeParam(t)],
+                args: vec![Type::TypeParam(t)].into(),
             }),
         };
         st.set_jvm_name(
@@ -3883,7 +3884,7 @@ impl PickleSupply {
                 match self.conv(st, bin, scope, &p.ty) {
                     Some(mut t) => {
                         if p.by_name && !matches!(t, Type::ByName(_)) {
-                            t = Type::ByName(Box::new(t));
+                            t = Type::ByName(TyBox::new(t));
                         }
                         want.push(t);
                     }
@@ -4219,7 +4220,7 @@ impl PickleSupply {
                         self.param_singletons.insert(
                             key.clone(),
                             Type::SingleType {
-                                prefix: Box::new(Type::NoType),
+                                prefix: TyBox::new(Type::NoType),
                                 sym: symbol,
                             },
                         );
@@ -4237,7 +4238,7 @@ impl PickleSupply {
                     return None;
                 };
                 if p.by_name && !matches!(t, Type::ByName(_)) {
-                    t = Type::ByName(Box::new(t));
+                    t = Type::ByName(TyBox::new(t));
                 }
                 let mut flags = if clause.implicit {
                     Flags::PARAM.with(Flags::IMPLICIT)
@@ -4676,7 +4677,7 @@ impl PickleSupply {
         st.get_mut(m).paramss = paramss_sym;
         st.get_mut(m).ty = Type::Method {
             paramss: paramss_ty,
-            ret: Box::new(ret),
+            ret: TyBox::new(ret),
         };
         // A parameter the caller may omit is filled from the class's
         // `<method>$default$<n>` getter. Without it the typer fills nothing and
@@ -5312,7 +5313,7 @@ impl PickleSupply {
             st.get_mut(id).parents = vec![Type::AnyRef];
             st.get_mut(id).ty = Type::Class {
                 sym: id,
-                args: vec![],
+                args: vec![].into(),
             };
             id
         };
@@ -5532,7 +5533,7 @@ impl PickleSupply {
         ));
         st.get_mut(cls).parents = vec![Type::Class {
             sym: parent,
-            args: Vec::new(),
+            args: Vec::new().into(),
         }];
     }
 
@@ -6714,7 +6715,7 @@ impl PickleSupply {
                         t
                     } else {
                         Type::SingleType {
-                            prefix: Box::new(Type::NoType),
+                            prefix: TyBox::new(Type::NoType),
                             sym: parameter,
                         }
                     });
@@ -6755,7 +6756,7 @@ impl PickleSupply {
                         let module = st.companion_module(cls).unwrap_or(cls);
                         if let Some(pre) = self.conv_at(st, bin, scope, prefix, d) {
                             return Some(Type::SingleType {
-                                prefix: Box::new(pre),
+                                prefix: TyBox::new(pre),
                                 sym: module,
                             });
                         }
@@ -6806,8 +6807,8 @@ impl PickleSupply {
             return Type::Wildcard;
         }
         Type::BoundedWildcard {
-            lo: lo.map(Box::new),
-            hi: hi.map(Box::new),
+            lo: lo.map(TyBox::new),
+            hi: hi.map(TyBox::new),
         }
     }
 
@@ -6942,7 +6943,7 @@ impl PickleSupply {
             (0, _) => None,
             (1, true) => Some(ps.remove(0)),
             _ => Some(Type::Refined {
-                parents: ps,
+                parents: ps.into(),
                 decls: ds,
             }),
         }
@@ -7127,7 +7128,7 @@ impl PickleSupply {
                         // too, so an overriding profile can refine Backend.
                         let root = self.completing_for.map(|sym| Type::Class {
                             sym,
-                            args: Vec::new(),
+                            args: Vec::new().into(),
                         });
                         let outer = self.self_ty.clone();
                         if let Some(root) = root {
@@ -7229,8 +7230,8 @@ impl PickleSupply {
                 a.push(converted);
             }
             return Some(Type::Applied {
-                ctor: Box::new(bound),
-                args: a,
+                ctor: TyBox::new(bound),
+                args: a.into(),
             });
         }
         match sym {
@@ -7247,7 +7248,7 @@ impl PickleSupply {
             "scala.Singleton" => {
                 return Some(Type::Class {
                     sym: st.singleton_sym,
-                    args: vec![],
+                    args: vec![].into(),
                 });
             }
             "scala.AnyRef" | "java.lang.Object" => return Some(Type::AnyRef),
@@ -7257,15 +7258,15 @@ impl PickleSupply {
             "java.lang.String" | "scala.Predef.String" => return Some(Type::String),
             "scala.Array" => {
                 let a = self.conv_all(st, bin, scope, args, d)?;
-                return a.into_iter().next().map(|e| Type::Array(Box::new(e)));
+                return a.into_iter().next().map(|e| Type::Array(TyBox::new(e)));
             }
             "scala.<byname>" => {
                 let a = self.conv_all(st, bin, scope, args, d)?;
-                return a.into_iter().next().map(|e| Type::ByName(Box::new(e)));
+                return a.into_iter().next().map(|e| Type::ByName(TyBox::new(e)));
             }
             "scala.<repeated>" => {
                 let a = self.conv_all(st, bin, scope, args, d)?;
-                return a.into_iter().next().map(|e| Type::Repeated(Box::new(e)));
+                return a.into_iter().next().map(|e| Type::Repeated(TyBox::new(e)));
             }
             _ => {}
         }
@@ -7274,14 +7275,14 @@ impl PickleSupply {
                 let mut a = self.conv_all(st, bin, scope, args, d)?;
                 let ret = a.pop()?;
                 return Some(Type::Function {
-                    params: a,
-                    ret: Box::new(ret),
+                    params: a.into(),
+                    ret: TyBox::new(ret),
                 });
             }
         }
         if let Some(n) = sym.strip_prefix("scala.Tuple") {
             if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() {
-                return Some(Type::Tuple(self.conv_all(st, bin, scope, args, d)?));
+                return Some(Type::Tuple(self.conv_all(st, bin, scope, args, d)?.into()));
             }
         }
         // An alias body is converted in the declaring class's vocabulary, so
@@ -7354,8 +7355,8 @@ impl PickleSupply {
                 if st.kind_arity(&t) == args.len() {
                     let a = self.conv_all(st, bin, scope, args, d)?;
                     return Some(Type::Applied {
-                        ctor: Box::new(t),
-                        args: a,
+                        ctor: TyBox::new(t),
+                        args: a.into(),
                     });
                 }
             }
@@ -7402,7 +7403,7 @@ impl PickleSupply {
                 return None;
             }
         }
-        Some(Type::Class { sym: cls, args: a })
+        Some(Type::Class { sym: cls, args: a.into() })
     }
 
     /// Convert `p1#Shape.Packed` using the exact formal path retained by the
@@ -7529,7 +7530,7 @@ impl PickleSupply {
                         .find(|id| matches!(st.get(*id).kind, SymKind::Term | SymKind::Method))?;
                     stable_path = Some(vec![owner, value]);
                     Type::SingleType {
-                        prefix: Box::new(Type::ModuleRef(owner)),
+                        prefix: TyBox::new(Type::ModuleRef(owner)),
                         sym: value,
                     }
                 }
@@ -7539,7 +7540,7 @@ impl PickleSupply {
                 // member was asked of, not of the class that declares it.
                 let root = self.completing_for.map(|c| Type::Class {
                     sym: c,
-                    args: Vec::new(),
+                    args: Vec::new().into(),
                 });
                 let outer = match root {
                     Some(r) => self.self_ty.replace(r),
@@ -7738,8 +7739,8 @@ impl PickleSupply {
                     }
                     let a = self.conv_all(st, bin, scope, args, d)?;
                     return Some(Type::Applied {
-                        ctor: Box::new(t),
-                        args: a,
+                        ctor: TyBox::new(t),
+                        args: a.into(),
                     });
                 }
             }
@@ -7847,7 +7848,7 @@ impl PickleSupply {
             // typechecks. Point `self_ty` at the owner for the conversion.
             let outer = self.self_ty.replace(Type::Class {
                 sym: owner,
-                args: Vec::new(),
+                args: Vec::new().into(),
             });
             if let Some(h) = self.conv_upper_bound(st, bin, &scope, &hi, d) {
                 if !matches!(h, Type::Any | Type::AnyRef) {
@@ -7903,7 +7904,7 @@ impl PickleSupply {
             0 => None,
             1 => Some(ps.remove(0)),
             _ => Some(Type::Refined {
-                parents: ps,
+                parents: ps.into(),
                 decls: Vec::new(),
             }),
         }
@@ -8159,7 +8160,7 @@ fn drop_stale_members(
 /// The type arguments of a class type, empty for anything else.
 fn parent_args(t: &Type) -> Vec<Type> {
     match t {
-        Type::Class { args, .. } => args.clone(),
+        Type::Class { args, .. } => args.clone().into_vec(),
         _ => Vec::new(),
     }
 }

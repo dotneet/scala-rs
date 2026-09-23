@@ -47,6 +47,7 @@
 //! Runs after the whole run is typed and before `pickle_all`, so nothing it
 //! adds can change how anything resolves.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 
 use crate::erasure::for_each_child;
@@ -92,7 +93,7 @@ pub fn add_value_class_companions(tree: &Tree, st: &mut SymbolTable) {
             symbol.pickle_clauses = vec![params.len()];
             symbol.ty = Type::Method {
                 paramss: vec![params],
-                ret: Box::new(ret),
+                ret: TyBox::new(ret),
             };
             methods.push(method);
         }
@@ -219,7 +220,8 @@ fn declare_extension(st: &mut SymbolTable, comp: SymbolId, cls: SymbolId, meth: 
         args: cls_tparams
             .iter()
             .map(|&t| Type::TypeParam(t))
-            .collect::<Vec<_>>(),
+            .collect::<Vec<_>>()
+            .into(),
     };
     let ext = st.alloc(
         &name,
@@ -243,6 +245,6 @@ fn declare_extension(st: &mut SymbolTable, comp: SymbolId, cls: SymbolId, meth: 
     st.get_mut(ext).pickle_clauses = ext_clauses;
     st.get_mut(ext).ty = Type::Method {
         paramss: vec![all_tys],
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
 }

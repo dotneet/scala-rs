@@ -17,6 +17,7 @@
 //! either and the diagnostic `value toMap is not a member of List[A]` comes out.
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -67,8 +68,9 @@ fn add_to_map(st: &mut SymbolTable, owner: SymbolId, less: SymbolId, map: Symbol
         sym: less,
         args: vec![
             Type::TypeParam(a),
-            Type::Tuple(vec![Type::TypeParam(k), Type::TypeParam(v)]),
-        ],
+            Type::Tuple(vec![Type::TypeParam(k), Type::TypeParam(v)].into()),
+        ]
+        .into(),
     };
     let ev = st.alloc(
         "ev",
@@ -83,9 +85,9 @@ fn add_to_map(st: &mut SymbolTable, owner: SymbolId, less: SymbolId, map: Symbol
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![ev_ty]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: map,
-            args: vec![Type::TypeParam(k), Type::TypeParam(v)],
+            args: vec![Type::TypeParam(k), Type::TypeParam(v)].into(),
         }),
     };
     st.get_mut(m).intrinsic = Intrinsic::None;
@@ -104,11 +106,11 @@ fn add_option_flatten(st: &mut SymbolTable, less: SymbolId) {
     let b = type_param(st, m, "B");
     let result = Type::Class {
         sym: owner,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     let evidence = Type::Class {
         sym: less,
-        args: vec![Type::TypeParam(a), result.clone()],
+        args: vec![Type::TypeParam(a), result.clone()].into(),
     };
     let ev = st.alloc(
         "ev",
@@ -123,6 +125,6 @@ fn add_option_flatten(st: &mut SymbolTable, less: SymbolId) {
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![evidence]],
-        ret: Box::new(result),
+        ret: TyBox::new(result),
     };
 }

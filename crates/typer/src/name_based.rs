@@ -98,7 +98,7 @@ impl Typer {
                 {
                     let elems = match self.st.dealias(&get_ty) {
                         Type::Tuple(ts) | Type::Class { args: ts, .. } => ts,
-                        _ => Vec::new(),
+                        _ => Vec::new().into(),
                     };
                     let elems = elems
                         .iter()
@@ -442,12 +442,12 @@ impl Typer {
     /// follows reports the count.
     fn product_selector_types(&mut self, unapply: SymbolId, get_ty: &Type, n: usize) -> Vec<Type> {
         match self.st.dealias(get_ty) {
-            Type::Tuple(ts) => return ts,
+            Type::Tuple(ts) => return ts.into_vec(),
             Type::Class { sym, args }
                 if numbered_arity(&self.st.get(sym).name, "Tuple")
                     .is_some_and(|k| k == args.len()) =>
             {
-                return args;
+                return args.into_vec();
             }
             _ => {}
         }

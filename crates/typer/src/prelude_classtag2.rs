@@ -1,5 +1,6 @@
 use crate::prelude::{iface, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// A parameterless getter that is *not* an implicit candidate.
@@ -7,7 +8,7 @@ fn plain_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) {
     let id = st.alloc(name, owner, SymKind::Method, Flags::EMPTY, "");
     st.get_mut(id).ty = Type::Method {
         paramss: vec![],
-        ret: Box::new(ty),
+        ret: TyBox::new(ty),
     };
 }
 pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
@@ -23,7 +24,7 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     st.get_mut(ct).tparams = vec![t];
     let class_ty = Type::Class {
         sym: jclass,
-        args: vec![],
+        args: vec![].into(),
     };
     method(
         st,
@@ -38,7 +39,7 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
         ct,
         "newArray",
         vec![Type::Int],
-        Type::Array(Box::new(Type::TypeParam(t))),
+        Type::Array(TyBox::new(Type::TypeParam(t))),
         Intrinsic::None,
     );
     // `case value: T` for an abstract `T` with a `ClassTag[T]` in scope is
@@ -52,7 +53,7 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
         vec![Type::Any],
         Type::Class {
             sym: st.option_sym,
-            args: vec![Type::TypeParam(t)],
+            args: vec![Type::TypeParam(t)].into(),
         },
         Intrinsic::None,
     );
@@ -60,7 +61,7 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     let mc = st.module_class_of(ctm);
     let tag = |elem: Type| Type::Class {
         sym: ct,
-        args: vec![elem],
+        args: vec![elem].into(),
     };
     plain_getter(st, mc, "Int", tag(Type::Int));
     plain_getter(st, mc, "Long", tag(Type::Long));
@@ -91,7 +92,7 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     st.get_mut(apply).tparams = vec![at];
     st.get_mut(apply).ty = Type::Method {
         paramss: vec![vec![class_ty]],
-        ret: Box::new(tag(Type::TypeParam(at))),
+        ret: TyBox::new(tag(Type::TypeParam(at))),
     };
     let mems = st.get(mc).members.clone();
     st.get_mut(ctm).members.extend(mems);

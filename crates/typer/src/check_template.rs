@@ -212,7 +212,7 @@ impl Typer {
     pub(crate) fn type_eta(&mut self, tree: &mut Tree, pt: &Type) {
         let dummy_method = Type::Method {
             paramss: vec![],
-            ret: Box::new(Type::NoType),
+            ret: TyBox::new(Type::NoType),
         };
         if let TreeKind::Typed { expr, .. } = &mut tree.kind {
             self.type_expr(expr, &dummy_method);
@@ -230,14 +230,19 @@ impl Typer {
             } else {
                 paramss
             };
-            let mut ret = *ret;
+            let mut ret = ret.clone();
             // `xs.map(identity _)` names a polymorphic method: its own type
             // parameters are the expected function type's to solve, exactly as
             // for the `_`-less form.
             if clauses.len() == 1 {
-                let (ps, r) = self.solve_eta_tparams(tree.sym, clauses[0].clone(), ret.clone(), pt);
+                let (ps, r) = self.solve_eta_tparams(
+                    tree.sym,
+                    clauses[0].clone(),
+                    ret.clone().into_inner(),
+                    pt,
+                );
                 clauses[0] = ps;
-                ret = r;
+                *ret = r.into();
             }
             self.eta_with_stable_receiver(tree, |this, tree| {
                 crate::uncurry::eta_expand_curried(
@@ -245,7 +250,7 @@ impl Typer {
                     &mut this.gensym,
                     tree,
                     &clauses,
-                    ret,
+                    ret.into_inner(),
                 );
             });
         }
@@ -428,7 +433,7 @@ impl Typer {
                     self.st.get_mut(mem).paramss = paramss_ids.clone();
                     self.st.get_mut(mem).ty = Type::Method {
                         paramss: paramss_ty.clone(),
-                        ret: Box::new(Type::Unit),
+                        ret: TyBox::new(Type::Unit),
                     };
                     // Unlike an ordinary method's `name$default$N` getters, a
                     // constructor default can't be an instance method on the
@@ -511,9 +516,9 @@ impl Typer {
                     self.st.get_mut(copy_id).paramss = copy_paramss.clone();
                     self.st.get_mut(copy_id).ty = Type::Method {
                         paramss: paramss_ty.clone(),
-                        ret: Box::new(Type::Class {
+                        ret: TyBox::new(Type::Class {
                             sym: id,
-                            args: vec![],
+                            args: vec![].into(),
                         }),
                     };
                     // Deliberately *not* copying `copy`'s access onto the
@@ -553,9 +558,9 @@ impl Typer {
                         self.st.get_mut(copy_id).tparams = own;
                         self.st.get_mut(copy_id).ty = Type::Method {
                             paramss: renamed,
-                            ret: Box::new(Type::Class {
+                            ret: TyBox::new(Type::Class {
                                 sym: id,
-                                args: own_tys,
+                                args: own_tys.into(),
                             }),
                         };
                         let getter_prefix = "copy$default$";
@@ -646,7 +651,7 @@ impl Typer {
             // must be constructible without one.
             if !k.is_none() {
                 let targs: Vec<Type> = match &kty {
-                    Type::Class { args, .. } => args.clone(),
+                    Type::Class { args, .. } => args.clone().into_vec(),
                     _ => Vec::new(),
                 };
                 if matches!(self.pick_ctor_at(k, &targs, &[], None), OverloadPick::None) {
@@ -686,7 +691,7 @@ impl Typer {
         self.report_bound_cycles(&member_bounds);
         self.st.get_mut(id).ty = Type::Class {
             sym: id,
-            args: vec![],
+            args: vec![].into(),
         };
         for stt in body.iter_mut() {
             if !matches!(stt.kind, TreeKind::TypeDef { .. }) {
@@ -775,7 +780,7 @@ impl Typer {
         self.return_meth = saved_ret;
         tree.ty = Type::Class {
             sym: id,
-            args: vec![],
+            args: vec![].into(),
         };
     }
 
@@ -835,11 +840,11 @@ impl Typer {
                 0 => Type::Boolean,
                 1 => Type::Class {
                     sym: self.st.option_sym,
-                    args: vec![ctor_param_tys[0].clone()],
+                    args: vec![ctor_param_tys[0].clone()].into(),
                 },
                 _ => Type::Class {
                     sym: self.st.option_sym,
-                    args: vec![Type::Tuple(ctor_param_tys.clone())],
+                    args: vec![Type::Tuple(ctor_param_tys.clone().into())].into(),
                 },
             };
             for mem in self.st.get(cls).members.clone() {
@@ -871,7 +876,7 @@ impl Typer {
                     self.st.get_mut(mem).tparams = own;
                     self.st.get_mut(mem).ty = Type::Method {
                         paramss,
-                        ret: Box::new(ret),
+                        ret: TyBox::new(ret),
                     };
                     self.st.get_mut(mem).paramss = paramss_ids.to_vec();
                     self.st.get_mut(mem).params = paramss_ids.iter().flatten().copied().collect();
@@ -879,7 +884,7 @@ impl Typer {
                     self.st.get_mut(mem).tparams = tps.clone();
                     self.st.get_mut(mem).ty = Type::Method {
                         paramss: vec![vec![class_ty.clone()]],
-                        ret: Box::new(unapply_ret.clone()),
+                        ret: TyBox::new(unapply_ret.clone()),
                     };
                 }
             }
@@ -891,7 +896,7 @@ impl Typer {
             if self.st.get(mem).name == "<init>" && self.st.get(mem).ty.is_no_type() {
                 self.st.get_mut(mem).ty = Type::Method {
                     paramss: paramss_ty.to_vec(),
-                    ret: Box::new(Type::Unit),
+                    ret: TyBox::new(Type::Unit),
                 };
             }
         }
@@ -1491,7 +1496,7 @@ impl Typer {
         // only that left the other parts' members out of scope entirely --
         // 230 "not found: value ownerOnly / referrersOnly / …".
         let roots: Vec<Type> = match &st {
-            Type::Refined { parents, .. } => parents.clone(),
+            Type::Refined { parents, .. } => parents.clone().into_vec(),
             other => vec![other.clone()],
         };
         let mut seen = std::collections::HashSet::new();
@@ -2206,7 +2211,7 @@ impl Typer {
         // Concrete subclasses still have to discharge that requirement.
         let this_ty = match self.st.get(class_id).self_type.clone() {
             Some(required) => Type::Refined {
-                parents: vec![base_this.clone(), required],
+                parents: vec![base_this.clone(), required].into(),
                 decls: Vec::new(),
             },
             None => base_this.clone(),
@@ -2245,7 +2250,7 @@ impl Typer {
             }
             seen.push(bt.clone());
             let args: Vec<Type> = match &bt {
-                Type::Class { args, .. } => args.clone(),
+                Type::Class { args, .. } => args.clone().into_vec(),
                 _ => Vec::new(),
             };
             if let Some(st) = self.st.get(id).self_type.clone() {

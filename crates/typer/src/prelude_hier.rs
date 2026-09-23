@@ -329,7 +329,7 @@ pub fn install(st: &mut SymbolTable) {
                 }
                 vec![Type::Class {
                     sym: tuple2,
-                    args: vec![Type::TypeParam(ctps[0]), Type::TypeParam(ctps[1])],
+                    args: vec![Type::TypeParam(ctps[0]), Type::TypeParam(ctps[1])].into(),
                 }]
             }
             Args::Int => vec![Type::Int],
@@ -375,7 +375,7 @@ fn ensure_link(st: &mut SymbolTable, jvm: &str, variance: &str) {
             st.get_mut(id).parents = vec![Type::AnyRef];
             st.get_mut(id).ty = Type::Class {
                 sym: id,
-                args: vec![],
+                args: vec![].into(),
             };
             id
         }
@@ -455,7 +455,7 @@ fn ensure_arity(st: &mut SymbolTable, jvm: &str, want: usize) -> SymbolId {
 fn set_parent(st: &mut SymbolTable, child: SymbolId, parent: SymbolId, targs: Vec<Type>) {
     let ty = Type::Class {
         sym: parent,
-        args: targs,
+        args: targs.into(),
     };
     let existing = st
         .get(child)

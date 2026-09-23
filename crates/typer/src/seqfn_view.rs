@@ -46,7 +46,7 @@ impl Typer {
             "wrapBooleanArray",
             Type::Class {
                 sym,
-                args: vec![Type::Boolean],
+                args: vec![Type::Boolean].into(),
             },
         ))
     }
@@ -83,7 +83,7 @@ impl Typer {
                 "genericWrapArray",
                 Type::Class {
                     sym,
-                    args: vec![elem.clone()],
+                    args: vec![elem.clone()].into(),
                 },
             ));
         }
@@ -94,7 +94,7 @@ impl Typer {
                 "copyArrayToImmutableIndexedSeq",
                 Type::Class {
                     sym,
-                    args: vec![elem.clone()],
+                    args: vec![elem.clone()].into(),
                 },
             ));
         }

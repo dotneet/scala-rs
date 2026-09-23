@@ -46,6 +46,7 @@
 //! nothing is declared without the jar and the pattern keeps reporting `not
 //! found: extractor +:` there.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 use crate::prelude::{ctor_field, module, type_param};
@@ -148,19 +149,19 @@ fn add_deferrer(st: &mut SymbolTable, coll_jvm: &str, lazy_elem: bool) {
     st.get_mut(d).parents = vec![Type::AnyVal];
     st.get_mut(d).ty = Type::Class {
         sym: d,
-        args: vec![],
+        args: vec![].into(),
     };
     let coll_of = |t: Type| Type::Class {
         sym: coll,
-        args: vec![t],
+        args: vec![t].into(),
     };
     let l = ctor_field(
         st,
         d,
         "l",
         Type::Function {
-            params: vec![],
-            ret: Box::new(coll_of(Type::TypeParam(a))),
+            params: vec![].into(),
+            ret: TyBox::new(coll_of(Type::TypeParam(a))),
         },
     );
     st.get_mut(d).ctor_fields = vec![l];
@@ -172,13 +173,13 @@ fn add_deferrer(st: &mut SymbolTable, coll_jvm: &str, lazy_elem: bool) {
         let param = if is_prefix {
             coll_of(Type::TypeParam(b))
         } else if lazy_elem {
-            Type::ByName(Box::new(Type::TypeParam(b)))
+            Type::ByName(TyBox::new(Type::TypeParam(b)))
         } else {
             Type::TypeParam(b)
         };
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![param]],
-            ret: Box::new(coll_of(Type::TypeParam(b))),
+            ret: TyBox::new(coll_of(Type::TypeParam(b))),
         };
     }
     let td = st.alloc(
@@ -191,10 +192,10 @@ fn add_deferrer(st: &mut SymbolTable, coll_jvm: &str, lazy_elem: bool) {
     let ta = type_param(st, td, "A");
     st.get_mut(td).tparams = vec![ta];
     st.get_mut(td).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(Box::new(coll_of(Type::TypeParam(ta))))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::ByName(TyBox::new(coll_of(Type::TypeParam(ta))))]],
+        ret: TyBox::new(Type::Class {
             sym: d,
-            args: vec![Type::TypeParam(ta)],
+            args: vec![Type::TypeParam(ta)].into(),
         }),
     };
 }
@@ -242,7 +243,7 @@ fn add_seq_unapply(st: &mut SymbolTable, mcls: SymbolId, seq: SymbolId, head_fir
     let c = type_param(st, id, "C");
     st.get_mut(c).bound_hi = Some(Type::Class {
         sym: seq,
-        args: vec![Type::TypeParam(a)],
+        args: vec![Type::TypeParam(a)].into(),
     });
     st.get_mut(id).tparams = vec![a, c];
     let payload = if head_first {
@@ -252,9 +253,9 @@ fn add_seq_unapply(st: &mut SymbolTable, mcls: SymbolId, seq: SymbolId, head_fir
     };
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(c)]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Tuple(payload)],
+            args: vec![Type::Tuple(payload.into())].into(),
         }),
     };
 }
@@ -267,13 +268,13 @@ fn add_cons_unapply(st: &mut SymbolTable, mcls: SymbolId, cls: SymbolId) {
     st.get_mut(id).tparams = vec![a];
     let coll = Type::Class {
         sym: cls,
-        args: vec![Type::TypeParam(a)],
+        args: vec![Type::TypeParam(a)].into(),
     };
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![coll.clone()]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: st.option_sym,
-            args: vec![Type::Tuple(vec![Type::TypeParam(a), coll])],
+            args: vec![Type::Tuple(vec![Type::TypeParam(a), coll].into())].into(),
         }),
     };
 }

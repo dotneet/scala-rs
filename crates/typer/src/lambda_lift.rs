@@ -5,6 +5,7 @@
 //! (including eta-expanded functions and recursive calls from lambdas) pass
 //! those captures so the backend actually emits and runs them.
 
+use scala_rs_parser::TyBox;
 use std::collections::{HashMap, HashSet};
 
 use scala_rs_parser::{Flags, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
@@ -528,7 +529,7 @@ impl<'a> Lifter<'a> {
                 if !cap_tys.is_empty() {
                     def.ty = Type::Method {
                         paramss: vec![cap_tys],
-                        ret: Box::new(def.ty.clone()),
+                        ret: TyBox::new(def.ty.clone()),
                     };
                 }
             }

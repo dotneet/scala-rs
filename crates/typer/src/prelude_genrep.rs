@@ -24,7 +24,10 @@ pub(crate) fn link_tuple_products(st: &mut SymbolTable) {
     let extra: Vec<Type> = ["scala/Product", "java/io/Serializable"]
         .iter()
         .filter_map(|jvm| crate::classpath::find_by_jvm(st, jvm))
-        .map(|sym| Type::Class { sym, args: vec![] })
+        .map(|sym| Type::Class {
+            sym,
+            args: vec![].into(),
+        })
         .collect();
     if extra.is_empty() {
         return;

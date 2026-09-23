@@ -36,7 +36,7 @@ pub fn install(st: &mut SymbolTable) {
     let jbd = crate::classpath::find_or_stub_java_class(st, "java/math/BigDecimal");
     let param = Type::Class {
         sym: jbd,
-        args: vec![],
+        args: vec![].into(),
     };
     let already = st.lookup_member(mcls, "apply").into_iter().any(|m| {
         matches!(&st.get(m).ty, Type::Method { paramss, .. }
@@ -47,7 +47,7 @@ pub fn install(st: &mut SymbolTable) {
     }
     let ret = Type::Class {
         sym: cls,
-        args: vec![],
+        args: vec![].into(),
     };
     let id = method(st, mcls, "apply", vec![param], ret, Intrinsic::None);
     // `add_big_decimal` mirrors the module class's members onto the module

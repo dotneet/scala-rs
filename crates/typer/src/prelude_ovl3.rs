@@ -25,6 +25,7 @@
 
 use crate::prelude::prelude_method;
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -59,7 +60,7 @@ fn add_string_builder_ctor(st: &mut SymbolTable) {
     }
     let sb_t = Type::Class {
         sym: sb,
-        args: vec![],
+        args: vec![].into(),
     };
     prelude_method(
         st,
@@ -148,19 +149,19 @@ fn widen_option(st: &mut SymbolTable) {
         let b = add_lower_bounded_tparam(st, m, "B", ta.clone());
         let tb = Type::TypeParam(b);
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::ByName(Box::new(tb.clone()))]],
-            ret: Box::new(tb),
+            paramss: vec![vec![Type::ByName(TyBox::new(tb.clone()))]],
+            ret: TyBox::new(tb),
         };
     }
     for m in members_named(st, o, "orElse") {
         let b = add_lower_bounded_tparam(st, m, "B", ta.clone());
         let opt_b = Type::Class {
             sym: o,
-            args: vec![Type::TypeParam(b)],
+            args: vec![Type::TypeParam(b)].into(),
         };
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::ByName(Box::new(opt_b.clone()))]],
-            ret: Box::new(opt_b),
+            paramss: vec![vec![Type::ByName(TyBox::new(opt_b.clone()))]],
+            ret: TyBox::new(opt_b),
         };
     }
 }
@@ -192,8 +193,8 @@ fn widen_map_get_or_else(st: &mut SymbolTable) {
             let v1 = add_lower_bounded_tparam(st, m, "V1", tv.clone());
             let tv1 = Type::TypeParam(v1);
             st.get_mut(m).ty = Type::Method {
-                paramss: vec![vec![key, Type::ByName(Box::new(tv1.clone()))]],
-                ret: Box::new(tv1),
+                paramss: vec![vec![key, Type::ByName(TyBox::new(tv1.clone()))]],
+                ret: TyBox::new(tv1),
             };
         }
     }

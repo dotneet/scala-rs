@@ -864,7 +864,7 @@ impl Typer {
                                 tps.iter().any(|tp| {
                                     crate::check::type_mentions_tparam_deep(
                                         &Type::Refined {
-                                            parents: Vec::new(),
+                                            parents: Vec::new().into(),
                                             decls: vec![d.clone()],
                                         },
                                         *tp,
@@ -1039,7 +1039,7 @@ impl Typer {
             return false;
         }
         let mut work: Vec<SymbolId> = self.implicit_scope_classes(ty);
-        let mut seen: std::collections::HashSet<u32> = work.iter().map(|c| c.0).collect();
+        let mut seen: rustc_hash::FxHashSet<u32> = work.iter().map(|c| c.0).collect();
         let mut fresh = false;
         while let Some(c) = work.pop() {
             if c.is_none() {
@@ -1648,7 +1648,7 @@ impl Typer {
         match member_ty {
             Type::Method { paramss, .. } => Type::Method {
                 paramss: paramss.clone(),
-                ret: Box::new(result),
+                ret: TyBox::new(result),
             },
             _ => result,
         }
@@ -1674,7 +1674,7 @@ impl Typer {
         };
         self.st
             .is_deferred_type_member(*id)
-            .then(|| (self.st.get(*id).name.clone(), args.clone()))
+            .then(|| (self.st.get(*id).name.clone(), args.to_vec()))
     }
 
     /// The type member `name` as `cls` sees it. A binary class answers from
@@ -2537,7 +2537,7 @@ mod tests {
         );
         typer.st.get_mut(accessor).ty = Type::ModuleRef(module);
         let singleton = Type::SingleType {
-            prefix: Box::new(Type::ModuleRef(module)),
+            prefix: TyBox::new(Type::ModuleRef(module)),
             sym: accessor,
         };
         assert_eq!(
@@ -2547,7 +2547,7 @@ mod tests {
         let prefixed = crate::prefix::with_prefix(
             Type::Class {
                 sym: module,
-                args: vec![],
+                args: vec![].into(),
             },
             Type::ThisType(typer.st.root),
         );

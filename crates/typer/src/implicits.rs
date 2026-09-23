@@ -28,6 +28,7 @@
 //! product-order check instead.
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::TyBox;
 use scala_rs_span::Span;
 
 use crate::check::Typer;
@@ -796,7 +797,7 @@ impl Typer {
             let declared = &self.st.get(id).ty;
             let ty = self.seen_cached(SeenKind::ValueFromThis, id, Some(id), &receiver, declared, || {
                 match self.st.subst_as_seen_from(&receiver, declared) {
-                    Type::Method { paramss, ret } if paramss.is_empty() => *ret,
+                    Type::Method { paramss, ret } if paramss.is_empty() => <scala_rs_parser::Type as Clone>::clone(&*ret),
                     other => other,
                 }
             });
@@ -1306,11 +1307,7 @@ impl Typer {
             }
         }
         let seen = std::rc::Rc::new(compute());
-        let named = |t: &Type| {
-            crate::symbol::any_type(t, &mut |p| {
-                matches!(p, Type::Named { .. } | Type::Tuple(_))
-            })
-        };
+        let named = |t: &Type| t.flags().contains(scala_rs_parser::TypeFlags::NAMED | scala_rs_parser::TypeFlags::TUPLE);
         // The substitution may itself have completed a symbol.
         if (self.st.mutation_gen.get(), self.st.abs_projection_of.len()) != epoch
             || named(prefix)
@@ -1351,7 +1348,7 @@ impl Typer {
             _ => false,
         };
         let expanded = if plain_prefix
-            && !crate::symbol::any_type(ty, &mut |t| matches!(t, Type::TypeMember(_)))
+            && !ty.flags().contains(scala_rs_parser::TypeFlags::TYPE_MEMBER)
         {
             std::borrow::Cow::Borrowed(ty)
         } else {
@@ -2303,7 +2300,7 @@ impl Typer {
             };
             let hi = crate::symbol::subst_tparams_slice(tps, targs, &hi);
             let parents: Vec<Type> = match &hi {
-                Type::Refined { parents, .. } => parents.clone(),
+                Type::Refined { parents, .. } => parents.clone().into_vec(),
                 other => vec![other.clone()],
             };
             for parent in &parents {
@@ -2360,7 +2357,7 @@ impl Typer {
                 match keep.len() {
                     1 => keep.remove(0),
                     _ => Type::Refined {
-                        parents: keep,
+                        parents: keep.into(),
                         decls: decls.clone(),
                     },
                 }
@@ -2577,7 +2574,7 @@ impl Typer {
                 };
                 match f {
                     Some(Type::Function { params, ret }) if params.len() == 1 => {
-                        Some((params[0].clone(), *ret))
+                        Some((params[0].clone(), <scala_rs_parser::Type as Clone>::clone(&*ret)))
                     }
                     _ => None,
                 }
@@ -3373,7 +3370,7 @@ impl Typer {
                     .any(|p| crate::check::type_mentions_tparam_deep(p, *tp))
                     && crate::check::type_mentions_tparam_deep(
                         &Type::Refined {
-                            parents: Vec::new(),
+                            parents: Vec::new().into(),
                             decls: decls.clone(),
                         },
                         *tp,
@@ -3472,11 +3469,11 @@ impl Typer {
         self.st.is_sub_type(
             &Type::Class {
                 sym: oa,
-                args: vec![],
+                args: vec![].into(),
             },
             &Type::Class {
                 sym: ob,
-                args: vec![],
+                args: vec![].into(),
             },
         ) || (self.is_named_low_priority_origin(b) && self.owner_is_proper_subclass(a, b))
     }
@@ -4078,8 +4075,8 @@ impl Typer {
         for _ in 0..8 {
             current = match current {
                 Type::TypeMember(id) | Type::TypeParam(id) => self.st.get(id).bound_hi.clone()?,
-                Type::BoundedWildcard { hi: Some(hi), .. } => *hi,
-                Type::Applied { ctor, .. } => *ctor,
+                Type::BoundedWildcard { hi: Some(hi), .. } => <scala_rs_parser::Type as Clone>::clone(&*hi),
+                Type::Applied { ctor, .. } => <scala_rs_parser::Type as Clone>::clone(&*ctor),
                 _ => return None,
             };
             if let Some(cls) = self.st.class_sym_of(&current) {
@@ -4109,7 +4106,7 @@ impl Typer {
         for _ in 0..8 {
             current = match current {
                 Type::TypeMember(id) | Type::TypeParam(id) => self.st.get(id).bound_hi.clone()?,
-                Type::BoundedWildcard { hi: Some(hi), .. } => *hi,
+                Type::BoundedWildcard { hi: Some(hi), .. } => <scala_rs_parser::Type as Clone>::clone(&*hi),
                 Type::Applied { ctor, args } => match ctor.as_ref() {
                     Type::TypeMember(id) | Type::TypeParam(id) => {
                         let hi = self.st.get(*id).bound_hi.clone()?;
@@ -4629,8 +4626,8 @@ impl Typer {
                 Type::Wildcard
             } else {
                 Type::BoundedWildcard {
-                    lo: lo.map(Box::new),
-                    hi: hi.map(Box::new),
+                    lo: lo.map(TyBox::new),
+                    hi: hi.map(TyBox::new),
                 }
             }
         };
@@ -4793,7 +4790,7 @@ impl Typer {
         // ordinary calls. Capture surplus leading arguments: EitherT[F, E, A]
         // supplies EitherT[F, E, *] and A, not bare EitherT and F. Applications
         // nested in a tuple need the same rule for views of (F[A], F[B]).
-        if crate::symbol::any_type(param, &mut |ty| matches!(ty, Type::Applied { .. })) {
+        if param.flags().contains(scala_rs_parser::TypeFlags::APPLIED) {
             crate::check::unify_one(&self.st, tp, param, from)
         } else {
             unify_conv_tparam(tp, param, from)
@@ -5285,7 +5282,7 @@ impl Typer {
                         if self.st.get(sym).kind == SymKind::ModuleClass
                             && self.st.get(sym).owner == outer_class =>
                     {
-                        Some(*prefix)
+                        Some(<scala_rs_parser::Type as Clone>::clone(&*prefix))
                     }
                     _ => None,
                 });
@@ -5505,7 +5502,7 @@ fn fold_applied(ty: &Type) -> Type {
             args: args.iter().map(fold_applied).collect(),
         },
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(fold_applied).collect()),
-        Type::Array(t) => Type::Array(Box::new(fold_applied(t))),
+        Type::Array(t) => Type::Array(TyBox::new(fold_applied(t))),
         Type::Refined { parents, decls } => Type::Refined {
             parents: parents.iter().map(fold_applied).collect(),
             decls: decls.clone(),
@@ -5601,7 +5598,7 @@ fn type_ctor_of(ty: &Type) -> Option<Type> {
     match ty {
         Type::Class { sym, args } if !args.is_empty() => Some(Type::Class {
             sym: *sym,
-            args: Vec::new(),
+            args: Vec::new().into(),
         }),
         Type::Applied { ctor, .. } => Some((**ctor).clone()),
         _ => None,
@@ -5644,11 +5641,11 @@ mod memo_tests {
             .alloc("Leaf", root, SymKind::Class, Flags::EMPTY, "Leaf");
         typer.st.get_mut(leaf).parents.push(Type::Class {
             sym: base,
-            args: vec![],
+            args: vec![].into(),
         });
         let wanted = Type::Class {
             sym: leaf,
-            args: vec![],
+            args: vec![].into(),
         };
         assert_eq!(typer.implicit_scope_classes(&wanted), vec![leaf, base]);
         let cached = typer.implicit_class_parts.borrow().map[&leaf.0].clone();
@@ -5668,7 +5665,7 @@ mod memo_tests {
             .alloc("Grand", root, SymKind::Class, Flags::EMPTY, "Grand");
         typer.st.get_mut(base).parents.push(Type::Class {
             sym: grand,
-            args: vec![],
+            args: vec![].into(),
         });
         assert_eq!(
             typer.implicit_scope_classes(&wanted),
@@ -5696,11 +5693,11 @@ mod memo_tests {
         );
         typer.st.get_mut(leaf).parents.push(Type::Named {
             name: "UnresolvedBase".into(),
-            args: vec![],
+            args: vec![].into(),
         });
         let wanted = Type::Class {
             sym: leaf,
-            args: vec![],
+            args: vec![].into(),
         };
         assert_eq!(typer.implicit_scope_classes(&wanted), vec![leaf]);
         assert!(!typer
@@ -5716,7 +5713,7 @@ mod memo_tests {
     fn macro_disabled_mode_is_part_of_the_memo_key() {
         let wanted = Type::Class {
             sym: SymbolId(42),
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         };
         assert_ne!(memo_key(&wanted, &[], false), memo_key(&wanted, &[], true));
     }
@@ -5737,7 +5734,7 @@ mod memo_tests {
         typer.st.get_mut(method).tparams = vec![tp];
         typer.st.get_mut(method).ty = Type::Method {
             paramss: vec![],
-            ret: Box::new(Type::TypeParam(tp)),
+            ret: TyBox::new(Type::TypeParam(tp)),
         };
         let members = typer.st.get(owner).members.clone();
         let method_members = typer.st.get(method).members.clone();
@@ -5770,15 +5767,15 @@ mod memo_tests {
         typer.st.get_mut(method).tparams = vec![tp];
         typer.st.get_mut(method).ty = Type::Method {
             paramss: vec![],
-            ret: Box::new(Type::Class {
+            ret: (Box::new(Type::Class {
                 sym: result,
-                args: vec![Type::TypeParam(tp)],
-            }),
+                args: vec![Type::TypeParam(tp)].into(),
+            })).into(),
         };
         typer.st.this_class = owner;
         let wanted_type = Type::Class {
             sym: wanted,
-            args: vec![],
+            args: vec![].into(),
         };
         assert!(typer.implicits_in_scope().contains(&method));
         typer.warm_implicit_candidates(&[wanted_type]);
@@ -5794,14 +5791,14 @@ mod memo_tests {
             .alloc("List", root, SymKind::Class, Flags::EMPTY, "List");
         let tail = Type::Class {
             sym: list,
-            args: vec![Type::Int],
+            args: vec![Type::Int].into(),
         };
         let full = Type::Class {
             sym: list,
             args: vec![Type::Annotated {
-                tpe: Box::new(tail.clone()),
+                tpe: TyBox::new(tail.clone()),
                 annot: "uncheckedVariance".into(),
-            }],
+            }].into(),
         };
         assert!(!dominates(&typer, &tail, &full));
         assert!(dominates(&typer, &full, &full));
@@ -5817,14 +5814,14 @@ mod memo_tests {
             .alloc("List", root, SymKind::Class, Flags::EMPTY, "List");
         let tail = Type::Class {
             sym: list,
-            args: vec![Type::Int],
+            args: vec![Type::Int].into(),
         };
         let full = Type::Class {
             sym: list,
-            args: vec![tail.clone()],
+            args: vec![tail.clone()].into(),
         };
         let refined = |parent| Type::Refined {
-            parents: vec![parent],
+            parents: vec![parent].into(),
             decls: Vec::new(),
         };
         let refined_tail = refined(tail);
@@ -5867,11 +5864,11 @@ mod memo_tests {
         typer.st.get_mut(shape).tparams = vec![level, mixed, unpacked, packed];
         let large = Type::Class {
             sym: shape,
-            args: vec![Type::Int, Type::Int, Type::Int, Type::Int],
+            args: vec![Type::Int, Type::Int, Type::Int, Type::Int].into(),
         };
         let shape_ty = |mixed_arg: Type, unpacked_arg: Type, packed_arg: Type| Type::Class {
             sym: shape,
-            args: vec![Type::Int, mixed_arg, unpacked_arg, packed_arg],
+            args: vec![Type::Int, mixed_arg, unpacked_arg, packed_arg].into(),
         };
 
         // The mixed/source argument shrinks while the packed projection grows
@@ -5915,7 +5912,7 @@ mod memo_tests {
         typer.st.get_mut(driver).tparams = vec![driver_input, driver_output];
         let driver_ty = |input: Type, output: Type| Type::Class {
             sym: driver,
-            args: vec![input, output],
+            args: vec![input, output].into(),
         };
         let driver_open = driver_ty(large.clone(), Type::Int);
         let driver_balanced = driver_ty(Type::Int, large.clone());
@@ -5924,14 +5921,14 @@ mod memo_tests {
         // A strictly larger result can still be a valid step when a declared
         // input shrinks. The stack-wide product-order check, rather than an
         // open-hole test, is what keeps this concrete case sound.
-        let larger = Type::Tuple(vec![large.clone(), large.clone()]);
+        let larger = Type::Tuple((vec![large.clone(), large.clone()]).into());
         let driver_grows = driver_ty(Type::Int, larger.clone());
         assert!(!dominates(&typer, &driver_grows, &driver_open));
 
         // A later target that grows without shrinking any declared input is
         // still a cycle against the original target, even after an
         // incomparable intermediate step was admitted.
-        let driver_cycle = driver_ty(large.clone(), Type::Tuple(vec![large.clone()]));
+        let driver_cycle = driver_ty(large.clone(), Type::Tuple((vec![large.clone()]).into()));
         assert!(dominates(&typer, &driver_cycle, &driver_open));
 
         // With two contravariant inputs, aggregate complexity is too strict:
@@ -5957,7 +5954,7 @@ mod memo_tests {
         typer.st.get_mut(multi).tparams = vec![left, right];
         let multi_ty = |left: Type, right: Type| Type::Class {
             sym: multi,
-            args: vec![left, right],
+            args: vec![left, right].into(),
         };
         let multi_open = multi_ty(large.clone(), Type::Int);
         let multi_incomparable = multi_ty(Type::Int, large.clone());
@@ -6003,12 +6000,12 @@ mod memo_tests {
             typer.st.get_mut(module).ty = Type::ModuleRef(module_class);
             typer.st.get_mut(module_class).parents = vec![Type::Class {
                 sym: shared,
-                args: vec![],
+                args: vec![].into(),
             }];
             (
                 Type::Class {
                     sym: class,
-                    args: vec![],
+                    args: vec![].into(),
                 },
                 module,
             )
@@ -6081,17 +6078,17 @@ mod memo_tests {
         member_info.tparams = vec![member_tp];
         member_info.bound_hi = Some(Type::Class {
             sym: impl_cls,
-            args: vec![Type::TypeParam(member_tp)],
+            args: vec![Type::TypeParam(member_tp)].into(),
         });
         let applied = Type::Applied {
-            ctor: Box::new(Type::TypeMember(member)),
-            args: vec![Type::Int],
+            ctor: TyBox::new(Type::TypeMember(member)),
+            args: vec![Type::Int].into(),
         };
         assert_eq!(
             typer.type_instance_for_bounded_member_lookup(&applied),
             Some(Type::Class {
                 sym: impl_cls,
-                args: vec![Type::Int],
+                args: vec![Type::Int].into(),
             })
         );
     }

@@ -1607,7 +1607,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 .and_then(|id| st.value_class_for_term(id))
                 .map(|class| Type::Class {
                     sym: class,
-                    args: vec![],
+                    args: vec![].into(),
                 })
                 .unwrap_or_else(|| p.ty.clone())
         })

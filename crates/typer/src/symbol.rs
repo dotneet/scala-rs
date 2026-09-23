@@ -1,5 +1,6 @@
 //! Symbols, scopes, and the compilation context.
 
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, RefineDecl, SpecializedType, SpecializedTypes, SymbolId, Type};
 
 /// Decl name that marks a refinement as the as-seen-from view of a type
@@ -2860,7 +2861,9 @@ impl SymbolTable {
         let mut seen: Vec<u32> = Vec::new();
         loop {
             match &t {
-                Type::BoundedWildcard { hi: Some(hi), .. } => t = *hi.clone(),
+                Type::BoundedWildcard { hi: Some(hi), .. } => {
+                    t = <scala_rs_parser::Type as Clone>::clone(&*hi.clone())
+                }
                 Type::TypeParam(id) => {
                     if seen.contains(&id.0) {
                         return ty.clone();
@@ -2916,7 +2919,9 @@ impl SymbolTable {
             return Type::ModuleRef(sym);
         }
         match symbol.ty.clone() {
-            Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => *ret,
+            Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => {
+                <scala_rs_parser::Type as Clone>::clone(&*ret)
+            }
             other => other,
         }
     }
@@ -3334,22 +3339,22 @@ impl SymbolTable {
                 args: args.iter().map(go).collect(),
             },
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(go).collect()),
-            Type::Array(t) => Type::Array(Box::new(go(t))),
-            Type::ByName(t) => Type::ByName(Box::new(go(t))),
-            Type::Repeated(t) => Type::Repeated(Box::new(go(t))),
+            Type::Array(t) => Type::Array(TyBox::new(go(t))),
+            Type::ByName(t) => Type::ByName(TyBox::new(go(t))),
+            Type::Repeated(t) => Type::Repeated(TyBox::new(go(t))),
             Type::Function { params, ret } => Type::Function {
                 params: params.iter().map(go).collect(),
-                ret: Box::new(go(ret)),
+                ret: TyBox::new(go(ret)),
             },
             Type::Method { paramss, ret } => Type::Method {
                 paramss: paramss
                     .iter()
                     .map(|ps| ps.iter().map(go).collect())
                     .collect(),
-                ret: Box::new(go(ret)),
+                ret: TyBox::new(go(ret)),
             },
             Type::Annotated { tpe, annot } => Type::Annotated {
-                tpe: Box::new(go(tpe)),
+                tpe: TyBox::new(go(tpe)),
                 annot: annot.clone(),
             },
             Type::Existential { params, body } => Type::Existential {
@@ -3357,7 +3362,7 @@ impl SymbolTable {
                     .iter()
                     .map(|(id, bounds)| (*id, go(bounds)))
                     .collect(),
-                body: Box::new(go(body)),
+                body: TyBox::new(go(body)),
             },
             Type::Refined { parents, decls } => Type::Refined {
                 parents: parents.iter().map(go).collect(),
@@ -3552,8 +3557,9 @@ impl SymbolTable {
         if tps.is_empty() {
             return false;
         }
-        any_type(
+        any_type_masked(
             ty,
+            scala_rs_parser::TypeFlags::TYPE_PARAM | scala_rs_parser::TypeFlags::TYPE_MEMBER,
             &mut |t| matches!(t, Type::TypeParam(id) | Type::TypeMember(id) if tps.contains(id)),
         )
     }
@@ -3623,7 +3629,7 @@ impl SymbolTable {
             return (false, false);
         }
         let (mut paths, mut projections) = (false, false);
-        any_type(ty, &mut |t| {
+        any_type_masked(ty, scala_rs_parser::TypeFlags::TYPE_MEMBER, &mut |t| {
             if let Type::TypeMember(id) = t {
                 paths |= want_paths && self.path_member_decl.contains_key(id);
                 projections |= want_projections && self.abs_projection_of.contains_key(id);
@@ -3637,8 +3643,9 @@ impl SymbolTable {
         if self.abs_projection_of.is_empty() {
             return false;
         }
-        any_type(
+        any_type_masked(
             ty,
+            scala_rs_parser::TypeFlags::TYPE_MEMBER,
             &mut |t| matches!(t, Type::TypeMember(id) if self.abs_projection_of.contains_key(id)),
         )
     }
@@ -3706,7 +3713,7 @@ impl SymbolTable {
     /// Every type member `ty` mentions anywhere, refinements included.
     pub fn type_members_in(&self, ty: &Type) -> Vec<SymbolId> {
         let mut out: Vec<SymbolId> = Vec::new();
-        any_type(ty, &mut |t| {
+        any_type_masked(ty, scala_rs_parser::TypeFlags::TYPE_MEMBER, &mut |t| {
             if let Type::TypeMember(id) = t {
                 if !out.contains(id) {
                     out.push(*id);
@@ -3728,8 +3735,9 @@ impl SymbolTable {
         if self.path_member_decl.is_empty() {
             return false;
         }
-        any_type(
+        any_type_masked(
             ty,
+            scala_rs_parser::TypeFlags::TYPE_MEMBER,
             &mut |t| matches!(t, Type::TypeMember(id) if self.path_member_decl.contains_key(id)),
         )
     }
@@ -4061,7 +4069,7 @@ impl SymbolTable {
         } else {
             Type::Existential {
                 params,
-                body: Box::new(body),
+                body: TyBox::new(body),
             }
         }
     }
@@ -4239,7 +4247,7 @@ impl SymbolTable {
     pub fn array_class_form(&self, ty: &Type) -> Option<Type> {
         match ty {
             Type::Class { sym, args } if *sym == self.array_sym && args.len() == 1 => {
-                Some(Type::Array(Box::new(args[0].clone())))
+                Some(Type::Array(TyBox::new(args[0].clone())))
             }
             _ => None,
         }
@@ -4662,7 +4670,16 @@ impl SymbolTable {
                         .iter()
                         .map(|t| Type::TypeParam(*t))
                         .collect();
-                    walk(st, &Type::Class { sym: *sym, args }, subs, seen, base);
+                    walk(
+                        st,
+                        &Type::Class {
+                            sym: *sym,
+                            args: args.into(),
+                        },
+                        subs,
+                        seen,
+                        base,
+                    );
                 }
                 // Only heads that `apply_type_ctor` folds may be re-walked: an
                 // abstract type-member head (`ColumnType[U]`) folds to the very
@@ -4674,7 +4691,7 @@ impl SymbolTable {
                         Type::Class { .. } | Type::Named { .. } | Type::Applied { .. }
                     ) =>
                 {
-                    let t = apply_type_ctor((**ctor).clone(), args.clone());
+                    let t = apply_type_ctor((**ctor).clone(), args.clone().into_vec());
                     if matches!(t, Type::Applied { .. }) {
                         // Still applied: the constructor is abstract (a type
                         // member or parameter), so it names no class to walk
@@ -4981,7 +4998,7 @@ impl SymbolTable {
                     match slots.entry(ps.0) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert(BaseSlot {
-                                args: pargs.clone(),
+                                args: pargs.clone().into_vec(),
                                 settled: false,
                                 more: Vec::new(),
                             });
@@ -5000,7 +5017,7 @@ impl SymbolTable {
                                 if slot.more.is_empty() {
                                     unmerged += 1;
                                 }
-                                slot.more.push(pargs.clone());
+                                slot.more.push(pargs.clone().into_vec());
                             }
                         }
                     }
@@ -5418,7 +5435,7 @@ impl SymbolTable {
             SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
             _ => Type::Class {
                 sym: id,
-                args: vec![],
+                args: vec![].into(),
             },
         }
     }
@@ -5437,7 +5454,7 @@ impl SymbolTable {
             SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
             _ if s.tparams.is_empty() => Type::Class {
                 sym: id,
-                args: vec![],
+                args: vec![].into(),
             },
             _ => Type::Class {
                 sym: id,
@@ -5689,7 +5706,7 @@ impl SymbolTable {
                 // LUB path has to expose it too when a heterogeneous `Seq` is
                 // built before `DBIO.sequence` can inspect its elements.
                 Type::Applied { ctor, args } => {
-                    let folded = apply_type_ctor((**ctor).clone(), args.clone());
+                    let folded = apply_type_ctor((**ctor).clone(), args.clone().into_vec());
                     if folded != cur {
                         if !seen.contains(&folded) {
                             seen.push(folded.clone());
@@ -5760,7 +5777,7 @@ impl SymbolTable {
             return b.clone();
         }
         Type::Refined {
-            parents: vec![a.clone(), b.clone()],
+            parents: vec![a.clone(), b.clone()].into(),
             decls: Vec::new(),
         }
     }
@@ -5807,7 +5824,7 @@ impl SymbolTable {
                 .collect();
             if minimal.len() > 1 {
                 return Type::Refined {
-                    parents: minimal,
+                    parents: minimal.into(),
                     decls: Vec::new(),
                 };
             }
@@ -5928,7 +5945,7 @@ impl SymbolTable {
                         } else {
                             Type::BoundedWildcard {
                                 lo: None,
-                                hi: Some(Box::new(self.lub_at(x, y, depth + 1))),
+                                hi: Some(TyBox::new(self.lub_at(x, y, depth + 1))),
                             }
                         }
                     })
@@ -5972,14 +5989,14 @@ impl SymbolTable {
                             // inapplicable to `Seq(elems: A*)`.
                             Type::BoundedWildcard {
                                 lo: None,
-                                hi: Some(Box::new(self.lub_at(x, y, depth + 1))),
+                                hi: Some(TyBox::new(self.lub_at(x, y, depth + 1))),
                             }
                         }
                     })
                     .collect();
                 return Type::Class {
                     sym: *s1,
-                    args: joined,
+                    args: joined.into(),
                 };
             }
         }
@@ -6007,7 +6024,7 @@ impl SymbolTable {
                         .zip(p2.iter())
                         .map(|(x, y)| self.glb(x, y))
                         .collect(),
-                    ret: Box::new(self.lub_at(r1, r2, depth + 1)),
+                    ret: TyBox::new(self.lub_at(r1, r2, depth + 1)),
                 };
             }
         }
@@ -6068,7 +6085,7 @@ impl SymbolTable {
             1 => return minimal.pop().unwrap(),
             _ => {
                 return Type::Refined {
-                    parents: minimal,
+                    parents: minimal.into(),
                     decls: Vec::new(),
                 }
             }
@@ -6698,7 +6715,7 @@ impl SymbolTable {
                                 Some(hi) => {
                                     bounded = Type::BoundedWildcard {
                                         lo: None,
-                                        hi: Some(Box::new(hi)),
+                                        hi: Some(TyBox::new(hi)),
                                     };
                                     &bounded
                                 }
@@ -6877,7 +6894,7 @@ impl SymbolTable {
                             && self.conforms_to_refinement(a, decls);
                     }
                 }
-                let folded = apply_type_ctor((**ctor).clone(), args.clone());
+                let folded = apply_type_ctor((**ctor).clone(), args.clone().into_vec());
                 if let Type::Applied { ctor, .. } = &folded {
                     // `type BaseColumnType[T] = JdbcType[T] & BaseTypedType[T]`
                     // applied to `U` is that intersection, and conforms to
@@ -6910,7 +6927,7 @@ impl SymbolTable {
                             // evidence) reported "could not find implicit".
                             let args = match &folded {
                                 Type::Applied { args, .. } => args.clone(),
-                                _ => Vec::new(),
+                                _ => Vec::new().into(),
                             };
                             // `CC[X, Y] <: MapOps[X, Y, CC, _]` mentions `CC`
                             // again, so reading the bound has to be guarded the
@@ -6929,7 +6946,7 @@ impl SymbolTable {
                 }
             }
             (other, Type::Applied { ctor, args }) => {
-                let folded = apply_type_ctor((**ctor).clone(), args.clone());
+                let folded = apply_type_ctor((**ctor).clone(), args.clone().into_vec());
                 if matches!(folded, Type::Applied { .. }) {
                     let expanded = self.expand_applied_hk_alias(folded.clone());
                     if expanded != folded {
@@ -7218,8 +7235,8 @@ impl SymbolTable {
         }
         let n = args.len() - 1;
         Some(Type::Function {
-            params: args[..n].to_vec(),
-            ret: Box::new(args[n].clone()),
+            params: args[..n].to_vec().into(),
+            ret: TyBox::new(args[n].clone()),
         })
     }
 
@@ -7909,13 +7926,13 @@ impl SymbolTable {
                 );
                 self.expand_applied_hk_alias(applied)
             }
-            Type::Array(t) => Type::Array(Box::new(self.expand_type_members(from, t))),
+            Type::Array(t) => Type::Array(TyBox::new(self.expand_type_members(from, t))),
             Type::Function { params, ret } => Type::Function {
                 params: params
                     .iter()
                     .map(|p| self.expand_type_members(from, p))
                     .collect(),
-                ret: Box::new(self.expand_type_members(from, ret)),
+                ret: TyBox::new(self.expand_type_members(from, ret)),
             },
             Type::Method { paramss, ret } => Type::Method {
                 paramss: paramss
@@ -7926,10 +7943,10 @@ impl SymbolTable {
                             .collect()
                     })
                     .collect(),
-                ret: Box::new(self.expand_type_members(from, ret)),
+                ret: TyBox::new(self.expand_type_members(from, ret)),
             },
-            Type::ByName(t) => Type::ByName(Box::new(self.expand_type_members(from, t))),
-            Type::Repeated(t) => Type::Repeated(Box::new(self.expand_type_members(from, t))),
+            Type::ByName(t) => Type::ByName(TyBox::new(self.expand_type_members(from, t))),
+            Type::Repeated(t) => Type::Repeated(TyBox::new(self.expand_type_members(from, t))),
             Type::Tuple(ts) => Type::Tuple(
                 ts.iter()
                     .map(|t| self.expand_type_members(from, t))
@@ -7946,7 +7963,7 @@ impl SymbolTable {
                     .collect(),
             },
             Type::Annotated { tpe, annot } => Type::Annotated {
-                tpe: Box::new(self.expand_type_members(from, tpe)),
+                tpe: TyBox::new(self.expand_type_members(from, tpe)),
                 annot: annot.clone(),
             },
             Type::Existential { params, body } => Type::Existential {
@@ -7954,18 +7971,20 @@ impl SymbolTable {
                     .iter()
                     .map(|(id, bounds)| (*id, self.expand_type_members(from, bounds)))
                     .collect(),
-                body: Box::new(self.expand_type_members(from, body)),
+                body: TyBox::new(self.expand_type_members(from, body)),
             },
             Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
-                lo: lo
+                lo: (lo
                     .as_ref()
-                    .map(|t| Box::new(self.expand_type_members(from, t))),
-                hi: hi
+                    .map(|t| Box::new(self.expand_type_members(from, t))))
+                .map(scala_rs_parser::TyBox::from),
+                hi: (hi
                     .as_ref()
-                    .map(|t| Box::new(self.expand_type_members(from, t))),
+                    .map(|t| Box::new(self.expand_type_members(from, t))))
+                .map(scala_rs_parser::TyBox::from),
             },
             Type::SingleType { prefix, sym } => Type::SingleType {
-                prefix: Box::new(self.expand_type_members(from, prefix)),
+                prefix: TyBox::new(self.expand_type_members(from, prefix)),
                 sym: *sym,
             },
             other => other.clone(),
@@ -8032,14 +8051,14 @@ impl SymbolTable {
                 } if n == name => {
                     return Some(Type::Method {
                         paramss: paramss.clone(),
-                        ret: Box::new(ret.clone()),
+                        ret: TyBox::new(ret.clone()),
                     });
                 }
                 RefineDecl::Val { name: n, ty } if n == name => return Some(ty.clone()),
                 RefineDecl::Type { name: n, rhs, .. } if n == name => {
                     return Some(rhs.clone().unwrap_or(Type::Named {
                         name: n.clone(),
-                        args: vec![],
+                        args: vec![].into(),
                     }));
                 }
                 _ => {}
@@ -8408,7 +8427,7 @@ impl SymbolTable {
             },
             _ => Type::Class {
                 sym: cls,
-                args: Vec::new(),
+                args: Vec::new().into(),
             },
         };
         let subst = |t: &Type| self.subst_as_seen_from_at(&recv, view_pre.as_ref(), t);
@@ -8557,6 +8576,15 @@ impl Default for SymbolTable {
 }
 
 fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Type {
+    // Nothing below a node with no type parameter changes, and no `Applied`
+    // is there to be renormalized by `apply_type_ctor`: the node is its own
+    // answer, and sharing it costs a reference count.
+    if !ty
+        .flags()
+        .contains(scala_rs_parser::TypeFlags::TYPE_PARAM | scala_rs_parser::TypeFlags::APPLIED)
+    {
+        return ty.clone();
+    }
     match ty {
         Type::TypeParam(id) => tps
             .iter()
@@ -8572,20 +8600,20 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
             subst_map(ctor, tps, args),
             as_.iter().map(|a| subst_map(a, tps, args)).collect(),
         ),
-        Type::Array(t) => Type::Array(Box::new(subst_map(t, tps, args))),
+        Type::Array(t) => Type::Array(TyBox::new(subst_map(t, tps, args))),
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|p| subst_map(p, tps, args)).collect(),
-            ret: Box::new(subst_map(ret, tps, args)),
+            ret: TyBox::new(subst_map(ret, tps, args)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(|p| subst_map(p, tps, args)).collect())
                 .collect(),
-            ret: Box::new(subst_map(ret, tps, args)),
+            ret: TyBox::new(subst_map(ret, tps, args)),
         },
-        Type::ByName(t) => Type::ByName(Box::new(subst_map(t, tps, args))),
-        Type::Repeated(t) => Type::Repeated(Box::new(subst_map(t, tps, args))),
+        Type::ByName(t) => Type::ByName(TyBox::new(subst_map(t, tps, args))),
+        Type::Repeated(t) => Type::Repeated(TyBox::new(subst_map(t, tps, args))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| subst_map(t, tps, args)).collect()),
         Type::Named { name, args: as_ } => Type::Named {
             name: name.clone(),
@@ -8599,7 +8627,7 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
                 .collect(),
         },
         Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(subst_map(tpe, tps, args)),
+            tpe: TyBox::new(subst_map(tpe, tps, args)),
             annot: annot.clone(),
         },
         Type::Existential { params, body } => {
@@ -8615,15 +8643,17 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
                     .iter()
                     .map(|(id, bounds)| (*id, subst_map(bounds, &ids, &values)))
                     .collect(),
-                body: Box::new(subst_map(body, &ids, &values)),
+                body: TyBox::new(subst_map(body, &ids, &values)),
             }
         }
         Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
-            lo: lo.as_ref().map(|t| Box::new(subst_map(t, tps, args))),
-            hi: hi.as_ref().map(|t| Box::new(subst_map(t, tps, args))),
+            lo: (lo.as_ref().map(|t| TyBox::new(subst_map(t, tps, args))))
+                .map(scala_rs_parser::TyBox::from),
+            hi: (hi.as_ref().map(|t| TyBox::new(subst_map(t, tps, args))))
+                .map(scala_rs_parser::TyBox::from),
         },
         Type::SingleType { prefix, sym } => Type::SingleType {
-            prefix: Box::new(subst_map(prefix, tps, args)),
+            prefix: TyBox::new(subst_map(prefix, tps, args)),
             sym: *sym,
         },
         other => other.clone(),
@@ -8846,7 +8876,7 @@ fn subst_refine_aliases_seen(
                 })
                 .collect(),
         },
-        Type::Array(t) => Type::Array(Box::new(subst_refine_aliases_seen(st, decls, t, seen))),
+        Type::Array(t) => Type::Array(TyBox::new(subst_refine_aliases_seen(st, decls, t, seen))),
         Type::Function { params, ret } => {
             let params = params
                 .iter()
@@ -8854,7 +8884,7 @@ fn subst_refine_aliases_seen(
                 .collect();
             Type::Function {
                 params,
-                ret: Box::new(subst_refine_aliases_seen(st, decls, ret, seen)),
+                ret: TyBox::new(subst_refine_aliases_seen(st, decls, ret, seen)),
             }
         }
         Type::Method { paramss, ret } => {
@@ -8868,12 +8898,12 @@ fn subst_refine_aliases_seen(
                 .collect();
             Type::Method {
                 paramss,
-                ret: Box::new(subst_refine_aliases_seen(st, decls, ret, seen)),
+                ret: TyBox::new(subst_refine_aliases_seen(st, decls, ret, seen)),
             }
         }
-        Type::ByName(t) => Type::ByName(Box::new(subst_refine_aliases_seen(st, decls, t, seen))),
+        Type::ByName(t) => Type::ByName(TyBox::new(subst_refine_aliases_seen(st, decls, t, seen))),
         Type::Repeated(t) => {
-            Type::Repeated(Box::new(subst_refine_aliases_seen(st, decls, t, seen)))
+            Type::Repeated(TyBox::new(subst_refine_aliases_seen(st, decls, t, seen)))
         }
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
@@ -8916,6 +8946,59 @@ pub(crate) fn subst_tparams_cow<'a>(
 
 /// Does any node of `ty` satisfy `f`? Walks the same shapes as `map_type`
 /// without rebuilding anything.
+/// [`any_type`] for a question only a node of certain kinds can answer
+/// `true` to: a subtree whose [`scala_rs_parser::TypeFlags`] hold none of
+/// `mask` is not entered. `f` must answer `false` for every node that is not
+/// one of those kinds.
+pub(crate) fn any_type_masked(
+    ty: &Type,
+    mask: scala_rs_parser::TypeFlags,
+    f: &mut impl FnMut(&Type) -> bool,
+) -> bool {
+    if !ty.flags().contains(mask) {
+        return false;
+    }
+    if f(ty) {
+        return true;
+    }
+    let some = |ts: &[Type], f: &mut _| ts.iter().any(|t| any_type_masked(t, mask, f));
+    let one = |t: &Type, f: &mut _| any_type_masked(t, mask, f);
+    match ty {
+        Type::Existential { params, body } => {
+            params.iter().any(|(_, bounds)| one(bounds, f)) || one(body, f)
+        }
+        Type::Class { args, .. }
+        | Type::Tuple(args)
+        | Type::Named { args, .. }
+        | Type::Overload(args) => some(args, f),
+        Type::Applied { ctor, args } => one(ctor, f) || some(args, f),
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            one(t, f)
+        }
+        Type::SingleType { prefix, .. } => one(prefix, f),
+        Type::Function { params, ret } => some(params, f) || one(ret, f),
+        Type::Method { paramss, ret } => paramss.iter().any(|ps| some(ps, f)) || one(ret, f),
+        Type::BoundedWildcard { lo, hi } => {
+            lo.as_ref().is_some_and(|t| one(t, f)) || hi.as_ref().is_some_and(|t| one(t, f))
+        }
+        Type::Refined { parents, decls } => {
+            some(parents, f)
+                || decls.iter().any(|d| match d {
+                    RefineDecl::Type { rhs, lo, hi, .. } => {
+                        rhs.as_ref().is_some_and(|t| one(t, f))
+                            || lo.as_ref().is_some_and(|t| one(t, f))
+                            || hi.as_ref().is_some_and(|t| one(t, f))
+                    }
+                    RefineDecl::Def { paramss, ret, .. } => {
+                        paramss.iter().any(|ps| some(ps, f)) || one(ret, f)
+                    }
+                    RefineDecl::Val { ty, .. } => one(ty, f),
+                })
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn any_type(ty: &Type, f: &mut impl FnMut(&Type) -> bool) -> bool {
     if f(ty) {
         return true;
@@ -8973,9 +9056,9 @@ pub(crate) fn map_type(ty: &Type, f: &mut impl FnMut(&Type) -> Type) -> Type {
             map_type(ctor, f),
             args.iter().map(|a| map_type(a, f)).collect(),
         ),
-        Type::Array(t) => Type::Array(Box::new(map_type(t, f))),
-        Type::ByName(t) => Type::ByName(Box::new(map_type(t, f))),
-        Type::Repeated(t) => Type::Repeated(Box::new(map_type(t, f))),
+        Type::Array(t) => Type::Array(TyBox::new(map_type(t, f))),
+        Type::ByName(t) => Type::ByName(TyBox::new(map_type(t, f))),
+        Type::Repeated(t) => Type::Repeated(TyBox::new(map_type(t, f))),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| map_type(t, f)).collect()),
         Type::Overload(ts) => Type::Overload(ts.iter().map(|t| map_type(t, f)).collect()),
         Type::Named { name, args } => Type::Named {
@@ -8984,17 +9067,17 @@ pub(crate) fn map_type(ty: &Type, f: &mut impl FnMut(&Type) -> Type) -> Type {
         },
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(|p| map_type(p, f)).collect(),
-            ret: Box::new(map_type(ret, f)),
+            ret: TyBox::new(map_type(ret, f)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(|p| map_type(p, f)).collect())
                 .collect(),
-            ret: Box::new(map_type(ret, f)),
+            ret: TyBox::new(map_type(ret, f)),
         },
         Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(map_type(tpe, f)),
+            tpe: TyBox::new(map_type(tpe, f)),
             annot: annot.clone(),
         },
         Type::Existential { params, body } => Type::Existential {
@@ -9002,14 +9085,14 @@ pub(crate) fn map_type(ty: &Type, f: &mut impl FnMut(&Type) -> Type) -> Type {
                 .iter()
                 .map(|(id, bounds)| (*id, map_type(bounds, f)))
                 .collect(),
-            body: Box::new(map_type(body, f)),
+            body: TyBox::new(map_type(body, f)),
         },
         Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
-            lo: lo.as_ref().map(|t| Box::new(map_type(t, f))),
-            hi: hi.as_ref().map(|t| Box::new(map_type(t, f))),
+            lo: (lo.as_ref().map(|t| TyBox::new(map_type(t, f)))).map(scala_rs_parser::TyBox::from),
+            hi: (hi.as_ref().map(|t| TyBox::new(map_type(t, f)))).map(scala_rs_parser::TyBox::from),
         },
         Type::SingleType { prefix, sym } => Type::SingleType {
-            prefix: Box::new(map_type(prefix, f)),
+            prefix: TyBox::new(map_type(prefix, f)),
             sym: *sym,
         },
         Type::Refined { parents, decls } => Type::Refined {
@@ -9088,11 +9171,11 @@ pub(crate) fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
         },
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(go).collect()),
         Type::Applied { ctor, args } => apply_type_ctor(go(ctor), args.iter().map(go).collect()),
-        Type::Array(t) => Type::Array(Box::new(go(t))),
-        Type::ByName(t) => Type::ByName(Box::new(go(t))),
-        Type::Repeated(t) => Type::Repeated(Box::new(go(t))),
+        Type::Array(t) => Type::Array(TyBox::new(go(t))),
+        Type::ByName(t) => Type::ByName(TyBox::new(go(t))),
+        Type::Repeated(t) => Type::Repeated(TyBox::new(go(t))),
         Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(go(tpe)),
+            tpe: TyBox::new(go(tpe)),
             annot: annot.clone(),
         },
         Type::Existential { params, body } => Type::Existential {
@@ -9100,24 +9183,24 @@ pub(crate) fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
                 .iter()
                 .map(|(id, bounds)| (*id, go(bounds)))
                 .collect(),
-            body: Box::new(go(body)),
+            body: TyBox::new(go(body)),
         },
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(go).collect(),
-            ret: Box::new(go(ret)),
+            ret: TyBox::new(go(ret)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(go).collect())
                 .collect(),
-            ret: Box::new(go(ret)),
+            ret: TyBox::new(go(ret)),
         },
         // See `this_type_owners`. A view's *prefix* is left alone: it is
         // `SymbolTable::rewrite_view_this`'s, which has already run and
         // knows the difference between the receiver's `this` and its class.
         Type::SingleType { prefix, sym } => Type::SingleType {
-            prefix: Box::new(go(prefix)),
+            prefix: TyBox::new(go(prefix)),
             sym: *sym,
         },
         Type::Refined { parents, decls } => Type::Refined {
@@ -9174,10 +9257,16 @@ pub fn apply_type_ctor(ctor: Type, args: Vec<Type>) -> Type {
         } => {
             let mut all = existing;
             all.extend(args);
-            apply_type_ctor(*ctor, all)
+            apply_type_ctor(
+                <scala_rs_parser::Type as Clone>::clone(&*ctor),
+                all.into_vec(),
+            )
         }
         Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(apply_type_ctor(*tpe, args)),
+            tpe: TyBox::new(apply_type_ctor(
+                <scala_rs_parser::Type as Clone>::clone(&*tpe),
+                args,
+            )),
             annot,
         },
         Type::Refined { mut parents, decls }
@@ -9189,8 +9278,8 @@ pub fn apply_type_ctor(ctor: Type, args: Vec<Type>) -> Type {
             Type::Refined { parents, decls }
         }
         other => Type::Applied {
-            ctor: Box::new(other),
-            args,
+            ctor: TyBox::new(other),
+            args: args.into(),
         },
     }
 }
@@ -9343,19 +9432,19 @@ mod api_boundary_tests {
         );
         st.get_mut(derived).parents.push(Type::Class {
             sym: base,
-            args: vec![],
+            args: vec![].into(),
         });
         let member = st.alloc("F", base, SymKind::TypeMember, Flags::EMPTY, "");
         let param = st.alloc("A", member, SymKind::TypeParam, Flags::EMPTY, "");
         st.get_mut(member).tparams.push(param);
         st.get_mut(member).bound_hi = Some(Type::Class {
             sym: action,
-            args: vec![],
+            args: vec![].into(),
         });
 
         let named = Type::Named {
             name: "namedmember.Derived.F".into(),
-            args: vec![Type::Int],
+            args: vec![Type::Int].into(),
         };
         assert_eq!(st.class_sym_of(&named), Some(action));
     }
@@ -9376,24 +9465,24 @@ mod api_boundary_tests {
         st.get_mut(alias).tparams.push(element);
         st.get_mut(alias).is_type_alias = true;
         st.get_mut(alias).ty = Type::Function {
-            params: vec![Type::Int],
-            ret: Box::new(Type::TypeParam(element)),
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(Type::TypeParam(element)),
         };
 
         let named = Type::Named {
             name: "alias.Types.Fetch".into(),
-            args: vec![Type::String],
+            args: vec![Type::String].into(),
         };
         let expanded = Type::Function {
-            params: vec![Type::Int],
-            ret: Box::new(Type::String),
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(Type::String),
         };
         assert!(st.is_sub_type(&expanded, &named));
         assert!(st.is_sub_type(&named, &expanded));
         assert!(!st.is_sub_type(
             &Type::Function {
-                params: vec![Type::Int],
-                ret: Box::new(Type::Int),
+                params: vec![Type::Int].into(),
+                ret: TyBox::new(Type::Int),
             },
             &named
         ));
@@ -9407,18 +9496,19 @@ mod api_boundary_tests {
         st.get_mut(base).tparams.push(element);
         let child = st.alloc("Child", st.root, SymKind::Class, Flags::EMPTY, "Child");
         st.get_mut(child).parents.push(Type::Applied {
-            ctor: Box::new(Type::Class {
+            ctor: (Box::new(Type::Class {
                 sym: base,
-                args: vec![],
-            }),
-            args: vec![Type::String],
+                args: vec![].into(),
+            }))
+            .into(),
+            args: vec![Type::String].into(),
         });
 
         assert_eq!(
             st.subst_as_seen_from(
                 &Type::Class {
                     sym: child,
-                    args: vec![],
+                    args: vec![].into(),
                 },
                 &Type::TypeParam(element),
             ),
@@ -9440,7 +9530,10 @@ mod reach_cache_tests {
     }
 
     fn bare(sym: SymbolId) -> Type {
-        Type::Class { sym, args: vec![] }
+        Type::Class {
+            sym,
+            args: vec![].into(),
+        }
     }
 
     /// Every ancestry walk is served from `reach_cache` while no symbol has
@@ -9474,7 +9567,7 @@ mod reach_cache_tests {
             leaf,
             Type::Named {
                 name: "Base".into(),
-                args: vec![],
+                args: vec![].into(),
             },
         );
         assert!(!st.is_ancestor_of(base, leaf));
@@ -9504,7 +9597,7 @@ mod reach_cache_tests {
             partial,
             Type::Class {
                 sym: function1,
-                args: vec![Type::Int, Type::String],
+                args: vec![Type::Int, Type::String].into(),
             },
         );
         extend(&mut st, seq, bare(partial));
@@ -9521,7 +9614,7 @@ mod reach_cache_tests {
             &bare(seq),
             &Type::Class {
                 sym: function1,
-                args: vec![Type::Int, Type::String],
+                args: vec![Type::Int, Type::String].into(),
             }
         ));
     }

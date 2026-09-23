@@ -34,7 +34,7 @@ impl Typer {
         let sub = |t: &Type| {
             let want = Type::Class {
                 sym: cls,
-                args: vec![t.clone()],
+                args: vec![t.clone()].into(),
             };
             match self.search_implicit_at(&want, depth + 1) {
                 ImplicitSearch::Found(_) => true,
@@ -131,7 +131,7 @@ impl Typer {
     fn manifest_sub(&mut self, cls: SymbolId, t: &Type, span: Span, depth: usize) -> Option<Tree> {
         let want = Type::Class {
             sym: cls,
-            args: vec![t.clone()],
+            args: vec![t.clone()].into(),
         };
         self.warm_implicit_scope(&want);
         match self.search_implicit_at(&want, depth) {
@@ -271,7 +271,7 @@ impl Typer {
                         self.reflect_class("scala.reflect.ClassTag", "scala/reflect/ClassTag")?;
                     let want = Type::Class {
                         sym: ct,
-                        args: vec![(**elem).clone()],
+                        args: vec![(**elem).clone()].into(),
                     };
                     self.warm_implicit_scope(&want);
                     match self.search_implicit_at(&want, depth + 1) {
@@ -325,7 +325,7 @@ impl Typer {
         }
         let class = match &t {
             Type::Class { sym, args } if self.manifest_static_class(*sym) => {
-                Some((*sym, args.clone()))
+                Some((*sym, args.to_vec()))
             }
             Type::String => Some((self.st.string_sym, vec![])),
             Type::Tuple(args) => self
@@ -333,9 +333,9 @@ impl Typer {
                     &format!("scala.Tuple{}", args.len()),
                     &format!("scala/Tuple{}", args.len()),
                 )
-                .map(|s| (s, args.clone())),
+                .map(|s| (s, args.to_vec())),
             Type::Function { .. } => self.st.function_class_form(&t).and_then(|c| match c {
-                Type::Class { sym, args } => Some((sym, args)),
+                Type::Class { sym, args } => Some((sym, args.into_vec())),
                 _ => None,
             }),
             _ => None,
@@ -350,7 +350,7 @@ impl Typer {
             );
             class_arg.ty = Type::Class {
                 sym,
-                args: targs.clone(),
+                args: targs.clone().into(),
             };
             let mut args = vec![class_arg];
             for t in targs {

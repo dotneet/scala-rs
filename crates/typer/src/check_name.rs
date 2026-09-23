@@ -60,7 +60,7 @@ mod import_prefix_tests {
         }
         t.st.get_mut(child).parents.push(Type::Class {
             sym: owner,
-            args: vec![],
+            args: vec![].into(),
         });
         {
             let _live = t.import_prefix_scope();
@@ -106,7 +106,7 @@ mod import_prefix_tests {
         let tp = t.st.alloc("T", child, SymKind::TypeParam, Flags::EMPTY, "");
         t.st.get_mut(tp).bound_hi = Some(Type::Class {
             sym: owner,
-            args: vec![],
+            args: vec![].into(),
         });
         t.st.get_mut(child).parents.push(Type::TypeParam(tp));
         t.term_import_prefixes.push((child, prefix()));
@@ -1948,7 +1948,7 @@ impl Typer {
         };
         // A compound self type offers the members of every part.
         let roots: Vec<Type> = match &st {
-            Type::Refined { parents, .. } => parents.clone(),
+            Type::Refined { parents, .. } => parents.clone().into_vec(),
             other => vec![other.clone()],
         };
         for root in roots {

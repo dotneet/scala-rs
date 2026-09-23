@@ -34,6 +34,7 @@
 //! `Check::report_reify_gap` reports it; nothing is approximated. The flag
 //! words on free symbols are the exact values nsc writes (`FreeFlags`).
 
+use scala_rs_parser::TyBox;
 use std::collections::{HashMap, HashSet};
 
 use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
@@ -1175,7 +1176,7 @@ impl<'a> Reifier<'a> {
                 free_flags::LAZY_VAL,
                 Type::Method {
                     paramss: vec![],
-                    ret: Box::new(s.ty.clone()),
+                    ret: TyBox::new(s.ty.clone()),
                 },
             ),
             SymKind::Term => (free_flags::VAL, s.ty.clone()),
@@ -1196,7 +1197,7 @@ impl<'a> Reifier<'a> {
                     free_flags::DEF,
                     Type::Method {
                         paramss: vec![],
-                        ret: Box::new(other.clone()),
+                        ret: TyBox::new(other.clone()),
                     },
                 ),
             },
@@ -1568,7 +1569,7 @@ impl<'a> Reifier<'a> {
                     self.support_member("mkIdent"),
                     vec![self.static_class(&format!("scala.Function{}", params.len()))],
                 );
-                let mut all: Vec<Type> = params.clone();
+                let mut all: Vec<Type> = params.clone().into_vec();
                 all.push((**ret).clone());
                 self.applied_tree(head, &all)
             }
@@ -1872,7 +1873,7 @@ impl<'a> Reifier<'a> {
             Type::Wildcard => Ok(self.call(self.universe_member("WildcardType"), vec![])),
             Type::Class { sym, args } => self.class_type_value(*sym, args),
             Type::Function { params, ret } => {
-                let mut all: Vec<Type> = params.clone();
+                let mut all: Vec<Type> = params.clone().into_vec();
                 all.push((**ret).clone());
                 self.applied_value(
                     self.static_class(&format!("scala.Function{}", params.len())),
@@ -2062,7 +2063,7 @@ impl<'a> Reifier<'a> {
         let st = self.st();
         let flat = st.dealias(&Type::Class {
             sym: cls,
-            args: args.to_vec(),
+            args: args.to_vec().into(),
         });
         match &flat {
             Type::Class { sym, args } if *sym == cls => {

@@ -5,6 +5,7 @@
 
 use crate::code::Assembler;
 use crate::gen::*;
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
 
@@ -30,7 +31,7 @@ pub(crate) fn gen_java_varargs_array(
     let n = args.len() as i32;
     asm.iconst(n);
     emit_newarray(asm, ctx, &elem);
-    let arr_ty = Type::Array(Box::new(elem.clone()));
+    let arr_ty = Type::Array(TyBox::new(elem.clone()));
     let elem_prim = is_jvm_primitive(&elem) && !is_unit_like(&elem);
     for (i, a) in args.iter().enumerate() {
         asm.dup();
@@ -436,7 +437,7 @@ pub(crate) fn jvm_assignable(st: &SymbolTable, from: &str, to: &str) -> bool {
         || st
             .base_type_seq(&Type::Class {
                 sym: f,
-                args: vec![],
+                args: vec![].into(),
             })
             .iter()
             .any(|b| st.class_sym_of(b) == Some(t))

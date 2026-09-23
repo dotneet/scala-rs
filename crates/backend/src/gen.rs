@@ -325,7 +325,7 @@ pub(crate) fn collect_super_accesses(
         {
             let selected_params = match &tree.ty {
                 Type::Method { paramss, .. } => Some(paramss.iter().flatten().cloned().collect()),
-                Type::Function { params, .. } => Some(params.clone()),
+                Type::Function { params, .. } => Some(params.to_vec()),
                 _ => None,
             };
             out.push((name.clone(), tree.sym, selected_params));

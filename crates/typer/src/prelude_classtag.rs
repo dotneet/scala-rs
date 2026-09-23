@@ -19,6 +19,7 @@
 
 use crate::prelude::prelude_method;
 use crate::symbol::{Intrinsic, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::Type;
 
 pub fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -41,7 +42,7 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         vec![],
         Type::Class {
             sym: ct,
-            args: vec![Type::Array(Box::new(Type::TypeParam(t)))],
+            args: vec![Type::Array(TyBox::new(Type::TypeParam(t)))].into(),
         },
         Intrinsic::None,
     );

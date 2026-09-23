@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, iface, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn add_bit_set(st: &mut SymbolTable) {
@@ -29,7 +30,7 @@ pub(crate) fn add_bit_set(st: &mut SymbolTable) {
     );
     let bs_t = Type::Class {
         sym: bs,
-        args: vec![],
+        args: vec![].into(),
     };
     let bs_mod = module(st, immp, "BitSet", "scala/collection/immutable/BitSet$");
     let bs_cls = st.module_class_of(bs_mod);
@@ -37,7 +38,7 @@ pub(crate) fn add_bit_set(st: &mut SymbolTable) {
         st,
         bs_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Int))],
+        vec![Type::Repeated(TyBox::new(Type::Int))],
         bs_t,
         Intrinsic::None,
     );
@@ -51,7 +52,7 @@ pub(crate) fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, libr
     let ta = Type::TypeParam(a);
     let opt = Type::Class {
         sym: o,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(st, o, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
     method(st, o, "get", vec![], ta.clone(), Intrinsic::None);
@@ -87,7 +88,7 @@ pub(crate) fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, libr
         if library_abi {
             Type::Class {
                 sym: option_wf,
-                args: vec![ta],
+                args: vec![ta].into(),
             }
         } else {
             opt
@@ -103,7 +104,7 @@ pub(crate) fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, libr
     // `Option[Int]` cannot recover `Int`.
     st.get_mut(some).parents = vec![Type::Class {
         sym: o,
-        args: vec![tsa.clone()],
+        args: vec![tsa.clone()].into(),
     }];
     method(
         st,
@@ -112,7 +113,7 @@ pub(crate) fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, libr
         vec![tsa.clone()],
         Type::Class {
             sym: some,
-            args: vec![tsa.clone()],
+            args: vec![tsa.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -139,7 +140,7 @@ pub(crate) fn add_option_members(st: &mut SymbolTable, option_wf: SymbolId, libr
     let none_cls = st.module_class_of(st.none_sym);
     st.get_mut(none_cls).parents = vec![Type::Class {
         sym: o,
-        args: vec![Type::Nothing],
+        args: vec![Type::Nothing].into(),
     }];
 }
 pub(crate) fn add_cons_members(st: &mut SymbolTable, library_abi: bool) {
@@ -149,7 +150,7 @@ pub(crate) fn add_cons_members(st: &mut SymbolTable, library_abi: bool) {
     let tca = Type::TypeParam(ca);
     let list_ca = Type::Class {
         sym: st.list_sym,
-        args: vec![tca.clone()],
+        args: vec![tca.clone()].into(),
     };
     // `::[A] extends List[A]`, so `case h :: t` on a `List[Int]` binds `h: Int`.
     st.get_mut(cons).parents = vec![list_ca.clone()];
@@ -161,7 +162,7 @@ pub(crate) fn add_cons_members(st: &mut SymbolTable, library_abi: bool) {
     let nil_cls = st.module_class_of(st.nil_sym);
     let nil_parent = vec![Type::Class {
         sym: st.list_sym,
-        args: vec![Type::Nothing],
+        args: vec![Type::Nothing].into(),
     }];
     st.get_mut(st.nil_sym).parents = nil_parent.clone();
     st.get_mut(nil_cls).parents = nil_parent;
@@ -190,7 +191,7 @@ pub(crate) fn add_list_members(
     let ta = Type::TypeParam(a);
     let list_t = Type::Class {
         sym: l,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(st, l, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
     method(st, l, "head", vec![], ta.clone(), Intrinsic::None);
@@ -235,9 +236,10 @@ pub(crate) fn add_list_members(
                 ta.clone(),
                 Type::Class {
                     sym: l,
-                    args: vec![],
+                    args: vec![].into(),
                 },
-            ],
+            ]
+            .into(),
         }
     } else {
         list_t.clone()
@@ -258,7 +260,7 @@ pub(crate) fn add_list_members(
             vec![],
             Type::Class {
                 sym: it,
-                args: vec![ta.clone()],
+                args: vec![ta.clone()].into(),
             },
             Intrinsic::None,
         );
@@ -273,7 +275,7 @@ pub(crate) fn add_list_members(
         vec![list_t.clone()],
         Type::Class {
             sym: st.option_sym,
-            args: vec![list_t.clone()],
+            args: vec![list_t.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -283,17 +285,17 @@ pub(crate) fn add_list_members(
             st,
             mcls,
             "apply",
-            vec![Type::Repeated(Box::new(Type::Any))],
+            vec![Type::Repeated(TyBox::new(Type::Any))],
             list_t.clone(),
             Intrinsic::None,
         );
         let la = type_param(st, list_apply, "A");
         st.get_mut(list_apply).tparams = vec![la];
         st.get_mut(list_apply).ty = Type::Method {
-            paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(la)))]],
-            ret: Box::new(Type::Class {
+            paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(la)))]],
+            ret: TyBox::new(Type::Class {
                 sym: l,
-                args: vec![Type::TypeParam(la)],
+                args: vec![Type::TypeParam(la)].into(),
             }),
         };
     }
@@ -343,7 +345,7 @@ pub(crate) fn add_partial_function(st: &mut SymbolTable) {
     st.get_mut(pf).parents = vec![
         Type::Class {
             sym: f1,
-            args: vec![ta.clone(), tb.clone()],
+            args: vec![ta.clone(), tb.clone()].into(),
         },
         Type::AnyRef,
     ];
@@ -389,11 +391,11 @@ pub(crate) fn add_list_collect(st: &mut SymbolTable) {
     };
     let list_t = Type::Class {
         sym: l,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     let pf_ty = Type::Class {
         sym: pf,
-        args: vec![ta, Type::Any],
+        args: vec![ta, Type::Any].into(),
     };
     method(st, l, "collect", vec![pf_ty], list_t, Intrinsic::None);
 }
@@ -414,11 +416,11 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
     let tv = Type::TypeParam(mv);
     let map_t = Type::Class {
         sym: map,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     method(
         st,
@@ -435,7 +437,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         vec![tk.clone()],
         Type::Class {
             sym: st.option_sym,
-            args: vec![tv.clone()],
+            args: vec![tv.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -472,7 +474,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: map,
-            args: vec![Type::Any, Type::Any],
+            args: vec![Type::Any, Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -480,7 +482,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         st,
         map_cls,
         "apply",
-        vec![Type::Repeated(Box::new(pair.clone()))],
+        vec![Type::Repeated(TyBox::new(pair.clone()))],
         map_t.clone(),
         Intrinsic::None,
     );
@@ -489,13 +491,13 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
     st.get_mut(map_apply).tparams = vec![mak, mav];
     let map_pair = Type::Class {
         sym: tuple2,
-        args: vec![Type::TypeParam(mak), Type::TypeParam(mav)],
+        args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
     };
     st.get_mut(map_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(map_pair))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(map_pair))]],
+        ret: TyBox::new(Type::Class {
             sym: map,
-            args: vec![Type::TypeParam(mak), Type::TypeParam(mav)],
+            args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
         }),
     };
     let mems = st.get(map_cls).members.clone();
@@ -513,7 +515,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
     let ta = Type::TypeParam(va);
     let vec_t = Type::Class {
         sym: vec,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -562,7 +564,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: vec,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -570,17 +572,17 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         st,
         vec_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         vec_t.clone(),
         Intrinsic::None,
     );
     let vaa = type_param(st, vec_apply, "A");
     st.get_mut(vec_apply).tparams = vec![vaa];
     st.get_mut(vec_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(vaa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(vaa)))]],
+        ret: TyBox::new(Type::Class {
             sym: vec,
-            args: vec![Type::TypeParam(vaa)],
+            args: vec![Type::TypeParam(vaa)].into(),
         }),
     };
     let mems = st.get(vec_cls).members.clone();
@@ -593,7 +595,7 @@ pub(crate) fn add_set(st: &mut SymbolTable) {
     let ta = Type::TypeParam(sa);
     let set_t = Type::Class {
         sym: set,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -640,7 +642,7 @@ pub(crate) fn add_set(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: set,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -648,17 +650,17 @@ pub(crate) fn add_set(st: &mut SymbolTable) {
         st,
         set_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         set_t,
         Intrinsic::None,
     );
     let saa = type_param(st, set_apply, "A");
     st.get_mut(set_apply).tparams = vec![saa];
     st.get_mut(set_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(saa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]],
+        ret: TyBox::new(Type::Class {
             sym: set,
-            args: vec![Type::TypeParam(saa)],
+            args: vec![Type::TypeParam(saa)].into(),
         }),
     };
     let mems = st.get(set_cls).members.clone();
@@ -671,7 +673,7 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
     let ta = Type::TypeParam(sa);
     let seq_t = Type::Class {
         sym: seq,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -699,7 +701,7 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: seq,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -707,17 +709,17 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
         st,
         seq_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         seq_t.clone(),
         Intrinsic::None,
     );
     let saa = type_param(st, seq_apply, "A");
     st.get_mut(seq_apply).tparams = vec![saa];
     st.get_mut(seq_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(saa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]],
+        ret: TyBox::new(Type::Class {
             sym: seq,
-            args: vec![Type::TypeParam(saa)],
+            args: vec![Type::TypeParam(saa)].into(),
         }),
     };
     let mems = st.get(seq_cls).members.clone();
@@ -735,7 +737,7 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
     let tll = Type::TypeParam(la);
     let ll_t = Type::Class {
         sym: ll,
-        args: vec![tll.clone()],
+        args: vec![tll.clone()].into(),
     };
     method(
         st,
@@ -760,7 +762,7 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: ll,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -768,17 +770,17 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
         st,
         ll_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         ll_t,
         Intrinsic::None,
     );
     let lla = type_param(st, ll_apply, "A");
     st.get_mut(ll_apply).tparams = vec![lla];
     st.get_mut(ll_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(lla)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(lla)))]],
+        ret: TyBox::new(Type::Class {
             sym: ll,
-            args: vec![Type::TypeParam(lla)],
+            args: vec![Type::TypeParam(lla)].into(),
         }),
     };
     let mems = st.get(ll_cls).members.clone();
@@ -787,14 +789,14 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
     // `List` is a `Seq` in 2.13; XML `Elem` takes `Seq[Node]`.
     st.get_mut(st.list_sym).parents.push(Type::Class {
         sym: seq,
-        args: vec![],
+        args: vec![].into(),
     });
     // `SeqHasAsJava` takes `scala.collection.Seq`, not `immutable.Seq`.
     let coll_seq = crate::classpath::find_or_stub_java_class(st, "scala/collection/Seq");
     let la = st.get(st.list_sym).tparams[0];
     st.get_mut(st.list_sym).parents.push(Type::Class {
         sym: coll_seq,
-        args: vec![Type::TypeParam(la)],
+        args: vec![Type::TypeParam(la)].into(),
     });
 }
 /// `scala.collection.View` / `SeqView` against 2.13.16.
@@ -811,11 +813,11 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
     let list_sym = st.list_sym;
     let view_t = |a: Type| Type::Class {
         sym: view,
-        args: vec![a],
+        args: vec![a].into(),
     };
     let list_t = |a: Type| Type::Class {
         sym: list_sym,
-        args: vec![a],
+        args: vec![a].into(),
     };
     method(
         st,
@@ -834,7 +836,7 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
     st.get_mut(vmap).paramss = vec![vec![vf]];
     st.get_mut(vmap).ty = Type::Method {
         paramss: vec![vec![fn1(vta.clone(), Type::TypeParam(vb))]],
-        ret: Box::new(view_t(Type::TypeParam(vb))),
+        ret: TyBox::new(view_t(Type::TypeParam(vb))),
     };
 
     let seq_view = iface(st, coll, "SeqView", "scala/collection/SeqView");
@@ -845,7 +847,7 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
         Type::AnyRef,
         Type::Class {
             sym: view,
-            args: vec![sta.clone()],
+            args: vec![sta.clone()].into(),
         },
     ];
     method(
@@ -865,9 +867,9 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
     st.get_mut(smap).paramss = vec![vec![sf]];
     st.get_mut(smap).ty = Type::Method {
         paramss: vec![vec![fn1(sta.clone(), Type::TypeParam(sb))]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: seq_view,
-            args: vec![Type::TypeParam(sb)],
+            args: vec![Type::TypeParam(sb)].into(),
         }),
     };
 
@@ -879,7 +881,7 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
             vec![],
             Type::Class {
                 sym: seq_view,
-                args: vec![Type::TypeParam(la)],
+                args: vec![Type::TypeParam(la)].into(),
             },
             Intrinsic::None,
         );
@@ -893,16 +895,16 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
     let n = st.alloc("n", fill, crate::symbol::SymKind::Term, Flags::PARAM, "");
     st.get_mut(n).ty = Type::Int;
     let elem = st.alloc("elem", fill, crate::symbol::SymKind::Term, Flags::PARAM, "");
-    st.get_mut(elem).ty = Type::ByName(Box::new(Type::TypeParam(fa)));
+    st.get_mut(elem).ty = Type::ByName(TyBox::new(Type::TypeParam(fa)));
     st.get_mut(fill).tparams = vec![fa];
     st.get_mut(fill).params = vec![n, elem];
     st.get_mut(fill).paramss = vec![vec![n], vec![elem]];
     st.get_mut(fill).ty = Type::Method {
         paramss: vec![
             vec![Type::Int],
-            vec![Type::ByName(Box::new(Type::TypeParam(fa)))],
+            vec![Type::ByName(TyBox::new(Type::TypeParam(fa)))],
         ],
-        ret: Box::new(view_t(Type::TypeParam(fa))),
+        ret: TyBox::new(view_t(Type::TypeParam(fa))),
     };
     st.set_jvm_name(fill, "(ILscala/Function0;)Ljava/lang/Object;");
 
@@ -934,7 +936,7 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
             vec![Type::TypeParam(ia), Type::Int],
             vec![fn1(Type::TypeParam(ia), Type::TypeParam(ia))],
         ],
-        ret: Box::new(view_t(Type::TypeParam(ia))),
+        ret: TyBox::new(view_t(Type::TypeParam(ia))),
     };
     st.get_mut(iterate).jvm_name =
         "(Ljava/lang/Object;ILscala/Function1;)Ljava/lang/Object;".into();
@@ -954,7 +956,7 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
     let ta = Type::TypeParam(ia);
     let idx_t = Type::Class {
         sym: idx,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -978,7 +980,7 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: idx,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -986,17 +988,17 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
         st,
         idx_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         idx_t.clone(),
         Intrinsic::None,
     );
     let iaa = type_param(st, idx_apply, "A");
     st.get_mut(idx_apply).tparams = vec![iaa];
     st.get_mut(idx_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(iaa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(iaa)))]],
+        ret: TyBox::new(Type::Class {
             sym: idx,
-            args: vec![Type::TypeParam(iaa)],
+            args: vec![Type::TypeParam(iaa)].into(),
         }),
     };
     let mems = st.get(idx_cls).members.clone();
@@ -1022,7 +1024,7 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
     let tq = Type::TypeParam(qa);
     let queue_t = Type::Class {
         sym: queue,
-        args: vec![tq.clone()],
+        args: vec![tq.clone()].into(),
     };
     method(
         st,
@@ -1039,7 +1041,7 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: tuple2,
-            args: vec![tq.clone(), queue_t.clone()],
+            args: vec![tq.clone(), queue_t.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -1060,7 +1062,7 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: queue,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -1068,17 +1070,17 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
         st,
         queue_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         queue_t.clone(),
         Intrinsic::None,
     );
     let qaa = type_param(st, q_apply, "A");
     st.get_mut(q_apply).tparams = vec![qaa];
     st.get_mut(q_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(qaa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(qaa)))]],
+        ret: TyBox::new(Type::Class {
             sym: queue,
-            args: vec![Type::TypeParam(qaa)],
+            args: vec![Type::TypeParam(qaa)].into(),
         }),
     };
     let mems = st.get(queue_cls).members.clone();

@@ -1,5 +1,6 @@
 use crate::prelude::{abs_class, class, ctor_field, iface, method, module_extending};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, Type};
 
 /// scala-xml 2.3 (`Elem(String, String, MetaData, NamespaceBinding, boolean, Seq[Node])`).
@@ -14,7 +15,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
     let node = abs_class(st, xml, "Node", "scala/xml/Node", &[Type::AnyRef]);
     let node_t = Type::Class {
         sym: node,
-        args: vec![],
+        args: vec![].into(),
     };
     let metadata = abs_class(st, xml, "MetaData", "scala/xml/MetaData", &[Type::AnyRef]);
     let nsb = abs_class(
@@ -31,7 +32,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
         "scala/xml/Null$",
         Type::Class {
             sym: metadata,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     let _top = module_extending(
@@ -41,7 +42,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
         "scala/xml/TopScope$",
         Type::Class {
             sym: nsb,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     let seq = st
@@ -53,7 +54,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
         .expect("Seq");
     let seq_node = Type::Class {
         sym: seq,
-        args: vec![node_t.clone()],
+        args: vec![node_t.clone()].into(),
     };
     let elem = class(st, xml, "Elem", "scala/xml/Elem", &[node_t.clone()]);
     let p_prefix = ctor_field(st, elem, "prefix", Type::String);
@@ -64,7 +65,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
         "attributes",
         Type::Class {
             sym: metadata,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     let p_scope = ctor_field(
@@ -73,7 +74,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
         "scope",
         Type::Class {
             sym: nsb,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     let p_min = ctor_field(st, elem, "minimizeEmpty", Type::Boolean);
@@ -112,7 +113,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
     st.get_mut(atom).ctor_fields = vec![ad];
     let meta_t = Type::Class {
         sym: metadata,
-        args: vec![],
+        args: vec![].into(),
     };
     let upa = class(
         st,
@@ -127,7 +128,7 @@ pub(crate) fn add_xml(st: &mut SymbolTable) {
     st.get_mut(upa).ctor_fields = vec![uk, uv, un];
     let nsb_t = Type::Class {
         sym: nsb,
-        args: vec![],
+        args: vec![].into(),
     };
     let np = ctor_field(st, nsb, "prefix", Type::String);
     let nu = ctor_field(st, nsb, "uri", Type::String);
@@ -159,7 +160,7 @@ pub(crate) fn add_enumeration(st: &mut SymbolTable) {
     method(st, val, "id", vec![], Type::Int, Intrinsic::None);
     let val_t = Type::Class {
         sym: val,
-        args: vec![],
+        args: vec![].into(),
     };
     method(st, en, "Value", vec![], val_t, Intrinsic::None);
 }
@@ -168,11 +169,11 @@ pub(crate) fn add_delayed_init_app(st: &mut SymbolTable) {
     let di = iface(st, st.scala_pkg, "DelayedInit", "scala/DelayedInit");
     let d = st.alloc("delayedInit", di, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(d).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(Box::new(Type::Unit))]],
-        ret: Box::new(Type::Unit),
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::Unit))]],
+        ret: TyBox::new(Type::Unit),
     };
     let p = st.alloc("x", d, SymKind::Term, Flags::PARAM.with(Flags::BYNAME), "");
-    st.get_mut(p).ty = Type::ByName(Box::new(Type::Unit));
+    st.get_mut(p).ty = Type::ByName(TyBox::new(Type::Unit));
     st.get_mut(d).params = vec![p];
     st.get_mut(d).paramss = vec![vec![p]];
 
@@ -180,25 +181,25 @@ pub(crate) fn add_delayed_init_app(st: &mut SymbolTable) {
     st.get_mut(app).parents = vec![
         Type::Class {
             sym: di,
-            args: vec![],
+            args: vec![].into(),
         },
         Type::AnyRef,
     ];
     let d2 = st.alloc("delayedInit", app, SymKind::Method, Flags::EMPTY, "");
     st.get_mut(d2).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(Box::new(Type::Unit))]],
-        ret: Box::new(Type::Unit),
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::Unit))]],
+        ret: TyBox::new(Type::Unit),
     };
     let p2 = st.alloc("x", d2, SymKind::Term, Flags::PARAM.with(Flags::BYNAME), "");
-    st.get_mut(p2).ty = Type::ByName(Box::new(Type::Unit));
+    st.get_mut(p2).ty = Type::ByName(TyBox::new(Type::Unit));
     st.get_mut(d2).params = vec![p2];
     st.get_mut(d2).paramss = vec![vec![p2]];
 
     let main = st.alloc("main", app, SymKind::Method, Flags::EMPTY, "");
-    let args_ty = Type::Array(Box::new(Type::String));
+    let args_ty = Type::Array(TyBox::new(Type::String));
     st.get_mut(main).ty = Type::Method {
         paramss: vec![vec![args_ty.clone()]],
-        ret: Box::new(Type::Unit),
+        ret: TyBox::new(Type::Unit),
     };
     let ap = st.alloc("args", main, SymKind::Term, Flags::PARAM, "");
     st.get_mut(ap).ty = args_ty;

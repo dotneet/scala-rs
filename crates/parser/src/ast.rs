@@ -187,6 +187,288 @@ impl fmt::Display for Lit {
 
 /// Structural types. `Class` carries a `SymbolId` once named; before that the
 /// name is kept in `Named` so the parser can represent type trees as types too.
+/// What a type mentions anywhere inside it, as bits: a cheap "no" for the
+/// walks that ask whether a type contains a type parameter, a type member,
+/// a name still to resolve, and so on.
+///
+/// Computed when a [`TyList`] or [`TyBox`] is built, so [`Type::flags`]
+/// costs one step per direct child rather than a walk of the whole type. A
+/// set bit means "may contain": a list or box mutated in place sets every
+/// bit, which is always a correct answer, but a lost bit costs whatever
+/// cache or shortcut was keyed on it, so the flags are otherwise exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TypeFlags(u16);
+
+impl TypeFlags {
+    pub const NONE: TypeFlags = TypeFlags(0);
+    pub const TYPE_PARAM: TypeFlags = TypeFlags(1 << 0);
+    pub const TYPE_MEMBER: TypeFlags = TypeFlags(1 << 1);
+    pub const NAMED: TypeFlags = TypeFlags(1 << 2);
+    pub const TUPLE: TypeFlags = TypeFlags(1 << 3);
+    /// `p.type` or `C.this.type`.
+    pub const SINGLETON: TypeFlags = TypeFlags(1 << 4);
+    /// `_`, `_ <: T`, or an existential.
+    pub const WILDCARD: TypeFlags = TypeFlags(1 << 5);
+    pub const REFINED: TypeFlags = TypeFlags(1 << 6);
+    pub const ERROR: TypeFlags = TypeFlags(1 << 7);
+    pub const APPLIED: TypeFlags = TypeFlags(1 << 8);
+    pub const MODULE_REF: TypeFlags = TypeFlags(1 << 9);
+    pub const CONSTANT: TypeFlags = TypeFlags(1 << 10);
+    pub const FUNCTION: TypeFlags = TypeFlags(1 << 11);
+    pub const ALL: TypeFlags = TypeFlags(u16::MAX);
+
+    #[inline]
+    pub fn contains(self, other: TypeFlags) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl std::ops::BitOr for TypeFlags {
+    type Output = TypeFlags;
+    #[inline]
+    fn bitor(self, other: TypeFlags) -> TypeFlags {
+        TypeFlags(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOrAssign for TypeFlags {
+    #[inline]
+    fn bitor_assign(&mut self, other: TypeFlags) {
+        self.0 |= other.0;
+    }
+}
+
+/// The type arguments, parameters or parents a [`Type`] holds: shared, so a
+/// clone is a reference count and not a copy of the whole subtree, with the
+/// [`TypeFlags`] of its elements computed once.
+///
+/// It reads as a slice (`Deref<Target = [Type]>`) and is built from a
+/// `Vec<Type>` (`.into()`) or by `collect()`. Mutating it in place copies the
+/// elements if they are shared, and gives up on the flags (every bit set),
+/// which stays correct.
+#[derive(Clone)]
+pub struct TyList {
+    items: std::rc::Rc<Vec<Type>>,
+    flags: TypeFlags,
+}
+
+impl TyList {
+    pub fn new(items: Vec<Type>) -> TyList {
+        let flags = items.iter().fold(TypeFlags::NONE, |f, t| f | t.flags());
+        TyList {
+            items: std::rc::Rc::new(items),
+            flags,
+        }
+    }
+
+    #[inline]
+    pub fn flags(&self) -> TypeFlags {
+        self.flags
+    }
+
+    /// The elements as a vector of their own.
+    pub fn into_vec(self) -> Vec<Type> {
+        std::rc::Rc::try_unwrap(self.items).unwrap_or_else(|shared| (*shared).clone())
+    }
+
+    /// Whether both share one allocation, which makes them equal.
+    #[inline]
+    pub fn ptr_eq(&self, other: &TyList) -> bool {
+        std::rc::Rc::ptr_eq(&self.items, &other.items)
+    }
+}
+
+impl Default for TyList {
+    fn default() -> TyList {
+        TyList::new(Vec::new())
+    }
+}
+
+impl std::ops::Deref for TyList {
+    type Target = Vec<Type>;
+    #[inline]
+    fn deref(&self) -> &Vec<Type> {
+        &self.items
+    }
+}
+
+impl std::ops::DerefMut for TyList {
+    fn deref_mut(&mut self) -> &mut Vec<Type> {
+        self.flags = TypeFlags::ALL;
+        std::rc::Rc::make_mut(&mut self.items)
+    }
+}
+
+impl PartialEq for TyList {
+    fn eq(&self, other: &TyList) -> bool {
+        self.ptr_eq(other) || *self.items == *other.items
+    }
+}
+
+impl PartialEq<Vec<Type>> for TyList {
+    fn eq(&self, other: &Vec<Type>) -> bool {
+        *self.items == *other
+    }
+}
+
+impl PartialEq<TyList> for Vec<Type> {
+    fn eq(&self, other: &TyList) -> bool {
+        *self == *other.items
+    }
+}
+
+impl fmt::Debug for TyList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.items, f)
+    }
+}
+
+impl From<Vec<Type>> for TyList {
+    fn from(items: Vec<Type>) -> TyList {
+        TyList::new(items)
+    }
+}
+
+impl From<&[Type]> for TyList {
+    fn from(items: &[Type]) -> TyList {
+        TyList::new(items.to_vec())
+    }
+}
+
+impl From<TyList> for Vec<Type> {
+    fn from(list: TyList) -> Vec<Type> {
+        list.into_vec()
+    }
+}
+
+impl FromIterator<Type> for TyList {
+    fn from_iter<I: IntoIterator<Item = Type>>(iter: I) -> TyList {
+        TyList::new(iter.into_iter().collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a TyList {
+    type Item = &'a Type;
+    type IntoIter = std::slice::Iter<'a, Type>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut TyList {
+    type Item = &'a mut Type;
+    type IntoIter = std::slice::IterMut<'a, Type>;
+    fn into_iter(self) -> Self::IntoIter {
+        use std::ops::DerefMut;
+        self.deref_mut().iter_mut()
+    }
+}
+
+impl IntoIterator for TyList {
+    type Item = Type;
+    type IntoIter = std::vec::IntoIter<Type>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
+/// A single [`Type`] held by another, shared the way [`TyList`] is: the
+/// result of a function or method, an array's element, a prefix, a bound.
+#[derive(Clone)]
+pub struct TyBox {
+    ty: std::rc::Rc<Type>,
+    flags: TypeFlags,
+}
+
+impl TyBox {
+    pub fn new(ty: Type) -> TyBox {
+        let flags = ty.flags();
+        TyBox {
+            ty: std::rc::Rc::new(ty),
+            flags,
+        }
+    }
+
+    #[inline]
+    pub fn flags(&self) -> TypeFlags {
+        self.flags
+    }
+
+    /// The type, writable, copied first if it is shared.
+    pub fn as_mut(&mut self) -> &mut Type {
+        use std::ops::DerefMut;
+        self.deref_mut()
+    }
+
+    /// The type itself, copied only if it is shared.
+    pub fn into_inner(self) -> Type {
+        std::rc::Rc::try_unwrap(self.ty).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
+impl std::ops::Deref for TyBox {
+    type Target = Type;
+    #[inline]
+    fn deref(&self) -> &Type {
+        &self.ty
+    }
+}
+
+impl std::ops::DerefMut for TyBox {
+    fn deref_mut(&mut self) -> &mut Type {
+        self.flags = TypeFlags::ALL;
+        std::rc::Rc::make_mut(&mut self.ty)
+    }
+}
+
+impl AsRef<Type> for TyBox {
+    fn as_ref(&self) -> &Type {
+        &self.ty
+    }
+}
+
+impl std::borrow::Borrow<Type> for TyBox {
+    fn borrow(&self) -> &Type {
+        &self.ty
+    }
+}
+
+impl PartialEq for TyBox {
+    fn eq(&self, other: &TyBox) -> bool {
+        std::rc::Rc::ptr_eq(&self.ty, &other.ty) || *self.ty == *other.ty
+    }
+}
+
+impl fmt::Debug for TyBox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.ty, f)
+    }
+}
+
+impl fmt::Display for TyBox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&*self.ty, f)
+    }
+}
+
+impl From<Type> for TyBox {
+    fn from(ty: Type) -> TyBox {
+        TyBox::new(ty)
+    }
+}
+
+impl From<Box<Type>> for TyBox {
+    fn from(ty: Box<Type>) -> TyBox {
+        TyBox::new(*ty)
+    }
+}
+
+impl From<TyBox> for Box<Type> {
+    fn from(ty: TyBox) -> Box<Type> {
+        Box::new(ty.into_inner())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
     NoType,
@@ -209,29 +491,29 @@ pub enum Type {
     AnyVal,
     Null,
     Nothing,
-    Array(Box<Type>),
-    Tuple(Vec<Type>),
+    Array(TyBox),
+    Tuple(TyList),
     Function {
-        params: Vec<Type>,
-        ret: Box<Type>,
+        params: TyList,
+        ret: TyBox,
     },
     /// Named type not yet bound to a symbol (`List[Int]`, user types in tpts).
     Named {
         name: String,
-        args: Vec<Type>,
+        args: TyList,
     },
     Class {
         sym: SymbolId,
-        args: Vec<Type>,
+        args: TyList,
     },
     Method {
         paramss: Vec<Vec<Type>>,
-        ret: Box<Type>,
+        ret: TyBox,
     },
-    ByName(Box<Type>),
+    ByName(TyBox),
     /// Repeated parameter `T*` (erasure: `Seq[T]`).
-    Repeated(Box<Type>),
-    Overload(Vec<Type>),
+    Repeated(TyBox),
+    Overload(TyList),
     /// Package or module as a prefix (for Select).
     ModuleRef(SymbolId),
     /// A type parameter (`T` in `def id[T](x: T): T`).
@@ -239,8 +521,8 @@ pub enum Type {
     /// Application of a higher-kinded type constructor that is not a class
     /// (`F[A]` where `F` is `F[_]`). Class applications stay `Class { args }`.
     Applied {
-        ctor: Box<Type>,
-        args: Vec<Type>,
+        ctor: TyBox,
+        args: TyList,
     },
     /// Abstract type member (`trait Foo { type A }`). Aliases expand away.
     TypeMember(SymbolId),
@@ -248,20 +530,20 @@ pub enum Type {
     Wildcard,
     /// Bounded wildcard `_ <: Hi` / `_ >: Lo` (as in `List[_ <: AnyRef]`).
     BoundedWildcard {
-        lo: Option<Box<Type>>,
-        hi: Option<Box<Type>>,
+        lo: Option<TyBox>,
+        hi: Option<TyBox>,
     },
     /// A wildcard quantified outside its body, rather than inside a nested
     /// application. Each parameter is paired with its wildcard bounds.
     Existential {
         params: Vec<(SymbolId, Type)>,
-        body: Box<Type>,
+        body: TyBox,
     },
     /// `this.type` of class `cls`.
     ThisType(SymbolId),
     /// Stable path singleton `p.type`. `sym` is the term (`val` / module).
     SingleType {
-        prefix: Box<Type>,
+        prefix: TyBox,
         sym: SymbolId,
     },
     /// SIP-23 literal / constant type (`1`, `true`, `"hi"`). Subtype of the
@@ -269,17 +551,58 @@ pub enum Type {
     Constant(Lit),
     /// `T @annot` (type annotation; not a symbol annotation).
     Annotated {
-        tpe: Box<Type>,
+        tpe: TyBox,
         annot: String,
     },
     /// Structural / refinement type (`{ def foo: Int }` or `T { type A = Int }`).
     Refined {
-        parents: Vec<Type>,
+        parents: TyList,
         decls: Vec<RefineDecl>,
     },
 }
 
 impl Type {
+    /// What this type may mention anywhere inside it; see [`TypeFlags`].
+    /// One step per direct child: the lists and boxes below carry theirs.
+    pub fn flags(&self) -> TypeFlags {
+        let bx = |b: &TyBox| b.flags();
+        match self {
+            Type::TypeParam(_) => TypeFlags::TYPE_PARAM,
+            Type::TypeMember(_) => TypeFlags::TYPE_MEMBER,
+            Type::Named { args, .. } => TypeFlags::NAMED | args.flags(),
+            Type::Tuple(ts) => TypeFlags::TUPLE | ts.flags(),
+            Type::Class { args, .. } => args.flags(),
+            Type::Overload(ts) => ts.flags(),
+            Type::Function { params, ret } => TypeFlags::FUNCTION | params.flags() | bx(ret),
+            Type::Method { paramss, ret } => {
+                paramss.iter().flatten().fold(bx(ret), |f, p| f | p.flags())
+            }
+            Type::Applied { ctor, args } => TypeFlags::APPLIED | bx(ctor) | args.flags(),
+            Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => bx(t),
+            Type::Annotated { tpe, .. } => bx(tpe),
+            Type::SingleType { prefix, .. } => TypeFlags::SINGLETON | bx(prefix),
+            Type::ThisType(_) => TypeFlags::SINGLETON,
+            Type::ModuleRef(_) => TypeFlags::MODULE_REF,
+            Type::Wildcard => TypeFlags::WILDCARD,
+            Type::BoundedWildcard { lo, hi } => {
+                let mut f = TypeFlags::WILDCARD;
+                for b in [lo, hi].into_iter().flatten() {
+                    f |= bx(b);
+                }
+                f
+            }
+            Type::Existential { params, body } => params
+                .iter()
+                .fold(TypeFlags::WILDCARD | bx(body), |f, (_, b)| f | b.flags()),
+            Type::Refined { parents, decls } => decls
+                .iter()
+                .fold(TypeFlags::REFINED | parents.flags(), |f, d| f | d.flags()),
+            Type::Constant(_) => TypeFlags::CONSTANT,
+            Type::Error => TypeFlags::ERROR,
+            _ => TypeFlags::NONE,
+        }
+    }
+
     pub fn is_error(&self) -> bool {
         matches!(self, Type::Error)
     }
@@ -309,7 +632,7 @@ impl Type {
             Lit::Null => Type::Null,
             Lit::Symbol(_) => Type::Named {
                 name: "Symbol".into(),
-                args: vec![],
+                args: vec![].into(),
             },
         }
     }
@@ -516,6 +839,21 @@ pub enum RefineDecl {
         name: String,
         ty: Type,
     },
+}
+
+impl RefineDecl {
+    /// What the declaration's types may mention; see [`TypeFlags`].
+    pub fn flags(&self) -> TypeFlags {
+        let opt = |t: &Option<Type>| t.as_ref().map_or(TypeFlags::NONE, Type::flags);
+        match self {
+            RefineDecl::Type { rhs, lo, hi, .. } => opt(rhs) | opt(lo) | opt(hi),
+            RefineDecl::Def { paramss, ret, .. } => paramss
+                .iter()
+                .flatten()
+                .fold(ret.flags(), |f, p| f | p.flags()),
+            RefineDecl::Val { ty, .. } => ty.flags(),
+        }
+    }
 }
 
 impl fmt::Display for RefineDecl {

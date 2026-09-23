@@ -271,7 +271,7 @@ impl Typer {
         }
         let mty = Type::Method {
             paramss,
-            ret: Box::new(found),
+            ret: TyBox::new(found),
         };
         tree.ty = mty.clone();
         self.st.get_mut(sym).ty = mty;
@@ -360,13 +360,13 @@ impl Typer {
             ty
         };
         if flags.contains(Flags::BYNAME) {
-            pickle_ty = pickle_ty.map(|ty| Type::ByName(Box::new(ty)));
+            pickle_ty = pickle_ty.map(|ty| Type::ByName(TyBox::new(ty)));
         }
         if matches!(ty, Type::Repeated(_)) {
-            pickle_ty = pickle_ty.map(|ty| Type::Repeated(Box::new(ty)));
+            pickle_ty = pickle_ty.map(|ty| Type::Repeated(TyBox::new(ty)));
         }
         let ty = if flags.contains(Flags::BYNAME) && !matches!(ty, Type::ByName(_) | Type::NoType) {
-            Type::ByName(Box::new(ty))
+            Type::ByName(TyBox::new(ty))
         } else {
             ty
         };
@@ -1042,8 +1042,8 @@ impl Typer {
                 self.gensym += 1;
                 let ev_name = format!("evidence${}", self.gensym);
                 let ev_ty = Type::Function {
-                    params: vec![Type::TypeParam(tp_id)],
-                    ret: Box::new(view_ty),
+                    params: vec![Type::TypeParam(tp_id)].into(),
+                    ret: TyBox::new(view_ty),
                 };
                 let ev_id = self.st.alloc(
                     &ev_name,
@@ -1222,7 +1222,7 @@ impl Typer {
         self.st.pop_scope();
         let mty = Type::Method {
             paramss: paramss_ty,
-            ret: Box::new(ret.clone()),
+            ret: TyBox::new(ret.clone()),
         };
         tree.ty = mty.clone();
         if !tree.sym.is_none() {
@@ -1230,7 +1230,7 @@ impl Typer {
             self.st.get_mut(tree.sym).pickle_ty = if has_pickle_alias {
                 Some(Type::Method {
                     paramss: pickle_paramss,
-                    ret: Box::new(pickle_ret.unwrap_or_else(|| ret.clone())),
+                    ret: TyBox::new(pickle_ret.unwrap_or_else(|| ret.clone())),
                 })
             } else {
                 None
@@ -1404,7 +1404,7 @@ impl Typer {
                 } else {
                     vec![preceding_tys]
                 },
-                ret: Box::new(ret.clone()),
+                ret: TyBox::new(ret.clone()),
             };
             self.st.get_mut(gid).params = preceding.clone();
             self.st.get_mut(gid).paramss = getter_paramss;
@@ -1840,7 +1840,7 @@ impl Typer {
                     return;
                 }
                 let targs: Vec<Type> = match &tree.ty {
-                    Type::Class { args, .. } => args.clone(),
+                    Type::Class { args, .. } => args.clone().into_vec(),
                     _ => Vec::new(),
                 };
                 match self.pick_ctor_at(id, &targs, &[], None) {
@@ -2591,7 +2591,7 @@ impl Typer {
         self.supply_binary_ctors(class_id);
         let written_targs = match crate::prefix::strip_view(&class_ty) {
             Type::Class { args, .. } => args.clone(),
-            _ => Vec::new(),
+            _ => Vec::new().into(),
         };
         let raw_tparams = self.st.get(class_id).tparams.clone();
         // `extends NumericOps(lhs)` inside `Integral[T]`: the parent is an
@@ -2630,7 +2630,7 @@ impl Typer {
                 // this argument in a Function0 thunk. Its type is checked by
                 // the selected by-name formal below, not as the raw value.
                 Type::ByName(_) if a.byname_thunk => Type::NoType,
-                Type::ByName(t) | Type::Repeated(t) => *t,
+                Type::ByName(t) | Type::Repeated(t) => t.into_inner(),
                 t => t,
             };
             // An argument this pass synthesized on an earlier walk of the same
@@ -2645,8 +2645,8 @@ impl Typer {
                     // As for `new Base(f)`, an unannotated lambda needs the
                     // selected constructor's expected parameter type.
                     a.ty = Type::Function {
-                        params: vec![Type::NoType; vparams.len()],
-                        ret: Box::new(Type::NoType),
+                        params: vec![Type::NoType; vparams.len()].into(),
+                        ret: TyBox::new(Type::NoType),
                     };
                     continue;
                 }
@@ -2671,7 +2671,7 @@ impl Typer {
         fun.ty = crate::prefix::with_prefix_opt(class_ty.clone(), parent_pre.as_ref());
         tree.ty = fun.ty.clone();
         let targs: Vec<Type> = match &class_ty {
-            Type::Class { args, .. } => args.clone(),
+            Type::Class { args, .. } => args.clone().into_vec(),
             _ => Vec::new(),
         };
         // A separately compiled Scala parent may carry its default getter only
@@ -2754,7 +2754,7 @@ impl Typer {
                             ) {
                                 if self.st.get(member).owner == owner {
                                     parent_path = Some(Type::SingleType {
-                                        prefix: Box::new(qual.ty.clone()),
+                                        prefix: TyBox::new(qual.ty.clone()),
                                         sym: member,
                                     });
                                 }
@@ -2784,17 +2784,17 @@ impl Typer {
                             if self.st.is_sub_type(
                                 &Type::Class {
                                     sym: owner,
-                                    args: vec![],
+                                    args: vec![].into(),
                                 },
                                 &Type::Class {
                                     sym: outer,
-                                    args: vec![],
+                                    args: vec![].into(),
                                 },
                             ) && self.st.is_sub_type(
                                 &Type::ModuleRef(*module),
                                 &Type::Class {
                                     sym: outer,
-                                    args: vec![],
+                                    args: vec![].into(),
                                 },
                             ) {
                                 self.st
@@ -2877,7 +2877,7 @@ impl Typer {
         if solutions.len() == 1 {
             Type::Class {
                 sym: class_id,
-                args: solutions.pop().unwrap(),
+                args: solutions.pop().unwrap().into(),
             }
         } else {
             class_ty.clone()
@@ -3006,7 +3006,7 @@ impl Typer {
                         .iter()
                         .map(|p| self.st.get(*p).ty.clone())
                         .collect()],
-                    ret: Box::new(Type::Unit),
+                    ret: TyBox::new(Type::Unit),
                 }
             } else {
                 flatten(ty)
@@ -3017,7 +3017,7 @@ impl Typer {
         let fun_ty = if alts.len() == 1 {
             alt_tys[0].clone()
         } else {
-            Type::Overload(alt_tys.clone())
+            Type::Overload(alt_tys.clone().into())
         };
         // `resolve_overload` re-reads a group of two or more alternatives off
         // their symbols, where they are written in the *parent's* type

@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, iface, method, module, module_extending, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn add_either(st: &mut SymbolTable) {
@@ -19,14 +20,14 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     let tb = Type::TypeParam(eb);
     let either_t = Type::Class {
         sym: either,
-        args: vec![Type::TypeParam(ea), tb.clone()],
+        args: vec![Type::TypeParam(ea), tb.clone()].into(),
     };
     method(st, either, "isLeft", vec![], Type::Boolean, Intrinsic::None);
     method(
         st,
         either,
         "getOrElse",
-        vec![Type::ByName(Box::new(Type::Any))],
+        vec![Type::ByName(TyBox::new(Type::Any))],
         Type::Any,
         Intrinsic::None,
     );
@@ -40,9 +41,9 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     st.get_mut(either_map).tparams = vec![b1];
     st.get_mut(either_map).ty = Type::Method {
         paramss: vec![vec![fn1(tb, Type::TypeParam(b1))]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: either,
-            args: vec![Type::TypeParam(ea), Type::TypeParam(b1)],
+            args: vec![Type::TypeParam(ea), Type::TypeParam(b1)].into(),
         }),
     };
 
@@ -59,7 +60,7 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     st.get_mut(left).tparams = vec![la, lb];
     st.get_mut(left).parents = vec![Type::Class {
         sym: either,
-        args: vec![Type::TypeParam(la), Type::TypeParam(lb)],
+        args: vec![Type::TypeParam(la), Type::TypeParam(lb)].into(),
     }];
     let lf = st.alloc("value", left, SymKind::Term, Flags::FINAL, "");
     st.get_mut(lf).ty = Type::TypeParam(la);
@@ -88,9 +89,9 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     st.get_mut(left_apply).tparams = vec![lma, lmb];
     st.get_mut(left_apply).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(lma)]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: left,
-            args: vec![Type::TypeParam(lma), Type::TypeParam(lmb)],
+            args: vec![Type::TypeParam(lma), Type::TypeParam(lmb)].into(),
         }),
     };
     let mems = st.get(left_cls).members.clone();
@@ -103,7 +104,7 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     st.get_mut(right).tparams = vec![ra, rb];
     st.get_mut(right).parents = vec![Type::Class {
         sym: either,
-        args: vec![Type::TypeParam(ra), Type::TypeParam(rb)],
+        args: vec![Type::TypeParam(ra), Type::TypeParam(rb)].into(),
     }];
     let rf = st.alloc("value", right, SymKind::Term, Flags::FINAL, "");
     st.get_mut(rf).ty = Type::TypeParam(rb);
@@ -125,9 +126,9 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     st.get_mut(right_apply).tparams = vec![rma, rmb];
     st.get_mut(right_apply).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(rmb)]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: right,
-            args: vec![Type::TypeParam(rma), Type::TypeParam(rmb)],
+            args: vec![Type::TypeParam(rma), Type::TypeParam(rmb)].into(),
         }),
     };
     let mems = st.get(right_cls).members.clone();
@@ -140,13 +141,13 @@ pub(crate) fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
     let t_ty = Type::TypeParam(tt);
     let try_t = Type::Class {
         sym: try_c,
-        args: vec![t_ty.clone()],
+        args: vec![t_ty.clone()].into(),
     };
     method(
         st,
         try_c,
         "getOrElse",
-        vec![Type::ByName(Box::new(Type::Any))],
+        vec![Type::ByName(TyBox::new(Type::Any))],
         Type::Any,
         Intrinsic::None,
     );
@@ -165,17 +166,17 @@ pub(crate) fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
         st,
         try_cls,
         "apply",
-        vec![Type::ByName(Box::new(Type::Any))],
+        vec![Type::ByName(TyBox::new(Type::Any))],
         Type::Any,
         Intrinsic::None,
     );
     let apply_t = type_param(st, apply, "T");
     st.get_mut(apply).tparams = vec![apply_t];
     st.get_mut(apply).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(apply_t)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::TypeParam(apply_t)))]],
+        ret: TyBox::new(Type::Class {
             sym: try_c,
-            args: vec![Type::TypeParam(apply_t)],
+            args: vec![Type::TypeParam(apply_t)].into(),
         }),
     };
     let mems = st.get(try_cls).members.clone();
@@ -219,9 +220,9 @@ pub(crate) fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
     st.get_mut(sm).tparams = vec![smt];
     st.get_mut(sm).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(smt)]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: success,
-            args: vec![Type::TypeParam(smt)],
+            args: vec![Type::TypeParam(smt)].into(),
         }),
     };
     let mems = st.get(success_cls).members.clone();
@@ -229,7 +230,7 @@ pub(crate) fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
 
     let throwable_ty = Type::Class {
         sym: throwable,
-        args: vec![],
+        args: vec![].into(),
     };
     let throwable_ty2 = throwable_ty.clone();
     let failure = class(st, st.scala_pkg, "Failure", "scala/util/Failure", &[try_t]);
@@ -265,9 +266,9 @@ pub(crate) fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
     st.get_mut(fm).tparams = vec![fmt];
     st.get_mut(fm).ty = Type::Method {
         paramss: vec![vec![throwable_ty2]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: failure,
-            args: vec![Type::TypeParam(fmt)],
+            args: vec![Type::TypeParam(fmt)].into(),
         }),
     };
     let mems = st.get(failure_cls).members.clone();
@@ -287,7 +288,7 @@ pub(crate) fn add_breaks(st: &mut SymbolTable) {
     st.get_mut(breaks).parents = vec![Type::AnyRef];
     st.get_mut(breaks).ty = Type::Class {
         sym: breaks,
-        args: vec![],
+        args: vec![].into(),
     };
     let try_block = iface(st, breaks, "TryBlock", "scala/util/control/Breaks$TryBlock");
     let tt = type_param(st, try_block, "T");
@@ -296,7 +297,7 @@ pub(crate) fn add_breaks(st: &mut SymbolTable) {
         st,
         try_block,
         "catchBreak",
-        vec![Type::ByName(Box::new(Type::TypeParam(tt)))],
+        vec![Type::ByName(TyBox::new(Type::TypeParam(tt)))],
         Type::TypeParam(tt),
         Intrinsic::None,
     );
@@ -309,7 +310,7 @@ pub(crate) fn add_breaks(st: &mut SymbolTable) {
         vec![],
         Type::Class {
             sym: breaks,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
@@ -320,7 +321,7 @@ pub(crate) fn add_breaks(st: &mut SymbolTable) {
         "scala/util/control/Breaks$",
         Type::Class {
             sym: breaks,
-            args: vec![],
+            args: vec![].into(),
         },
     );
     let mcls = st.module_class_of(breaks_mod);
@@ -333,7 +334,7 @@ fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId, try_block: SymbolId
         st,
         owner,
         "breakable",
-        vec![Type::ByName(Box::new(Type::Unit))],
+        vec![Type::ByName(TyBox::new(Type::Unit))],
         Type::Unit,
         Intrinsic::None,
     );
@@ -350,15 +351,15 @@ fn add_breaks_members(st: &mut SymbolTable, owner: SymbolId, try_block: SymbolId
     );
     let t = type_param(st, tb, "T");
     let op = st.alloc("op", tb, crate::symbol::SymKind::Term, Flags::PARAM, "");
-    st.get_mut(op).ty = Type::ByName(Box::new(Type::TypeParam(t)));
+    st.get_mut(op).ty = Type::ByName(TyBox::new(Type::TypeParam(t)));
     st.get_mut(tb).tparams = vec![t];
     st.get_mut(tb).params = vec![op];
     st.get_mut(tb).paramss = vec![vec![op]];
     st.get_mut(tb).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(t)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::TypeParam(t)))]],
+        ret: TyBox::new(Type::Class {
             sym: try_block,
-            args: vec![Type::TypeParam(t)],
+            args: vec![Type::TypeParam(t)].into(),
         }),
     };
     st.set_jvm_name(

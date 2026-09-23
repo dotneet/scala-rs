@@ -8,6 +8,7 @@
 //! the bytecode the way nsc does. See `docs/macros.md` for the full design.
 
 use scala_rs_parser::{CaseDef, Flags, SymbolId, Template, Tree, TreeKind, Type};
+use scala_rs_parser::TyBox;
 use scala_rs_span::Span;
 
 use crate::check::Typer;
@@ -678,7 +679,7 @@ impl Typer {
         // implementation with parameters must not be eta-expanded.
         let dummy = Type::Method {
             paramss: Vec::new(),
-            ret: Box::new(Type::NoType),
+            ret: TyBox::new(Type::NoType),
         };
         let mark = self.diags.len();
         let saved_callee = std::mem::replace(&mut self.typing_callee, true);

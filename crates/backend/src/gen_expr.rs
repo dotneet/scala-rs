@@ -3458,7 +3458,7 @@ pub(crate) fn gen_apply(
             if !fun.sym.is_none() {
                 match &ctx.st.get(fun.sym).ty {
                     Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-                    Type::Function { params, .. } => params.clone(),
+                    Type::Function { params, .. } => params.clone().into_vec(),
                     _ => Vec::new(),
                 }
             } else {
@@ -3468,7 +3468,7 @@ pub(crate) fn gen_apply(
     } else if !fun.sym.is_none() {
         match &ctx.st.get(fun.sym).ty {
             Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
-            Type::Function { params, .. } => params.clone(),
+            Type::Function { params, .. } => params.clone().into_vec(),
             _ => Vec::new(),
         }
     } else {
@@ -3731,7 +3731,7 @@ pub(crate) fn super_is_qualified(fun: &Tree) -> bool {
 fn method_param_types(ty: &Type) -> Option<Vec<Type>> {
     match ty {
         Type::Method { paramss, .. } => Some(paramss.iter().flatten().cloned().collect()),
-        Type::Function { params, .. } => Some(params.clone()),
+        Type::Function { params, .. } => Some(params.clone().into_vec()),
         _ => None,
     }
 }

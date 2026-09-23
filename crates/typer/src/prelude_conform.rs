@@ -32,6 +32,7 @@
 //! silently-accepted stub.
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 fn class(
@@ -45,7 +46,7 @@ fn class(
     st.get_mut(id).parents = parents.to_vec();
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     id
 }
@@ -86,7 +87,7 @@ fn method(
     };
     st.get_mut(id).ty = Type::Method {
         paramss,
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = intrinsic;
     id
@@ -116,8 +117,8 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         st.get_mut(id).tparams = vec![from, to];
         st.get_mut(id).parents = vec![
             Type::Function {
-                params: vec![Type::TypeParam(from)],
-                ret: Box::new(Type::TypeParam(to)),
+                params: vec![Type::TypeParam(from)].into(),
+                ret: TyBox::new(Type::TypeParam(to)),
             },
             Type::AnyRef,
         ];
@@ -141,7 +142,7 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         st.get_mut(id).tparams = vec![from, to];
         st.get_mut(id).parents = vec![Type::Class {
             sym: less,
-            args: vec![Type::TypeParam(from), Type::TypeParam(to)],
+            args: vec![Type::TypeParam(from), Type::TypeParam(to)].into(),
         }];
         // `lookup_member`'s parent walk *would* find `<:<::apply` here, but
         // member selection substitutes using the referenced symbol's own
@@ -181,9 +182,9 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         st.get_mut(refl).tparams = vec![ra];
         st.get_mut(refl).ty = Type::Method {
             paramss: vec![vec![]],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: eq,
-                args: vec![Type::TypeParam(ra), Type::TypeParam(ra)],
+                args: vec![Type::TypeParam(ra), Type::TypeParam(ra)].into(),
             }),
         };
     }
@@ -222,14 +223,14 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         );
         let ev_ty = Type::Class {
             sym: less,
-            args: vec![Type::Null, result.clone()],
+            args: vec![Type::Null, result.clone()].into(),
         };
         st.get_mut(ev).ty = ev_ty.clone();
         st.get_mut(or_null).params = vec![ev];
         st.get_mut(or_null).paramss = vec![vec![ev]];
         st.get_mut(or_null).ty = Type::Method {
             paramss: vec![vec![ev_ty]],
-            ret: Box::new(result),
+            ret: TyBox::new(result),
         };
     }
 
@@ -258,8 +259,8 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
             id,
             "foreach",
             vec![Type::Function {
-                params: vec![a],
-                ret: Box::new(Type::Any),
+                params: vec![a].into(),
+                ret: TyBox::new(Type::Any),
             }],
             Type::Unit,
             Intrinsic::None,
@@ -277,7 +278,7 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         if let Some(la) = st.get(st.list_sym).tparams.first().copied() {
             let parent = Type::Class {
                 sym: iterable,
-                args: vec![Type::TypeParam(la)],
+                args: vec![Type::TypeParam(la)].into(),
             };
             if !st
                 .get(st.list_sym)
@@ -346,9 +347,9 @@ fn install_conforms_member(st: &mut SymbolTable) {
     st.get_mut(conforms).tparams = vec![a];
     st.get_mut(conforms).ty = Type::Method {
         paramss: vec![vec![]],
-        ret: Box::new(Type::Function {
-            params: vec![Type::TypeParam(a)],
-            ret: Box::new(Type::TypeParam(a)),
+        ret: TyBox::new(Type::Function {
+            params: vec![Type::TypeParam(a)].into(),
+            ret: Box::new(Type::TypeParam(a)).into(),
         }),
     };
     st.get_mut(st.predef).members.push(conforms);

@@ -19,6 +19,7 @@
 
 use crate::prelude::{fn1, fn2, iface, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// Return `scala.collection.IterableOnce[A]`, reusing an existing one if there is one.
@@ -45,7 +46,7 @@ fn find_iterable_once(st: &mut SymbolTable, coll: SymbolId) -> SymbolId {
     if let Some(la) = st.get(st.list_sym).tparams.first().copied() {
         let parent = Type::Class {
             sym: ioc,
-            args: vec![Type::TypeParam(la)],
+            args: vec![Type::TypeParam(la)].into(),
         };
         if !st
             .get(st.list_sym)
@@ -138,12 +139,12 @@ fn add_numeric_instance(
     st.get_mut(m).flags = st.get(m).flags.with(Flags::IMPLICIT);
     st.get_mut(m).ty = Type::Class {
         sym: numeric,
-        args: vec![arg.clone()],
+        args: vec![arg.clone()].into(),
     };
     let cls = st.module_class_of(m);
     st.get_mut(cls).parents = vec![Type::Class {
         sym: numeric,
-        args: vec![arg],
+        args: vec![arg].into(),
     }];
 }
 
@@ -171,7 +172,7 @@ fn add_array_ops_simple_extensions(
     let coll = crate::classpath::ensure_package(st, "scala/collection");
     let a = st.get(aops).tparams[0];
     let ta = Type::TypeParam(a);
-    let array_a = Type::Array(Box::new(ta.clone()));
+    let array_a = Type::Array(TyBox::new(ta.clone()));
 
     // toSeq / toIndexedSeq: `Array[A] => Seq[A]` / `=> IndexedSeq[A]`.
     // `Seq` / `IndexedSeq` are already registered as `scala.Seq` / `scala.IndexedSeq`
@@ -193,7 +194,7 @@ fn add_array_ops_simple_extensions(
         vec![],
         Type::Class {
             sym: seq,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -204,7 +205,7 @@ fn add_array_ops_simple_extensions(
         vec![],
         Type::Class {
             sym: idx_seq,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -224,9 +225,9 @@ fn add_array_ops_simple_extensions(
     st.get_mut(gb).paramss = vec![vec![f]];
     st.get_mut(gb).ty = Type::Method {
         paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(gk))]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: map_sym,
-            args: vec![Type::TypeParam(gk), array_a.clone()],
+            args: vec![Type::TypeParam(gk), array_a.clone()].into(),
         }),
     };
 
@@ -244,7 +245,7 @@ fn add_array_ops_simple_extensions(
     );
     st.get_mut(sbev).ty = Type::Class {
         sym: ordering,
-        args: vec![Type::TypeParam(sbk)],
+        args: vec![Type::TypeParam(sbk)].into(),
     };
     st.get_mut(sb).tparams = vec![sbk];
     st.get_mut(sb).params = vec![sbf, sbev];
@@ -254,10 +255,10 @@ fn add_array_ops_simple_extensions(
             vec![fn1(ta.clone(), Type::TypeParam(sbk))],
             vec![Type::Class {
                 sym: ordering,
-                args: vec![Type::TypeParam(sbk)],
+                args: vec![Type::TypeParam(sbk)].into(),
             }],
         ],
-        ret: Box::new(array_a.clone()),
+        ret: TyBox::new(array_a.clone()),
     };
 
     // sorted(implicit ord: Ordering[A]): Array[A]
@@ -270,7 +271,7 @@ fn add_array_ops_simple_extensions(
     );
     st.get_mut(sorted_ev).ty = Type::Class {
         sym: ordering,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     let sorted_m = method(st, aops, "sorted", vec![], Type::Unit, Intrinsic::None);
     st.get_mut(sorted_m).params = vec![sorted_ev];
@@ -278,9 +279,9 @@ fn add_array_ops_simple_extensions(
     st.get_mut(sorted_m).ty = Type::Method {
         paramss: vec![vec![Type::Class {
             sym: ordering,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         }]],
-        ret: Box::new(array_a.clone()),
+        ret: TyBox::new(array_a.clone()),
     };
 
     // sortWith(lt: (A, A) => Boolean): Array[A]
@@ -300,7 +301,7 @@ fn add_array_ops_simple_extensions(
     let that = st.alloc("that", za, SymKind::Term, Flags::PARAM, "");
     st.get_mut(that).ty = Type::Class {
         sym: iterable_once,
-        args: vec![Type::TypeParam(zb)],
+        args: vec![Type::TypeParam(zb)].into(),
     };
     let this_elem = st.alloc("thisElem", za, SymKind::Term, Flags::PARAM, "");
     st.get_mut(this_elem).ty = ta.clone();
@@ -311,18 +312,18 @@ fn add_array_ops_simple_extensions(
     st.get_mut(za).paramss = vec![vec![that, this_elem, that_elem]];
     let pair_ab = Type::Class {
         sym: tuple2,
-        args: vec![ta.clone(), Type::TypeParam(zb)],
+        args: vec![ta.clone(), Type::TypeParam(zb)].into(),
     };
     st.get_mut(za).ty = Type::Method {
         paramss: vec![vec![
             Type::Class {
                 sym: iterable_once,
-                args: vec![Type::TypeParam(zb)],
+                args: vec![Type::TypeParam(zb)].into(),
             },
             ta.clone(),
             Type::TypeParam(zb),
         ]],
-        ret: Box::new(Type::Array(Box::new(pair_ab))),
+        ret: TyBox::new(Type::Array(Box::new(pair_ab).into())),
     };
 
     // indexWhere(p: A => Boolean, from: Int = 0): Int — both arities so
@@ -371,7 +372,7 @@ fn add_array_ops_simple_extensions(
     let p_other = st.alloc("other", patch_m, SymKind::Term, Flags::PARAM, "");
     st.get_mut(p_other).ty = Type::Class {
         sym: iterable_once,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     let p_replaced = st.alloc("replaced", patch_m, SymKind::Term, Flags::PARAM, "");
     st.get_mut(p_replaced).ty = Type::Int;
@@ -384,7 +385,7 @@ fn add_array_ops_simple_extensions(
     );
     st.get_mut(p_ev).ty = Type::Class {
         sym: ct,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     st.get_mut(patch_m).params = vec![p_from, p_other, p_replaced, p_ev];
     st.get_mut(patch_m).paramss = vec![vec![p_from, p_other, p_replaced], vec![p_ev]];
@@ -394,16 +395,16 @@ fn add_array_ops_simple_extensions(
                 Type::Int,
                 Type::Class {
                     sym: iterable_once,
-                    args: vec![ta.clone()],
+                    args: vec![ta.clone()].into(),
                 },
                 Type::Int,
             ],
             vec![Type::Class {
                 sym: ct,
-                args: vec![ta.clone()],
+                args: vec![ta.clone()].into(),
             }],
         ],
-        ret: Box::new(array_a.clone()),
+        ret: TyBox::new(array_a.clone()),
     };
 
     // updated(index: Int, elem: A)(implicit ClassTag[A]): Array[A]
@@ -444,7 +445,7 @@ fn add_array_ops_simple_extensions(
         let suffix = st.alloc("suffix", m, SymKind::Term, Flags::PARAM, "");
         st.get_mut(suffix).ty = Type::Class {
             sym: iterable_once,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         };
         let ev = st.alloc(
             "evidence$1",
@@ -455,7 +456,7 @@ fn add_array_ops_simple_extensions(
         );
         st.get_mut(ev).ty = Type::Class {
             sym: ct,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         };
         st.get_mut(m).params = vec![suffix, ev];
         st.get_mut(m).paramss = vec![vec![suffix], vec![ev]];
@@ -463,14 +464,14 @@ fn add_array_ops_simple_extensions(
             paramss: vec![
                 vec![Type::Class {
                     sym: iterable_once,
-                    args: vec![ta.clone()],
+                    args: vec![ta.clone()].into(),
                 }],
                 vec![Type::Class {
                     sym: ct,
-                    args: vec![ta.clone()],
+                    args: vec![ta.clone()].into(),
                 }],
             ],
-            ret: Box::new(array_a.clone()),
+            ret: TyBox::new(array_a.clone()),
         };
     }
 }
@@ -500,7 +501,7 @@ fn add_one_elem_ct_method(
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![elem.clone()],
+        args: vec![elem.clone()].into(),
     };
     let mut params = explicit_ids.clone();
     params.push(ev);
@@ -511,10 +512,10 @@ fn add_one_elem_ct_method(
             explicit.to_vec(),
             vec![Type::Class {
                 sym: ct,
-                args: vec![elem.clone()],
+                args: vec![elem.clone()].into(),
             }],
         ],
-        ret: Box::new(ret.clone()),
+        ret: TyBox::new(ret.clone()),
     };
 }
 
@@ -533,7 +534,7 @@ fn add_array_ops_wrapped_conversions(
 
     let list_t = Type::Class {
         sym: st.list_sym,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(st, aops, "toList", vec![], list_t, Intrinsic::None);
 
@@ -549,7 +550,7 @@ fn add_array_ops_wrapped_conversions(
         vec![],
         Type::Class {
             sym: set_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -566,7 +567,7 @@ fn add_array_ops_wrapped_conversions(
         vec![],
         Type::Class {
             sym: vector_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -650,16 +651,16 @@ fn add_numeric_fold(
     );
     st.get_mut(ev).ty = Type::Class {
         sym: numeric,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     st.get_mut(m).params = vec![ev];
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![Type::Class {
             sym: numeric,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         }]],
-        ret: Box::new(ta.clone()),
+        ret: TyBox::new(ta.clone()),
     };
 }
 
@@ -680,16 +681,16 @@ fn add_ordering_pick(
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ordering,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     st.get_mut(m).params = vec![ev];
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![Type::Class {
             sym: ordering,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         }]],
-        ret: Box::new(ta.clone()),
+        ret: TyBox::new(ta.clone()),
     };
 }
 
@@ -708,7 +709,7 @@ fn add_by_pick(st: &mut SymbolTable, aops: SymbolId, ta: &Type, ordering: Symbol
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ordering,
-        args: vec![tb.clone()],
+        args: vec![tb.clone()].into(),
     };
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).params = vec![f, ev];
@@ -718,10 +719,10 @@ fn add_by_pick(st: &mut SymbolTable, aops: SymbolId, ta: &Type, ordering: Symbol
             vec![fn1(ta.clone(), tb.clone())],
             vec![Type::Class {
                 sym: ordering,
-                args: vec![tb],
+                args: vec![tb].into(),
             }],
         ],
-        ret: Box::new(ta.clone()),
+        ret: TyBox::new(ta.clone()),
     };
 }
 
@@ -775,7 +776,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
     let tv = Type::TypeParam(mv);
     let mapview_t = |v: Type| Type::Class {
         sym: mapview,
-        args: vec![tk.clone(), v],
+        args: vec![tk.clone(), v].into(),
     };
 
     // Reuse the existing `Iterable`; a second one with the same JVM name
@@ -794,7 +795,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
     };
     let iterable_t = |a: Type| Type::Class {
         sym: iterable,
-        args: vec![a],
+        args: vec![a].into(),
     };
     // Add at least toList/foreach on the Iterable side too (via IterableOnceOps), so
     // that `mv.keys.toList` / `mv.values.toList` go through.
@@ -805,7 +806,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![it_a_type(st, iterable)],
+            args: vec![it_a_type(st, iterable)].into(),
         },
         Intrinsic::None,
     );
@@ -861,7 +862,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
     st.get_mut(mvm).paramss = vec![vec![f]];
     st.get_mut(mvm).ty = Type::Method {
         paramss: vec![vec![fn1(tv.clone(), tw.clone())]],
-        ret: Box::new(mapview_t(tw)),
+        ret: TyBox::new(mapview_t(tw)),
     };
 
     // toMap: Map[K, V] -- codegen synthesises the `<:<` evidence with
@@ -875,13 +876,13 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         vec![],
         Type::Class {
             sym: map_sym,
-            args: vec![tk.clone(), tv.clone()],
+            args: vec![tk.clone(), tv.clone()].into(),
         },
         Intrinsic::None,
     );
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     method_absent(
         st,
@@ -890,7 +891,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![pair.clone()],
+            args: vec![pair.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -906,7 +907,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         vec![],
         Type::Class {
             sym: seq,
-            args: vec![pair],
+            args: vec![pair].into(),
         },
         Intrinsic::None,
     );
@@ -926,7 +927,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         vec![fn1(
             Type::Class {
                 sym: tuple2,
-                args: vec![tk.clone(), tv.clone()],
+                args: vec![tk.clone(), tv.clone()].into(),
             },
             Type::Unit,
         )],
@@ -952,7 +953,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
         vec![],
         Type::Class {
             sym: mapview,
-            args: vec![map_k, map_v],
+            args: vec![map_k, map_v].into(),
         },
         Intrinsic::None,
     );

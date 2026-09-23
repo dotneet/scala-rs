@@ -10,6 +10,7 @@
 use crate::check::Typer;
 use crate::prelude::{method, module};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 use scala_rs_span::Span;
 
@@ -47,7 +48,7 @@ pub fn install_range_companion(st: &mut SymbolTable) {
     }
     let range_t = Type::Class {
         sym: range,
-        args: vec![],
+        args: vec![].into(),
     };
     let m = module(
         st,
@@ -157,11 +158,11 @@ pub fn install_ordered_companion(st: &mut SymbolTable) {
     let tt = Type::TypeParam(t);
     let ord_t = Type::Class {
         sym: ordering,
-        args: vec![tt.clone()],
+        args: vec![tt.clone()].into(),
     };
     let ret = Type::Class {
         sym: ordered,
-        args: vec![tt.clone()],
+        args: vec![tt.clone()].into(),
     };
     let x = st.alloc("x", conv, SymKind::Term, Flags::PARAM, "");
     st.get_mut(x).ty = tt.clone();
@@ -178,7 +179,7 @@ pub fn install_ordered_companion(st: &mut SymbolTable) {
     st.get_mut(conv).paramss = vec![vec![x], vec![ev]];
     st.get_mut(conv).ty = Type::Method {
         paramss: vec![vec![tt], vec![ord_t]],
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     // `T` erases to `Object` and `Ordering[T]` / `Ordered[T]` to their raw
     // classes; spell the descriptor out rather than rely on that.
@@ -303,7 +304,7 @@ impl Typer {
                 vec![under],
                 Type::Class {
                     sym: box_cls,
-                    args: vec![],
+                    args: vec![].into(),
                 },
                 Intrinsic::NewWrapper,
             );

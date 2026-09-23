@@ -134,7 +134,7 @@ impl Typer {
                 self.st.get_mut(id).ty = match ty {
                     Type::Repeated(inner) => Type::Class {
                         sym: self.st.list_sym,
-                        args: vec![(**inner).clone()],
+                        args: vec![(**inner).clone()].into(),
                     },
                     other => other.clone(),
                 };

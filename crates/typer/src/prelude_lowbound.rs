@@ -12,6 +12,7 @@
 //! the private runtime nor the real scala-library ABI is affected.
 
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable) {
@@ -22,13 +23,13 @@ pub(crate) fn install(st: &mut SymbolTable) {
     };
     let list_of = |b: SymbolId| Type::Class {
         sym: list,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     for m in members_named(st, list, "::") {
         let b = add_lower_bounded_tparam(st, m, "B", Type::TypeParam(elem));
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![Type::TypeParam(b)]],
-            ret: Box::new(list_of(b)),
+            ret: TyBox::new(list_of(b)),
         };
     }
     install_ordering_family(st, list, elem);
@@ -65,7 +66,7 @@ fn install_ordering_family(st: &mut SymbolTable, list: SymbolId, elem: SymbolId)
     let numeric = crate::classpath::find_by_jvm(st, "scala/math/Numeric");
     let list_a = Type::Class {
         sym: list,
-        args: vec![Type::TypeParam(elem)],
+        args: vec![Type::TypeParam(elem)].into(),
     };
     // (name, evidence class, result)
     let mut jobs: Vec<(&str, SymbolId, Ret)> = Vec::new();
@@ -104,13 +105,13 @@ fn install_ordering_family(st: &mut SymbolTable, list: SymbolId, elem: SymbolId)
             let b = add_lower_bounded_tparam(st, m, "B", Type::TypeParam(elem));
             let ev = Type::Class {
                 sym: evidence,
-                args: vec![Type::TypeParam(b)],
+                args: vec![Type::TypeParam(b)].into(),
             };
             let result = match &ret {
                 Ret::Fixed(t) => t.clone(),
                 Ret::Elem => Type::TypeParam(elem),
                 Ret::Widened => Type::TypeParam(b),
-                Ret::ArrayOfWidened => Type::Array(Box::new(Type::TypeParam(b))),
+                Ret::ArrayOfWidened => Type::Array(TyBox::new(Type::TypeParam(b))),
             };
             set_single_implicit_param(st, m, ev.clone(), result.clone());
         }
@@ -152,7 +153,7 @@ fn install_membership(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
         let b = add_lower_bounded_tparam(st, m, "A1", ta.clone());
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![Type::TypeParam(b)]],
-            ret: Box::new(Type::Boolean),
+            ret: TyBox::new(Type::Boolean),
         };
     }
     let mut widened_index_of = false;
@@ -163,7 +164,7 @@ fn install_membership(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
         let b = add_lower_bounded_tparam(st, m, "B", ta.clone());
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![Type::TypeParam(b)]],
-            ret: Box::new(Type::Int),
+            ret: TyBox::new(Type::Int),
         };
         widened_index_of = true;
     }
@@ -180,7 +181,7 @@ fn install_membership(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
         let b = add_lower_bounded_tparam(st, m, "B", ta.clone());
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![Type::TypeParam(b), Type::Int]],
-            ret: Box::new(Type::Int),
+            ret: TyBox::new(Type::Int),
         };
     }
 }
@@ -246,10 +247,10 @@ fn install_reductions(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
             };
             st.get_mut(m).ty = Type::Method {
                 paramss: vec![vec![Type::Function {
-                    params: vec![left, right],
-                    ret: Box::new(tb.clone()),
+                    params: vec![left, right].into(),
+                    ret: TyBox::new(tb.clone()),
                 }]],
-                ret: Box::new(tb),
+                ret: TyBox::new(tb),
             };
         }
     }
@@ -294,11 +295,11 @@ fn install_map_add(st: &mut SymbolTable) {
     };
     let map_of = |v: &Type| Type::Class {
         sym: map,
-        args: vec![tk.clone(), v.clone()],
+        args: vec![tk.clone(), v.clone()].into(),
     };
     let pair_v = Type::Class {
         sym: tuple2,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     for m in members_named(st, map, "+") {
         let Type::Method { paramss, .. } = st.get(m).ty.clone() else {
@@ -312,9 +313,9 @@ fn install_map_add(st: &mut SymbolTable) {
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![Type::Class {
                 sym: tuple2,
-                args: vec![tk.clone(), tv1.clone()],
+                args: vec![tk.clone(), tv1.clone()].into(),
             }]],
-            ret: Box::new(map_of(&tv1)),
+            ret: TyBox::new(map_of(&tv1)),
         };
     }
     for m in members_named(st, map, "updated") {
@@ -329,7 +330,7 @@ fn install_map_add(st: &mut SymbolTable) {
         let tv1 = Type::TypeParam(v1);
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![key, tv1.clone()]],
-            ret: Box::new(map_of(&tv1)),
+            ret: TyBox::new(map_of(&tv1)),
         };
     }
 }
@@ -383,7 +384,7 @@ fn set_single_implicit_param(st: &mut SymbolTable, method: SymbolId, ev: Type, r
     st.get_mut(method).paramss = vec![vec![p]];
     st.get_mut(method).ty = Type::Method {
         paramss: vec![vec![ev]],
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
 }
 

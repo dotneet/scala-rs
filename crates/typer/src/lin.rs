@@ -411,13 +411,13 @@ mod cache_tests {
         let leaf = class(&mut st, "Leaf");
         st.get_mut(leaf).parents.push(Type::Class {
             sym: mid,
-            args: vec![],
+            args: vec![].into(),
         });
         assert_eq!(linearize(&st, leaf), vec![leaf, mid]);
         // Cached now; adding a parent to `Mid` must still be seen.
         st.get_mut(mid).parents.push(Type::Class {
             sym: base,
-            args: vec![],
+            args: vec![].into(),
         });
         assert_eq!(linearize(&st, leaf), vec![leaf, mid, base]);
     }
@@ -432,7 +432,7 @@ mod cache_tests {
         let leaf = class(&mut st, "Leaf");
         st.get_mut(leaf).parents.push(Type::Named {
             name: "Base".into(),
-            args: vec![],
+            args: vec![].into(),
         });
         // Nothing binds `Base` as a type yet, so the parent resolves to nothing.
         assert_eq!(linearize(&st, leaf), vec![leaf]);
@@ -452,11 +452,11 @@ mod cache_tests {
         let y = class(&mut st, "Y");
         st.get_mut(x).parents.push(Type::Class {
             sym: y,
-            args: vec![],
+            args: vec![].into(),
         });
         st.get_mut(y).parents.push(Type::Class {
             sym: x,
-            args: vec![],
+            args: vec![].into(),
         });
         assert_eq!(linearize(&st, x), vec![x, y]);
         assert!(!linearize_settled(&st, x).1);

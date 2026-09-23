@@ -65,7 +65,7 @@ fn ctx(st: &mut SymbolTable, owner: SymbolId, jvm: &str) -> SymbolId {
     st.get_mut(id).parents = vec![Type::AnyRef];
     st.get_mut(id).ty = Type::Class {
         sym: id,
-        args: vec![],
+        args: vec![].into(),
     };
     id
 }

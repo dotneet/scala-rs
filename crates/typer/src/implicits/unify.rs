@@ -681,7 +681,7 @@ fn as_application(ty: &Type) -> Option<(Type, &[Type])> {
         Type::Class { sym, args } if !args.is_empty() => Some((
             Type::Class {
                 sym: *sym,
-                args: Vec::new(),
+                args: Vec::new().into(),
             },
             args,
         )),

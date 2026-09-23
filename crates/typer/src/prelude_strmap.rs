@@ -26,6 +26,7 @@
 //! is installed only under `library_abi`.
 
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -53,12 +54,12 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     let tb = Type::TypeParam(b);
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![Type::Function {
-            params: vec![Type::Char],
-            ret: Box::new(tb.clone()),
+            params: vec![Type::Char].into(),
+            ret: TyBox::new(tb.clone()),
         }]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: idx,
-            args: vec![tb],
+            args: vec![tb].into(),
         }),
     };
 }

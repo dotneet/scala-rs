@@ -1,5 +1,6 @@
 use crate::prelude::{class, method, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn add_predef_members(
@@ -24,9 +25,9 @@ pub(crate) fn add_predef_members(
         st.get_mut(co).tparams = vec![t];
         st.get_mut(co).ty = Type::Method {
             paramss: Vec::new(),
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: jclass,
-                args: vec![Type::TypeParam(t)],
+                args: vec![Type::TypeParam(t)].into(),
             }),
         };
     }
@@ -46,7 +47,7 @@ pub(crate) fn add_predef_members(
             vec![],
             Type::Class {
                 sym: jclass,
-                args: vec![Type::Wildcard],
+                args: vec![Type::Wildcard].into(),
             },
             Intrinsic::GetClass,
         );
@@ -65,8 +66,9 @@ pub(crate) fn add_predef_members(
                     sym: jclass,
                     args: vec![Type::BoundedWildcard {
                         lo: None,
-                        hi: Some(Box::new(Type::AnyVal)),
-                    }],
+                        hi: Some(TyBox::new(Type::AnyVal)),
+                    }]
+                    .into(),
                 },
                 Intrinsic::GetClass,
             );
@@ -105,7 +107,7 @@ pub(crate) fn add_predef_members(
         st,
         owner,
         "assert",
-        vec![Type::Boolean, Type::ByName(Box::new(Type::Any))],
+        vec![Type::Boolean, Type::ByName(TyBox::new(Type::Any))],
         Type::Unit,
         Intrinsic::Assert,
     );
@@ -121,7 +123,7 @@ pub(crate) fn add_predef_members(
         st,
         owner,
         "require",
-        vec![Type::Boolean, Type::ByName(Box::new(Type::Any))],
+        vec![Type::Boolean, Type::ByName(TyBox::new(Type::Any))],
         Type::Unit,
         Intrinsic::Require,
     );
@@ -145,7 +147,7 @@ pub(crate) fn add_predef_members(
     st.get_mut(ident).tparams = vec![ia];
     st.get_mut(ident).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(ia)]],
-        ret: Box::new(Type::TypeParam(ia)),
+        ret: TyBox::new(Type::TypeParam(ia)),
     };
     let loc = method(
         st,
@@ -159,7 +161,7 @@ pub(crate) fn add_predef_members(
     st.get_mut(loc).tparams = vec![lt];
     st.get_mut(loc).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(lt)]],
-        ret: Box::new(Type::TypeParam(lt)),
+        ret: TyBox::new(Type::TypeParam(lt)),
     };
     let implm = method(
         st,
@@ -183,7 +185,7 @@ pub(crate) fn add_predef_members(
     st.get_mut(implm).paramss = vec![vec![ip]];
     st.get_mut(implm).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(it)]],
-        ret: Box::new(Type::TypeParam(it)),
+        ret: TyBox::new(Type::TypeParam(it)),
     };
     let sadd = if library_abi {
         let s = class(
@@ -230,7 +232,7 @@ pub(crate) fn add_predef_members(
         vec![Type::Any],
         Type::Class {
             sym: sadd,
-            args: vec![],
+            args: vec![].into(),
         },
         if library_abi {
             Intrinsic::Identity
@@ -251,9 +253,9 @@ pub(crate) fn add_predef_members(
     st.get_mut(conv).tparams = vec![arrow_a];
     st.get_mut(conv).ty = Type::Method {
         paramss: vec![vec![Type::TypeParam(arrow_a)]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: arrow,
-            args: vec![Type::TypeParam(arrow_a)],
+            args: vec![Type::TypeParam(arrow_a)].into(),
         }),
     };
     st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
@@ -265,7 +267,7 @@ pub(crate) fn add_predef_members(
             vec![Type::String],
             Type::Class {
                 sym: sops,
-                args: vec![],
+                args: vec![].into(),
             },
             Intrinsic::Identity,
         );
@@ -278,7 +280,7 @@ pub(crate) fn add_predef_members(
             "scala/collection/immutable/WrappedString",
             &[Type::Class {
                 sym: seq,
-                args: vec![Type::Char],
+                args: vec![Type::Char].into(),
             }],
         );
         let wrap_str = method(
@@ -288,7 +290,7 @@ pub(crate) fn add_predef_members(
             vec![Type::String],
             Type::Class {
                 sym: ws,
-                args: vec![],
+                args: vec![].into(),
             },
             Intrinsic::None,
         );
@@ -305,10 +307,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "intArrayOps",
-            vec![Type::Array(Box::new(Type::Int))],
+            vec![Type::Array(TyBox::new(Type::Int))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Int],
+                args: vec![Type::Int].into(),
             },
             Intrinsic::Identity,
         );
@@ -317,10 +319,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "longArrayOps",
-            vec![Type::Array(Box::new(Type::Long))],
+            vec![Type::Array(TyBox::new(Type::Long))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Long],
+                args: vec![Type::Long].into(),
             },
             Intrinsic::Identity,
         );
@@ -329,10 +331,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "byteArrayOps",
-            vec![Type::Array(Box::new(Type::Byte))],
+            vec![Type::Array(TyBox::new(Type::Byte))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Byte],
+                args: vec![Type::Byte].into(),
             },
             Intrinsic::Identity,
         );
@@ -341,10 +343,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "shortArrayOps",
-            vec![Type::Array(Box::new(Type::Short))],
+            vec![Type::Array(TyBox::new(Type::Short))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Short],
+                args: vec![Type::Short].into(),
             },
             Intrinsic::Identity,
         );
@@ -353,10 +355,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "charArrayOps",
-            vec![Type::Array(Box::new(Type::Char))],
+            vec![Type::Array(TyBox::new(Type::Char))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Char],
+                args: vec![Type::Char].into(),
             },
             Intrinsic::Identity,
         );
@@ -365,10 +367,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "floatArrayOps",
-            vec![Type::Array(Box::new(Type::Float))],
+            vec![Type::Array(TyBox::new(Type::Float))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Float],
+                args: vec![Type::Float].into(),
             },
             Intrinsic::Identity,
         );
@@ -377,10 +379,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "doubleArrayOps",
-            vec![Type::Array(Box::new(Type::Double))],
+            vec![Type::Array(TyBox::new(Type::Double))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Double],
+                args: vec![Type::Double].into(),
             },
             Intrinsic::Identity,
         );
@@ -389,10 +391,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "booleanArrayOps",
-            vec![Type::Array(Box::new(Type::Boolean))],
+            vec![Type::Array(TyBox::new(Type::Boolean))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Boolean],
+                args: vec![Type::Boolean].into(),
             },
             Intrinsic::Identity,
         );
@@ -401,10 +403,10 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "unitArrayOps",
-            vec![Type::Array(Box::new(Type::Unit))],
+            vec![Type::Array(TyBox::new(Type::Unit))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Unit],
+                args: vec![Type::Unit].into(),
             },
             Intrinsic::Identity,
         );
@@ -413,20 +415,20 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "refArrayOps",
-            vec![Type::Array(Box::new(Type::AnyRef))],
+            vec![Type::Array(TyBox::new(Type::AnyRef))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::AnyRef],
+                args: vec![Type::AnyRef].into(),
             },
             Intrinsic::Identity,
         );
         let rt = type_param(st, wrap_ref, "T");
         st.get_mut(wrap_ref).tparams = vec![rt];
         st.get_mut(wrap_ref).ty = Type::Method {
-            paramss: vec![vec![Type::Array(Box::new(Type::TypeParam(rt)))]],
-            ret: Box::new(Type::Class {
+            paramss: vec![vec![Type::Array(TyBox::new(Type::TypeParam(rt)))]],
+            ret: TyBox::new(Type::Class {
                 sym: aops,
-                args: vec![Type::TypeParam(rt)],
+                args: vec![Type::TypeParam(rt)].into(),
             }),
         };
         st.get_mut(wrap_ref).flags = st.get(wrap_ref).flags.with(Flags::IMPLICIT);
@@ -437,20 +439,20 @@ pub(crate) fn add_predef_members(
             st,
             owner,
             "genericArrayOps",
-            vec![Type::Array(Box::new(Type::Any))],
+            vec![Type::Array(TyBox::new(Type::Any))],
             Type::Class {
                 sym: aops,
-                args: vec![Type::Any],
+                args: vec![Type::Any].into(),
             },
             Intrinsic::Identity,
         );
         let gt = type_param(st, wrap_g, "T");
         st.get_mut(wrap_g).tparams = vec![gt];
         st.get_mut(wrap_g).ty = Type::Method {
-            paramss: vec![vec![Type::Array(Box::new(Type::TypeParam(gt)))]],
-            ret: Box::new(Type::Class {
+            paramss: vec![vec![Type::Array(TyBox::new(Type::TypeParam(gt)))]],
+            ret: TyBox::new(Type::Class {
                 sym: aops,
-                args: vec![Type::TypeParam(gt)],
+                args: vec![Type::TypeParam(gt)].into(),
             }),
         };
         st.get_mut(wrap_g).flags = st.get(wrap_g).flags.with(Flags::IMPLICIT);
@@ -463,7 +465,7 @@ pub(crate) fn add_predef_members(
             vec![Type::Int],
             Type::Class {
                 sym: ri,
-                args: vec![],
+                args: vec![].into(),
             },
             Intrinsic::Identity,
         );
@@ -498,10 +500,10 @@ pub(crate) fn add_predef_members(
                 st,
                 owner,
                 "wrapIntArray",
-                vec![Type::Array(Box::new(Type::Int))],
+                vec![Type::Array(TyBox::new(Type::Int))],
                 Type::Class {
                     sym: of_int,
-                    args: vec![],
+                    args: vec![].into(),
                 },
                 Intrinsic::None,
             );
@@ -528,7 +530,7 @@ fn add_numeric_wrapper(
         vec![from],
         Type::Class {
             sym: cls,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::Identity,
     );

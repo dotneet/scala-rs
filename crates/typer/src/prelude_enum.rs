@@ -57,7 +57,7 @@ pub(crate) fn install(st: &mut SymbolTable) {
     };
     let val_t = Type::Class {
         sym: val,
-        args: vec![],
+        args: vec![].into(),
     };
     for params in [
         vec![Type::Int],

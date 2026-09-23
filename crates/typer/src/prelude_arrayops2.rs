@@ -1,5 +1,6 @@
 use crate::prelude::{class, fn1, fn2, iface, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
@@ -14,7 +15,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
     st.get_mut(aops).tparams = vec![a];
     let ta = Type::TypeParam(a);
     let xs = st.alloc("xs", aops, SymKind::Term, Flags::PARAM, "");
-    st.get_mut(xs).ty = Type::Array(Box::new(ta.clone()));
+    st.get_mut(xs).ty = Type::Array(TyBox::new(ta.clone()));
     st.get_mut(aops).ctor_fields = vec![xs];
     method(st, aops, "head", vec![], ta.clone(), Intrinsic::None);
     method(
@@ -22,7 +23,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "tail",
         vec![],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -38,7 +39,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "filter",
         vec![fn1(ta.clone(), Type::Boolean)],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -46,7 +47,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "take",
         vec![Type::Int],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -54,7 +55,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "drop",
         vec![Type::Int],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -62,7 +63,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "dropWhile",
         vec![fn1(ta.clone(), Type::Boolean)],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -94,7 +95,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "slice",
         vec![Type::Int, Type::Int],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(st, aops, "last", vec![], ta.clone(), Intrinsic::None);
@@ -103,7 +104,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "init",
         vec![],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -111,7 +112,7 @@ pub(crate) fn add_array_ops(st: &mut SymbolTable) -> SymbolId {
         aops,
         "reverse",
         vec![],
-        Type::Array(Box::new(ta)),
+        Type::Array(TyBox::new(ta)),
         Intrinsic::None,
     );
     method(st, aops, "size", vec![], Type::Int, Intrinsic::None);
@@ -136,7 +137,7 @@ pub(crate) fn add_array_ops_map(st: &mut SymbolTable, aops: SymbolId, ct: Symbol
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).params = vec![f, ev];
@@ -146,10 +147,10 @@ pub(crate) fn add_array_ops_map(st: &mut SymbolTable, aops: SymbolId, ct: Symbol
             vec![fn1(ta, Type::TypeParam(b))],
             vec![Type::Class {
                 sym: ct,
-                args: vec![Type::TypeParam(b)],
+                args: vec![Type::TypeParam(b)].into(),
             }],
         ],
-        ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+        ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
 /// `ArrayOps.flatMap[B](f: A => Any)(implicit ClassTag[B]): Array[B]`.
@@ -171,7 +172,7 @@ pub(crate) fn add_array_ops_flat_map(st: &mut SymbolTable, aops: SymbolId, ct: S
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).params = vec![f, ev];
@@ -181,10 +182,10 @@ pub(crate) fn add_array_ops_flat_map(st: &mut SymbolTable, aops: SymbolId, ct: S
             vec![fn1(ta, Type::Any)],
             vec![Type::Class {
                 sym: ct,
-                args: vec![Type::TypeParam(b)],
+                args: vec![Type::TypeParam(b)].into(),
             }],
         ],
-        ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+        ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
 /// `ArrayOps.flatMap[BS, B](f: A => BS)(implicit asIterable: BS => Iterable[B], m: ClassTag[B])`.
@@ -208,7 +209,7 @@ pub(crate) fn add_array_ops_flat_map_from_array(
         "scala/collection/mutable/ArraySeq$ofInt",
         &[Type::Class {
             sym: iterable,
-            args: vec![Type::Int],
+            args: vec![Type::Int].into(),
         }],
     );
     let a = st.get(aops).tparams[0];
@@ -229,7 +230,7 @@ pub(crate) fn add_array_ops_flat_map_from_array(
         Type::TypeParam(bs),
         Type::Class {
             sym: iterable,
-            args: vec![Type::TypeParam(b)],
+            args: vec![Type::TypeParam(b)].into(),
         },
     );
     let ev = st.alloc(
@@ -241,7 +242,7 @@ pub(crate) fn add_array_ops_flat_map_from_array(
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     st.get_mut(m).tparams = vec![bs, b];
     st.get_mut(m).params = vec![f, as_it, ev];
@@ -254,16 +255,16 @@ pub(crate) fn add_array_ops_flat_map_from_array(
                     Type::TypeParam(bs),
                     Type::Class {
                         sym: iterable,
-                        args: vec![Type::TypeParam(b)],
+                        args: vec![Type::TypeParam(b)].into(),
                     },
                 ),
                 Type::Class {
                     sym: ct,
-                    args: vec![Type::TypeParam(b)],
+                    args: vec![Type::TypeParam(b)].into(),
                 },
             ],
         ],
-        ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+        ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
 /// `ArrayOps.collect[B](pf: PartialFunction[A, B])(implicit ClassTag[B]): Array[B]`.
@@ -283,7 +284,7 @@ pub(crate) fn add_array_ops_collect(st: &mut SymbolTable, aops: SymbolId, ct: Sy
     let f = st.alloc("pf", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
     st.get_mut(f).ty = Type::Class {
         sym: pf,
-        args: vec![ta.clone(), Type::TypeParam(b)],
+        args: vec![ta.clone(), Type::TypeParam(b)].into(),
     };
     let ev = st.alloc(
         "evidence$1",
@@ -294,7 +295,7 @@ pub(crate) fn add_array_ops_collect(st: &mut SymbolTable, aops: SymbolId, ct: Sy
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).params = vec![f, ev];
@@ -303,14 +304,14 @@ pub(crate) fn add_array_ops_collect(st: &mut SymbolTable, aops: SymbolId, ct: Sy
         paramss: vec![
             vec![Type::Class {
                 sym: pf,
-                args: vec![ta, Type::TypeParam(b)],
+                args: vec![ta, Type::TypeParam(b)].into(),
             }],
             vec![Type::Class {
                 sym: ct,
-                args: vec![Type::TypeParam(b)],
+                args: vec![Type::TypeParam(b)].into(),
             }],
         ],
-        ret: Box::new(Type::Array(Box::new(Type::TypeParam(b)))),
+        ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
 /// `ArrayOps.zip[B](that: IterableOnce[B]): Array[(A, B)]`.
@@ -325,7 +326,7 @@ pub(crate) fn add_array_ops_zip(st: &mut SymbolTable, aops: SymbolId, tuple2: Sy
     if let Some(la) = st.get(st.list_sym).tparams.first().copied() {
         let parent = Type::Class {
             sym: ioc,
-            args: vec![Type::TypeParam(la)],
+            args: vec![Type::TypeParam(la)].into(),
         };
         if !st
             .get(st.list_sym)
@@ -343,7 +344,7 @@ pub(crate) fn add_array_ops_zip(st: &mut SymbolTable, aops: SymbolId, tuple2: Sy
     let that = st.alloc("that", m, crate::symbol::SymKind::Term, Flags::PARAM, "");
     st.get_mut(that).ty = Type::Class {
         sym: ioc,
-        args: vec![Type::TypeParam(b)],
+        args: vec![Type::TypeParam(b)].into(),
     };
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).params = vec![that];
@@ -351,12 +352,15 @@ pub(crate) fn add_array_ops_zip(st: &mut SymbolTable, aops: SymbolId, tuple2: Sy
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![Type::Class {
             sym: ioc,
-            args: vec![Type::TypeParam(b)],
+            args: vec![Type::TypeParam(b)].into(),
         }]],
-        ret: Box::new(Type::Array(Box::new(Type::Class {
-            sym: tuple2,
-            args: vec![ta, Type::TypeParam(b)],
-        }))),
+        ret: TyBox::new(Type::Array(
+            Box::new(Type::Class {
+                sym: tuple2,
+                args: vec![ta, Type::TypeParam(b)].into(),
+            })
+            .into(),
+        )),
     };
 }
 /// ArrayOps.foldLeft / fold / foldRight.
@@ -382,7 +386,7 @@ pub(crate) fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
             vec![tb.clone()],
             vec![fn2(tb.clone(), ta.clone(), tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
 
     let m = method(st, aops, "fold", vec![], Type::Unit, Intrinsic::None);
@@ -400,7 +404,7 @@ pub(crate) fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
             vec![ta1.clone()],
             vec![fn2(ta1.clone(), ta1.clone(), ta1.clone())],
         ],
-        ret: Box::new(ta1),
+        ret: TyBox::new(ta1),
     };
 
     let m = method(st, aops, "foldRight", vec![], Type::Unit, Intrinsic::None);
@@ -415,7 +419,7 @@ pub(crate) fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
     st.get_mut(m).paramss = vec![vec![z], vec![op]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![tb.clone()], vec![fn2(ta, tb.clone(), tb.clone())]],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
 }
 /// ArrayOps.scanLeft[B: ClassTag](z: B)(op: (B, A) => B): Array[B]
@@ -446,7 +450,7 @@ pub(crate) fn add_array_ops_scan_left(st: &mut SymbolTable, aops: SymbolId) {
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![tb.clone()],
+        args: vec![tb.clone()].into(),
     };
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).params = vec![z, op, ev];
@@ -457,10 +461,10 @@ pub(crate) fn add_array_ops_scan_left(st: &mut SymbolTable, aops: SymbolId) {
             vec![fn2(tb.clone(), ta, tb.clone())],
             vec![Type::Class {
                 sym: ct,
-                args: vec![tb.clone()],
+                args: vec![tb.clone()].into(),
             }],
         ],
-        ret: Box::new(Type::Array(Box::new(tb))),
+        ret: TyBox::new(Type::Array(Box::new(tb).into())),
     };
 }
 /// ArrayOps.find / contains / distinct / takeRight / dropRight / takeWhile /
@@ -481,7 +485,7 @@ pub(crate) fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
         vec![fn1(ta.clone(), Type::Boolean)],
         Type::Class {
             sym: st.option_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -498,7 +502,7 @@ pub(crate) fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
         aops,
         "distinct",
         vec![],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -506,7 +510,7 @@ pub(crate) fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
         aops,
         "takeRight",
         vec![Type::Int],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -514,7 +518,7 @@ pub(crate) fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
         aops,
         "dropRight",
         vec![Type::Int],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -522,7 +526,7 @@ pub(crate) fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
         aops,
         "takeWhile",
         vec![fn1(ta.clone(), Type::Boolean)],
-        Type::Array(Box::new(ta.clone())),
+        Type::Array(TyBox::new(ta.clone())),
         Intrinsic::None,
     );
     method(
@@ -545,7 +549,7 @@ pub(crate) fn add_array_ops_remaining(st: &mut SymbolTable, aops: SymbolId) {
         vec![],
         Type::Class {
             sym: range,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
@@ -564,7 +568,7 @@ pub(crate) fn add_array_ops_filter_not_opts_part(
 ) {
     let a = st.get(aops).tparams[0];
     let ta = Type::TypeParam(a);
-    let arr = Type::Array(Box::new(ta.clone()));
+    let arr = Type::Array(TyBox::new(ta.clone()));
     method(
         st,
         aops,
@@ -580,7 +584,7 @@ pub(crate) fn add_array_ops_filter_not_opts_part(
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -591,13 +595,13 @@ pub(crate) fn add_array_ops_filter_not_opts_part(
         vec![],
         Type::Class {
             sym: st.option_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![arr.clone(), arr],
+        args: vec![arr.clone(), arr].into(),
     };
     method(
         st,
@@ -636,9 +640,9 @@ pub(crate) fn add_array_ops_zip_index_size(st: &mut SymbolTable, aops: SymbolId,
         aops,
         "zipWithIndex",
         vec![],
-        Type::Array(Box::new(Type::Class {
+        Type::Array(TyBox::new(Type::Class {
             sym: tuple2,
-            args: vec![ta, Type::Int],
+            args: vec![ta, Type::Int].into(),
         })),
         Intrinsic::None,
     );
@@ -691,7 +695,7 @@ pub(crate) fn add_array_ops_length_index_copy(
         st,
         aops,
         "copyToArray",
-        vec![Type::Array(Box::new(ta.clone()))],
+        vec![Type::Array(TyBox::new(ta.clone()))],
         Type::Int,
         Intrinsic::None,
     );
@@ -702,7 +706,7 @@ pub(crate) fn add_array_ops_length_index_copy(
         vec![],
         Type::Class {
             sym: iterator,
-            args: vec![ta],
+            args: vec![ta].into(),
         },
         Intrinsic::None,
     );
@@ -715,13 +719,13 @@ pub(crate) fn add_array_companion(st: &mut SymbolTable, ct: SymbolId) {
         st,
         mc,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
-        Type::Array(Box::new(Type::Any)),
+        vec![Type::Repeated(TyBox::new(Type::Any))],
+        Type::Array(TyBox::new(Type::Any)),
         Intrinsic::None,
     );
     let t = type_param(st, apply, "T");
     let xs = st.alloc("xs", apply, crate::symbol::SymKind::Term, Flags::PARAM, "");
-    st.get_mut(xs).ty = Type::Repeated(Box::new(Type::TypeParam(t)));
+    st.get_mut(xs).ty = Type::Repeated(TyBox::new(Type::TypeParam(t)));
     let ev = st.alloc(
         "evidence$1",
         apply,
@@ -731,20 +735,20 @@ pub(crate) fn add_array_companion(st: &mut SymbolTable, ct: SymbolId) {
     );
     st.get_mut(ev).ty = Type::Class {
         sym: ct,
-        args: vec![Type::TypeParam(t)],
+        args: vec![Type::TypeParam(t)].into(),
     };
     st.get_mut(apply).tparams = vec![t];
     st.get_mut(apply).params = vec![xs, ev];
     st.get_mut(apply).paramss = vec![vec![xs], vec![ev]];
     st.get_mut(apply).ty = Type::Method {
         paramss: vec![
-            vec![Type::Repeated(Box::new(Type::TypeParam(t)))],
+            vec![Type::Repeated(TyBox::new(Type::TypeParam(t)))],
             vec![Type::Class {
                 sym: ct,
-                args: vec![Type::TypeParam(t)],
+                args: vec![Type::TypeParam(t)].into(),
             }],
         ],
-        ret: Box::new(Type::Array(Box::new(Type::TypeParam(t)))),
+        ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(t)).into())),
     };
     let mems = st.get(mc).members.clone();
     st.get_mut(am).members.extend(mems);

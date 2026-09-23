@@ -14,6 +14,7 @@
 //! "not a member of Int" instead of producing bytecode that fails at load time.
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> SymbolId {
@@ -34,7 +35,7 @@ fn getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ret: Type) -> Symbo
     let id = st.alloc(name, owner, SymKind::Method, Flags::FINAL, "");
     st.get_mut(id).ty = Type::Method {
         paramss: Vec::new(),
-        ret: Box::new(ret),
+        ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = Intrinsic::None;
     id

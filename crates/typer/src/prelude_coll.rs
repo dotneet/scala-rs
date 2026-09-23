@@ -9,6 +9,7 @@
 //! for the real (erased) JVM descriptor being modeled.
 
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 use crate::prelude::{fn1, fn2, iface, method, module, type_param};
@@ -79,7 +80,7 @@ fn find_or_create_iterable(st: &mut SymbolTable, iterator_sym: SymbolId) -> Symb
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -92,7 +93,7 @@ fn find_or_create_iterable(st: &mut SymbolTable, iterator_sym: SymbolId) -> Symb
         vec![],
         Type::Class {
             sym: iterator_sym,
-            args: vec![ta],
+            args: vec![ta].into(),
         },
         Intrinsic::None,
     );
@@ -148,7 +149,7 @@ fn add_tuple2_extra(st: &mut SymbolTable, tuple2: SymbolId) {
     let t2 = st.get(tuple2).tparams[1];
     let swapped = Type::Class {
         sym: tuple2,
-        args: vec![Type::TypeParam(t2), Type::TypeParam(t1)],
+        args: vec![Type::TypeParam(t2), Type::TypeParam(t1)].into(),
     };
     method(st, tuple2, "swap", vec![], swapped, Intrinsic::None);
     method(
@@ -201,7 +202,7 @@ fn add_indexed_buffer_extra(
     let ta = Type::TypeParam(ba);
     let buf_t = Type::Class {
         sym: buf,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
 
     method(st, buf, "length", vec![], Type::Int, Intrinsic::None);
@@ -275,7 +276,7 @@ fn add_indexed_buffer_extra(
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -286,7 +287,7 @@ fn add_indexed_buffer_extra(
         vec![],
         Type::Class {
             sym: iterator_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -347,7 +348,7 @@ fn add_indexed_buffer_extra(
             vec![tb.clone()],
             vec![fn2(tb.clone(), ta.clone(), tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
 
     if ordering != SymbolId::NONE {
@@ -358,7 +359,7 @@ fn add_indexed_buffer_extra(
         let f = alloc_param(st, m, "f", fn1(ta.clone(), tb.clone()), false);
         let ord_ty = Type::Class {
             sym: ordering,
-            args: vec![tb.clone()],
+            args: vec![tb.clone()].into(),
         };
         let ev = alloc_param(st, m, "ord", ord_ty.clone(), true);
         st.get_mut(m).tparams = vec![b];
@@ -366,21 +367,21 @@ fn add_indexed_buffer_extra(
         st.get_mut(m).paramss = vec![vec![f], vec![ev]];
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![fn1(ta.clone(), tb)], vec![ord_ty]],
-            ret: Box::new(buf_t.clone()),
+            ret: TyBox::new(buf_t.clone()),
         };
 
         // sorted(implicit ord: Ordering[A]): buf.type
         let m = method(st, buf, "sorted", vec![], Type::Unit, Intrinsic::None);
         let ord_ty = Type::Class {
             sym: ordering,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         };
         let ev = alloc_param(st, m, "ord", ord_ty.clone(), true);
         st.get_mut(m).params = vec![ev];
         st.get_mut(m).paramss = vec![vec![ev]];
         st.get_mut(m).ty = Type::Method {
             paramss: vec![vec![ord_ty]],
-            ret: Box::new(buf_t),
+            ret: TyBox::new(buf_t),
         };
     }
 }
@@ -411,15 +412,15 @@ fn add_mutable_map(
     let tv = Type::TypeParam(mv);
     let map_t = Type::Class {
         sym: map,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     let opt_v = Type::Class {
         sym: st.option_sym,
-        args: vec![tv.clone()],
+        args: vec![tv.clone()].into(),
     };
 
     method(
@@ -461,7 +462,7 @@ fn add_mutable_map(
         vec![],
         Type::Class {
             sym: coll_iterable,
-            args: vec![tk.clone()],
+            args: vec![tk.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -472,7 +473,7 @@ fn add_mutable_map(
         vec![],
         Type::Class {
             sym: coll_iterable,
-            args: vec![tv.clone()],
+            args: vec![tv.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -527,7 +528,7 @@ fn add_mutable_map(
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![pair.clone()],
+            args: vec![pair.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -538,7 +539,7 @@ fn add_mutable_map(
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![pair.clone()],
+            args: vec![pair.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -549,7 +550,7 @@ fn add_mutable_map(
         vec![],
         Type::Class {
             sym: iterator_sym,
-            args: vec![pair.clone()],
+            args: vec![pair.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -576,7 +577,7 @@ fn add_mutable_map(
         st,
         map,
         "getOrElse",
-        vec![tk.clone(), Type::ByName(Box::new(tv.clone()))],
+        vec![tk.clone(), Type::ByName(TyBox::new(tv.clone()))],
         tv.clone(),
         Intrinsic::None,
     );
@@ -585,7 +586,7 @@ fn add_mutable_map(
         st,
         map,
         "getOrElseUpdate",
-        vec![tk.clone(), Type::ByName(Box::new(tv.clone()))],
+        vec![tk.clone(), Type::ByName(TyBox::new(tv.clone()))],
         tv,
         Intrinsic::None,
     );
@@ -599,7 +600,7 @@ fn add_mutable_map(
         vec![],
         Type::Class {
             sym: map,
-            args: vec![Type::Any, Type::Any],
+            args: vec![Type::Any, Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -607,7 +608,7 @@ fn add_mutable_map(
         st,
         map_cls,
         "apply",
-        vec![Type::Repeated(Box::new(pair))],
+        vec![Type::Repeated(TyBox::new(pair))],
         map_t,
         Intrinsic::None,
     );
@@ -616,13 +617,13 @@ fn add_mutable_map(
     st.get_mut(map_apply).tparams = vec![mak, mav];
     let map_pair = Type::Class {
         sym: tuple2,
-        args: vec![Type::TypeParam(mak), Type::TypeParam(mav)],
+        args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
     };
     st.get_mut(map_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(map_pair))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(map_pair))]],
+        ret: TyBox::new(Type::Class {
             sym: map,
-            args: vec![Type::TypeParam(mak), Type::TypeParam(mav)],
+            args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
         }),
     };
     let mems = st.get(map_cls).members.clone();
@@ -642,7 +643,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
     let ta = Type::TypeParam(sa);
     let set_t = Type::Class {
         sym: set,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -711,7 +712,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -722,7 +723,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -733,7 +734,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
         vec![],
         Type::Class {
             sym: iterator_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -764,7 +765,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
         vec![],
         Type::Class {
             sym: set,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -772,17 +773,17 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
         st,
         set_cls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         set_t,
         Intrinsic::None,
     );
     let saa = type_param(st, set_apply, "A");
     st.get_mut(set_apply).tparams = vec![saa];
     st.get_mut(set_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(Box::new(Type::TypeParam(saa)))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]],
+        ret: TyBox::new(Type::Class {
             sym: set,
-            args: vec![Type::TypeParam(saa)],
+            args: vec![Type::TypeParam(saa)].into(),
         }),
     };
     let mems = st.get(set_cls).members.clone();
@@ -811,18 +812,18 @@ fn add_immutable_map_extra(
     let tv = Type::TypeParam(mv);
     let map_t = Type::Class {
         sym: map,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     let pair = Type::Class {
         sym: tuple2,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
 
     method(
         st,
         map,
         "getOrElse",
-        vec![tk.clone(), Type::ByName(Box::new(tv.clone()))],
+        vec![tk.clone(), Type::ByName(TyBox::new(tv.clone()))],
         tv.clone(),
         Intrinsic::None,
     );
@@ -841,7 +842,7 @@ fn add_immutable_map_extra(
         vec![],
         Type::Class {
             sym: coll_iterable,
-            args: vec![tk.clone()],
+            args: vec![tk.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -852,7 +853,7 @@ fn add_immutable_map_extra(
         vec![],
         Type::Class {
             sym: coll_iterable,
-            args: vec![tv.clone()],
+            args: vec![tv.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -864,7 +865,7 @@ fn add_immutable_map_extra(
             vec![],
             Type::Class {
                 sym: set,
-                args: vec![tk.clone()],
+                args: vec![tk.clone()].into(),
             },
             Intrinsic::None,
         );
@@ -904,7 +905,7 @@ fn add_immutable_map_extra(
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![pair.clone()],
+            args: vec![pair.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -915,7 +916,7 @@ fn add_immutable_map_extra(
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![pair.clone()],
+            args: vec![pair.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -926,7 +927,7 @@ fn add_immutable_map_extra(
         vec![],
         Type::Class {
             sym: iterator_sym,
-            args: vec![pair.clone()],
+            args: vec![pair.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -968,7 +969,7 @@ fn add_immutable_map_extra(
             vec![tb.clone()],
             vec![fn2(tb.clone(), pair.clone(), tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
     method(
         st,
@@ -999,7 +1000,7 @@ fn add_immutable_map_extra(
     // declared directly on `MapView` (e.g. `mapValues` below).
     let view_t = Type::Class {
         sym: map_view,
-        args: vec![tk.clone(), tv.clone()],
+        args: vec![tk.clone(), tv.clone()].into(),
     };
     method(st, map, "view", vec![], view_t.clone(), Intrinsic::None);
     // `prelude_arrconv` may already declare `mapValues`; a second copy
@@ -1021,9 +1022,9 @@ fn add_immutable_map_extra(
         st.get_mut(mm).paramss = vec![vec![f]];
         st.get_mut(mm).ty = Type::Method {
             paramss: vec![vec![fn1(Type::TypeParam(vv), tw.clone())]],
-            ret: Box::new(Type::Class {
+            ret: TyBox::new(Type::Class {
                 sym: map_view,
-                args: vec![Type::TypeParam(vk), tw],
+                args: vec![Type::TypeParam(vk), tw].into(),
             }),
         };
     }
@@ -1036,8 +1037,9 @@ fn add_immutable_map_extra(
             sym: st.list_sym,
             args: vec![Type::Class {
                 sym: tuple2,
-                args: vec![Type::TypeParam(vk), Type::TypeParam(vv)],
-            }],
+                args: vec![Type::TypeParam(vk), Type::TypeParam(vv)].into(),
+            }]
+            .into(),
         },
         Intrinsic::None,
     );
@@ -1064,7 +1066,7 @@ fn add_immutable_map_extra(
         vec![fn1(
             Type::Class {
                 sym: tuple2,
-                args: vec![Type::TypeParam(vk), Type::TypeParam(vv)],
+                args: vec![Type::TypeParam(vk), Type::TypeParam(vv)].into(),
             },
             Type::Unit,
         )],
@@ -1086,7 +1088,7 @@ fn add_immutable_set_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_s
     let ta = Type::TypeParam(sa);
     let set_t = Type::Class {
         sym: set,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(
         st,
@@ -1110,7 +1112,7 @@ fn add_immutable_set_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_s
         "++",
         vec![Type::Class {
             sym: set,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         }],
         set_t.clone(),
         Intrinsic::None,
@@ -1133,7 +1135,7 @@ fn add_immutable_set_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_s
         vec![fn1(ta.clone(), Type::Any)],
         Type::Class {
             sym: set,
-            args: vec![Type::Any],
+            args: vec![Type::Any].into(),
         },
         Intrinsic::None,
     );
@@ -1144,7 +1146,7 @@ fn add_immutable_set_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_s
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -1155,7 +1157,7 @@ fn add_immutable_set_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_s
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -1166,7 +1168,7 @@ fn add_immutable_set_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_s
         vec![],
         Type::Class {
             sym: iterator_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -1209,11 +1211,11 @@ fn add_sorted_set_ops(st: &mut SymbolTable) {
     };
     let arg = Type::Class {
         sym: set,
-        args: vec![Type::TypeParam(elem)],
+        args: vec![Type::TypeParam(elem)].into(),
     };
     let result = Type::Class {
         sym: sorted,
-        args: vec![Type::TypeParam(elem)],
+        args: vec![Type::TypeParam(elem)].into(),
     };
     for name in ["|", "&"] {
         if st.lookup_member(sorted, name).is_empty() {
@@ -1241,7 +1243,7 @@ fn add_vector_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_sym: Sym
     let ta = Type::TypeParam(va);
     let vec_t = Type::Class {
         sym: vec,
-        args: vec![ta.clone()],
+        args: vec![ta.clone()].into(),
     };
     method(st, vec, "size", vec![], Type::Int, Intrinsic::None);
     method(st, vec, "isEmpty", vec![], Type::Boolean, Intrinsic::None);
@@ -1270,7 +1272,7 @@ fn add_vector_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_sym: Sym
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -1281,7 +1283,7 @@ fn add_vector_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_sym: Sym
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -1292,7 +1294,7 @@ fn add_vector_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_sym: Sym
         vec![],
         Type::Class {
             sym: iterator_sym,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         },
         Intrinsic::None,
     );
@@ -1327,6 +1329,6 @@ fn add_vector_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_sym: Sym
             vec![tb.clone()],
             vec![fn2(tb.clone(), Type::TypeParam(va), tb.clone())],
         ],
-        ret: Box::new(tb),
+        ret: TyBox::new(tb),
     };
 }

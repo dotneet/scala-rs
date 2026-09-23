@@ -36,6 +36,7 @@
 //! broken code).
 
 use crate::symbol::{SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// The JVM names of the built-in companions that get an `unapplySeq`.
@@ -111,14 +112,15 @@ fn add_seq_unapply_seq(st: &mut SymbolTable, module: SymbolId, coll: SymbolId) {
     st.get_mut(id).ty = Type::Method {
         paramss: vec![vec![Type::Class {
             sym: coll,
-            args: vec![ta.clone()],
+            args: vec![ta.clone()].into(),
         }]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: st.option_sym,
             args: vec![Type::Class {
                 sym: seq,
-                args: vec![ta],
-            }],
+                args: vec![ta].into(),
+            }]
+            .into(),
         }),
     };
 }
@@ -141,13 +143,14 @@ fn add_array_unapply_seq(st: &mut SymbolTable, module: SymbolId) {
     st.get_mut(id).tparams = vec![a];
     let ta = Type::TypeParam(a);
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![vec![Type::Array(Box::new(ta.clone()))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Array(TyBox::new(ta.clone()))]],
+        ret: TyBox::new(Type::Class {
             sym: st.option_sym,
             args: vec![Type::Class {
                 sym: seq,
-                args: vec![ta],
-            }],
+                args: vec![ta].into(),
+            }]
+            .into(),
         }),
     };
 }

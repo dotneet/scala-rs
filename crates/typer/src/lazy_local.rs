@@ -38,6 +38,7 @@
 //! Before this pass the declaration site evaluated the right-hand side eagerly
 //! — the program type-checked and ran, it just was not lazy.
 
+use scala_rs_parser::TyBox;
 use std::collections::HashMap;
 
 use scala_rs_parser::{Flags, Modifiers, SymbolId, Tree, TreeKind, Type};
@@ -126,7 +127,7 @@ impl Pass<'_> {
         let cell_cls = cell_class(self.st, &ty)?;
         let cell_ty = Type::Class {
             sym: cell_cls,
-            args: vec![],
+            args: vec![].into(),
         };
         let owner = self.st.get(vsym).owner;
         let name = self.st.get(vsym).name.clone();
@@ -156,7 +157,7 @@ impl Pass<'_> {
         );
         let mty = Type::Method {
             paramss: vec![vec![cell_ty.clone()]],
-            ret: Box::new(ty.clone()),
+            ret: TyBox::new(ty.clone()),
         };
         self.st.get_mut(acc).ty = mty.clone();
         self.st.get_mut(acc).params = vec![cell];

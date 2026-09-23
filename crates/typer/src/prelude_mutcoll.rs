@@ -31,6 +31,7 @@
 
 use crate::prelude::{class, method, module, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 pub fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -109,7 +110,7 @@ fn add_string_builder_companion(st: &mut SymbolTable, mutp: SymbolId) {
         vec![],
         Type::Class {
             sym: cls,
-            args: vec![],
+            args: vec![].into(),
         },
         Intrinsic::None,
     );
@@ -176,7 +177,7 @@ fn add_constructors(st: &mut SymbolTable, ordering: Option<SymbolId>) {
         };
         st.get_mut(ctor).ty = Type::Method {
             paramss: tys,
-            ret: Box::new(ret),
+            ret: TyBox::new(ret),
         };
     }
 }
@@ -222,7 +223,7 @@ fn add_factory(
     st.get_mut(cls).tparams = vec![a];
     let cls_t = Type::Class {
         sym: cls,
-        args: vec![Type::TypeParam(a)],
+        args: vec![Type::TypeParam(a)].into(),
     };
 
     let m = module(st, mutp, name, &format!("{jvm}$"));
@@ -236,9 +237,9 @@ fn add_factory(
     st.get_mut(empty).paramss = eps;
     st.get_mut(empty).ty = Type::Method {
         paramss: epss,
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: cls,
-            args: vec![Type::TypeParam(ea)],
+            args: vec![Type::TypeParam(ea)].into(),
         }),
     };
 
@@ -246,7 +247,7 @@ fn add_factory(
         st,
         mcls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         cls_t,
         Intrinsic::None,
     );
@@ -259,15 +260,15 @@ fn add_factory(
         evidence,
         aa,
         vec![vec![elems]],
-        vec![vec![Type::Repeated(Box::new(Type::TypeParam(aa)))]],
+        vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(aa)))]],
     );
     st.get_mut(apply).params = aps.concat();
     st.get_mut(apply).paramss = aps;
     st.get_mut(apply).ty = Type::Method {
         paramss: apss,
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: cls,
-            args: vec![Type::TypeParam(aa)],
+            args: vec![Type::TypeParam(aa)].into(),
         }),
     };
 
@@ -296,7 +297,7 @@ fn add_map_factory(
     st.get_mut(cls).tparams = vec![k, v];
     let cls_t = Type::Class {
         sym: cls,
-        args: vec![Type::TypeParam(k), Type::TypeParam(v)],
+        args: vec![Type::TypeParam(k), Type::TypeParam(v)].into(),
     };
 
     let m = module(st, mutp, "TreeMap", "scala/collection/mutable/TreeMap$");
@@ -311,9 +312,9 @@ fn add_map_factory(
     st.get_mut(empty).paramss = eps;
     st.get_mut(empty).ty = Type::Method {
         paramss: epss,
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: cls,
-            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)],
+            args: vec![Type::TypeParam(ek), Type::TypeParam(ev)].into(),
         }),
     };
 
@@ -321,7 +322,7 @@ fn add_map_factory(
         st,
         mcls,
         "apply",
-        vec![Type::Repeated(Box::new(Type::Any))],
+        vec![Type::Repeated(TyBox::new(Type::Any))],
         cls_t,
         Intrinsic::None,
     );
@@ -331,9 +332,9 @@ fn add_map_factory(
     let pair = match tuple2 {
         Some(t2) => Type::Class {
             sym: t2,
-            args: vec![Type::TypeParam(ak), Type::TypeParam(av)],
+            args: vec![Type::TypeParam(ak), Type::TypeParam(av)].into(),
         },
-        None => Type::Tuple(vec![Type::TypeParam(ak), Type::TypeParam(av)]),
+        None => Type::Tuple(vec![Type::TypeParam(ak), Type::TypeParam(av)].into()),
     };
     let elems = repeated_param(st, apply, pair.clone());
     let (aps, apss) = evidence_clause(
@@ -342,15 +343,15 @@ fn add_map_factory(
         ordering,
         ak,
         vec![vec![elems]],
-        vec![vec![Type::Repeated(Box::new(pair))]],
+        vec![vec![Type::Repeated(TyBox::new(pair))]],
     );
     st.get_mut(apply).params = aps.concat();
     st.get_mut(apply).paramss = aps;
     st.get_mut(apply).ty = Type::Method {
         paramss: apss,
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: cls,
-            args: vec![Type::TypeParam(ak), Type::TypeParam(av)],
+            args: vec![Type::TypeParam(ak), Type::TypeParam(av)].into(),
         }),
     };
 
@@ -360,7 +361,7 @@ fn add_map_factory(
 
 fn repeated_param(st: &mut SymbolTable, owner: SymbolId, elem: Type) -> SymbolId {
     let id = st.alloc("elems", owner, SymKind::Term, Flags::PARAM, "");
-    st.get_mut(id).ty = Type::Repeated(Box::new(elem));
+    st.get_mut(id).ty = Type::Repeated(TyBox::new(elem));
     id
 }
 
@@ -383,7 +384,7 @@ fn evidence_clause(
     };
     let ev_ty = Type::Class {
         sym: ev_cls,
-        args: vec![Type::TypeParam(tp)],
+        args: vec![Type::TypeParam(tp)].into(),
     };
     let id = st.alloc(
         "evidence$1",
@@ -440,7 +441,7 @@ fn add_array_seq_members(st: &mut SymbolTable, cls: SymbolId) {
         vec![],
         Type::Class {
             sym: st.list_sym,
-            args: vec![ta],
+            args: vec![ta].into(),
         },
         Intrinsic::None,
     );
@@ -459,7 +460,7 @@ fn add_priority_queue_members(st: &mut SymbolTable, cls: SymbolId) {
         st,
         cls,
         "enqueue",
-        vec![Type::Repeated(Box::new(Type::TypeParam(a)))],
+        vec![Type::Repeated(TyBox::new(Type::TypeParam(a)))],
         Type::Unit,
         Intrinsic::None,
     );
@@ -485,7 +486,7 @@ fn add_array_deque_append(st: &mut SymbolTable) {
     };
     let self_t = Type::Class {
         sym: cls,
-        args: vec![Type::TypeParam(a)],
+        args: vec![Type::TypeParam(a)].into(),
     };
     method(
         st,

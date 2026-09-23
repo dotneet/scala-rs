@@ -51,6 +51,7 @@
 
 use crate::prelude::{method, type_param};
 use crate::symbol::{Intrinsic, SymKind, SymbolTable};
+use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, SymbolId, Type};
 
 /// All of this is `library_abi` only. The private runtime (`--no-scala-library`) has
@@ -124,7 +125,7 @@ fn add_set_widening_concat(st: &mut SymbolTable) {
     let tb = Type::TypeParam(b);
     let param_ty = Type::Class {
         sym: ioc,
-        args: vec![tb.clone()],
+        args: vec![tb.clone()].into(),
     };
     let p = st.alloc("that", m, SymKind::Term, Flags::PARAM, "");
     st.get_mut(p).ty = param_ty.clone();
@@ -133,9 +134,9 @@ fn add_set_widening_concat(st: &mut SymbolTable) {
     st.get_mut(m).paramss = vec![vec![p]];
     st.get_mut(m).ty = Type::Method {
         paramss: vec![vec![param_ty]],
-        ret: Box::new(Type::Class {
+        ret: TyBox::new(Type::Class {
             sym: set,
-            args: vec![tb],
+            args: vec![tb].into(),
         }),
     };
     st.get_mut(m).intrinsic = Intrinsic::None;
@@ -177,7 +178,7 @@ fn add_option_is_iterable_once(st: &mut SymbolTable) {
     let a = Type::TypeParam(st.get(opt).tparams[0]);
     st.get_mut(opt).parents.push(Type::Class {
         sym: ioc,
-        args: vec![a],
+        args: vec![a].into(),
     });
 }
 
@@ -210,15 +211,15 @@ fn add_wrap(st: &mut SymbolTable, owner: SymbolId, name: &str, cls: SymbolId) {
     let t = type_param(st, m, "T");
     let tt = Type::TypeParam(t);
     let param = st.alloc("xs", m, SymKind::Term, Flags::PARAM, "");
-    st.get_mut(param).ty = Type::Array(Box::new(tt.clone()));
+    st.get_mut(param).ty = Type::Array(TyBox::new(tt.clone()));
     st.get_mut(m).tparams = vec![t];
     st.get_mut(m).params = vec![param];
     st.get_mut(m).paramss = vec![vec![param]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![Type::Array(Box::new(tt.clone()))]],
-        ret: Box::new(Type::Class {
+        paramss: vec![vec![Type::Array(TyBox::new(tt.clone()))]],
+        ret: TyBox::new(Type::Class {
             sym: cls,
-            args: vec![tt],
+            args: vec![tt].into(),
         }),
     };
     st.get_mut(m).intrinsic = Intrinsic::None;
@@ -274,7 +275,7 @@ fn add_collection_map_members(st: &mut SymbolTable) {
         vec![k],
         Type::Class {
             sym: st.option_sym,
-            args: vec![v],
+            args: vec![v].into(),
         },
         Intrinsic::None,
     );

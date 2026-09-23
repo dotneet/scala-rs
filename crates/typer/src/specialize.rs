@@ -47,7 +47,7 @@ mod traversal_tests {
         let local = st.alloc("Local", method, SymKind::Class, Flags::EMPTY, "Local$1");
         let self_type = Type::Class {
             sym: local,
-            args: vec![],
+            args: vec![].into(),
         };
         st.get_mut(local).self_type = Some(self_type.clone());
         let mut tree = Tree::dummy(TreeKind::ClassDef {
@@ -71,7 +71,7 @@ mod traversal_tests {
         let cloned = map[&local];
         let expected = Type::Class {
             sym: cloned,
-            args: vec![],
+            args: vec![].into(),
         };
         assert_eq!(tree.sym, cloned);
         assert_eq!(st.get(cloned).owner, variant);

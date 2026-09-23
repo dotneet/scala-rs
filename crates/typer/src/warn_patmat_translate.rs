@@ -340,7 +340,7 @@ impl<'t> Translator<'t> {
             param_type = self.ty(&pat.ty);
             let cargs = match &pat.ty {
                 Type::Class { args, .. } => args.clone(),
-                _ => Vec::new(),
+                _ => Vec::new().into(),
             };
             fields = s.ctor_fields.clone();
             let repeated = st.repeated_case_element(cls);
@@ -353,9 +353,9 @@ impl<'t> Translator<'t> {
                     st.subst_tparams(cls, &cargs, &ft)
                 };
                 let ft = match ft {
-                    Type::Repeated(e) => *e,
-                    Type::Method { paramss, ret } if paramss.is_empty() => *ret,
-                    t => t,
+                    Type::Repeated(e) => e.clone(),
+                    Type::Method { paramss, ret } if paramss.is_empty() => ret.clone(),
+                    t => t.into(),
                 };
                 field_tys.push(self.ty(&ft));
             }
@@ -454,7 +454,7 @@ impl<'t> Translator<'t> {
                                     if let Type::Class { args: sargs, .. } = &pat.ty {
                                         ret = Type::Class {
                                             sym: *sym,
-                                            args: vec![sargs[0].clone()],
+                                            args: vec![sargs[0].clone()].into(),
                                         };
                                     }
                                 }

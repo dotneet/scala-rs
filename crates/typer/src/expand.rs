@@ -34,6 +34,7 @@
 //!
 //! What works today, and what does not, is in `docs/macros.md` §7.11.
 
+use scala_rs_parser::TyBox;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -1354,9 +1355,10 @@ impl Typer {
                 );
                 {
                     let (params, ret) = match declared {
-                        Type::Method { paramss, ret } => {
-                            (paramss.into_iter().flatten().collect::<Vec<Type>>(), *ret)
-                        }
+                        Type::Method { paramss, ret } => (
+                            paramss.into_iter().flatten().collect::<Vec<Type>>(),
+                            <scala_rs_parser::Type as Clone>::clone(&*ret),
+                        ),
                         ret => (Vec::new(), ret),
                     };
                     let actuals: Vec<Type> =
@@ -2200,15 +2202,15 @@ impl Typer {
             Type::Class { sym, args } if !args.is_empty() => {
                 let name = crate::materialize::static_class_of_sym(&self.st, *sym)
                     .map_err(|why| format!("scala-rs cannot build a type tag for {why}"))?;
-                Ok(Some((name, args.clone())))
+                Ok(Some((name, args.clone().into_vec())))
             }
             Type::Tuple(ts) if (1..=22).contains(&ts.len()) => {
-                named(&format!("scala.Tuple{}", ts.len()), ts.clone())
+                named(&format!("scala.Tuple{}", ts.len()), ts.clone().into_vec())
             }
             Type::Function { params, ret } if params.len() <= 22 => {
                 let mut args = params.clone();
                 args.push((**ret).clone());
-                named(&format!("scala.Function{}", params.len()), args)
+                named(&format!("scala.Function{}", params.len()), args.into_vec())
             }
             Type::Array(t) => named("scala.Array", vec![(**t).clone()]),
             _ => Ok(None),
@@ -3188,7 +3190,10 @@ impl Typer {
                     span,
                 )?;
                 tree.sym = id;
-                tree.ty = Type::Class { sym: id, args };
+                tree.ty = Type::Class {
+                    sym: id,
+                    args: args.into(),
+                };
                 return Ok(tree);
             }
             Some("cst") => {
@@ -3209,7 +3214,7 @@ impl Typer {
                 }
                 let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
                 tree.ty = Type::Refined {
-                    parents,
+                    parents: parents.into(),
                     decls: Vec::new(),
                 };
                 return Ok(tree);
@@ -3217,13 +3222,13 @@ impl Typer {
             Some("repeated") => {
                 let element = self.type_tree_from_wire(at(items, 1)?, span)?;
                 let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
-                tree.ty = Type::Repeated(Box::new(self.tree_to_type(&element)));
+                tree.ty = Type::Repeated(TyBox::new(self.tree_to_type(&element)));
                 return Ok(tree);
             }
             Some("byname") => {
                 let result = self.type_tree_from_wire(at(items, 1)?, span)?;
                 let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
-                tree.ty = Type::ByName(Box::new(self.tree_to_type(&result)));
+                tree.ty = Type::ByName(TyBox::new(self.tree_to_type(&result)));
                 return Ok(tree);
             }
             Some("mem") => {
@@ -3258,7 +3263,10 @@ impl Typer {
                 }
                 let ty = match self.st.get(id).kind {
                     crate::symbol::SymKind::Class | crate::symbol::SymKind::ModuleClass => {
-                        Type::Class { sym: id, args }
+                        Type::Class {
+                            sym: id,
+                            args: args.into(),
+                        }
                     }
                     crate::symbol::SymKind::TypeParam if args.is_empty() => Type::TypeParam(id),
                     crate::symbol::SymKind::TypeParam => {
