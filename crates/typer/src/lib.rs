@@ -40,6 +40,7 @@ mod kind_bounds;
 mod lambda_lift;
 mod lazy_local;
 mod lazysig;
+mod library_members;
 mod lin;
 mod localobj;
 mod macros;

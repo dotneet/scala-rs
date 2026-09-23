@@ -713,6 +713,7 @@ impl Typer {
                 format!("class {} needs to be a mixin.", self.st.get(id).name)
             };
             self.check_abstract_override_grounded(id, tree_span, &headline);
+            self.complete_overridden_library_members(id, &body_snapshot);
             self.check_overrides(id, &body_snapshot, tree_span);
             self.check_double_defs(id, &body_snapshot);
             self.check_default_overloads(id, tree_span);

@@ -79,3 +79,35 @@ object Main {
 "#,
     );
 }
+
+/// The prelude declares `Numeric` without members, so the overridden
+/// `fromInt(Int): T` has to come from its pickle before the bridge pass.
+#[test]
+fn memberless_prelude_traits_get_erasure_bridges() {
+    assert_runs_like_scalac(
+        "library-trait-bridges-numeric",
+        r#"
+class Num extends Numeric[Int] {
+  def plus(x: Int, y: Int) = x + y; def minus(x: Int, y: Int) = x - y; def times(x: Int, y: Int) = x * y
+  def negate(x: Int) = -x; def fromInt(x: Int) = x; def parseString(s: String) = s.toIntOption
+  def toInt(x: Int) = x; def toLong(x: Int) = x.toLong; def toFloat(x: Int) = x.toFloat; def toDouble(x: Int) = x.toDouble
+  def compare(x: Int, y: Int) = Integer.compare(x, y)
+}
+class Frac extends Fractional[Double] {
+  def plus(x: Double, y: Double) = x + y; def minus(x: Double, y: Double) = x - y; def times(x: Double, y: Double) = x * y
+  def div(x: Double, y: Double) = x / y
+  def negate(x: Double) = -x; def fromInt(x: Int) = x.toDouble; def parseString(s: String) = s.toDoubleOption
+  def toInt(x: Double) = x.toInt; def toLong(x: Double) = x.toLong; def toFloat(x: Double) = x.toFloat; def toDouble(x: Double) = x
+  def compare(x: Double, y: Double) = java.lang.Double.compare(x, y)
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(List(1, 2, 3).sum(new Num))
+    println(List(1, 2, 3).product(new Num))
+    println(List(1, 3, 2).max(new Num))
+    println(List(1.5, 2.5).sum(new Frac))
+  }
+}
+"#,
+    );
+}
