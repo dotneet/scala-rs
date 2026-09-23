@@ -3598,7 +3598,17 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             return r;
         }
         let owner = self.facts.get(id).owner.0;
-        let pref = if self.facts.get(SymbolId(owner)).kind == SymKind::ModuleClass {
+        let pref = if self.facts.get(SymbolId(owner)).kind == SymKind::ModuleClass
+            && self.sym_index.contains_key(&owner)
+        {
+            // The locally declared ALIASsym already carries its module-class
+            // owner. Prefixing that same symbol with the module singleton
+            // spells it twice (`Lib.type#Lib.Al`) instead of the declaration
+            // name scalac expects (`Lib.Al`). External members still need the
+            // singleton path below because their symbol is not owned by this
+            // pickle.
+            self.noprefix
+        } else if self.facts.get(SymbolId(owner)).kind == SymKind::ModuleClass {
             // A type member declared in an object is reached through the
             // object's singleton, not through `ThisType` of its module
             // class.  `ThisTpe(ExtModClassRef(P))` is not the same prefix as

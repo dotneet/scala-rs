@@ -468,6 +468,11 @@ pub(crate) fn add_predef_members(
             Intrinsic::Identity,
         );
         st.get_mut(wrap).flags = st.get(wrap).flags.with(Flags::IMPLICIT);
+        // `intWrapper` is inherited from `LowPriorityImplicits`, just like
+        // the other numeric `Rich*` wrappers installed below. Keep the
+        // synthetic prelude's priority equivalent so an exact `byteWrapper`
+        // or `shortWrapper` beats the weakly applicable `Int` conversion.
+        st.get_mut(wrap).low_priority = true;
     }
     if let Some((rl, rd, rc)) = rich_ldc {
         add_numeric_wrapper(st, owner, "longWrapper", Type::Long, rl);

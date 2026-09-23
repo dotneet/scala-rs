@@ -691,9 +691,14 @@ impl Typer {
                                 function_values.push((m, params.clone(), (**ret).clone()));
                             }
                         }
-                        if let Type::ModuleRef(module) = ty {
+                        let module = if self.st.get(m).kind == SymKind::Module {
+                            Some(self.st.module_class_of(m))
+                        } else {
+                            self.module_class_of_value(m, ty)
+                        };
+                        if let Some(module) = module {
                             for apply in
-                                self.drop_overridden(self.st.lookup_member(*module, "apply"))
+                                self.drop_overridden(self.st.lookup_member(module, "apply"))
                             {
                                 let apply_ty =
                                     self.st.subst_as_seen_from(ty, &self.st.get(apply).ty);
