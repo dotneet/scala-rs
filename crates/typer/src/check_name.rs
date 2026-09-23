@@ -926,11 +926,7 @@ impl Typer {
             // newly discovered members as well. Otherwise loading one member
             // through an import can make a different package-object value
             // disappear from qualified lookup later in the same run.
-            for mem in self.st.get(mcls).members.clone() {
-                if !self.st.get(owner).members.contains(&mem) {
-                    self.st.get_mut(owner).members.push(mem);
-                }
-            }
+            self.fold_binary_package_members(owner, mcls);
             // The package object may have been entered by an earlier term or
             // import lookup. Its inherited type aliases are pickle-only, so
             // the already-present module must still trigger the same lazy
@@ -952,16 +948,25 @@ impl Typer {
         // before its wildcard scope is populated, just like a named object.
         self.adopt_cp_module_class(mcls);
         // A package object's members are the package's members.
-        for mem in self.st.get(mcls).members.clone() {
-            if !self.st.get(owner).members.contains(&mem) {
-                self.st.get_mut(owner).members.push(mem);
-            }
-        }
+        self.fold_binary_package_members(owner, mcls);
         self.install_pickled_package_aliases(owner, span);
         // `scala.concurrent.duration`'s postfix unit syntax (`5.seconds`)
         // hangs off this package object; see `prelude_durrange.rs`.
         self.install_duration_syntax(owner, span);
         Some(mcls)
+    }
+
+    fn fold_binary_package_members(&mut self, owner: SymbolId, module_class: SymbolId) {
+        let mut present: HashSet<_> = self.st.get(owner).members.iter().copied().collect();
+        let additions: Vec<_> = self
+            .st
+            .get(module_class)
+            .members
+            .iter()
+            .copied()
+            .filter(|member| present.insert(*member))
+            .collect();
+        self.st.get_mut(owner).members.extend(additions);
     }
 
     /// A package object's `type` aliases never reach its classfile: scalac
