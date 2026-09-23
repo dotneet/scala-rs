@@ -1932,7 +1932,15 @@ pub(crate) fn gen_select(
                     && !value_member_needs_box(ctx.st, tree.sym)
                 {
                     box_value_class_receiver(asm, ctx, ctx.st.get(tree.sym).owner, qual);
-                    invoke_value_extension(asm, ctx, tree.sym, Some(&tree.ty), false);
+                    // The underlying accessor has no `$extension`: the
+                    // receiver just unboxed to the value it returns. A
+                    // binary value class's `val v` is a method here, and on
+                    // a boxed lambda parameter (`List(m).map(_.v)`) it
+                    // reached this branch and called `v$extension`, which
+                    // does not exist (`NoSuchMethodError`).
+                    if !is_value_class_underlying_accessor(ctx.st, tree.sym) {
+                        invoke_value_extension(asm, ctx, tree.sym, Some(&tree.ty), false);
+                    }
                 } else {
                     // `x.toString` on an `Int` dispatches on
                     // `java/lang/Integer` (or `java/lang/Object` for the
@@ -4809,6 +4817,27 @@ pub(crate) fn value_member_needs_box(st: &SymbolTable, id: SymbolId) -> bool {
         return false;
     }
     !s.declaring_class.is_empty() && s.declaring_class != class_internal(st, s.owner)
+}
+
+/// Whether method `id` is the nullary accessor of its value class's
+/// underlying field -- the one member whose unboxed form is the identity.
+pub(crate) fn is_value_class_underlying_accessor(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    let s = st.get(id);
+    let owner = s.owner;
+    if owner.is_none() || !st.is_value_class(owner) {
+        return false;
+    }
+    let Some(&field) = st.get(owner).ctor_fields.first() else {
+        return false;
+    };
+    let nullary = match &s.ty {
+        Type::Method { paramss, .. } => paramss.iter().flatten().next().is_none(),
+        _ => true,
+    };
+    nullary && (s.name == st.value_class_getter(owner) || s.name == st.get(field).name)
 }
 
 /// The underlying value of value class `owner` is on the stack; replace it
