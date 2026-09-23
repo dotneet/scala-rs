@@ -2049,9 +2049,10 @@ fn install_java_module(
         let cls = st.module_class_of(m);
         apply_java_class_meta(st, cls, c);
         // Static forwarders are a Java-facing view, not source members of the
-        // Scala module.  Its pickle (and, when loaded, `Foo$.class`) supplies
-        // the instance declarations with the correct owner and flags.
-        if !c.scala_module {
+        // Scala module. The implementation class (`Foo$.class`) is different:
+        // its instance methods are the erased fallback when the pickle cannot
+        // express a declaration, such as an enum singleton-valued accessor.
+        if !c.scala_module || c.internal_name.ends_with('$') {
             fill_java_members(st, cls, c);
         }
         return cls;
@@ -2085,7 +2086,7 @@ fn install_java_module(
             return id;
         }
         apply_java_class_meta(st, id, c);
-        if !c.scala_module {
+        if !c.scala_module || c.internal_name.ends_with('$') {
             fill_java_members(st, id, c);
         }
         enter_module_in_companion_scope(st, id, owner, &c.internal_name);
@@ -2112,7 +2113,7 @@ fn install_java_module(
         st.enter_in_current(&simple, m);
     }
     apply_java_class_meta(st, cls, c);
-    if !c.scala_module {
+    if !c.scala_module || c.internal_name.ends_with('$') {
         fill_java_members(st, cls, c);
     }
     cls

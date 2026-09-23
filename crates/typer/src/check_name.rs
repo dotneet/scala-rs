@@ -897,6 +897,11 @@ impl Typer {
             .into_iter()
             .find(|&s| matches!(self.st.get(s).kind, SymKind::Module | SymKind::ModuleClass))
         {
+            // A member signature can stub `package$` before the package
+            // object itself is opened. Load its implementation class now so
+            // descriptor-backed accessors remain available when a pickled
+            // singleton result cannot be represented by this typer.
+            self.load_binary_into(&format!("{pkg_jvm}/package$"), owner, span, true);
             let mcls = self.st.module_class_of(id);
             self.adopt_cp_module_class(mcls);
             // The module can be discovered from its class file before its
