@@ -530,14 +530,14 @@ impl Typer {
         // Refine potentially flattened clauses before argument matching. Single
         // parameters retain deferred completion: their dependent result aliases
         // must be read after explicit type arguments have been substituted.
-        if found.iter().any(|m| {
-            let s = self.st.get(*m);
-            m.0 >= self.st.prelude_end
+        let refinable_forwarder = |this: &Self, m: SymbolId| {
+            let s = this.st.get(m);
+            m.0 >= this.st.prelude_end
                 && s.pickled_origin.is_empty()
                 // Directory scans have no descriptor or JAVA flag, but
                 // their inherited forwarders need the same pickle refinement.
                 && ((s.flags.contains(Flags::JAVA) && s.jvm_name.starts_with('('))
-                    || (s.jvm_name.is_empty() && s.owner.0 < self.st.source_start))
+                    || (s.jvm_name.is_empty() && s.owner.0 < this.st.source_start))
                 && matches!(&s.ty, Type::Method { paramss, .. }
                     if (paramss.len() == 1 && paramss[0].len() > 1)
                         || s.tparams.is_empty()
@@ -547,15 +547,23 @@ impl Typer {
                         // with the parameter's yielded type.
                         || (paramss.len() == 1
                             && paramss[0].len() == 1
-                            && self.st.class_sym_of(&paramss[0][0]).is_some_and(|p| {
-                                self.st.get(p).jvm_name == "scala/Function0"
+                            && this.st.class_sym_of(&paramss[0][0]).is_some_and(|p| {
+                                this.st.get(p).jvm_name == "scala/Function0"
                             })))
-                && !self.st.is_source_owner(s.owner)
-        }) {
+                && !this.st.is_source_owner(s.owner)
+        };
+        if found.iter().any(|&m| refinable_forwarder(self, m)) {
             let precise = self.supply_from_pickle(&recv_ty, &name);
             if !precise.is_empty() {
                 found = precise;
             }
+            // Only the first selection of a name gets the refined members
+            // alone. Once they are installed beside the raw forwarder, a
+            // later completion answers with both (and `lookup_member` finds
+            // both): a directory scan leaves the forwarder in the member
+            // table, so `i.pair; i.pair` on an inherited `pair: (T, T)` typed
+            // the second call as the overload `Tuple2[Any, Any] | (Int, Int)`.
+            self.drop_superseded_forwarders(&mut found, refinable_forwarder);
         }
         // A one-argument generic mixin forwarder can also lose a result of
         // the declaring trait's abstract type constructor (`Repr[A]`) to its
@@ -2043,6 +2051,36 @@ impl Typer {
             return found;
         }
         kept
+    }
+
+    /// Drop each raw forwarder (`is_raw`) that a pickled candidate in the same
+    /// set already refines: same erased parameters, so one JVM method seen
+    /// twice. `type_select` replaces raw forwarders with the pickle's answer
+    /// on the first selection of a name; this is the same replacement for a
+    /// later selection, when the member table (and so the memoised
+    /// completion's answer) holds both. Unlike `drop_classfile_forwarders` it does
+    /// not ask the raw copy to be faithful -- a raw forwarder is what the
+    /// refinement exists to replace, `Tuple2[Any, Any]` for `(T, T)` included.
+    fn drop_superseded_forwarders(
+        &self,
+        found: &mut Vec<SymbolId>,
+        is_raw: impl Fn(&Self, SymbolId) -> bool,
+    ) {
+        let pickled: Vec<Vec<Option<String>>> = found
+            .iter()
+            .filter(|&&m| !self.st.get(m).pickled_origin.is_empty())
+            .map(|&m| crate::pickle_supply::flat_erased_params(&self.st, &self.st.get(m).ty))
+            .collect();
+        if pickled.is_empty() {
+            return;
+        }
+        found.retain(|&m| {
+            !is_raw(self, m)
+                || !pickled.contains(&crate::pickle_supply::flat_erased_params(
+                    &self.st,
+                    &self.st.get(m).ty,
+                ))
+        });
     }
 
     /// Whether `copy` says exactly what `decl` says, minus what a JVM generic
