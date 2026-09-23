@@ -382,6 +382,31 @@ fn binary_higher_kinded_alias_is_preserved_in_shape_parent() {
     let _ = fs::remove_dir_all(&out);
 }
 
+#[test]
+fn option_flatmap_infers_open_result_from_lambda_view() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip sh_option_flatmap: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip sh_option_flatmap: slick 3.4.1 not in the local Coursier cache");
+        return;
+    };
+    let Some(scalac) = real_scalac() else {
+        eprintln!("skip sh_option_flatmap: scalac 2.13.16 not present");
+        return;
+    };
+    let cp = format!("{}:{}", lib.display(), classpath(&jars));
+    let (ok, msgs, out) = compile(
+        "sh_option_flatmap",
+        &["-cp", &cp, "--scala-library", lib.to_str().unwrap()],
+    );
+    assert!(ok, "scala-rs compilation failed:\n{msgs}");
+    let (ok, msgs) = scalac_run(&scalac, "sh_option_flatmap", Some(&cp));
+    assert!(ok, "scalac compilation failed:\n{msgs}");
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// A projection slick has no `Shape` for is still a missing implicit, and an
 /// operator at an arity no conversion offers is still not a member. Real
 /// scalac reports the same two lines.

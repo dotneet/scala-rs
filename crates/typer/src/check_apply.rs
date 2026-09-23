@@ -2413,6 +2413,36 @@ impl Typer {
                             if relaxed_here {
                                 self.relaxed_pt_depth -= 1;
                             }
+                            // The lambda result may reach a still-open result
+                            // constructor through an implicit view. For
+                            // `flatMap[B](f: A => Rep[Option[B]])`, a body of
+                            // `Rep[Int]` first takes the available
+                            // `Rep[Int] => Rep[Option[Int]]` view and thereby
+                            // determines B. Checking the body against
+                            // `Rep[Option[_]]` instead loses that information.
+                            if let (
+                                Type::Function { ret: wanted, .. },
+                                TreeKind::Function { body, .. },
+                            ) = (&p_shape, &mut a.kind)
+                            {
+                                let found = body.ty.clone();
+                                if !open.is_empty()
+                                    && !found.is_no_type()
+                                    && !found.is_error()
+                                    && !self.st.is_sub_type(&found, wanted)
+                                {
+                                    self.warm_own_scope_once(&found);
+                                    self.warm_conversion_witnesses(&found, wanted);
+                                    if let Some((_, solved, _)) =
+                                        self.search_conversion_open(&found, wanted, &open)
+                                    {
+                                        self.adapt(body, &solved);
+                                        if let Type::Function { ret, .. } = &mut a.ty {
+                                            **ret = body.ty.clone();
+                                        }
+                                    }
+                                }
+                            }
                             // A `flatMap` body that is an `Array` is converted by
                             // a view, as nsc's `typedArgToPoly` does against the
                             // lenient `A => IterableOnce[?]`: `Seq(1, 2).flatMap(x
