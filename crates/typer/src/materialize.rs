@@ -100,16 +100,17 @@ impl Tag {
 
 /// Whether `pt` is `TypeTag[T]` / `WeakTypeTag[T]`, and what `T` is.
 ///
-/// Both shapes a tag arrives in are recognised. Reached through the *pickle*
+/// All shapes a tag arrives in are recognised. Reached through the *pickle*
 /// -- `c.WeakTypeTag[R]`, an alias on `blackbox.Context` -- it is a resolved
-/// `Type::Class`. Reached through `install_classpath`'s pickle subset, which
+/// `Type::Class`, possibly carrying an as-seen-from prefix. Reached through
+/// `install_classpath`'s pickle subset, which
 /// records member types by simple name, `TypeTags#typeOf`'s implicit
 /// parameter is an unresolved `Type::Named { name: "TypeTags$TypeTag" }`:
 /// the class file `TypeTags$TypeTag.class` carries no `ScalaSignature` of its
 /// own (a trait's nested class is pickled inside the trait), so nothing had
 /// entered a symbol for it.
 pub(crate) fn tag_request(st: &SymbolTable, pt: &Type) -> Option<(Tag, Type)> {
-    let (name, args) = match pt {
+    let (name, args) = match crate::prefix::strip_view(pt) {
         Type::Class { sym, args } => (st.get(*sym).jvm_name.clone(), args),
         Type::Named { name, args } => (name.clone(), args),
         _ => return None,

@@ -9155,4 +9155,31 @@ mod api_boundary_tests {
             &named
         ));
     }
+
+    #[test]
+    fn as_seen_from_walks_an_applied_class_parent() {
+        let mut st = SymbolTable::new();
+        let base = st.alloc("Base", st.root, SymKind::Class, Flags::EMPTY, "Base");
+        let element = st.alloc("A", base, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(base).tparams.push(element);
+        let child = st.alloc("Child", st.root, SymKind::Class, Flags::EMPTY, "Child");
+        st.get_mut(child).parents.push(Type::Applied {
+            ctor: Box::new(Type::Class {
+                sym: base,
+                args: vec![],
+            }),
+            args: vec![Type::String],
+        });
+
+        assert_eq!(
+            st.subst_as_seen_from(
+                &Type::Class {
+                    sym: child,
+                    args: vec![],
+                },
+                &Type::TypeParam(element),
+            ),
+            Type::String
+        );
+    }
 }
