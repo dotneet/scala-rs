@@ -1856,6 +1856,17 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                             "F" => Some(Type::Float),
                             "D" => Some(Type::Double),
                             _ => None,
+                        })
+                        // The other way round: a generic declaration's
+                        // `Object` result seen at a primitive (`IntBox.first`,
+                        // see `box_to_descriptor_params`) comes back boxed and
+                        // is unboxed to what the position expects.
+                        .or_else(|| {
+                            let (_, ref_result) = descriptor_ref_slots(st, fun.sym)?;
+                            (ref_result
+                                && is_primitive(&erase_ty(ret, st))
+                                && !matches!(**ret, Type::Unit))
+                            .then_some(Type::Any)
                         });
                     fun_ty = Type::Method {
                         paramss: vec![param_tys.clone()],
@@ -2009,6 +2020,54 @@ fn vc_arg_expected(st: &SymbolTable, pre: &[Type], declared: &[Type], i: usize) 
     })
 }
 
+/// The parameter and result descriptors of a binary member whose `jvm_name`
+/// records the class file's method descriptor (`(II)Ljava/lang/Object;`), each
+/// answered as "is this slot a reference". `None` for any other `jvm_name`.
+fn descriptor_ref_slots(st: &SymbolTable, sym: SymbolId) -> Option<(Vec<bool>, bool)> {
+    let desc = st.get(sym).jvm_name.strip_prefix('(')?;
+    let (params, result) = desc.rsplit_once(')')?;
+    let mut slots = Vec::new();
+    let mut rest = params.as_bytes();
+    while let Some(&c) = rest.first() {
+        let mut len = 1;
+        while rest.get(len - 1) == Some(&b'[') {
+            len += 1;
+        }
+        if rest[len - 1] == b'L' {
+            len += rest[len - 1..].iter().position(|&b| b == b';')?;
+        }
+        slots.push(matches!(c, b'L' | b'['));
+        rest = &rest[len..];
+    }
+    Some((slots, result.starts_with(['L', '['])))
+}
+
+/// A member inherited from a generic declaration keeps the declaration's
+/// erasure in the class file even where the receiver instantiates the
+/// parameter at a primitive: `class IntBox extends Ops[Int]` sees
+/// `first(x: Int, y: Int): Int`, and the only method to call is
+/// `first(Object, Object)Object`. Such a parameter is adapted as an `Any`
+/// (boxed), exactly as nsc's erasure does against the declaration's `A`.
+fn box_to_descriptor_params(st: &SymbolTable, sym: SymbolId, params: Vec<Type>) -> Vec<Type> {
+    let Some((slots, _)) = descriptor_ref_slots(st, sym) else {
+        return params;
+    };
+    if slots.len() != params.len() {
+        return params;
+    }
+    params
+        .into_iter()
+        .zip(slots)
+        .map(|(p, is_ref)| {
+            if is_ref && is_primitive(&erase_ty(&p, st)) && !matches!(p, Type::Unit) {
+                Type::Any
+            } else {
+                p
+            }
+        })
+        .collect()
+}
+
 fn method_param_types(
     st: &SymbolTable,
     fun: &Tree,
@@ -2113,7 +2172,8 @@ fn method_param_types(
         }
         match &st.get(fun.sym).ty {
             Type::Method { paramss, .. } => {
-                return paramss.iter().flatten().cloned().collect();
+                let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                return box_to_descriptor_params(st, fun.sym, params);
             }
             Type::Function { params, .. } => return params.clone(),
             _ => {}

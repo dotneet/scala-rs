@@ -138,6 +138,45 @@ object Main {
     }
 }
 
+/// `class IntBox extends Ops[Int]` sees `first(x: Int, y: Int): Int`, but the
+/// class file only has `first(Object, Object)Object`: the arguments have to be
+/// boxed to the declaration's erasure and the result unboxed. scala-rs used to
+/// decline the member and fall back to the erased forwarder ("found: Any
+/// required: Int").
+#[test]
+fn primitive_instantiated_generic_member_boxes_to_the_declared_descriptor() {
+    let lib = r#"
+package lib
+trait Ops[A] {
+  def first(x: A, y: A): A = x
+  def second(x: A, y: A): A = y
+  def both(x: A, y: A): (A, A) = (x, y)
+}
+class IntBox extends Ops[Int]
+class DoubleBox extends Ops[Double]
+final class Meters(val v: Int) extends AnyVal { override def toString = s"${v}m" }
+class MeterBox extends Ops[Meters]
+"#;
+    let client = r#"
+import lib._
+object Main {
+  def main(args: Array[String]): Unit = {
+    val i: Int = new IntBox().first(3, 4)
+    println(i + 1)
+    println(new IntBox().second(3, 4) * 10)
+    println(new IntBox().both(5, 6))
+    val d: Double = new DoubleBox().second(1.5, 2.5)
+    println(d)
+    val m: Meters = new MeterBox().first(new Meters(7), new Meters(8))
+    println(m.v + 1)
+  }
+}
+"#;
+    if let Some(out) = same_as_scalac("inherited-generic-primitive", lib, client) {
+        assert_eq!(out, "4\n40\n(5,6)\n2.5\n8\n");
+    }
+}
+
 #[test]
 fn inner_class_result_through_applied_subclass_reads_the_outer_arguments() {
     let lib = r#"

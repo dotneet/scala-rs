@@ -3857,37 +3857,12 @@ impl PickleSupply {
         };
         let declared: Vec<Option<String>> =
             declared.iter().map(|t| erased_param_desc(st, t)).collect();
-        let Some(seen) = seen else {
-            return Some(declared);
-        };
         // `class IntBox extends Ops[Int]` sees `first(x: Int, y: Int)`, whose
-        // declaration takes two references. Erasure adapts an argument to the
-        // installed member's parameter type, so a member installed with the
-        // receiver's `Int` would pass a bare `int` to `(Object, Object)`
-        // (VerifyError). Such a member stays with the declaring class, whose
-        // own `A` is what makes erasure box the argument.
-        let passes_unboxed = |t: &Type| match t {
-            Type::Boolean
-            | Type::Byte
-            | Type::Short
-            | Type::Char
-            | Type::Int
-            | Type::Long
-            | Type::Float
-            | Type::Double => true,
-            Type::Class { sym, .. } => st.is_value_class(*sym),
-            _ => false,
-        };
-        let seen_want: Vec<Option<String>> =
-            seen.iter().map(|t| erased_param_desc(st, t)).collect();
-        if seen
-            .iter()
-            .zip(&seen_want)
-            .zip(&declared)
-            .any(|((t, seen), declared)| seen != declared && passes_unboxed(t))
-        {
-            return Some(seen_want);
-        }
+        // declaration takes two references. The member is installed with the
+        // receiver's `Int`s and the declaration's `(Object, Object)Object`
+        // descriptor; erasure reads the descriptor back and boxes the
+        // arguments and unboxes the result at the call (`method_param_types`
+        // and `descriptor_result` in `erasure.rs`).
         Some(declared)
     }
 
