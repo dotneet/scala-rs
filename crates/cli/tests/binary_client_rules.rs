@@ -114,3 +114,74 @@ object Main {
         assert_eq!(stdout.trim(), "true");
     }
 }
+
+/// nsc: `not enough arguments for constructor Plain: (tag: String)`. A
+/// classpath class was never judged, so `new lib.Plain` compiled to an
+/// `<init>()V` the class does not have and threw `NoSuchMethodError`. `Plain`
+/// is also reached first through `Mk.p`'s descriptor, which stubs it the way
+/// a Java class is stubbed; its pickled constructor still decides.
+#[test]
+fn unapplied_new_of_binary_class_needs_its_arguments() {
+    let lib = r#"
+package lib
+class Plain(val tag: String)
+object Mk { def p: Plain = new Plain("x") }
+class Two(val a: Int)(implicit val n: Int)
+class Dflt(val tag: String = "d") { override def toString = "Dflt" + tag }
+class Impl(implicit val n: Int) { override def toString = "Impl" + n }
+class Aux(val a: Int) { def this() = this(3); override def toString = "Aux" + a }
+"#;
+    let bad = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    implicit val n: Int = 4
+    val q = lib.Mk.p
+    val a = new lib.Plain
+    val b = new lib.Plain()
+    val t = new lib.Two
+  }
+}
+"#;
+    let Some((_dir, outcome)) = compile_against_lib_dir("unapplied-new-bad", lib, bad) else {
+        return;
+    };
+    assert!(!outcome.success(), "new lib.Plain must be rejected");
+    let diags = outcome.diagnostics();
+    assert_eq!(
+        diags
+            .matches("not enough arguments for constructor Plain: (tag: String)")
+            .count(),
+        2,
+        "{diags}"
+    );
+    assert!(
+        diags.contains("not enough arguments for constructor Two: (a: Int)(implicit n: Int)")
+            && diags.contains("Unspecified value parameter a."),
+        "{diags}"
+    );
+
+    // Defaulted and implicit parameters, an auxiliary no-argument
+    // constructor, Java classes and scala-library classes all still take a
+    // bare `new`.
+    let good = r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    implicit val n: Int = 4
+    val d = new lib.Dflt
+    val i = new lib.Impl
+    val x = new lib.Aux
+    val sb = new java.lang.StringBuilder
+    val ub = new scala.collection.mutable.UnrolledBuffer[Int]
+    val pq = new scala.collection.mutable.PriorityQueue[Int]
+    println(s"$d $i $x ${sb.length} ${ub.size} ${pq.size}")
+  }
+}
+"#;
+    let Some((dir, outcome)) = compile_against_lib_dir("unapplied-new-good", lib, good) else {
+        return;
+    };
+    outcome.assert_success("omissible constructor arguments");
+    if let Some(stdout) = run_main(&dir) {
+        assert_eq!(stdout.trim(), "Dfltd Impl4 Aux3 0 0 0");
+    }
+}
