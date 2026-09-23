@@ -32,6 +32,8 @@ mod anyconstr;
 mod appidentity;
 #[path = "../applied_collection_names.rs"]
 mod applied_collection_names;
+#[path = "../applied_inner_result_prefix.rs"]
+mod applied_inner_result_prefix;
 #[path = "../arraygen.rs"]
 mod arraygen;
 #[path = "../arrconv.rs"]

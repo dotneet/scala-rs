@@ -2983,6 +2983,7 @@ impl PickleSupply {
                 hit.owner_module,
                 &shape,
                 &class_scope,
+                m.result_prefix.as_ref(),
                 &mut seen_shapes,
                 &mut superseded,
             ) {
@@ -3885,6 +3886,7 @@ impl PickleSupply {
         owner_module: bool,
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
+        result_prefix: Option<&SigType>,
         seen_shapes: &mut Vec<(SymbolId, String, usize, Vec<Type>)>,
         // Members detached again because a later declaration with the same
         // explicit parameters and an extra implicit clause took their
@@ -4001,13 +4003,35 @@ impl PickleSupply {
         let ret = self.conv(st, bin, &scope, &shape.ret);
         self.param_singletons = saved_singletons;
         self.param_singleton_symbols = saved_singleton_symbols;
-        let Some(ret) = ret else {
+        let Some(mut ret) = ret else {
             trace(format_args!(
                 "{internal}#{name}: unmappable result type {:?}",
                 shape.ret
             ));
             return None;
         };
+        // An inner class may be returned through an applied outer class rather
+        // than through `this`: `def ops[T](x: T)(implicit ord: Ordering[T]):
+        // Ordering[T]#OrderingOps`. The compact signature stores the result's
+        // class separately from its TypeRef prefix. Keep the applied outer
+        // type on the result so a later selection can substitute the outer
+        // class's parameters in members of the inner class.
+        if let (Some(prefix @ SigType::Ref { .. }), Type::Class { sym, .. }) =
+            (result_prefix, crate::prefix::strip_view(&ret))
+        {
+            if crate::prefix::view_prefix(&ret).is_none() {
+                if let Some(outer) = self.conv_at(st, bin, &scope, prefix, 0) {
+                    let owner = st.get(*sym).owner;
+                    if !owner.is_none()
+                        && st.get(*sym).kind == SymKind::Class
+                        && st.get(owner).kind == SymKind::Class
+                        && st.class_sym_of(&outer) == Some(owner)
+                    {
+                        ret = crate::prefix::with_prefix(ret, outer);
+                    }
+                }
+            }
+        }
         // The erased descriptor comes from the classfile itself rather than
         // from re-deriving scalac's erasure: the bytes are the truth, and a
         // descriptor we merely guessed would fail to link. Resolved now that
