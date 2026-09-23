@@ -3,6 +3,12 @@
 The experiment described in `docs/macros.md` §2.3, verbatim. **Not production
 code.** It does not run in CI.
 
+**Historical.** The production engine superseded this probe: it is
+`crates/typer/java/ScalaRsMacroEngine.java`, driven from
+`crates/typer/src/expand*.rs` (see `docs/macros.md` §7.11 onward). The files
+here are kept as the record of the feasibility check; the last section's list
+of gaps describes this probe, not the current engine.
+
 ## What it establishes
 
 One thing only: whether the design in `docs/macros.md` §2.2 — running a def
