@@ -7437,7 +7437,12 @@ impl PickleSupply {
         };
         let body = st.subst_as_seen_from(&param, &body);
         let resolved = st.expand_in_type(&param, &body);
-        if resolved != Type::TypeMember(decl) {
+        // An alias that reads a type argument the parameter's type leaves
+        // open (`type Packed = Packed_` on a `Shape[L, A, A, ?]`) is not
+        // settled by the declaration: only the argument at each call is.
+        // Answering the wildcard made `firstPacked(p1: Shape[.., ?], ...):
+        // Selected[p1.Packed]` a `Selected[_]` at every call.
+        if resolved != Type::TypeMember(decl) && !crate::check::type_has_wildcard(&resolved) {
             return Some(resolved);
         }
         let projected = st.path_member(&[param_sym], decl, &param);
