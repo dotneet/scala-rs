@@ -1542,8 +1542,21 @@ impl Typer {
                 // zip: Zip[K, V, R], ev: R <:< V)` relies on this: typing
                 // `zip` with no prototype leaves its element type open even
                 // though `a` and `b` have already fixed K and V.
+                // A parameterless method reference still has its own type
+                // parameters to infer, so adapting it to this partial result
+                // would erase the invariant mismatch it must diagnose.
+                let parameterless_method_ref = match &a.kind {
+                    TreeKind::Ident { name } => self
+                        .st
+                        .lookup_term(name)
+                        .into_iter()
+                        .any(|sym| self.is_nullary_method_sym(sym)),
+                    _ => false,
+                };
                 let sequential_proto = match &fun_ty_for_pretype {
-                    Type::Method { paramss, .. } if ai > 0 && !fun.sym.is_none() => {
+                    Type::Method { paramss, .. }
+                        if ai > 0 && !fun.sym.is_none() && !parameterless_method_ref =>
+                    {
                         let params = paramss.first().cloned().unwrap_or_default();
                         let prior: Vec<Type> = (0..ai)
                             .filter_map(|i| param_at(&params, i).cloned())
