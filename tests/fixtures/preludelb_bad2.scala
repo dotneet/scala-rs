@@ -8,9 +8,9 @@
 // Both compilers refuse it, at different ends of the same call. nsc
 // minimises `B` over the expected type -- `Array[Dog]` gives `B := Dog` --
 // and then the argument is wrong: `found: ClassTag[Animal] required:
-// ClassTag[Dog]`. Here `B` is solved from the argument and the result is
-// wrong: `found: Array[Animal] required: Array[Dog]`. What is asserted is
-// only that no uninstantiated `B` reaches the message.
+// ClassTag[Dog]`. This compiler now minimises `B` the same way and
+// reports the same argument. What is asserted is that message and that no
+// uninstantiated `B` reaches it.
 class Animal
 class Dog extends Animal
 

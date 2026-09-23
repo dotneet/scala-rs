@@ -409,7 +409,9 @@ fn preludelb_bad_is_rejected_by_scalac_too() {
 
 /// `toArray`'s uninstantiated `B` must not reach the message. Both compilers
 /// refuse this file; the branch point refused it saying `found: Array[B]`,
-/// naming a parameter of a signature the programmer never wrote.
+/// naming a parameter of a signature the programmer never wrote. Like nsc,
+/// `B` is minimised over the expected type, so the argument is what is
+/// reported (`preludelb_bad2_is_rejected_by_scalac_too`).
 #[test]
 fn preludelb_toarray_does_not_report_an_uninstantiated_parameter() {
     let Some(jar) = scala_library_jar() else {
@@ -421,7 +423,7 @@ fn preludelb_toarray_does_not_report_an_uninstantiated_parameter() {
     rejected(
         run,
         "`dogs.toArray(ctAnimal)` ascribed to `Array[Dog]`",
-        &["found: Array[Animal]", "required: Array[Dog]"],
+        &["found: ClassTag[Animal]", "required: ClassTag[Dog]"],
     );
     let again = compile_rs(&fixture("preludelb_bad2"), &dir, &jar);
     assert!(
