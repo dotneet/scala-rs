@@ -2836,6 +2836,25 @@ impl<'a> Gen<'a> {
         !owner.is_none() && linearize(self.st, superclass).contains(&owner)
     }
 
+    /// Whether a parent member is known to be `final`, so no bridge may
+    /// override it.
+    ///
+    /// The hand-written prelude stamps `Flags::FINAL` on *every* method it
+    /// declares (`prelude::method`), abstract ones included, so the flag says
+    /// nothing there: `Ordering.compare`, `PartialFunction.isDefinedAt` and
+    /// `Equiv.equiv` all carry it. Trusting it skipped the erasure bridge
+    /// `compare(Object, Object)` of every `Ordering[String]` subclass, which
+    /// then failed with `AbstractMethodError` the first time the library
+    /// called it. Only a symbol whose modifiers came from source or a pickle
+    /// (see `override_check::modifiers_are_known`) is taken at its word, and a
+    /// deferred member is never final whatever its flags say.
+    fn member_is_really_final(&self, m: SymbolId) -> bool {
+        let s = self.st.get(m);
+        s.flags.contains(Flags::FINAL)
+            && (m.0 >= self.st.prelude_end || !s.pickled_origin.is_empty())
+            && !self.st.method_is_deferred(m)
+    }
+
     pub(crate) fn emit_inherited_covariant_bridges(
         &self,
         b: &mut ClassBuilder,
@@ -2852,7 +2871,7 @@ impl<'a> Gen<'a> {
                     || ps.name == "<clinit>"
                     || ps.flags.contains(Flags::STATIC)
                     || ps.flags.contains(Flags::PARAM)
-                    || ps.flags.contains(Flags::FINAL)
+                    || self.member_is_really_final(pmid)
                 {
                     continue;
                 }
@@ -3329,7 +3348,7 @@ impl<'a> Gen<'a> {
                 if !matches!(ps.kind, SymKind::Method | SymKind::Term)
                     || ps.flags.contains(Flags::PRIVATE)
                     || ps.flags.contains(Flags::STATIC)
-                    || (ps.flags.contains(Flags::FINAL)
+                    || (self.member_is_really_final(pmid)
                         && ![self.st.anyref_sym, self.st.any_sym].contains(&parent))
                 {
                     continue;

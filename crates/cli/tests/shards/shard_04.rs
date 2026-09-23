@@ -1,6 +1,9 @@
 //! Aggregated CLI integration tests (alphabetical slice 4/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../support/mod.rs"]
+mod support;
+
 #[path = "../java_pattern_parent.rs"]
 mod java_pattern_parent;
 #[path = "../javanest.rs"]
@@ -57,6 +60,8 @@ mod libov;
 mod liboverload;
 #[path = "../libprelude.rs"]
 mod libprelude;
+#[path = "../library_trait_bridges.rs"]
+mod library_trait_bridges;
 #[path = "../linearization.rs"]
 mod linearization;
 #[path = "../list_alias_implicit.rs"]
