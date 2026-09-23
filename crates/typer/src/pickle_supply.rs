@@ -4866,6 +4866,24 @@ impl PickleSupply {
         self.attach_parents(st, bin, cls, &full, is_module);
     }
 
+    /// [`Self::ensure_parents`] for `cls` and, transitively, every class it
+    /// inherits from, so [`SymbolTable::is_ancestor_of`] sees the whole chain.
+    fn ensure_ancestor_parents(&mut self, st: &mut SymbolTable, bin: &mut BinaryIndex, cls: SymbolId) {
+        let mut stack = vec![cls];
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.0) {
+                continue;
+            }
+            self.ensure_parents(st, bin, c);
+            for parent in st.get(c).parents.clone() {
+                if let Some(p) = st.class_sym_of(&parent) {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+
     /// Give a class the parents its own pickle declares, if it does not have
     /// them already.
     ///
@@ -6676,13 +6694,28 @@ impl PickleSupply {
             // The imported value was consequently visible but could not serve
             // as a `Profile`. Preserving `Profile` lets the receiver's outer
             // prefix rebind it to the concrete enclosing instance.
-            SigType::This(owner) => self
-                .ensure_class(st, bin, owner, false)
-                .map(Type::ThisType)
-                .or_else(|| match &self.self_ty {
+            //
+            // `subst_as_seen_from` can only do that when it sees the declaring
+            // class among the installing class's ancestors, and a jar class's
+            // parents are attached one class at a time. `duplicate: this.type`
+            // is declared by reflect's `TreeApi` and installed on `SelectApi`,
+            // whose chain runs through `SymTreeApi` -- a class nothing else
+            // completed, left with `AnyRef` as its only parent. The result then
+            // stayed `TreeApi.this.type` instead of the receiver. Complete the
+            // chain before handing out a `this.type` of an ancestor.
+            SigType::This(owner) => {
+                let this = self.ensure_class(st, bin, owner, false);
+                if let (Some(this), Some(Type::Class { sym, .. })) = (this, self.self_ty.clone())
+                {
+                    if this != sym && !st.is_ancestor_of(this, sym) {
+                        self.ensure_ancestor_parents(st, bin, sym);
+                    }
+                }
+                this.map(Type::ThisType).or_else(|| match &self.self_ty {
                     Some(Type::Class { sym, .. }) => Some(Type::ThisType(*sym)),
                     other => other.clone(),
-                }),
+                })
+            }
             SigType::Refined { parents, decls } => {
                 self.conv_refined(st, bin, scope, parents, decls, d)
             }
