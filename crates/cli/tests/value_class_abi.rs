@@ -171,3 +171,68 @@ object Main {
 "#,
     );
 }
+
+/// An unannotated `final val` keeps the constant type of its (folded)
+/// right-hand side -- `final val N = 42` is `Int(42)`, `final val C = 1 + 2`
+/// is `Int(3)` -- and nsc replaces a reference through a stable path by the
+/// literal, so `println(K.N)` prints `42` without initializing `K`. Both
+/// halves cross the compilation boundary: the constant type is in the pickle,
+/// and a scalac library's constants are inlined by a scala-rs client. An
+/// impure qualifier (`f().N`) is still evaluated.
+#[test]
+fn final_val_constant_type_is_pickled_and_inlined() {
+    check_separate(
+        "final-val-constant",
+        r#"package lib
+object K {
+  println("K init")
+  final val N = 42
+  final val S = "str"
+  final val Nl = null
+  final val U = ()
+  final lazy val L = 7
+  final var V = 8
+  final val T: Int = 9
+  val P = 10
+  final val C = 1 + 2
+  val Lit: 11 = 11
+  final val D = 2.5
+  final val B = true && !false
+  final val Ch = 'c'
+  final val X = N * 2
+  final val Big = 1L << 40
+  final val Neg = -5
+  final val Cat = "a" + "b"
+  final val Msg = "n=" + N
+  final val Cmp = N > 40
+  final val Mix = N + 0.5
+  final val Sh = -16 >>> 28
+  final val Div = 7 / 2 % 3
+  final val F = 1.5f * 2
+  final val Conv = 5.toLong
+}
+trait Tr { println("Tr init"); final val TN = 3 }
+object O extends Tr
+class Cl { println("Cl init"); final val M = 5 }
+"#,
+        r#"import lib._
+object Main {
+  final val Local = K.N + 1
+  def f() = { println("f"); K }
+  def main(args: Array[String]): Unit = {
+    println(Local)
+    println(List(K.N, K.C, K.X, K.Neg, K.Sh, K.Div).mkString(","))
+    println(List(K.S, K.Cat, K.Nl, K.Big, K.Cmp, K.Mix, K.F, K.D, K.B, K.Ch, K.Conv).mkString(","))
+    println(O.TN)
+    val c = new Cl; println(c.M)
+    (args.length + 42) match { case K.N => println("matched N"); case _ => println("no") }
+    println(f().N)
+    println(K.Msg)
+    println(K.P)
+    println(K.Lit + K.T + K.L + K.V)
+    println(K.U)
+  }
+}
+"#,
+    );
+}

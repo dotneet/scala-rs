@@ -10,6 +10,8 @@ use crate::symbol::{Intrinsic, SymbolTable};
 /// (erased) forms.
 pub fn erase(tree: &mut Tree, st: &mut SymbolTable) {
     let boxed_params = value_class_lambda_params(tree, st);
+    // Before `erase_symbols`, which erases the constant types away.
+    inline_constant_refs(tree, st);
     erase_symbols(st);
     // A `FunctionN.apply` takes `Object`, so a lambda parameter instantiated at
     // a value class receives the *boxed* instance: `xs.map(_.n)` over a
@@ -26,6 +28,104 @@ pub fn erase(tree: &mut Tree, st: &mut SymbolTable) {
         st.erasure_settled = false;
     }
     erase_tree(tree, st, None);
+}
+
+/// nsc's typer replaces a reference to a constant-typed value by its literal
+/// (`adaptConstant`): `final val N = 42` is `Int(42)`, and `println(K.N)`
+/// compiles to `println(42)` without touching -- or initializing -- `K`. A
+/// qualifier that could do something is kept, as nsc keeps it: `f().N` still
+/// calls `f`. Stable-identifier patterns (`case K.N =>`) fold the same way.
+/// Type trees are left alone; `K.N.type` is not a read.
+fn inline_constant_refs(tree: &mut Tree, st: &SymbolTable) {
+    match &mut tree.kind {
+        TreeKind::Ident { .. } | TreeKind::Select { .. } => {
+            if let Some(lit) = constant_ref(tree, st) {
+                tree.kind = TreeKind::Literal { lit: lit.clone() };
+                tree.sym = SymbolId::NONE;
+                tree.ty = Type::Constant(lit);
+                return;
+            }
+        }
+        TreeKind::ValDef { rhs, .. } => return inline_constant_refs(rhs, st),
+        TreeKind::DefDef { vparamss, rhs, .. } => {
+            for p in vparamss.iter_mut().flatten() {
+                inline_constant_refs(p, st);
+            }
+            return inline_constant_refs(rhs, st);
+        }
+        TreeKind::TypeApply { fun, .. } => return inline_constant_refs(fun, st),
+        TreeKind::Typed { expr, .. } => return inline_constant_refs(expr, st),
+        TreeKind::TypeDef { .. } | TreeKind::Import { .. } | TreeKind::New { .. } => return,
+        _ => {}
+    }
+    for c in crate::lazy_local::children_mut(tree) {
+        inline_constant_refs(c, st);
+    }
+}
+
+/// The literal a reference to a constant-typed member stands for.
+fn constant_ref(tree: &Tree, st: &SymbolTable) -> Option<Lit> {
+    if tree.sym.is_none() {
+        return None;
+    }
+    let s = st.get(tree.sym);
+    if s.flags.contains(Flags::LAZY)
+        || s.flags.contains(Flags::MUTABLE)
+        || s.flags.contains(Flags::PARAM)
+        || !matches!(
+            s.kind,
+            crate::symbol::SymKind::Term | crate::symbol::SymKind::Method
+        )
+        || s.owner.is_none()
+        || !st.get(s.owner).is_class_like()
+    {
+        return None;
+    }
+    let lit = match &s.ty {
+        Type::Constant(lit) => lit,
+        Type::Method { paramss, ret } if paramss.is_empty() => match &**ret {
+            Type::Constant(lit) => lit,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if matches!(lit, Lit::Unit | Lit::Symbol(_)) {
+        return None;
+    }
+    match &tree.kind {
+        TreeKind::Ident { .. } => Some(lit.clone()),
+        TreeKind::Select { qual, .. } if is_pure_path(qual, st) => Some(lit.clone()),
+        _ => None,
+    }
+}
+
+/// A qualifier whose evaluation nsc may drop: a stable path of packages,
+/// modules, `this` and strict, immutable values.
+fn is_pure_path(t: &Tree, st: &SymbolTable) -> bool {
+    use crate::symbol::SymKind;
+    match &t.kind {
+        TreeKind::This { .. } => true,
+        TreeKind::Ident { .. } | TreeKind::Select { .. } => {
+            if t.sym.is_none() {
+                return false;
+            }
+            let s = st.get(t.sym);
+            let ok = match s.kind {
+                SymKind::Package | SymKind::Module | SymKind::ModuleClass => true,
+                SymKind::Term => {
+                    !s.flags.contains(Flags::LAZY)
+                        && !s.flags.contains(Flags::MUTABLE)
+                        && !s.flags.contains(Flags::BYNAME)
+                }
+                _ => false,
+            };
+            ok && match &t.kind {
+                TreeKind::Select { qual, .. } => is_pure_path(qual, st),
+                _ => true,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Default getters are stored on symbols instead of in the compilation-unit

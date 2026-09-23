@@ -21,6 +21,7 @@ mod check_types;
 mod class_rules;
 mod classpath;
 mod compile_time_only;
+mod const_fold;
 mod ctor_defaults;
 mod cyclic;
 mod default_recv;
