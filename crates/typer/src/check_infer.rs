@@ -2430,7 +2430,10 @@ impl Typer {
                     // `A := (X, Y)` off the inner `swap` and only the declared
                     // result says `A` is `(C, A)` -- which is what then solves
                     // `X` and `Y`.
-                    if strong && slot.1 != ty && !type_has_wildcard(&ty) {
+                    if strong
+                        && slot.1 != ty
+                        && (self.relaxed_pt_depth == 0 || !type_has_wildcard(&ty))
+                    {
                         if self.st.is_sub_type(&slot.1, &ty) || self.st.is_sub_type(&ty, &slot.1) {
                             slot.1 = ty;
                         } else if !matches!(&slot.1, Type::TypeParam(v) if self.undet_tvars.contains(v))
