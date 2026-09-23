@@ -1,6 +1,5 @@
 //! `reify { … }` over `val` and `def` definitions bound *inside* the body
-//! itself (the `agent/reifydefs` slice, `docs/macros.md` §7.17 "What
-//! remains", item 3).
+//! itself (the `agent/reifydefs` slice, `docs/macros.md` §7.19).
 //!
 //! Its own file per the project convention (`libctor.rs`, `tqmacro.rs`,
 //! `engine.rs`, `rf_reify.rs`), so appending to a shared file's tail never

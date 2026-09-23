@@ -1,8 +1,8 @@
 //! The five known failures the cats and gitbucket *execution* harnesses carried.
 //!
 //! `tests/cats_run.sh` reported `progs=8 ok=4` and `tests/gitbucket_run.sh`
-//! `progs=6 ok=5` with a ledger of four plus one expected failures
-//! (`docs/notes/rh-cats-gitbucket-run.md`). Every one of them typechecks, emits,
+//! `progs=6 ok=5` with a ledger of four plus one expected failures. Every one
+//! of them typechecks, emits,
 //! passes `tests/classfile_lint.py` and loads; what they fail is *running* the
 //! code, or letting real scalac compile against it.
 //!

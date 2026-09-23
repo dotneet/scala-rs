@@ -2,7 +2,7 @@
 
 This note is the design of scala-rs's `reify`, the measured walls it was
 built against, and what is left in order. It supersedes the reify parts of
-`docs/macros.md` §7.15 and §7.17 (which are kept as history) and the
+`docs/macros.md` §7.15, §7.17 and §7.19 (now condensed to the tree shapes) and the
 `agent/reifybody` / `reify` widening sections of
 `docs/notes/macro-reflect-and-reify.md`.
 

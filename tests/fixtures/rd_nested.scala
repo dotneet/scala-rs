@@ -1,6 +1,6 @@
 // Nested `object`s of the reflection API, and `<a val>.type` as a stable
-// identifier. `docs/macros.md` §7.8 residuals 5 and 6, the two gaps §7.13.4
-// names in front of a self-built `reify`.
+// identifier. `docs/macros.md` §7.14: the two gaps that stood
+// in front of a self-built `reify`.
 //
 // `trait Exprs { object Expr { … } }` compiles to an interface method
 // `Expr()Lscala/reflect/api/Exprs$Expr$;` plus the module's own class file.

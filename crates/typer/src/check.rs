@@ -982,6 +982,7 @@ pub fn typecheck_units_src(
     }
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
+    t.complete_classpath_nesting();
     t.link_tuple_products();
     t.link_string_parents();
     t.defer_default_rhs = true;

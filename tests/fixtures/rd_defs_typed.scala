@@ -18,7 +18,7 @@ object Main {
 
   // 2. A locally declared `def`'s own type parameter, used in a value
   //    position. There is no tag to look it up by -- it is not the *macro
-  //    implementation's* type parameter (`docs/macros.md` §7.16's `noTag`),
+  //    implementation's* type parameter (`rb_free.scala`'s `noTag`),
   //    it is one this very `def` introduces -- so it can only be built
   //    structurally too, the same gap as case 1.
   val genericDef = reify { def id[U](x: U): U = x; id(1) }

@@ -53,10 +53,61 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     let Some(pf) = find_partial_function(st) else {
         return;
     };
+    let io = find_by_jvm(st, "scala/collection/IterableOnce");
     add_collect(st, so, idx, pf);
     add_apply(st, so);
     add_add_string(st, so);
-    add_with_filter(st, so, idx);
+    if let Some(io) = io {
+        add_generic_flat_map(st, so, idx, io, Flags::FINAL);
+    }
+    add_with_filter(st, so, idx, io);
+}
+
+/// `flatMap[B](f: Char => IterableOnce[B]): IndexedSeq[B]`, the generic
+/// sibling of the `flatMap(f: Char => String): String` that `prelude.rs`
+/// declares. nsc 2.13.16 JVM (on `StringOps`, and the same pair without
+/// `$extension` on `StringOps.WithFilter`):
+///
+/// ```text
+/// public static java.lang.String flatMap$extension(java.lang.String, scala.Function1);
+/// public static <B> scala.collection.immutable.IndexedSeq<B>
+///     flatMap$extension(java.lang.String, scala.Function1);
+/// ```
+///
+/// Without it `"hello".flatMap(c => List(c, c))` -- and every for
+/// comprehension over a `String` with a non-`String` inner generator -- was
+/// forced through the `String` overload and rejected with
+/// `found: List[Char] required: String`. Two symbols for the reason the
+/// module doc gives; the `String` one is the more specific, so it still wins
+/// for `Char => String`.
+fn add_generic_flat_map(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    idx: SymbolId,
+    io: SymbolId,
+    flags: Flags,
+) {
+    if st
+        .lookup_member(owner, "flatMap")
+        .into_iter()
+        .any(|m| !st.get(m).tparams.is_empty())
+    {
+        return;
+    }
+    let g = st.alloc("flatMap", owner, SymKind::Method, flags, "");
+    let b = st.alloc("B", g, SymKind::TypeParam, Flags::EMPTY, "");
+    st.get_mut(b).ty = Type::TypeParam(b);
+    st.get_mut(g).tparams = vec![b];
+    let tb = Type::TypeParam(b);
+    let io_b = Type::Class {
+        sym: io,
+        args: vec![tb.clone()],
+    };
+    let seq_b = Type::Class {
+        sym: idx,
+        args: vec![tb],
+    };
+    set_fn1_method(st, g, "f", Type::Char, io_b, seq_b);
 }
 
 /// `collect(pf: PartialFunction[Char, Char]): String` and
@@ -170,7 +221,7 @@ fn add_add_string(st: &mut SymbolTable, so: SymbolId) {
 /// `invokevirtual`s against `scala/collection/StringOps$WithFilter` -- no
 /// `$extension` involved. Its `map` and `flatMap` are result-type overloads
 /// like `StringOps`' own, so each gets two symbols.
-fn add_with_filter(st: &mut SymbolTable, so: SymbolId, idx: SymbolId) {
+fn add_with_filter(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, io: Option<SymbolId>) {
     if !st.lookup_member(so, "withFilter").is_empty() {
         return;
     }
@@ -204,6 +255,10 @@ fn add_with_filter(st: &mut SymbolTable, so: SymbolId, idx: SymbolId) {
     // flatMap(f: Char => String): String
     let f1 = st.alloc("flatMap", wf, SymKind::Method, Flags::EMPTY, "");
     set_fn1_method(st, f1, "f", Type::Char, Type::String, Type::String);
+    // flatMap[B](f: Char => IterableOnce[B]): IndexedSeq[B]
+    if let Some(io) = io {
+        add_generic_flat_map(st, wf, idx, io, Flags::EMPTY);
+    }
 
     // withFilter(p: Char => Boolean): WithFilter
     let wfty = Type::Class {

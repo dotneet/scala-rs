@@ -2752,7 +2752,7 @@ impl Typer {
     /// on `blackbox.Context` -- report `stable identifier required, but
     /// c.universe found` while `c.universe.Tree`, which goes through
     /// `path_dependent_type` and only asks `member_is_stable`, compiled fine.
-    /// `docs/macros.md` §7.8 residual 6.
+    /// `docs/macros.md` §7.14.
     fn names_a_singleton(&self, s: SymbolId) -> bool {
         let sy = self.st.get(s);
         match sy.kind {

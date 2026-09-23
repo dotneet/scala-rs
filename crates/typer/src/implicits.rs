@@ -1469,7 +1469,7 @@ impl Typer {
                 if !self.only_implicit_clauses(id) {
                     return None;
                 }
-                let Some(fit) = self.implicit_solve(id, ret, pt, undet) else {
+                let Some(mut fit) = self.implicit_solve(id, ret, pt, undet) else {
                     return self.implicit_fit_open(id, ret, pt, undet, paramss, depth);
                 };
                 if self.implicit_diverges(id, pt) {
@@ -1480,19 +1480,49 @@ impl Typer {
                     .borrow_mut()
                     .push((id, self.subst_undet(pt, &fit.undet)));
                 let params = self.st.get(id).params.clone();
-                let ok = paramss.iter().flatten().enumerate().all(|(index, p)| {
-                    let want = crate::symbol::subst_tparams_slice(&tps, &fit.targs, p);
-                    let found = self.search_implicit_at(&want, depth + 1);
-                    let ok = found.is_found()
-                        || self.built_not_found(&want, depth + 1)
-                        || self.conv_param_view_resolves(&want)
-                        || params.get(index).is_some_and(|pid| {
-                            self.st.get(*pid).flags.contains(Flags::DEFAULTPARAM)
-                        });
-                    ok
-                });
+                let mut tagged: Vec<SymbolId> = Vec::new();
+                let ok =
+                    paramss.iter().flatten().enumerate().all(|(index, p)| {
+                        let want = crate::symbol::subst_tparams_slice(&tps, &fit.targs, p);
+                        let found = self.search_implicit_at(&want, depth + 1);
+                        if found.is_found() {
+                            return true;
+                        }
+                        if self.built_not_found(&want, depth + 1) {
+                            if self.is_materialized_tag(&want) {
+                                tagged.extend(undet.iter().copied().filter(|d| {
+                                    crate::check::type_mentions_tparam_deep(&want, *d)
+                                }));
+                            }
+                            return true;
+                        }
+                        self.conv_param_view_resolves(&want)
+                            || params.get(index).is_some_and(|pid| {
+                                self.st.get(*pid).flags.contains(Flags::DEFAULTPARAM)
+                            })
+                    });
                 self.open_implicits.borrow_mut().pop();
                 if ok {
+                    // nsc materializes a tag for a still-undetermined type
+                    // variable at that variable's lower bound, and the
+                    // instantiation is part of the search's answer:
+                    // `implicit def evAny[A](implicit ct: ClassTag[A]): Ev[A]`
+                    // found for `make[A](x)(implicit ev: Ev[A]): Box[A]` makes
+                    // the call `make[Nothing]`. Leaving `A` unbound here
+                    // left the call at `Box[A]` -- rejected against a
+                    // declared `Box[Long]`, and with an erased
+                    // `ClassTag(classOf[Object])` fabricated for it elsewhere.
+                    // The direct `(implicit ct: ClassTag[A])` clause has the
+                    // same rule in `solve_implicit_only_tparams`.
+                    for d in tagged {
+                        if fit.undet.iter().any(|(b, _)| *b == d)
+                            || !self.st.get(d).tparams.is_empty()
+                        {
+                            continue;
+                        }
+                        let lo = self.st.get(d).bound_lo.clone().unwrap_or(Type::Nothing);
+                        fit.undet.push((d, lo));
+                    }
                     return Some(fit);
                 }
                 // The result type did not really determine this candidate: one
@@ -1555,6 +1585,14 @@ impl Typer {
             if !args.is_empty()
                 && self.st.get(*sym).name == "ClassTag"
                 && self.st.companion_module(*sym).is_some())
+    }
+
+    /// A `ClassTag` or `TypeTag`/`WeakTypeTag` request: evidence the compiler
+    /// builds for any type, an undetermined variable included.
+    fn is_materialized_tag(&self, want: &Type) -> bool {
+        matches!(want, Type::Class { sym, .. }
+            if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+            || crate::materialize::tag_request(&self.st, want).is_some()
     }
 
     /// nsc's "diverging implicit expansion": the same implicit is already

@@ -285,8 +285,8 @@ if [[ -n ${KNOWN:-} ]]; then
 fi
 # Empty since `agent/rhfix`: `Utils` passes on both axes. Two roots were in its
 # way -- `returning … insert` inferring the id as `Nothing`, and `Byte` pickled
-# as a root-owned reference -- both written up in
-# `docs/notes/rh-cats-gitbucket-run.md`.
+# as a root-owned reference. `crates/cli/tests/rhf.rs` holds the reduced
+# `Utils` programs.
 
 PROGS=("$@")
 if [[ ${#PROGS[@]} -eq 0 ]]; then

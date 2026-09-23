@@ -681,6 +681,23 @@ impl Typer {
             );
         }
         self.warn_trivial_self_reference(tree.sym, rhs);
+        // SLS 4.1: an unannotated `final val` whose right-hand side is a
+        // constant expression has that constant type -- `final val N = 42` is
+        // `Int(42)`, `final val C = 1 + 2` is `Int(3)` -- and the pickle says
+        // so. nsc folds the right-hand side itself to the literal too, and
+        // every reference is then replaced by it (see
+        // `erasure::inline_constant_ref`), which is why `println(K.N)` never
+        // initializes `K`. A `lazy` or `var` one is not a constant.
+        let lazy = !tree.sym.is_none() && self.st.get(tree.sym).flags.contains(Flags::LAZY);
+        if final_value && !lazy && !is_var && declared.is_no_type() {
+            if let Some(lit) = crate::const_fold::fold(rhs) {
+                if !matches!(rhs.kind, TreeKind::Literal { .. }) {
+                    rhs.kind = TreeKind::Literal { lit: lit.clone() };
+                    rhs.sym = SymbolId::NONE;
+                }
+                rhs.ty = Type::Constant(lit);
+            }
+        }
         let preserve_constant = final_value && matches!(rhs.ty, Type::Constant(_));
         if let Some(expected) = inherited.filter(|_| feature && !preserve_constant) {
             self.adapt(rhs, &expected);
@@ -691,7 +708,14 @@ impl Typer {
             // (nsc's mono-mode `instantiate`): `val b = List.newBuilder` is a
             // `Builder[Nothing, List[Nothing]]`, not a `Builder[?A, …]` that a
             // later line could still solve.
-            tree.ty = self.close_leaked_undet(&rhs.ty.widen_constant());
+            // `()` is typed `Unit(())` here, but nsc has no constant `Unit`
+            // type for a definition: `final val U = ()` is plain `Unit`.
+            let unit = matches!(rhs.ty, Type::Constant(Lit::Unit));
+            tree.ty = if preserve_constant && !lazy && !is_var && !unit {
+                rhs.ty.clone()
+            } else {
+                self.close_leaked_undet(&rhs.ty.widen_constant())
+            };
             if is_var {
                 tree.ty = self.widen_inferred_singleton(tree.ty.clone());
             }

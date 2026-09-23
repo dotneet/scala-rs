@@ -268,7 +268,7 @@ pub(crate) struct TagClasses {
 /// `ScalaSignature`. So nothing ever entered a symbol for it, the descriptor
 /// `()Lscala/reflect/api/TypeTags$TypeTag$;` on `TypeTags#TypeTag` came back
 /// as an unresolved `Type::Named`, and `u.TypeTag.apply` / `u.TypeTag.Int`
-/// were "not a member of TypeTags$TypeTag$" (`docs/macros.md` §7.8, item 5).
+/// were "not a member of TypeTags$TypeTag$" (`docs/macros.md` §7.10).
 ///
 /// `apply`'s erased descriptor is written out rather than derived: the Scala
 /// signature is `apply[T](mirror1: Mirror[TypeTags.this.type], tpec1:

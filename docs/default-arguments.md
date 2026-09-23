@@ -18,110 +18,68 @@ off, and what is still missing.
 | a Scala class file, via its pickle | `pflags::DEFAULTPARAM` on the pickled parameter (`pickle_supply::install`) |
 | a class file whose pickle is not used | **the `name$default$n` methods beside it** (`classpath::mark_defaults_from_getters`) |
 
-The third row is the one that used to be missing. A class file records no
-per-parameter bit at all, so a member the pickle path declines is described by
-`classpath::fill_java_members` alone, and that reader ignored the getters
-sitting next to the method. json4s's
-
-```scala
-FieldSerializer[String]()
-```
-
-reported
-
-```
-no matching overload for
-  (PartialFunction[…], PartialFunction[…], Boolean, ClassTag[String])FieldSerializer[String]
-  with arguments ()
-```
-
-The getter's name does not say which *overload* it belongs to.
-`org.scalatra.Control` declares `halt(ActionResult)` next to
-`halt[T](Integer = null, T = (), Map = Map.empty)`; arity settles most slots and
-the getter's result descriptor settles the rest
+A class file records no per-parameter bit, so for a member the pickle path
+declines, the getters sitting next to the method are the only evidence. The
+getter's name does not say which *overload* it belongs to (scalatra's
+`Control` declares `halt(ActionResult)` next to
+`halt[T](Integer = null, T = (), Map = Map.empty)`); arity settles most slots
+and the getter's result descriptor settles the rest
 (`classpath::getter_fills_param`).
 
 ## A case class's companion `apply` is `SYNTHETIC`
 
 `Member::is_public_api` filters `SYNTHETIC` out along with bridges and
-`$anonfun`s, so the pickled `apply`/`unapply`/`copy` of a `case class` were
-never installed and the class file's cruder description stood in their place --
-one that records neither the defaults nor which clause is `implicit`.
+`$anonfun`s, which would leave the pickled `apply` / `unapply` / `copy` of a
+binary `case class` uninstalled and the class file's cruder description --
+no defaults, no `implicit` clause -- in their place.
 `Member::is_case_synthetic` (`CASE` alongside `SYNTHETIC`, which nsc sets on
 exactly the members it derives from a `case` declaration) admits those three,
-and `adopt_binary_class` drops the class file copies it replaces.
+and `adopt_binary_class` drops the class-file copies it replaces.
 
-**Not for a prelude class.** The relaxation is scoped to classes whose only
-description is a class file; `scala.*` classes the prelude built are
-hand-written and authoritative, and `adopt_binary_class` refuses them outright
-for the same reason. Offering the pickled `Some$.apply` from `complete_named`
-made `Some("first")("spurious")` compile -- as `Some$.apply("spurious")`, with
-the receiver dropped and the lambda never called. That is `scala/scala`'s
-`neg/t4196`, and the full corpus is what caught it; the shape is now in
-`tests/fixtures/da_defaults_bad.scala`. The underlying looseness -- a
-non-empty `complete_named` answer read as "this receiver can be applied" -- is
-not fixed here.
+This is **not** done for prelude classes: `scala.*` classes the prelude built
+are authoritative, and `adopt_binary_class` refuses them. Offering the
+pickled `Some$.apply` there made `Some("first")("spurious")` compile as
+`Some$.apply("spurious")` (scala/scala's `neg/t4196`; the shape is in
+`tests/fixtures/da_defaults_bad.scala`).
 
 ## Which prefix the getter is selected off
 
 The getter is a fresh `Select` built by `Typer::default_getter_apply`, so it
-needs a receiver even though the source wrote none. Taking `this` is right only
-when the enclosing class really has the member:
+needs a receiver even though the source wrote none. `this` is right only when
+the enclosing class really has the member; `Typer::default_getter_receiver`
+decides:
 
-* a name that arrived through `import <object>._` belongs to the object --
-  "value avatar$default$3 is not a member of IndexControllerBase";
-* a name a cake's self type contributes, seen from inside an anonymous class,
-  belongs to the class that carries the annotation and is reached through that
-  class's `$outer` -- "value getAccountByUserNameIgnoreCase$default$2 is not a
-  member of $anon$61";
-* a `def` written inside a method body has its getter in that same body. There
-  is no receiver and no class to emit it on, so the default's own expression is
-  spliced instead, in the scope that wrote it. twirl writes gitbucket's
-  templates as a local `def menuitem(…, count: Int = 0)` inside `apply`.
+* a name that arrived through `import <object>._` belongs to the object;
+* a name a self type contributes, seen from inside an anonymous or nested
+  class, belongs to the class that carries the self-type annotation and is
+  reached through `$outer`;
+* a `def` written inside a method body has its getter in that same body.
+  There is no receiver and no class to emit it on, so the default's own
+  expression is spliced instead, in the scope that wrote it (twirl templates
+  write local `def`s with defaults).
 
-`Typer::default_getter_receiver` decides between those.
-
-### The second shape was also a miscompilation
-
-The *main* call in the anonymous-class case compiled to `aload_0; checkcast
-AccountService` on an object that does not implement it -- a
-`ClassCastException` from a program that type-checked, with explicit arguments
-and no defaults involved. `gen_desc::outer_self_type_reaches` teaches the
-backend's receiver walk that an enclosing class's **self type** supplies
-members too, so the `$outer` is loaded and cast instead.
-`gen_desc::self_type_supplies` is the matching stopping condition inside
-`load_owner_instance`: the class that carries the annotation really is mixed
-with its self type at run time, so the walk ends there rather than running on
-to the outermost enclosing instance.
-
-## A compound self type contributed only its first component
-
-`SymbolTable::class_sym_of` answers a `Type::Refined` with its first parent, so
-`self: WikiService & RepositoryService & AccountService & … =>` (six
-components, which is how every gitbucket controller is written) made only
-`WikiService`'s members visible from inside. `SymbolTable::self_type_classes`
-returns all of them, and the three traversals that walk a self type
-(`lookup_member`, `members_including_inherited`, `is_ancestor_of`) use it.
+On the backend side, `gen_desc::outer_self_type_reaches` lets the receiver
+walk treat an enclosing class's **self type** as a supplier of members, so the
+`$outer` is loaded and cast rather than `this`, and
+`gen_desc::self_type_supplies` stops the walk at the class that carries the
+annotation. A compound self type (`self: A & B & C =>`) contributes all of
+its components (`SymbolTable::self_type_classes`), not just the first.
 
 ## Type parameters and defaults
 
-Two places have to *withhold* the parameter's declared type rather than demand
+Two places *withhold* the parameter's declared type rather than demand
 conformance to it, because the default is what determines the type argument:
 
 * **the call site.** `halt(400)` on
   `def halt[T: ClassTag](status: Int = 400, body: T = (), …)` fills `body` from
-  `halt$default$2()`, whose result is `Unit`. Checking that against the
-  unsolved `T` reported "type mismatch; found: Unit  required: T".
-  `default_getter_apply` types the getter call with no expectation when the
-  parameter's type still mentions a type parameter, which is what
-  `pretype_spliced_default` already did for a spliced default.
+  `halt$default$2()`, whose result is `Unit`. `default_getter_apply` types the
+  getter call with no expectation when the parameter's type still mentions a
+  type parameter, as `pretype_spliced_default` does for a spliced default.
 * **the supply of the getter itself.** nsc infers a default getter's result
-  type, so `halt$default$1` is `[T]()Integer` -- a type parameter the signature
-  mentions nowhere else. `pin_undetermined_tparams` refused such a shape, and a
-  getter that cannot be supplied makes the *method* ineligible, which is how
-  `halt(400)` lost its only applicable overload. A type parameter no parameter
-  and no result names is now kept: nothing at the call site depends on how it
-  is solved.
+  type, so `halt$default$1` is `[T]()Integer` -- a type parameter the
+  signature mentions nowhere else. A type parameter no parameter and no result
+  names is kept when the getter is supplied, because nothing at the call site
+  depends on how it is solved; refusing it would make the *method* ineligible.
 
 ## Not implemented
 
@@ -129,14 +87,17 @@ conformance to it, because the default is what determines the type argument:
   against the parameter's declared `T` and reports a mismatch; nsc infers the
   getter's result type instead and accepts it. Reading such a method back out
   of a class file works (`tests/multi/defaultargs_binary/Halt_1.scala`), which
-  is what the libraries need; writing one does not.
-* **Curried defaults in a class file scala-rs itself produced.** A `-cp` class
-  compiled by scala-rs is described by its class file only -- the typer reads
-  pickles from the standard library and from classes `adopt_binary_class` has
-  taken over, not from arbitrary `-cp` output -- and a class file flattens the
-  clauses, so `def join(a: String)(b: String = "-")(c: String = a + b)` comes
-  back as a single three-parameter method. Against **nsc's** class files the
-  pickle is read and the same declaration works.
+  is what the libraries need.
+* **Solving a class type parameter from an omitted constructor default**
+  (`case class C[+F <: Option[Int]](n: String, f: F = None)` called as
+  `C("q")`): the getter is emitted with nsc's descriptor, but the call site
+  does not consult its result type.
+* **Getters of defaults in a later parameter clause, as scalac reads them.**
+  For `def join(a: String)(b: String = "-")(c: String = a + b)` we pickle
+  `join$default$3` with one flat clause `(a, b)` where nsc writes `(a)(b)`, so
+  a scalac client of our class file cannot omit those arguments
+  (`not enough arguments for method join$default$3`). A scala-rs client of the
+  same class files, and scala-rs against nsc's class files, both work.
 
 ## Tests
 
@@ -144,6 +105,6 @@ conformance to it, because the default is what determines the type argument:
   run in both the private-runtime and `--scala-library` modes, printing what
   each default produced. Output verified against scalac 2.13.16.
 * `tests/multi/defaultargs_binary/`: `dalib` compiled by **real scalac**, the
-  consumer by scala-rs. This is the only setting the class-file root appears
-  in.
+  consumer by scala-rs. This is the only setting the class-file row of the
+  table above appears in.
 * `crates/cli/tests/defaultargs.rs` drives both.

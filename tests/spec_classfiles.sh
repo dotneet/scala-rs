@@ -4,7 +4,8 @@
 #
 # Why this exists
 # ---------------
-# Accepting `@specialized` (stage 1, see docs/specialization.md) turns a large
+# Accepting `@specialized` (docs/specialization.md, "Accepting and recording the
+# annotation") turns a large
 # number of corpus tests green without implementing specialization: a `pos`
 # test only asserts that the program type-checks, and `@specialized` changes no
 # answer, only the boxing and the classes on disk. So the `pos` number goes up

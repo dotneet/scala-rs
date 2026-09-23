@@ -1,8 +1,8 @@
 # scala-async / `-Xasync`
 
-## 利用方法
+## Usage
 
-Scala 2.13 用の scala-async 1.0.1 をクラスパスへ追加します。
+Add scala-async 1.0.1 for Scala 2.13 to the class path.
 
 ```sh
 target/release/scala-rs compile Main.scala \
@@ -28,119 +28,143 @@ object Main {
 }
 ```
 
-`async` は `Future` を返します。`await` は非同期処理を中断・再開するための
-マーカーで、スレッドをブロックする `Await.result` とは異なります。上の例の
-`Await.result` は、main が出力を待つために明示的に使用しています。
+`async` returns a `Future`. `await` is a marker for suspending and resuming
+asynchronous work; it is not the thread-blocking `Await.result`. The
+`Await.result` in the example above is used explicitly so that `main` waits for
+the output.
 
-## 変換と対応範囲
+## Transformation and coverage
 
-`crates/typer/src/async_lower.rs` が、型付け後のライブラリ呼び出しを識別し、
-`Future.flatMap` と `Future.successful` に変換します。元のシンボルを保持して
-ローカル変数の参照・キャプチャを維持し、待機をまたぐオペランドを一時変数に
-保存します。`while` / `do-while` は Future を返すローカルメソッドを介して
-次の反復へ進みます。ガード内の `await` が false なら次の case を試します。
+`crates/typer/src/async_lower.rs` recognizes the library calls after typing and
+rewrites them into `Future.flatMap` and `Future.successful`. It keeps the
+original symbols so that references to and captures of local variables are
+preserved, and it saves operands that span a suspension point in temporaries.
+`while` / `do-while` advance to the next iteration through a local method that
+returns a Future. When an `await` inside a guard yields false, the next case is
+tried.
 
-対応する実行例は `tests/fixtures/async_runtime.scala` と `async_values.scala`:
+The runtime examples are `tests/fixtures/async_runtime.scala` and
+`async_values.scala`:
 
-- 待機なし、連続待機、入れ子の `async` / `await`。
-- 単一スレッドの実行コンテキストで、Promise を待つ処理と完了させる処理。
-- `val` / `var`、代入、配列・フィールド更新、コンストラクタ引数。
-- クラス・オブジェクトのフィールド初期化内での async と、可変ローカル変数の共有。
-- `if`、`match` と非同期ガード、短絡評価、10,000 回のループ。
-- 型引数、異なる分岐結果の共通型、ローカルメソッド・クラスのキャプチャ。
-- 待機先の失敗、本体の例外、ExecutionContext の一度だけの評価。
-- import の別名と、変換対象ではない同名の通常メソッド。
-- 非ローカル `return`、`return await(...)`、ループ・生成クラスをまたぐ戻り先。
+- No suspension, consecutive awaits, nested `async` / `await`.
+- On a single-threaded execution context, code that waits on a Promise and code
+  that completes it.
+- `val` / `var`, assignment, array and field updates, constructor arguments.
+- async inside class and object field initializers, and shared mutable local
+  variables.
+- `if`, `match` with asynchronous guards, short-circuit evaluation, a
+  10,000-iteration loop.
+- Type arguments, the common type of differing branch results, captures of local
+  methods and classes.
+- Failure of the awaited value, exceptions in the body, evaluating the
+  ExecutionContext exactly once.
+- Import aliases, and ordinary methods with the same name that are not
+  transformed.
+- Non-local `return`, `return await(...)`, and return targets across loops and
+  generated classes.
 
-### 非ローカル `return`
+### Non-local `return`
 
-`async` 内の `return` は、Scala 2.13 と同じく、字句的に外側にあるメソッドを
-戻り先とします。`async` の結果を返すための構文ではありません。
-戻り先のメソッドを呼ぶたびに新しいキーを生成し、
-`scala.runtime.NonLocalReturnControl` とキーが一致する呼び出しだけで捕捉します。
-同じメソッドへ再入した場合にも、内側の呼び出しが戻り値を横取りしません。
+A `return` inside `async` targets the lexically enclosing method, as in Scala
+2.13. It is not syntax for returning the result of the `async` block.
+Each invocation of the target method allocates a fresh key, and only the
+invocation whose key matches the `scala.runtime.NonLocalReturnControl` catches
+it. When the same method is re-entered, an inner invocation does not steal the
+return value.
 
-即時実行する ExecutionContext なら、まだ実行中の外側のメソッドへ戻れます。
-待機後、すでに外側のメソッドが終了している場合はこの制御例外が外へ伝播し、
-async の Future は未完了のままです。実行コンテキストによる例外報告も含め、
-一般の `return` を非同期処理の結果通知として使用しないでください。
-`async_return.scala` は即時実行・遅延再開・再入・finally を実 scalac と比較します。
+With an ExecutionContext that runs immediately, the return can reach the outer
+method while it is still running. If the outer method has already finished by
+the time execution resumes after a suspension, this control exception
+propagates out and the async Future stays incomplete. Do not use a general
+`return` to deliver the result of asynchronous work, including through the
+execution context's exception reporting.
+`async_return.scala` compares immediate execution, delayed resumption,
+re-entry, and `finally` against real scalac.
 
-### 独自ライブラリの変換フック
+### Transform hook for custom libraries
 
-`c.internal.markForAsyncTransform(owner, method, awaitSymbol, config)` を使う
-マクロも受け取れます。変換対象は指定された await メソッドであり、名前が
-`await` である必要はありません。この経路では scala-async の jar は不要です。
-マクロ実装のクラスパスには、通常のマクロと同じく scala-reflect が必要です。
+Macros that call `c.internal.markForAsyncTransform(owner, method, awaitSymbol, config)`
+are accepted too. The transformation targets the given await method, which does
+not have to be named `await`. This path does not need the scala-async jar.
+As with ordinary macros, the macro implementation's class path needs
+scala-reflect.
 
-生成クラスが提供する次のプロトコルを使用します。
+It uses the following protocol provided by the generated class:
 
-- `state` / `state_=`: 開始状態と中断後の状態。
-- `onComplete(awaitable)`: 再開コールバックの登録。
-- `getCompleted(awaitable)`: 省略可能な、完了済み結果の取得。
-- `tryGet(completion)`: 値の取得。状態機械自身を返すと継続を打ち切る。
-- `completeSuccess(value)` / `completeFailure(error)`: 結果の通知。
+- `state` / `state_=`: the initial state and the state after a suspension.
+- `onComplete(awaitable)`: registers the resumption callback.
+- `getCompleted(awaitable)`: optional; fetches an already-completed result.
+- `tryGet(completion)`: fetches the value. Returning the state machine itself
+  stops the continuation.
+- `completeSuccess(value)` / `completeFailure(error)`: report the result.
 
-内部では Promise と継続を接続します。実行待ちの継続をキューで処理するため、
-完了済みの値を繰り返し await してもコールスタックを積み上げません。
-`allowExceptionsToPropagate` 設定にも対応し、例外を `completeFailure` へ渡す代わりに
-呼び出し側へ伝播します。未知の設定キーは nsc と同様に無視します。
-通常設定では制御例外を含む `Throwable` を元の種類のまま `completeFailure` に渡します。
-したがって、独自ライブラリでの非ローカル `return` の伝播は、このメソッドの実装にも
-依存します。例えば、例外を再スローする Option の実装では外側のメソッドへ戻り、
-例外を保存する CompletableFuture の実装では Future が例外終了します。
+Internally it connects a Promise to the continuations. Pending continuations
+are processed through a queue, so awaiting already-completed values repeatedly
+does not grow the call stack.
+The `allowExceptionsToPropagate` setting is supported as well: instead of
+passing exceptions to `completeFailure`, it propagates them to the caller.
+Unknown setting keys are ignored, as in nsc.
+With the default settings, any `Throwable`, including control exceptions, is
+passed to `completeFailure` with its original type. Propagation of a non-local
+`return` in a custom library therefore also depends on how that method is
+implemented. For example, an Option implementation that rethrows the exception
+returns to the outer method, while a CompletableFuture implementation that
+stores the exception completes the Future exceptionally.
 
-`async_hook_impl.scala` / `async_hook_runtime.scala` は、独自の Option と
-Java CompletableFuture のマクロで、中断・再開・途中終了・例外・10,000 回のループを
-比較します。別スレッドからの 1,000 回の完了通知、割り込み状態、完了フックの例外、
-同名の通常オーバーロードも差分試験で確認します。
-`async_hook_bad.scala` は対象外に残った await と不正な入れ子を拒否します。
+`async_hook_impl.scala` / `async_hook_runtime.scala` compare suspension,
+resumption, early exit, exceptions, and a 10,000-iteration loop using macros for
+a custom Option and for Java's CompletableFuture. Differential tests also cover
+1,000 completions from another thread, the interrupt status, exceptions from
+completion hooks, and ordinary overloads with the same name.
+`async_hook_bad.scala` rejects awaits left outside the transformed code and
+invalid nesting.
 
-`async_bad.scala` では、本体外の `await`、入れ子のメソッド・関数・クラス・
-オブジェクト、lazy val、by-name 引数、try 内での `await` を拒否します。
-`await` を含まないローカル定義・try は利用できます。
+`async_bad.scala` rejects `await` outside the body, inside nested methods,
+functions, classes, and objects, in lazy vals, in by-name arguments, and inside
+`try`. Local definitions and `try` that contain no `await` are allowed.
 
-## 検証
+## Verification
 
-Scala 2.13.16 と同じソースをコンパイルし、`java -Xverify:all` で出力を比較します。
-単一スレッドでの試験には実行期限を設け、ブロッキング実装のデッドロックも
-テストの失敗として検出します。jar を通常の Coursier キャッシュ以外に置く場合:
+The same sources are compiled with Scala 2.13.16 and the outputs are compared
+under `java -Xverify:all`. Single-threaded tests run with a time limit, so a
+deadlock in a blocking implementation is also detected as a test failure. When
+the jar is not in the usual Coursier cache:
 
 ```sh
 SCALA_ASYNC_JAR=/path/to/scala-async_2.13-1.0.1.jar tests/cli_test.sh xflags
 ```
 
-関連する型検査修正として、手書き prelude の外にある `scala.concurrent` クラスの
-親型を、引数の適合性判定前に補完します。これにより `Future[A]` と
-`Awaitable[A]`、`FiniteDuration` と `Duration` の関係が、ロード順に依存せず
-`Await.result` で利用できます。
+As a related type-checking fix, the parent types of `scala.concurrent` classes
+outside the hand-written prelude are completed before argument conformance is
+checked. This makes the relationships between `Future[A]` and `Awaitable[A]`,
+and between `FiniteDuration` and `Duration`, available to `Await.result`
+independently of load order.
 
-初回実装の統合ゲートと変更前比較は、[初回の検証記録](notes/async-validation-2026-09-15.md)、
-汎用フックと非ローカル return の追加検証は、[追加検証記録](notes/async-hooks-validation-2026-09-16.md)
-を参照してください。
+## Limitations and references
 
-## 制限と参照先
+The single `FutureStateMachine` that nsc generates, and its bytecode shape and
+allocation counts, are not matched. The generic hook's `postAnfTransform` /
+`stateDiagram` configuration callbacks, and the form that passes the state
+machine instance as an extra parameter, are unsupported and diagnosed
+explicitly. This does not therefore mean full compatibility with the whole
+internal `-Xasync` API.
 
-nsc が生成する単一 `FutureStateMachine` とバイトコードの形・割り当て数は
-一致しません。汎用フックの `postAnfTransform` / `stateDiagram` 設定コールバックと、
-状態機械インスタンスを追加パラメータで渡す形式は未対応で、明示的に診断します。
-このため、`-Xasync` の内部 API 全体との完全互換を意味するものではありません。
+Primary sources:
 
-一次資料:
+- [scala-async usage and limitations](https://github.com/scala/scala-async)
+- `scala/async/Async.scala` in the scala-async 1.0.1 sources jar:
+  `async` is a macro and `await` is a compileTimeOnly marker; it checks
+  `-Xasync` and then calls `markForAsyncTransform`.
+- [Scala 2.13's public transform hook](https://github.com/scala/scala/blob/v2.13.16/src/reflect/scala/reflect/api/Internals.scala)
+- [Scala 2.13's async transform](https://github.com/scala/scala/blob/v2.13.16/src/compiler/scala/tools/nsc/transform/async/AsyncPhase.scala)
+- [Design of the compiler-side -Xasync](https://contributors.scala-lang.org/t/design-of-xasync/4419)
 
-- [scala-async の利用方法と制限](https://github.com/scala/scala-async)
-- scala-async 1.0.1 sources jar の `scala/async/Async.scala`:
-  `async` はマクロ、`await` は compileTimeOnly のマーカーであり、`-Xasync` を
-  検査してから `markForAsyncTransform` を呼びます。
-- [Scala 2.13 の公開変換フック](https://github.com/scala/scala/blob/v2.13.16/src/reflect/scala/reflect/api/Internals.scala)
-- [Scala 2.13 の async 変換](https://github.com/scala/scala/blob/v2.13.16/src/compiler/scala/tools/nsc/transform/async/AsyncPhase.scala)
-- [コンパイラ側の -Xasync の設計](https://contributors.scala-lang.org/t/design-of-xasync/4419)
-
-差分試験の境界: Scala 2.13.16 / scala-async 1.0.1 では、
-`mark("a") + await(Future { mark("b") }) + mark("c")` が `bac` の順で
-副作用を実行しました。scala-rs はオペランドを左から右へ保存し、`abc` になります。
-共通の実行試験では `val first = mark("a")` として順序を明示しています。
-また、待機前に定義したローカルクラスが間接的に捕捉する値だけを待機後に
-使う例は、同じ参照コンパイラで `VerifyError` になりました。共通試験では
-その値の直接参照も残しています。これらは参照コンパイラとの一致を主張する
-対象外です。
+Boundaries of the differential tests: with Scala 2.13.16 / scala-async 1.0.1,
+`mark("a") + await(Future { mark("b") }) + mark("c")` ran its side effects in
+the order `bac`. scala-rs saves operands left to right and produces `abc`.
+The shared runtime test makes the order explicit with `val first = mark("a")`.
+Also, an example that, after a suspension, uses only a value captured
+indirectly by a local class defined before the suspension produced a
+`VerifyError` with the same reference compiler. The shared test keeps a direct
+reference to that value as well. Matching the reference compiler is not claimed
+for these cases.

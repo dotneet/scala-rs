@@ -37,28 +37,30 @@ impl Typer {
     /// ```
     ///
     /// scala-rs accepted it and emitted a call to a `<init>()V` the class
-    /// does not have (scala/scala `neg/t1038`). Only classes this run
-    /// compiles are judged: their constructors are all known. A constructor
-    /// taking a single parameter `()` could be adapted to (a type parameter,
-    /// `Any`, `AnyVal`, `Unit`) is left alone, as nsc inserts the `()`.
+    /// does not have (scala/scala `neg/t1038`). A constructor taking a single
+    /// parameter `()` could be adapted to (a type parameter, `Any`, `AnyVal`,
+    /// `Unit`) is left alone, as nsc inserts the `()`.
+    ///
+    /// A Scala class from the classpath is judged too, by the constructors
+    /// its pickle declares: `new lib.Plain` for `class Plain(val tag:
+    /// String)` compiled by scalac was accepted and failed at run time with
+    /// `NoSuchMethodError: lib.Plain.<init>()V`. Those carry the source
+    /// names, clauses and `implicit` / default flags; a constructor only the
+    /// class-file reader knows (parameters `x$0`, `x$1`, ..., including a
+    /// nested class's hidden outer slot, and every Java constructor) says
+    /// nothing about them and leaves the class unjudged. `Flags::JAVA` does
+    /// not tell the two apart: a Scala class first reached through another
+    /// class's descriptor is stubbed with it and keeps it once read.
     pub(crate) fn unapplied_new_error(&self, cls: SymbolId, targs: &[Type]) -> Option<String> {
         let s = self.st.get(cls);
         if s.kind != SymKind::Class
             || s.flags.contains(Flags::TRAIT)
             || s.flags.contains(Flags::ABSTRACT)
             || s.flags.contains(Flags::INTERFACE)
-            || s.flags.contains(Flags::JAVA)
             || cls.0 < self.st.prelude_end
             || !s.pickled_origin.is_empty()
             || s.binary_outer_desc.is_some()
-            // A class read from a class file is not one this run compiles:
-            // its constructor as the classfile reader installed it still has
-            // the hidden outer slot of a nested class (`x$0: C` for
-            // `class C { class D }` compiled by scalac), which
-            // `supply_binary_ctors` drops only when the constructor is used.
-            || self.st.binary_read.contains(&cls.0)
             || s.name.starts_with("$anon")
-            || cls.0 < self.st.source_start
         {
             return None;
         }
@@ -94,7 +96,7 @@ impl Typer {
             if synthetic_names {
                 return None;
             }
-            let Type::Method { paramss, .. } = &cs.ty else {
+            let Some(paramss) = self.ctor_clause_types(c) else {
                 return None;
             };
             let first = paramss.first().cloned().unwrap_or_default();
@@ -133,7 +135,7 @@ impl Typer {
         };
         let sig = |c: SymbolId| -> String {
             let cs = self.st.get(c);
-            let Type::Method { paramss, .. } = &cs.ty else {
+            let Some(paramss) = self.ctor_clause_types(c) else {
                 return String::new();
             };
             let mut out = String::new();
@@ -186,6 +188,35 @@ impl Typer {
                 alts.join(" <and>\n")
             ))
         }
+    }
+
+    /// A constructor's parameter types clause by clause, as its parameter
+    /// symbols group them. A constructor from a pickle is typed with its
+    /// clauses flattened into one list (constructor applications are
+    /// flattened the same way), so `class Two(a: Int)(implicit n: Int)`
+    /// reads `(Int, Int)` off its method type; `paramss` keeps the source
+    /// boundaries.
+    fn ctor_clause_types(&self, ctor: SymbolId) -> Option<Vec<Vec<Type>>> {
+        let cs = self.st.get(ctor);
+        let Type::Method { paramss, .. } = &cs.ty else {
+            return None;
+        };
+        let sizes: Vec<usize> = cs.paramss.iter().map(Vec::len).collect();
+        if paramss.iter().map(Vec::len).eq(sizes.iter().copied()) {
+            return Some(paramss.clone());
+        }
+        let flat: Vec<Type> = paramss.iter().flatten().cloned().collect();
+        if flat.len() != sizes.iter().sum::<usize>() {
+            return None;
+        }
+        let mut rest = flat.as_slice();
+        let mut out = Vec::with_capacity(sizes.len());
+        for n in sizes {
+            let (clause, tail) = rest.split_at(n);
+            out.push(clause.to_vec());
+            rest = tail;
+        }
+        Some(out)
     }
 
     /// `tys` with the class's type parameters replaced by the type arguments

@@ -50,11 +50,10 @@
 //! to be *applicable*: what the call leaves uncovered must carry a default,
 //! be implicit, or be the repeated tail.
 //!
-//! Left standing, and recorded in `docs/not-implemented.md`: `val v` beside a
-//! hand-written `def v_=`, which scalac accepts as a setter call and this
-//! compiler still reports as `reassignment to val`; and assignment to a
-//! wildcard-imported `var`, whose receiver is `this` (a `ClassCastException`
-//! at run time). Neither is in this family's root.
+//! Two neighbouring shapes are outside this family's root and were fixed
+//! separately: `val v` beside a hand-written `def v_=` (a setter call, as in
+//! scalac) and assignment to a wildcard-imported `var` (the object is the
+//! receiver, not `this`).
 //!
 //! Fixture prefix: `varassign_`, plus `varassign.scala`.
 

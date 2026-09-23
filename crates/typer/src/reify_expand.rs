@@ -1,4 +1,4 @@
-//! The tree `reify { … }` expands into (`docs/macros.md` §7.14,
+//! The tree `reify { … }` expands into (`docs/macros.md` §7.15,
 //! `docs/notes/reify-design.md`).
 //!
 //! `reify` is a compiler-internal macro like the quasiquotes: `scala.reflect

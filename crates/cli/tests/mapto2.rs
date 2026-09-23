@@ -27,11 +27,11 @@
 //! here.
 //!
 //! The library is a **jar** rather than a directory on purpose: a class file
-//! directory on `-cp` goes through `classpath::install_classpath`, which reads
-//! its own pickle subset eagerly and installs a macro def as an ordinary method
-//! with no binding at all. That is a separate defect (`docs/macros.md` §7.22,
-//! "A defect this slice found and did not fix"); jars are what slick and
-//! gitbucket actually are, and what the macro path is built for.
+//! directory on `-cp` used to go through an eager pickle reader that installed
+//! a macro def as an ordinary method with no binding at all. That was a
+//! separate defect, since fixed (`docs/macros.md` §7.22, "A macro def read from
+//! a class-file directory"); jars are what slick and gitbucket actually are,
+//! and what the macro path is built for.
 
 use std::fs;
 use std::path::{Path, PathBuf};

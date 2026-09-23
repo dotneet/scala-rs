@@ -2,10 +2,10 @@
 // way nsc requires -- the implementation has to come from an earlier run.
 //
 // The macro `def` itself lives here, alongside its call site, rather than in
-// the implementation file: scala-rs does not yet write `macro_impl` into its
-// own pickle (`docs/macros.md` §7.17 "What this is worth, measured", item
-// under "Of the remaining 16"), so a macro `def` compiled in an *earlier*
-// round is read back in a later one as an ordinary method with no bytecode.
+// the implementation file: scala-rs did not yet write `macro_impl` into its
+// own pickle when this was written (it does now: `docs/macros.md` §5),
+// so a macro `def` compiled in an *earlier*
+// round was read back in a later one as an ordinary method with no bytecode.
 // That is a separate, already-recorded gap and not what this fixture is
 // testing.
 import scala.language.experimental.macros

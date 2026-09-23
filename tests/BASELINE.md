@@ -2243,7 +2243,7 @@ all 5324 identities and statuses unchanged. Raw ledger:
 `tests/baselines/corpus-3343f368.tsv`.
 
 The user requested a broad inventory and as many practical repairs as possible
-before validation. The inventory in docs/batches/member-application.md covers
+before validation. The inventory in docs/batches/member-application.md (removed; see git history) covers
 18 candidate rows, including hypotheses disproved or left unconfirmed by
 probes. Seven mechanisms were composed before the single full gate:
 
@@ -2570,7 +2570,7 @@ stdout comparisons. The original t12576 macro and consumer are rebuilt by
 both compilers and execute with identical `List()` output. Accepted230 fails
 new valid ownership/transport fixtures and has the separately demonstrated
 inferred-implementation VerifyError and missing storage metadata. Detailed
-pre-gate investigation is in `docs/batches/macro-transport.md`; its checkpoint
+pre-gate investigation is in `docs/batches/macro-transport.md` (removed; see git history); its checkpoint
 status statements describe the state before this accepted gate.
 
 Next-batch inventory is `/tmp/scala-rs-next-batch-inventory/README.md`. It
@@ -2971,7 +2971,7 @@ Clippy retains exactly the 57 accepted warning identities, with none added.
 All 5324 corpus identities are present; losses=0, changes=3:
 pos/implicits-old, pos/t8310, run/fors. Counts are recorded above.
 
-The batch follows the broad inventory in docs/batches/collection-results.md:
+The batch follows the broad inventory in docs/batches/collection-results.md (removed; see git history):
 receiver-substituted collection results, covariant SortedMap keys, library
 value classes, duplicate nullary overloads, six sorted evidence factories,
 lazy ArraySeq/ClassTag factories, result-constrained implicit clauses, real
@@ -3105,7 +3105,7 @@ The corpus contains all 5324 unique identities, with zero losses and
 20 gains. Exact statuses and counts are above; raw diagnostics
 are retained in the ledger. Changes: neg/sammy_expected, pos/context, pos/depmet_1_pos, pos/sammy_exist, pos/sammy_scope, pos/scoping1, pos/scoping3, pos/t0039, pos/t10418_bounds, pos/t1049, pos/t1050, pos/t10792, pos/t11558, pos/t3371, pos/t360, pos/t361, pos/t372, pos/t3861, run/t6443, run/try-catch-unify.
 
-The batch follows the inventory in docs/batches/dependent-adaptation.md and
+The batch follows the inventory in docs/batches/dependent-adaptation.md (removed; see git history) and
 implements seven mechanisms together: immutable.Seq erasure of pickled repeated
 parameters; Java SAM completion, ground targets and contravariant inference;
 actual argument singletons in dependent results; ordinary overrides hiding
@@ -3317,7 +3317,7 @@ actual AnyRef/AnyVal adaptation; inherited initializer expectations and
 Scala linearization; real Symbol literal identity; source and binary curried
 constructor clause/default placement; and one-time evaluation of arguments
 reused by later default getters. No stubs or subagents. Its inventory and
-corrected hypotheses are in docs/batches/contextual-followup.md on the
+corrected hypotheses are in docs/batches/contextual-followup.md (removed; see git history) on the
 candidate branch.
 
 The new matrix contains 32 Scala acceptance/rejection programs in six groups,
@@ -3422,7 +3422,7 @@ new groups contain 35 programs: 26 accepted and nine rejected. All match real
 scalac 2.13.16; valid programs execute with java -Xverify:all and byte-exact
 stdout. The accepted-before executable differs on 26 programs, including
 eight false acceptances. No stubs, subagents, or aggregate before measurements.
-Inventory and corrected hypotheses: docs/batches/lexical-context.md on the
+Inventory and corrected hypotheses: docs/batches/lexical-context.md (removed; see git history) on the
 candidate. The simple Java Array[AnyRef] narrowing hypothesis was disproved
 by scalac's legal boxed Object[] stores and replaced by explicit Java element
 identity. Capture ownership was corrected at the lexical binder, rather than
@@ -3583,7 +3583,7 @@ Ledger [`baselines/corpus-e608c7dc.tsv`](baselines/corpus-e608c7dc.tsv), SHA-256
 `265cc379503904978574bdc8926ca65dd6047d06f83ad80fe1fa9a78ae1e313b`.
 
 The batch inventory and hypothesis corrections are in
-[declaration-boundaries.md](../docs/batches/declaration-boundaries.md).
+docs/batches/declaration-boundaries.md (removed; see git history).
 Repairs include source/loaded method clause identity, generic and existential
 Array signatures, superclass declaration storage, generic Unit field/lazy
 loads, value-class accessor collisions, implicit clause completion, identity
@@ -3696,7 +3696,7 @@ agree. Existing generic implicit-factory and same-arity secondary-constructor
 defects are also reduced: scalac executes; both binaries refuse them. Include
 these supported fixes together with recovery of the three regressions in the
 next batch, rather than paying another full gate for one repair alone.
-See [recovery inventory](../docs/batches/contextual-recovery-inventory.md).
+See recovery inventory, docs/batches/contextual-recovery-inventory.md (removed; see git history).
 Scratch proofs and owned terminal results are in /tmp/scala-rs-contextual-evidence.
 
 Exact summary block:
@@ -3795,7 +3795,7 @@ refuse valid code or accept a function where Int is required; Function1..3 liter
 compile and verify but throw IncompatibleClassChangeError at runtime, while named
 function values execute correctly. Include supported repairs with recovery of
 both regressions in the next batch; do not spend a gate on one repair alone.
-See [next combined inventory](../docs/batches/case-copy-byname-inventory.md).
+See next combined inventory, docs/batches/case-copy-byname-inventory.md (removed; see git history).
 All proof binaries, logs and terminal results are under /tmp/scala-rs-contextual-recovery.
 
 Exact summary block:
@@ -3873,7 +3873,7 @@ Independent audit problems: ["gate verdict is not PASS", "gate process failed", 
 Evidence:/tmp/scala-rs-copy-byname/, especially checked-prerequisites,
 early-measures5, marker-probe and the frozen full gate.
 Next grouped boundaries and the corrected diagnoses are in
-[byname-marker-inventory.md](../docs/batches/byname-marker-inventory.md).
+docs/batches/byname-marker-inventory.md (removed; see git history).
 The gated tree remains untouched; repair marker identity and reification
 consumers together after recording this result. MODE=a and specialization
 remain red. No successful gitbucket/cats compilation is claimed.
@@ -3933,7 +3933,7 @@ including quasi/reify/typequote/kind-projector, parser67/backend58/typer190;
 2500 corpus identities including all1405 negatives
 and all44 historical losses, losses=0. Clippy57 existing occurrences, zero new.
 Health: four pinned source trees,121 jars,33 Java cache classes and1498 reference
-class hashes. Evidence and corrected hypotheses: docs/batches/copy-byname-recovery.md
+class hashes. Evidence and corrected hypotheses: docs/batches/copy-byname-recovery.md (removed; see git history)
 and /tmp/scala-rs-copy-byname/. The first full gate failed two quasiquote tests; it was recorded and the
 marker identity/reification consumers were repaired before this accepted gate.
 All9 new run passes were independently compiled by both real scalac and the
@@ -3945,7 +3945,7 @@ its two Set[_ <: A] arguments now retain Set[A]. The same overload rejection
 remains at that location; no successful compile is attributed to that change.
 
 Remaining errors and deeper boundaries are inventoried in
-[contextual-next-inventory.md](../docs/batches/contextual-next-inventory.md).
+docs/batches/contextual-next-inventory.md (removed; see git history).
 MODE=a and specialization remain red and were not rerun. These results do not
 claim complete Scala conformance or successful gitbucket/cats compilation.
 
@@ -4389,7 +4389,7 @@ The five ledger entries were eight roots:
 
 Saved ledger: [`baselines/corpus-ce3e99ec.tsv`](baselines/corpus-ce3e99ec.tsv),
 SHA-256 `467d4c05cf04fdf347a0fa31687a87f3803e80ee8b2c3f6914c5492897dfc015`. Still open, recorded in
-`docs/notes/rh-cats-gitbucket-run.md`: `Database.forURL` resolving to
+`docs/notes/rh-cats-gitbucket-run.md` (removed; see git history): `Database.forURL` resolving to
 `BasicBackend`'s factory through `import blockingApi._`, and polymorphic aliases
 being dealiased before pickling.
 

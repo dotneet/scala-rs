@@ -1,0 +1,238 @@
+//! Value-class and constant ABI shared with scalac under separate compilation.
+//!
+//! Each case compiles a library and a client with every pairing of the two
+//! compilers and requires the program to print what scalac's own build prints:
+//! a scala-rs client against a scalac library, and a scalac client against a
+//! scala-rs library.
+
+use crate::support::{toolchain, TestDir};
+use std::{fs, path::Path, process::Command};
+
+fn output_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Compile `lib` and `client` in all three pairings and compare the runs.
+fn check_separate(label: &str, lib: &str, client: &str) {
+    let tools = toolchain();
+    let (Some(library), Some(java), Some(scalac)) =
+        (tools.scala_library(), tools.java(), tools.scalac())
+    else {
+        eprintln!("skip: scalac, scala-library or Java is unavailable");
+        return;
+    };
+    let dir = TestDir::new(label);
+    let lib_src = dir.join("Lib.scala");
+    let use_src = dir.join("Use.scala");
+    fs::write(&lib_src, lib).unwrap();
+    fs::write(&use_src, client).unwrap();
+    let out = |name: &str| {
+        let p = dir.join(name);
+        fs::create_dir_all(&p).unwrap();
+        p
+    };
+    let nsc = |src: &Path, cp: Option<&Path>, dest: &Path| {
+        let mut c = Command::new(scalac);
+        if let Some(cp) = cp {
+            c.arg("-cp").arg(cp);
+        }
+        let r = c.arg("-d").arg(dest).arg(src).output().unwrap();
+        assert!(
+            r.status.success(),
+            "scalac {}:\n{}",
+            src.display(),
+            output_text(&r)
+        );
+    };
+    let ours = |src: &Path, cp: Option<&Path>, dest: &Path| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
+        c.arg("compile")
+            .arg(src)
+            .arg("--scala-library")
+            .arg(library);
+        if let Some(cp) = cp {
+            c.arg("-cp").arg(cp);
+        }
+        let r = c.arg("-d").arg(dest).output().unwrap();
+        assert!(
+            r.status.success(),
+            "scala-rs {}:\n{}",
+            src.display(),
+            output_text(&r)
+        );
+    };
+    let run = |dirs: &[&Path]| {
+        let mut cp: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        cp.push(library.display().to_string());
+        let r = Command::new(java)
+            .args(["-Xverify:all", "-cp", &cp.join(":"), "Main"])
+            .output()
+            .unwrap();
+        output_text(&r)
+    };
+    let lib_sc = out("lib-sc");
+    let lib_rs = out("lib-rs");
+    nsc(&lib_src, None, &lib_sc);
+    ours(&lib_src, None, &lib_rs);
+    let use_sc = out("use-sc");
+    nsc(&use_src, Some(&lib_sc), &use_sc);
+    let expected = run(&[&use_sc, &lib_sc]);
+
+    let use_rs = out("use-rs");
+    ours(&use_src, Some(&lib_sc), &use_rs);
+    assert_eq!(
+        run(&[&use_rs, &lib_sc]),
+        expected,
+        "scala-rs client against a scalac library"
+    );
+
+    let use_sc2 = out("use-sc2");
+    nsc(&use_src, Some(&lib_rs), &use_sc2);
+    assert_eq!(
+        run(&[&use_sc2, &lib_rs]),
+        expected,
+        "scalac client against a scala-rs library"
+    );
+
+    let use_rs2 = out("use-rs2");
+    ours(&use_src, Some(&lib_rs), &use_rs2);
+    assert_eq!(
+        run(&[&use_rs2, &lib_rs]),
+        expected,
+        "scala-rs client against a scala-rs library"
+    );
+}
+
+/// nsc erases `Wrap[Int]` for `class Wrap[A](val a: A) extends AnyVal` to
+/// `java.lang.Integer`, not `int`: the underlying type is a type parameter,
+/// and the class's own extension methods work on the boxed form.
+#[test]
+fn generic_value_class_at_a_primitive_erases_to_the_box() {
+    check_separate(
+        "vc-generic-primitive",
+        r#"package lib
+final class Wrap[A](val a: A) extends AnyVal { def get: A = a; def map[B](f: A => B): Wrap[B] = new Wrap(f(a)) }
+object Api {
+  def wrapped: Wrap[Int] = new Wrap(5)
+  def take(w: Wrap[Int]): Int = w.get * 2
+  def dbl: Wrap[Double] = new Wrap(1.5)
+  def unit: Wrap[Unit] = new Wrap(())
+  def str: Wrap[String] = new Wrap("s")
+  def list: List[Wrap[Int]] = List(new Wrap(1), new Wrap(2))
+}
+"#,
+        r#"import lib._
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(Api.wrapped.map(_ + 1).get)
+    println(Api.take(new Wrap(21)))
+    val w = Api.wrapped; println(w.get + 1)
+    println(Api.dbl.get * 2); println(Api.unit.get); println(Api.str.get)
+    println(Api.list.map(_.get).sum)
+    val any: Any = Api.wrapped; println(any.asInstanceOf[Wrap[Int]].get)
+    println(Api.take(Api.wrapped.map(x => x * 3)))
+    println(classOf[Api.type].getMethods.filter(m => Set("wrapped", "take", "dbl", "unit")(m.getName)).map(_.toString).sorted.mkString("\n"))
+  }
+}
+"#,
+    );
+}
+
+/// A value-class method's default getter has an `$extension` of its own, and
+/// nsc's erasure looks it up on the companion's pickled members: a scalac
+/// client calling `new Meter(1.5).scale()` crashed with `no extension method
+/// found for: method scale$default$1:Int` when only the classfile had it.
+#[test]
+fn value_class_default_getter_extension_is_pickled() {
+    check_separate(
+        "vc-default-getter",
+        r#"package lib
+class Meter(val v: Double) extends AnyVal {
+  def scale(k: Int = 2): Double = v * k
+  def shift(by: Double)(times: Int = by.toInt + 1): Double = v + by * times
+  def pick[A](xs: List[A], i: Int = 0): A = xs(i)
+}
+final class Box[A](val a: A) extends AnyVal { def or(other: A = a): A = other }
+"#,
+        r#"import lib._
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new Meter(1.5).scale())
+    println(new Meter(1.5).scale(4))
+    println(new Meter(1.0).shift(2.0)())
+    println(new Meter(1.0).pick(List("a", "b")))
+    println(new Box("x").or())
+  }
+}
+"#,
+    );
+}
+
+/// An unannotated `final val` keeps the constant type of its (folded)
+/// right-hand side -- `final val N = 42` is `Int(42)`, `final val C = 1 + 2`
+/// is `Int(3)` -- and nsc replaces a reference through a stable path by the
+/// literal, so `println(K.N)` prints `42` without initializing `K`. Both
+/// halves cross the compilation boundary: the constant type is in the pickle,
+/// and a scalac library's constants are inlined by a scala-rs client. An
+/// impure qualifier (`f().N`) is still evaluated.
+#[test]
+fn final_val_constant_type_is_pickled_and_inlined() {
+    check_separate(
+        "final-val-constant",
+        r#"package lib
+object K {
+  println("K init")
+  final val N = 42
+  final val S = "str"
+  final val Nl = null
+  final val U = ()
+  final lazy val L = 7
+  final var V = 8
+  final val T: Int = 9
+  val P = 10
+  final val C = 1 + 2
+  val Lit: 11 = 11
+  final val D = 2.5
+  final val B = true && !false
+  final val Ch = 'c'
+  final val X = N * 2
+  final val Big = 1L << 40
+  final val Neg = -5
+  final val Cat = "a" + "b"
+  final val Msg = "n=" + N
+  final val Cmp = N > 40
+  final val Mix = N + 0.5
+  final val Sh = -16 >>> 28
+  final val Div = 7 / 2 % 3
+  final val F = 1.5f * 2
+  final val Conv = 5.toLong
+}
+trait Tr { println("Tr init"); final val TN = 3 }
+object O extends Tr
+class Cl { println("Cl init"); final val M = 5 }
+"#,
+        r#"import lib._
+object Main {
+  final val Local = K.N + 1
+  def f() = { println("f"); K }
+  def main(args: Array[String]): Unit = {
+    println(Local)
+    println(List(K.N, K.C, K.X, K.Neg, K.Sh, K.Div).mkString(","))
+    println(List(K.S, K.Cat, K.Nl, K.Big, K.Cmp, K.Mix, K.F, K.D, K.B, K.Ch, K.Conv).mkString(","))
+    println(O.TN)
+    val c = new Cl; println(c.M)
+    (args.length + 42) match { case K.N => println("matched N"); case _ => println("no") }
+    println(f().N)
+    println(K.Msg)
+    println(K.P)
+    println(K.Lit + K.T + K.L + K.V)
+    println(K.U)
+  }
+}
+"#,
+    );
+}

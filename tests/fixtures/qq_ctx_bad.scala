@@ -23,7 +23,7 @@ object QqCtxBad {
 
   // A right-associative operator and a `_` placeholder lambda used to stand
   // here; both are reified now, out of the `freshTermName` block nsc builds
-  // for them (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
+  // for them (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.9a).
 
   // A by-name type: nsc's own parser rejects it inside `tq"..."`.
   def byNameType(c: blackbox.Context): c.Tree = {

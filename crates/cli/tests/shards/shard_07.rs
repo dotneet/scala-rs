@@ -8,6 +8,8 @@ mod support;
 mod fs2_io;
 #[path = "../samconv.rs"]
 mod samconv;
+#[path = "../scalac_client_pickle.rs"]
+mod scalac_client_pickle;
 #[path = "../scalalibmisc.rs"]
 mod scalalibmisc;
 #[path = "../secondaryctor.rs"]
@@ -62,6 +64,8 @@ mod sortedlb;
 mod sortedmap;
 #[path = "../specialized.rs"]
 mod specialized;
+#[path = "../specialized_tuple_fields.rs"]
+mod specialized_tuple_fields;
 #[path = "../sqlstoragebatch.rs"]
 mod sqlstoragebatch;
 #[path = "../stableprofile.rs"]
@@ -72,6 +76,8 @@ mod stale_term_method;
 mod stmtval;
 #[path = "../strarrayops.rs"]
 mod strarrayops;
+#[path = "../string_generic_flat_map.rs"]
+mod string_generic_flat_map;
 #[path = "../stringops8.rs"]
 mod stringops8;
 #[path = "../subtypeterm.rs"]

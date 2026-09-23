@@ -1,6 +1,9 @@
 //! Aggregated CLI integration tests (alphabetical slice 8/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../support/mod.rs"]
+mod support;
+
 #[path = "../compiledquery.rs"]
 mod compiledquery;
 #[path = "../protected_this.rs"]
@@ -73,6 +76,8 @@ mod unitpop;
 mod unqname;
 #[path = "../valclass.rs"]
 mod valclass;
+#[path = "../value_class_abi.rs"]
+mod value_class_abi;
 #[path = "../valueclass.rs"]
 mod valueclass;
 #[path = "../varargsrecv.rs"]

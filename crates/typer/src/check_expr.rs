@@ -330,7 +330,7 @@ impl Typer {
         }
     }
 
-    /// Expand `reify { … }` in place (`docs/macros.md` §7.14,
+    /// Expand `reify { … }` in place (`docs/macros.md` §7.15,
     /// `crate::reify_expand`, `crate::reify::tree`).
     ///
     /// Returns false only when this is not a `reify` application at all. A
@@ -1463,7 +1463,7 @@ impl Typer {
                     // the collapse kept the val, so `c.Expr[Int](tree)` became
                     // `universe.Expr.apply[Int](tree)` and failed against that
                     // method's `(Mirror, TreeCreator)` parameters.
-                    // `docs/macros.md` §7.11 residual 1.
+                    // `docs/macros.md` §7.12.
                     if let Some((only, ty)) = self.alt_taking_targs(sym, targs.len()) {
                         sym = only;
                         base_ty = ty;

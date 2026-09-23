@@ -526,6 +526,51 @@ impl Typer {
                     // risk an `IllegalAccessError` for no observable gain.
                     // See docs/not-implemented.md.
                     self.synthesize_default_getters(id, copy_id, "copy", &[], &copy_paramss);
+                    // nsc's copy is polymorphic: `copy[A](value: A = …): C[A]`
+                    // for `case class C[A]`, so `c.copy(value = 1)` may change
+                    // `A`. The getters were built above against the class's
+                    // own parameters, which is what their bodies (`this.value`)
+                    // produce -- nsc also leaves them `[A]A_class
+                    // @uncheckedVariance`, with type parameters of their own
+                    // that the result does not mention. A separately compiled
+                    // scalac client reads this signature; a monomorphic copy
+                    // returning a raw `C` rejected `copy(value = 1)` there.
+                    let class_tps = self.st.get(id).tparams.clone();
+                    if !class_tps.is_empty() {
+                        let own = self.fresh_method_tparams(copy_id, &class_tps);
+                        let own_tys: Vec<Type> = own.iter().map(|t| Type::TypeParam(*t)).collect();
+                        let renamed: Vec<Vec<Type>> = paramss_ty
+                            .iter()
+                            .map(|ps| {
+                                ps.iter()
+                                    .map(|t| self.st.rename_type_params(&class_tps, &own, t))
+                                    .collect()
+                            })
+                            .collect();
+                        for (pid, ty) in copy_params.iter().zip(renamed.iter().flatten()) {
+                            self.st.get_mut(*pid).ty = ty.clone();
+                        }
+                        self.st.get_mut(copy_id).tparams = own;
+                        self.st.get_mut(copy_id).ty = Type::Method {
+                            paramss: renamed,
+                            ret: Box::new(Type::Class {
+                                sym: id,
+                                args: own_tys,
+                            }),
+                        };
+                        let getter_prefix = "copy$default$";
+                        for getter in self.st.get(id).members.clone() {
+                            let g = self.st.get(getter);
+                            if g.kind == SymKind::Method
+                                && g.flags.contains(Flags::SYNTHETIC)
+                                && g.name.starts_with(getter_prefix)
+                                && g.tparams.is_empty()
+                            {
+                                let tps = self.fresh_method_tparams(getter, &class_tps);
+                                self.st.get_mut(getter).tparams = tps;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -713,6 +758,7 @@ impl Typer {
                 format!("class {} needs to be a mixin.", self.st.get(id).name)
             };
             self.check_abstract_override_grounded(id, tree_span, &headline);
+            self.complete_overridden_library_members(id, &body_snapshot);
             self.check_overrides(id, &body_snapshot, tree_span);
             self.check_double_defs(id, &body_snapshot);
             self.check_default_overloads(id, tree_span);

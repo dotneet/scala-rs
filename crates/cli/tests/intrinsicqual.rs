@@ -445,8 +445,7 @@ fn the_ctor_bad_fixture_is_rejected_with_nscs_wording() {
 /// the line and the sentence in its own `.check` file.
 ///
 /// `neg/t6601` is the fourth and is **not** here: it is a separate
-/// compilation, and the privacy of a constructor does not survive the round
-/// trip through a class file yet. See `docs/comparison-with-scalac.md`.
+/// compilation, covered by `crates/cli/tests/ctorgaps.rs`.
 #[test]
 fn the_corpus_negatives_are_rejected_at_nscs_line_and_text() {
     let Some(jar) = scala_library_jar() else {

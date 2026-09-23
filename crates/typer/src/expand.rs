@@ -1,4 +1,4 @@
-//! Def-macro expansion: the JVM bridge (`docs/macros.md` §2.2, phase 2).
+//! Def-macro expansion: the JVM bridge (`docs/macros.md` §2.2).
 //!
 //! nsc expands a macro by *running* its implementation: it loads the
 //! implementation class from the macro classpath and calls it through Java
@@ -1439,8 +1439,8 @@ impl Typer {
     /// *conversation*: an expansion may stop and write `(q …)`, a question
     /// only scala-rs can answer -- what does this tree typecheck to, in the
     /// scope the macro was called from -- and wait for `(a …)` on its own
-    /// stdin before going on. That is the reverse RPC `docs/macros.md` §7.18
-    /// asks for, and it is what makes `c.typecheck` possible at all: the
+    /// stdin before going on. That is the reverse RPC of `docs/macros.md`
+    /// §7.20, and it is what makes `c.typecheck` possible at all: the
     /// answer has to come from the run's own symbols, which live here and
     /// cannot be snapshotted into the engine.
     ///

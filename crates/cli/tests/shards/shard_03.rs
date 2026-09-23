@@ -62,6 +62,8 @@ mod implfilter;
 mod implfind;
 #[path = "../implguard.rs"]
 mod implguard;
+#[path = "../implicit_derived_tag_undet.rs"]
+mod implicit_derived_tag_undet;
 #[path = "../implicit_misc.rs"]
 mod implicit_misc;
 #[path = "../implicitcast.rs"]
@@ -84,6 +86,8 @@ mod inherited_alias_owner_pickle;
 mod inherited_bridge_owner;
 #[path = "../inherited_extension_pickle.rs"]
 mod inherited_extension_pickle;
+#[path = "../inherited_generic_binary.rs"]
+mod inherited_generic_binary;
 #[path = "../innerclasses.rs"]
 mod innerclasses;
 #[path = "../integral.rs"]

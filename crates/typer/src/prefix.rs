@@ -103,6 +103,30 @@ pub fn parent_form(ty: &Type) -> Type {
     }
 }
 
+impl crate::check::Typer {
+    /// Read the class-file header of every nested class the directory
+    /// classpath stubbed, so `is_binary_nested_class` can answer for it.
+    ///
+    /// `install_classpath` enters a directory's pickled classes eagerly, and
+    /// their member signatures stub the nested classes they mention
+    /// (`A3$Cell` for `def mk: Cell`) without opening those class files.
+    /// Until something else happens to complete such a stub -- adopting the
+    /// outer class's pickle, or a `new Cell(...)` with arguments -- it is not
+    /// in `binary_read`, so it read as "not inner" and `b.Cell` was built as
+    /// the bare class every `a.Cell` conforms to: `val x: b.Cell = a.mk(1)`
+    /// compiled against a directory and was rejected against the same
+    /// classes in a jar. The header is all that is read; members stay lazy.
+    pub(crate) fn complete_classpath_nesting(&mut self) {
+        let end = self.st.symbols.len() as u32;
+        for id in self.st.prelude_end..end {
+            let sym = SymbolId(id);
+            if self.st.is_unread_binary_nested_candidate(sym) {
+                crate::classpath::install_classpath_metadata(&mut self.st, &mut self.binary, sym);
+            }
+        }
+    }
+}
+
 impl SymbolTable {
     pub(crate) fn as_seen_from_view_decls(decls: &[RefineDecl]) -> bool {
         decls
@@ -155,6 +179,23 @@ impl SymbolTable {
             return false;
         }
         self.get(s.owner).kind == SymKind::Class
+    }
+
+    /// A binary class `is_binary_nested_class` cannot judge yet: a stub named
+    /// like a nested class (`Outer$Inner`) under a class, whose class file
+    /// -- and so whose `InnerClasses` entry -- has not been read.
+    fn is_unread_binary_nested_candidate(&self, sym: SymbolId) -> bool {
+        let s = self.get(sym);
+        if s.kind != SymKind::Class
+            || !s.flags.contains(Flags::JAVA)
+            || self.binary_read.contains(&sym.0)
+            || s.owner.is_none()
+            || s.owner == sym
+        {
+            return false;
+        }
+        let simple = s.jvm_name.rsplit('/').next().unwrap_or("");
+        simple.contains('$') && !simple.ends_with('$') && self.get(s.owner).kind == SymKind::Class
     }
 
     /// Does `ty` name a class `is_inner_class_of_class` says yes to, with no

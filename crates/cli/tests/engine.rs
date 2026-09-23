@@ -1062,7 +1062,7 @@ fn sd_unsupported_forms_are_named() {
 // ---------------------------------------------------------------------------
 // The two gaps in front of a self-built `reify`: a nested `object` of the
 // reflection API, and `<a pickled val>.type` as a stable identifier.
-// `docs/macros.md` §7.8 residuals 5 and 6, §7.13.4 gaps 1 and 2.
+// `docs/macros.md` §7.14.
 
 /// `tests/fixtures/rd_nested.scala`, compiled by scala-rs and run.
 ///
@@ -1145,7 +1145,8 @@ fn rd_nested_matches_real_scalac() {
 /// `rd_impl.scala` + `rd_use.scala`: the shape `reify { … }` expands into,
 /// written out by hand and **expanded for real** through the bridge.
 ///
-/// `reify` itself is still the §7.8 diagnostic, but everything it has to emit
+/// `reify` was not expanded yet when this was written (§7.15 does it), but
+/// everything it has to emit
 /// is exercised here: `c.universe.Expr.apply` (whose pickled signature says
 /// `Mirror[Universe.this.type]` and is written out, the way `TypeTag.apply`
 /// is), `Mirror[c.universe.type]`, a `TreeCreator` subclass, a static symbol
@@ -1254,7 +1255,7 @@ fn rd_reify_shape_matches_real_scalac() {
 }
 
 /// `rb_impl.scala` + `rb_use.scala`: **`reify { … }` expanded by scala-rs**
-/// (`docs/macros.md` §7.14, `crates/typer/src/reify_expand.rs`).
+/// (`docs/macros.md` §7.15, `crates/typer/src/reify_expand.rs`).
 ///
 /// `rd_impl.scala` above writes out, by hand, the tree `reify` has to build;
 /// this pair writes `reify` and makes the compiler build it. Sixteen lines of

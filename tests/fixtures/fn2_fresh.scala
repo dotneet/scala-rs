@@ -1,6 +1,6 @@
 // The three quasiquote forms whose expansion nsc builds out of a *fresh name*:
 // a `_` placeholder function literal, a `_` type argument (an existential),
-// and a right-associative operator. `docs/macros.md` §7.10.
+// and a right-associative operator. `docs/macros.md` §7.9a.
 //
 // What makes them different from every other form is that nsc's expansion is
 // not one expression but a **block**: it emits

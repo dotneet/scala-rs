@@ -14,7 +14,7 @@ object QrFormsBad {
 
   // A right-associative operator and a `_` placeholder lambda used to stand
   // here; both are reified now, out of a `freshTermName` block
-  // (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.10).
+  // (`tests/fixtures/fn2_fresh.scala`, `docs/macros.md` §7.9a).
 
   // A by-name type: nsc's own parser rejects it inside `tq"..."`.
   val byName = tq"=> Int"

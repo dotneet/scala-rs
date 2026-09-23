@@ -8,29 +8,61 @@ The crates of the Cargo workspace:
 | `scala-rs-lexer`  | lexing (newline tokens for semicolon inference, mode stack for `s`/`f`/`raw"..."`)       |
 | `scala-rs-parser` | recursive-descent parser; the AST is close to nsc's `Tree`                               |
 | `scala-rs-pickle` | reader for nsc `ScalaSignature` pickles; used by both `typer` and `backend`              |
-| `scala-rs-typer`  | namer + typer + uncurry + lambda-lift + erasure, including implicit search               |
-| `scala-rs-backend`| JVM class file emission (major 52 / `StackMapTable`) and the scala-rs runtime            |
+| `scala-rs-typer`  | namer + typer (including implicit search and macro expansion) and the tree lowerings up to erasure |
+| `scala-rs-backend`| JVM class file emission (major 52 / `StackMapTable`), the pickle writer, and the private runtime |
 | `scala-rs-driver` | drives the pipeline                                                                     |
 | `scala-rs-cli`    | command line; binary `scala-rs`                                                         |
 
+### Pipeline
+
+`crates/driver/src/lib.rs::compile_paths` runs, for the whole compilation run
+against one symbol table:
+
+1. **parse** every unit (`crates/parser`);
+2. **namer and typer** (`typecheck_units_src`): the namer enters every unit,
+   then a header pass types all class parents, a signature pass all member
+   signatures, and a body pass the bodies. Members without a type annotation
+   are completed lazily (`lazysig.rs`). Constant folding of `final val`s
+   (`const_fold.rs`), macro expansion, quasiquote/`reify` lowering and the
+   `-Xasync` transform happen here;
+3. local-object checks, then per unit: default-receiver hoisting, restoring
+   named-argument and right-associative evaluation order, **uncurry**, local
+   `lazy val` lowering, **lambda-lift**, capture analysis for local and
+   anonymous classes (`anon_capture.rs`), and private-name expansion;
+4. value-class companions, override families and super accessors are
+   recorded; the **pickler** (`backend::pickle::pickle_all`) writes every
+   `ScalaSignature` from the typed symbols;
+5. the **method specialization** pass (`specialize.rs`, see
+   [specialization.md](specialization.md)), which runs after the pickler as
+   nsc's does;
+6. generic `Signature` attributes are recorded (`backend/src/sig.rs`), then
+   **erasure** (`erasure.rs`) rewrites types, inserts boxing and marks bridges;
+7. **code generation** (`crates/backend`), including tail-call loops
+   (`gen_tailrec.rs`), lambdas as `invokedynamic`, and bridges.
+
 ### Supplying symbols from `ScalaSignature`
 
-For a long time the members of the standard library were hand-written in
-`crates/typer/src/prelude*.rs`. That approach does not scale to 2.13
-compatibility, so there is now a path that **reads the `ScalaSignature` (nsc
-`PickleFormat`) embedded in scala-library's class files and supplies symbols
-from it**. It coexists with the hand-written prelude and **fills in, on demand,
-only the members the prelude does not have**.
+The standard library is described by two sources: a hand-written prelude
+(`crates/typer/src/prelude*.rs`) and the **`ScalaSignature` (nsc
+`PickleFormat`) embedded in scala-library's class files**. The pickle path
+coexists with the prelude and **fills in, on demand, only the members the
+prelude does not have**. Scala classes from other jars and class directories
+on `-cp` are read the same way: `PickleSupply::adopt_binary_class` overlays a
+class-file symbol with its pickle (type-parameter kinds such as `F[_]`, which a
+JVM generic signature cannot express, and each member's Scala signature),
+keeping the class-file description for anything the pickle cannot express.
+`java.*` classes and the symbols the prelude built are not adopted.
 
 | module                            | role                                                                          |
 | --------------------------------- | ----------------------------------------------------------------------------- |
+| `crates/pickle/src/abi.rs`        | binary names and flags shared at the class-file/pickle boundary               |
 | `crates/pickle/src/codec.rs`      | SID-10 ByteCodecs (shared with the writer)                                    |
 | `crates/pickle/src/classfile.rs`  | just enough class file parsing to reach `ScalaSignature`; also handles `ScalaLongSignature` (array-valued) |
 | `crates/pickle/src/names.rs`      | Scala `NameTransformer` (`++` ↔ `$plus$plus`); shared with the backend         |
 | `crates/pickle/src/read.rs`       | the pickle **reader**: bytes → entry table                                    |
 | `crates/pickle/src/sym.rs`        | entry table → class signature; walks parents and substitutes type arguments   |
 | `crates/typer/src/pickle_supply.rs` | `SigType` → `scala_rs_parser::Type`, and installation into the `SymbolTable` |
-| `crates/backend/src/pickle.rs`    | the pickle **writer** (pre-existing; a subset of nsc's `PickleFormat`)         |
+| `crates/backend/src/pickle.rs`    | the pickle **writer** (a subset of nsc's `PickleFormat`)                       |
 
 `crates/pickle` is its own crate because `crates/typer` cannot depend on
 `crates/backend` (the dependency runs the other way).
@@ -58,8 +90,8 @@ List#filter (from scala.collection.IterableOps)
 
 #### Hooking into type checking (`pickle_supply.rs`)
 
-It is called **only when member resolution in `check.rs` has failed
-completely**. Three rules keep it from lying.
+It is called **only when member resolution in the typer (`check_*.rs`) has
+failed completely**. Four rules keep it from lying.
 
 1. **The hand-written prelude always wins.** It runs only after nothing was
    found, so it never overrides or shadows an existing declaration (pinned by
@@ -72,18 +104,22 @@ completely**. Three rules keep it from lying.
    afterwards.
 4. **Look at both the class side and the companion side, and merge them.** When
    the receiver is a class, `PickleSupply::complete` queries **both** the class
-   and its companion and merges the results. It used to be "if the class side
-   supplied even one member, do not look at the companion", which made the
-   answer **depend on unrelated global state**. `scala.math.BigDecimal` declares
-   an instance method `apply(MathContext)` whose parameter type cannot be
-   represented until `java.math.MathContext` is in the symbol table — so the
-   class side only succeeded after something had touched `java.math.BigDecimal`,
-   and the companion's seven `apply`s were then dropped wholesale, making
-   `BigDecimal(2)` compile or not **depending on statement order**. Merging is
-   order-independent.
+   and its companion and merges the results. Answering from whichever side
+   supplied something first made the result depend on unrelated global state:
+   `scala.math.BigDecimal`'s instance `apply(MathContext)` is representable
+   only once `java.math.MathContext` is in the symbol table, and when it won,
+   the companion's seven `apply`s were dropped, so `BigDecimal(2)` compiled or
+   not depending on statement order.
+
+Two other callers ask the pickle without a failed lookup: a class file that
+declares a signature none of the hand-written candidates has
+(`Check::supply_receiver_override`), and a source class with a generic
+`scala.*` ancestor, whose overridden members are completed before the bridge
+pass so that erasure bridges exist (for example `Numeric.fromInt` for
+`class Num extends Numeric[Int]`).
 
 When an overload set **spans several owners** (a class and its companion),
-`resolve_overload` in `check.rs` re-derives the candidate symbols from the owner
+`resolve_overload` (`check_overload.rs`) re-derives the candidate symbols from the owner
 of `fun.sym`, because `Type::Overload` carries only types. That drops one
 owner's candidates **entirely**, so the sets lost in the re-derivation are now
 remembered in `Check::overload_groups` and used. On top of that, and only when
@@ -102,40 +138,7 @@ the member is not supplied.
 `SCALA_RS_PICKLE_DEBUG=1` traces which members were supplied, and why the others
 were not.
 
-#### How much of the hand-written prelude could be replaced (investigation only; nothing deleted)
-
-Because the fill-in runs only when resolution fails, there is normally no way to
-tell whether a member already in the prelude could have been built from a
-pickle. So a temporary hook pointed `PickleSupply::complete` directly at members
-the prelude already has, to print **what signatures the pickle alone can
-produce**. Of the 39 hand-written members of `List` / `Option` / `Vector`, **38**
-can be produced.
-
-| receiver | producible from the pickle |
-| -------- | -------------------------- |
-| `List`   | `map` `foreach` `head` `tail` `isEmpty` `length` `size` `nonEmpty` `reverse` `apply` `contains` `exists` `forall` `toList` `toString` `collect` `zip` `sum` `min` `max` `indexOf` `drop` `take` |
-| `Option` | `get` `isEmpty` `isDefined` `getOrElse` `map` `flatMap` `foreach` `filter` `toList` `orElse` |
-| `Vector` | `map` `apply` `length` `foreach` `head` |
-
-The only one that could not be produced is `List#withFilter` (its `WithFilter`
-return type is a class the prelude holds in a shape of its own, which does not
-line up with the pickle's).
-
-**But this only says the shape of the signature can be obtained; it is not
-grounds for deleting anything as it stands.** In fact `List#zip` comes out as
-`List[(tparam#289, tparam#2739)]` and `Option#orElse` as
-`(=> #29[tparam#2719])Option[B]`: the type parameter bindings are broken in the
-rendering. Replacing them would have to be done one at a time, checked against
-the fixtures' actual output. This round **only leaves the list and the evidence;
-nothing was removed from the prelude**.
-
-To reproduce, write a temporary test that calls `PickleSupply::complete`
-directly on already-preluded symbols (it rebuilds the symbol table per member,
-so 39 of them take about 100 seconds).
-
 #### The codegen side
-
-**No change to `gen.rs` was needed.** The existing machinery lines up as is.
 
 - When a method symbol's `jvm_name` starts with `(`, `method_desc_from_sym`
   uses it directly as the descriptor. Supplied members put the erased descriptor
@@ -165,9 +168,8 @@ caps on depth and on total steps.
 - **Operator names**: nsc keeps operator names **encoded**. `SetOps` pickles `&`
   as `$amp`, and the class file declares `$amp` too. So both the pickle lookup
   and the descriptor lookup are done with the **encoded** name, while the symbol
-  registered keeps the source name. `NameTransformer` was moved to
-  `crates/pickle/src/names.rs` and is shared with the backend (the assembler
-  already encoded output names, so codegen needed no change).
+  registered keeps the source name. `NameTransformer` lives in
+  `crates/pickle/src/names.rs` and is shared with the backend.
 - **Overload deduplication** is done on the erased parameter list. Declarations
   that erase to the same thing are the same JVM method seen through different
   parents; when they differ only in result type
@@ -186,89 +188,35 @@ caps on depth and on total steps.
   Without that, `xs.lastIndexOf(2)` typechecks and then emits bytecode that calls
   a two-argument descriptor with one argument, giving a `VerifyError`.
 
-#### What works today
-
-With `--scala-library <jar>`, the following typecheck **without a single line in
-the prelude** and produce output **byte-identical** to scalac 2.13.16's under
-`java -Xverify:all -cp out:jar Main`.
-
-- `List`: `filter` `filterNot` `count` `exists` `forall` `take` `drop`
-  `takeWhile` `dropWhile` `reverse` `mkString` (0/1/3 args) `contains` `indexOf`
-  `init` `last` `distinct` `startsWith` `splitAt` `partition` `span` `slice`
-  `headOption` `lastOption` `find` `sorted` `sortBy` `sortWith` `max` `min`
-  `maxBy` `toVector` `toSet` `toSeq` `toArray` `scanLeft` `zip` `padTo`
-  `updated` `patch` `indexWhere` `tails` `combinations` `permutations`
-  `zipWithIndex` `grouped` `sliding` (1/2 args) `view` `iterator` `flatMap`
-  `foldRight` `reduce` `reduceLeft` `copyToArray` `sum` `product`
-- Operators: `:+` `+:` `++` `++:`; `&` `|` `&~` `++` on `Set`; `+` `-` on `Map`
-- `Map`: `map` `filter` `keySet`. `Set`: `map` `filter`. `Vector`: `map`
-  `filter` `mkString`
-- `Range` / `IndexedSeq`: `filter` `map`
-- `Option`: `exists` `forall` `contains` `filter` `toList`
-- Companions: `Iterator.from` `.continually` `.single`, `List.fill` `.tabulate`,
-  `Vector.fill` `.tabulate`, `Set.empty`
-
-There are two places where the treatment of type parameters deliberately matches
-nsc's.
+#### Type parameters that match nsc
 
 - `scala.package.List` / `scala.package.Ordering` are **type aliases** in the
-  package object, and the pickle refers to them by the alias name. Rather than
-  keeping a table, the `ALIASsym` is looked up in `scala/package.class`'s pickle
-  and expanded. For the path where the source uses the same alias **by name**
-  (`new NoSuchElementException("x")` / `Ref[F, A]`), see the section "type
-  aliases in a jar's package object": the same `ALIASsym` is registered as a
-  type member of the package instead of being expanded.
-- `def max[B >: A](implicit ord: Ordering[B]): A` gives the call site nothing to
-  determine `B` from. scalac resolves it to the lower bound `A`, so we do the
-  same. Without it the typer could not solve `Ordering[B]` and — instead of
-  reporting an error — **eta-expanded `xs.max` into a function value** and
-  printed `Main$$$anonfun$4@...`. Members that still have undetermined type
-  parameters after this step are not supplied.
+  package object, and the pickle refers to them by the alias name. The
+  `ALIASsym` is looked up in `scala/package.class`'s pickle and expanded.
+  Where the source uses such an alias **by name** (`new
+  NoSuchElementException("x")`, `Ref[F, A]`), the same `ALIASsym` is
+  registered as a type member of the package instead.
+- `def max[B >: A](implicit ord: Ordering[B]): A` gives the call site nothing
+  to determine `B` from. scalac resolves it to the lower bound `A`, and so do
+  we. Members that still have undetermined type parameters after this step
+  are not supplied.
 
-#### What does not work yet
+#### Limits
 
-- **Rebuilding classes that are already in the symbol table.**
-  `scala/collection/Seq` is installed by `find_or_stub_java_class` **without type
-  parameters**, so `Seq[B]` does not match and `diff` / `intersect` / `union` /
-  `indexOfSlice` / `containsSlice` cannot be supplied. Retrofitting the pickle's
-  type parameters did work once, but reshaping symbols the prelude built has wide
-  effects: the moment `Seq` changed, the **hand-written** `segmentLength` /
-  `scanRight` stopped resolving. Breaking what works is worse, so the table is
-  left alone. Stubbing a class that is not in the table remains fine.
-- **Stubs get no parents** (when creating a class that is not in the table).
-  Giving them a parent chain changes subtyping globally, so they get only
-  `Type::AnyRef`. A stub type is essentially usable only as itself. Note that
-  classes that were *completed* do get the parents the pickle declares
-  (`attach_parents`); without that, `Set#&` (whose argument is
-  `collection.Set[A]`) could be supplied but not called. The 11th slice widened
-  this in exactly two ways. (a) An **empty placeholder** installed by
-  `find_or_stub_java_class` gets the pickle's type parameters even under a
-  `scala/` name, as long as it was allocated after `prelude_end`
-  (`give_stub_its_kinds`; symbols the prelude built are still untouched). (b)
-  When a parent denoting the same class is already present but **differs only in
-  its arguments**, the pickle's version refines it — a class file's generic
-  signature can only say `ReusableBuilder<T, Object>`, and since `To` is
-  invariant, `ArrayBuilder[E]` would not become `Builder[E, Array[E]]`.
-- **A mismatch in the default-getter convention.** `default_getter_apply` passes
-  the actual arguments preceding the default to the getter, whereas scalac emits
-  `SeqOps.lastIndexOf$default$2()` with no arguments. Shapes that disagree are
-  not supplied (`lastIndexOf` currently falls out here). Fixing it means touching
-  the default-argument path in `check.rs`.
-- **`String.format`**: it goes through the `augmentString` → `StringOps`
-  **extension method** path, and the fill-in hook sits after member resolution
-  fails. The receiver is `java/lang/String`, so it does not land in `scala/`
-  scope either.
-- **`scala.io.Source`**: resolved on the Java class file loader side, not through
-  the pickle path.
-- **`reduceOption`**: `[B >: A](op: (B, B) => B): Option[B]`. `B` cannot be
-  solved from the lambda, and `bound_lo` does not reach it (an inference-side
-  matter).
-- **`collect { case … }`**: inferring from an inline partial function literal is
-  a typer limitation that predates pickle supply (`list_collect.scala` passes a
-  named `PartialFunction`).
-
-`SCALA_RS_PICKLE_DEBUG=1` traces which members were supplied, and why the others
-were not.
+- **Symbols the prelude built are not reshaped.** Retrofitting pickle type
+  parameters or parents onto a hand-written class changes what the other
+  hand-written members resolve to, so the prelude always wins
+  (see [prelude-fidelity.md](prelude-fidelity.md) for what that costs).
+- **Stubs get no parents.** A class created only as a placeholder gets
+  `Type::AnyRef` as its sole parent, because a parent chain would change
+  subtyping globally. Classes that are *completed* get the parents the pickle
+  declares (`attach_parents`); an empty placeholder allocated after
+  `prelude_end` gets the pickle's type parameters (`give_stub_its_kinds`); and
+  a parent that differs only in its arguments is refined from the pickle
+  (a class file's generic signature can only say `ReusableBuilder<T, Object>`,
+  so `ArrayBuilder[E]` would not otherwise be a `Builder[E, Array[E]]`).
+- Classes from plain Java (and the Java-written parts of the library) are
+  read from their class files, not through this path.
 
 ### What the 2.13.16 pickles revealed
 
@@ -281,9 +229,6 @@ were not.
   because nsc permutes the low 12 bits through `rawToPickledFlags`. Bit 12 and
   above match raw, and **some bits are shared between terms and types**
   (`COVARIANT`/`BYNAMEPARAM` are the same bit; so are `TRAIT`/`DEFAULTPARAM`).
-  This table was initially off by one from bit 16 up, so `is_public_api` was
-  reading STABLE where it meant SYNTHETIC and JAVA where it meant LOCAL (the
-  error was in the over-rejecting direction, so the results happened to come out
-  right). It is now pinned across every position by
-  `flag_bits_match_the_library`, against real symbols. Bits 30 and above are not
-  named because there has been no need.
+  The table is pinned across every position by `flag_bits_match_the_library`
+  (`crates/pickle/tests/lib_jar.rs`), against real symbols. Bits 30 and above
+  are not named.
