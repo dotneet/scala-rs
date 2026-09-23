@@ -1175,6 +1175,7 @@ impl std::fmt::Display for LoadError {
 #[derive(Default)]
 pub struct SigCache {
     cache: HashMap<String, Result<Rc<ClassSig>, LoadError>>,
+    linearizations: HashMap<(String, bool), (Vec<LinStep>, Vec<LoadError>)>,
 }
 
 /// One member found by [`SigCache::lookup`].
@@ -1270,12 +1271,21 @@ impl SigCache {
         module: bool,
         errs: &mut Vec<LoadError>,
     ) -> Vec<LinStep> {
+        let key = (full_name.to_string(), module);
+        if let Some((steps, cached_errors)) = self.linearizations.get(&key) {
+            errs.extend_from_slice(cached_errors);
+            return steps.clone();
+        }
+        let mut errors = Vec::new();
         let mut walk = LinWalk {
             budget: LIN_BUDGET,
             depth: 0,
-            errs,
+            errs: &mut errors,
         };
-        self.lin_of(src, full_name, module, HashMap::new(), &mut walk)
+        let steps = self.lin_of(src, full_name, module, HashMap::new(), &mut walk);
+        errs.extend_from_slice(&errors);
+        self.linearizations.insert(key, (steps.clone(), errors));
+        steps
     }
 
     fn lin_of<S: ClassSource + ?Sized>(
@@ -1830,6 +1840,31 @@ pub fn render(t: &SigType) -> String {
 #[cfg(test)]
 mod tests {
     use super::pickle_files_for;
+
+    #[test]
+    fn linearization_reuses_a_cached_walk_and_its_diagnostics() {
+        use super::*;
+        let mut source = |_: &str| None;
+        let mut cache = SigCache::new();
+        let mut first_errors = Vec::new();
+        let first = cache.linearization(&mut source, "missing.Example", false, &mut first_errors);
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first_errors,
+            [LoadError::NotFound("missing.Example".into())]
+        );
+        assert_eq!(cache.linearizations.len(), 1);
+
+        let mut second_errors = Vec::new();
+        let second = cache.linearization(&mut source, "missing.Example", false, &mut second_errors);
+        assert_eq!(second[0].class_name, first[0].class_name);
+        assert_eq!(second_errors, first_errors);
+        assert_eq!(cache.linearizations.len(), 1);
+
+        let mut module_errors = Vec::new();
+        cache.linearization(&mut source, "missing.Example", true, &mut module_errors);
+        assert_eq!(cache.linearizations.len(), 2);
+    }
 
     #[test]
     fn applying_a_substituted_type_lambda_preserves_nested_binders() {
