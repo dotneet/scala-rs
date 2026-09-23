@@ -8,13 +8,30 @@ scope decisions; their absence must not be confused with a Scala 2.13 pass.
 
 ## Starting point
 
-`main` at `46a66d0` has the same implementation as the measured `902da04`.
-Only the session handoff notes and `tests/BASELINE.md` differed. Use that table as the
-reference; do not rerun the unchanged baseline. Existing unmerged work is
-preserved on `agent/implicitmemo`, `worktree-agent-a44905be6f76c9f6a`, and
-`agent/catstail3`.
+`tests/BASELINE.md` is the reference for current numbers; read its latest
+gate section (at the end of the file) instead of re-measuring the baseline.
+The last accepted gate recorded there is `ff08907d` (2026-09-14): slick, cats
+and gitbucket compile with zero errors and pass their execution harnesses
+(12/12, 9/9 and 6/6 programs), the standard library is at 2 errors in 2
+files, and the corpus passes 1251 `pos` / 813 `neg` / 1018 `run`.
+[`notes/handoff-2026-09-13.md`](notes/handoff-2026-09-13.md) records the work
+after that checkpoint and the remaining gaps in the projects' own test
+sources. Work that has not been through `tests/verify_merge.sh` is not a new
+baseline.
 
-## Order of work
+The full workspace suite is not green on every `main` commit (on 2026-09-23 it
+had 47 failures that predate the work being tested), so compare a branch
+against a run on its base commit, by test name; see
+[testing.md](testing.md).
+
+## Order of work (historical, 2026-09-06)
+
+This list was written for the session that started at `46a66d0`. Its first
+two items name branches (`agent/implicitmemo`,
+`worktree-agent-a44905be6f76c9f6a`, `agent/catstail3`) that no longer exist
+and a `HANDOFF.md` that is no longer the entry point. The remaining items
+describe obligations; check each against `tests/BASELINE.md` and
+[not-implemented.md](not-implemented.md) before treating it as open.
 
 1. Recover and review those three branches in their existing worktrees.
    Preserve uncommitted work, merge local `main`, then run release workspace
@@ -72,6 +89,11 @@ These rules supersede conflicting historical process advice in
   unmeasured or deliberately red checks explicit; do not infer their results.
 
 ## Acceptance gates
+
+`tests/verify_merge.sh` runs the checks below as one command with one
+`VERDICT=PASS|FAIL` line; see [testing.md](testing.md). When it runs detached,
+pair it with a waiter that polls for its `DONE` sentinel and then reads the
+verdict, so a failed run is noticed.
 
 - Release workspace tests and focused positive/negative regressions pass.
   Formatting and lint introduce no new warnings.
