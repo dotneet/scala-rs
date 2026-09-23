@@ -173,6 +173,17 @@ tests/scala_corpus_report.sh $MYDIR/corpus.tsv [top-N]
 
 ## Where we stand
 
+> **Current status.** The accepted numbers are in `tests/BASELINE.md`: at gate
+> `ff08907d` (2026-09-14) the full corpus passes **1251 `pos` / 813 `neg` /
+> 1018 `run`** of the same 5324 identities, and the saved ledger is
+> `tests/baselines/corpus-ff08907d.tsv`. The merge gate
+> (`tests/verify_merge.sh`) runs the full corpus and compares it by test
+> identity against the ledger `tests/BASELINE.md` names, with
+> `python3 tests/compare_corpus.py <baseline.tsv> <candidate.tsv>`; a lost
+> pass (including a pass that became a timeout skip) fails the gate unless it
+> passes on the gate's serial re-run of that test. Everything below in this section is the 2026-09-05
+> survey and is kept as measured.
+
 Measured on `agent/scalacorpus` merged with `main` at `10bd2d5`, 2026-09-05,
 whole corpus, `CORPUS_JOBS=6`, about fifteen minutes.
 
