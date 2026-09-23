@@ -52,6 +52,8 @@ mod bare_blocks;
 mod basetype;
 #[path = "../batchtypes.rs"]
 mod batchtypes;
+#[path = "../binary_client_rules.rs"]
+mod binary_client_rules;
 #[path = "../binary_value_class_lambda.rs"]
 mod binary_value_class_lambda;
 #[path = "../boxed.rs"]
