@@ -104,8 +104,7 @@ described in [the testing guide](docs/testing.md).
 - [refined](docs/refined.md): refined `coreJVM` build verification
 - [Macros](docs/macros.md), [async](docs/async.md),
   [specialization](docs/specialization.md) and [tail calls](docs/tailrec.md)
-- [Development notes](docs/notes/README.md): focused implementation records
-- [Batch records](docs/batches/): measured changes and follow-up inventories
+- [Design notes](docs/notes/README.md): mechanisms that are easy to get wrong
 
 ## Contributing
 
