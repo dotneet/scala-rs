@@ -2160,6 +2160,32 @@ impl Typer {
             Some(sp) => self.project_from_prefix_at(span, &pty, name, sp),
             None => self.project_from_prefix(span, &pty, name),
         };
+        // `pShape: Shape[..., ?]` can refer to `pShape.Packed`, where
+        // `type Packed = Packed_`. Expanding the alias through the wildcard
+        // argument loses the identity of that stable path. If the alias was
+        // still lazy at the first reference, it produced a path member; keep
+        // that same member after completion instead of changing the type to
+        // `_` based on source-file order.
+        let t = if matches!(t, Type::Wildcard) {
+            let path = self.stable_term_path(prefix);
+            let cls = self.st.class_sym_of(&pty);
+            match (path, cls) {
+                (Some(path), Some(cls)) => {
+                    let alias = self.st.lookup_member(cls, name).into_iter().find(|m| {
+                        let s = self.st.get(*m);
+                        matches!(&s.ty, Type::TypeParam(tp)
+                            if s.kind == SymKind::TypeMember
+                                && s.is_type_alias
+                                && s.tparams.is_empty()
+                                && self.st.get(s.owner).tparams.contains(tp))
+                    });
+                    alias.map_or(t, |m| Type::TypeMember(self.st.path_member(&path, m, &pty)))
+                }
+                _ => t,
+            }
+        } else {
+            t
+        };
         let direct = |st: &SymbolTable, sym: SymbolId| {
             st.class_sym_of(&pty).is_some_and(|c| {
                 st.lookup_member(c, name)

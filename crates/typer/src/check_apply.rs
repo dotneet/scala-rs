@@ -1581,7 +1581,8 @@ impl Typer {
                             let current = param_at(&params, ai).cloned().filter(|p| {
                                 !matches!(
                                     match p {
-                                        Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                                        Type::ByName(inner) | Type::Repeated(inner) =>
+                                            inner.as_ref(),
                                         other => other,
                                     },
                                     Type::TypeParam(_)
@@ -1639,18 +1640,17 @@ impl Typer {
                             open.dedup();
                             (open.len(), usize::from(type_mentions_wildcard(ty)))
                         };
-                        let chosen = if let Some(merged) =
-                            merge_argument_prototypes(&pt_arg, &sequential)
-                        {
-                            merged
-                        } else if pt_arg.is_no_type()
-                            || pt_arg.is_error()
-                            || uncertainty(&sequential) < uncertainty(&pt_arg)
-                        {
-                            sequential
-                        } else {
-                            pt_arg
-                        };
+                        let chosen =
+                            if let Some(merged) = merge_argument_prototypes(&pt_arg, &sequential) {
+                                merged
+                            } else if pt_arg.is_no_type()
+                                || pt_arg.is_error()
+                                || uncertainty(&sequential) < uncertainty(&pt_arg)
+                            {
+                                sequential
+                            } else {
+                                pt_arg
+                            };
                         // The wildcards stand for variables no earlier
                         // argument settled, exactly as a lenient prototype's
                         // do: an argument that takes one into its own type
@@ -1723,6 +1723,30 @@ impl Typer {
                     let declared_p = match &fun_ty_for_pretype {
                         Type::Method { paramss, .. } => {
                             paramss.first().and_then(|ps| param_at(ps, ai)).cloned()
+                        }
+                        Type::ModuleRef(cls) => {
+                            // A qualified companion call such as `model.Column(...)`
+                            // keeps the module as its callee until overload
+                            // selection. Its own `apply` may have a written
+                            // wildcard formal, which must not be treated as a
+                            // provisional wildcard invented by this call.
+                            let mut own =
+                                self.st
+                                    .lookup_member(*cls, "apply")
+                                    .into_iter()
+                                    .filter(|sym| {
+                                        let s = self.st.get(*sym);
+                                        s.owner == *cls && !s.flags.contains(Flags::STATIC)
+                                    });
+                            match (own.next(), own.next()) {
+                                (Some(sym), None) => match &self.st.get(sym).ty {
+                                    Type::Method { paramss, .. } => {
+                                        paramss.first().and_then(|ps| param_at(ps, ai)).cloned()
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
                         }
                         _ => None,
                     };

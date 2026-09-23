@@ -54,6 +54,59 @@ fn compile_with_scalac(scalac: &Path, source: &str, out: &Path, cp: Option<&Path
 }
 
 #[test]
+fn source_wildcard_alias_keeps_its_path_identity_across_file_order() {
+    let (Some(scalac), Some(scala_library)) = (scalac(), scala_library()) else {
+        eprintln!("skip wildcard alias regression: scalac or scala-library unavailable");
+        return;
+    };
+    let use_source = fixtures_dir().join("compiledquery_order_use.scala");
+    let shape_source = fixtures_dir().join("compiledquery_order_shape.scala");
+    let scala_rs = bin();
+    let mut outputs = Vec::new();
+    for (compiler, is_scala_rs) in [(&scalac, false), (&scala_rs, true)] {
+        let out = tmp_dir("compiled-query-order");
+        let mut command = Command::new(compiler);
+        if is_scala_rs {
+            command.arg("compile");
+        }
+        command.args([
+            use_source.to_str().unwrap(),
+            shape_source.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-Xsource:3-cross",
+        ]);
+        if is_scala_rs {
+            command.args(["--scala-library", scala_library.to_str().unwrap()]);
+        }
+        let output = command
+            .output()
+            .expect("compile ordered wildcard alias sources");
+        assert!(
+            output.status.success(),
+            "{} rejected ordered wildcard alias sources: {}{}",
+            compiler.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cp = format!("{}:{}", out.display(), scala_library.display());
+        let runtime = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "compiledqueryorder.Main"])
+            .output()
+            .expect("run ordered wildcard alias output");
+        assert!(
+            runtime.status.success(),
+            "{} emitted invalid ordered wildcard alias classes: {}",
+            compiler.display(),
+            String::from_utf8_lossy(&runtime.stderr)
+        );
+        outputs.push(String::from_utf8_lossy(&runtime.stdout).into_owned());
+        let _ = fs::remove_dir_all(out);
+    }
+    assert_eq!(outputs, ["Parameters\n", "Parameters\n"]);
+}
+
+#[test]
 fn reads_dependent_projection_from_scalac_classfiles() {
     let (Some(scalac), Some(scala_library)) = (scalac(), scala_library()) else {
         eprintln!("skip compiled-query regression: scalac or scala-library unavailable");

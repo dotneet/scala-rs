@@ -183,6 +183,11 @@ fn scala_library_dual_run_setmap1() {
     dual_run_fixture("setmap1");
 }
 
+#[test]
+fn scala_library_dual_run_setmap_qualified() {
+    dual_run_fixture("setmap_qualified");
+}
+
 /// The wrappings must not make everything conform: scalac rejects both of
 /// these too (`Array[Int]` is no `Seq[String]`, and `collection.Map` has no
 /// `noSuchLookup`).

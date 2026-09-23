@@ -53,6 +53,27 @@ fn assert_runs_like_scalac(label: &str, source: &str) {
 }
 
 #[test]
+fn abstract_superclass_gets_bridge_to_trait_implementation() {
+    assert_runs_like_scalac(
+        "abstract-super-trait-bridge",
+        r#"
+abstract class Base {
+  protected def value(): Base
+  final def read(): Base = value()
+}
+trait Impl extends Base {
+  override def value(): Impl = this
+}
+abstract class Middle extends Base with Impl
+final class Leaf extends Middle
+object Main {
+  def main(args: Array[String]): Unit = println(new Leaf().read().getClass.getSimpleName)
+}
+"#,
+    );
+}
+
+#[test]
 fn prelude_library_traits_get_erasure_bridges() {
     assert_runs_like_scalac(
         "library-trait-bridges-prelude",

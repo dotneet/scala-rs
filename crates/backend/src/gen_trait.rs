@@ -2825,6 +2825,12 @@ impl<'a> Gen<'a> {
     /// target.  This is the shape of `Reducible.compose` versus
     /// `NonEmptyTraverse.compose` in Cats (and the small `R`/`N` toy).
     fn inherited_from_nontrait_superclass(&self, class_id: SymbolId, base: SymbolId) -> bool {
+        // An abstract declaration in the superclass does not provide a JVM
+        // entry point. A concrete trait method with a narrower return still
+        // needs a bridge for that descriptor (Slick's Node / SimplyTypedNode).
+        if self.st.method_is_deferred(base) {
+            return false;
+        }
         let Some(superclass) = linearize(self.st, class_id)
             .into_iter()
             .skip(1)
@@ -3049,6 +3055,13 @@ impl<'a> Gen<'a> {
                 let target = have.clone();
                 let name = enc.clone();
                 let target_ret = have[have.find(')').map(|i| i + 1).unwrap_or(0)..].to_string();
+                let return_cast = if target_ret != *pret && pret.starts_with('L') {
+                    Some(pret[1..pret.len() - 1].to_string())
+                } else if target_ret != *pret && pret.starts_with('[') {
+                    Some(pret.to_string())
+                } else {
+                    None
+                };
                 b.add_code(
                     ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
                     &enc,
@@ -3062,6 +3075,12 @@ impl<'a> Gen<'a> {
                         }
                         asm.invokevirtual(&cn, &name, &target);
                         if !emit_forwarded_nothing(asm, &target_ret) {
+                            // A Scala trait extending a class is emitted as a
+                            // JVM interface, so the verifier cannot infer
+                            // that its return type extends the class.
+                            if let Some(class) = &return_cast {
+                                asm.checkcast(class);
+                            }
                             ret_of_sort(asm, ret_str_sort(&target_ret));
                         }
                     },

@@ -4,10 +4,13 @@
 
 The standard workload is a **full compile** of slick's 184 sources (the file
 list `tests/bench.sh` pins, including the seven expanded FreeMarker
-templates), with `-Xsource:3`, and scala-library 2.13.16, slick's dependency
-jars and scala-reflect on the classpath: type checking → erasure → code
-generation → writing the class files. The same compile with real scalac
-2.13.16 took 12.0 s wall and 68.6 s of CPU when it was last compared.
+templates), with scala-library 2.13.16, Slick's dependency jars and
+scala-reflect on the classpath: type checking → erasure → code generation →
+writing the class files. Historical scala-rs-only runs used `-Xsource:3`;
+the direct scala-rs/scalac comparison below gives both compilers
+`-Xsource:3-cross`, matching Slick's Scala 2.13 build setting. Its medians
+supersede the older, differently configured scalac observation of 12.0 s
+wall and 68.6 s CPU.
 
 ### Where we stand
 
@@ -16,12 +19,27 @@ rather than an absolute benchmark:
 
 * **slick, 184 sources**: 3.06 s wall, 2.80 s user CPU, 1504 class files
   (medians of eight alternating pairs, 2026-09-12).
-* **slick, 2026-09-24**: main had drifted to 1.24e11 instructions and 6.4 s
-  user CPU by then, and it stops at two type errors (JdbcModelBuilder,
-  Compiled) before code generation, so these figures cover type checking
-  only. The ancestry caches, the function-parent walk and the shared
-  conversion memo below took it to 6.37e10 instructions (-48%) and about
-  3.7 s user, with the same diagnostics.
+* **slick, 2026-09-24, full-compilation comparison**: the two remaining type
+  errors in `JdbcModelBuilder` and `Compiled` have been fixed. On the same 184
+  sources, dependency classpath, JDK 21.0.2 and `-Xsource:3-cross` (Slick's
+  Scala 2.13 setting), three alternating fresh-output runs took 3.98, 4.01,
+  4.04 s wall with scala-rs and 10.59, 10.95, 10.83 s with scalac 2.13.16.
+  Both exited successfully and emitted 1504 and 1498 class files respectively.
+  The wall-time median is 4.01 vs 10.83 s, or 2.70x in favor of scala-rs for
+  this compiler-only workload. The twelve differential client programs,
+  compiled against scalac's Slick output, all produced identical output with
+  both libraries in three runs each. Reverse interoperability remains red:
+  when those clients are compiled against scala-rs's Slick output, scalac
+  rejects eleven of twelve because methods such as `createStatements` and
+  `statements` are missing from its view of the emitted API. The JVM class
+  sweep found no verification failures but could not initialize two classes.
+  This timing is not evidence that Slick is a drop-in binary replacement.
+* **slick, earlier 2026-09-24 type-check-only comparison**: main had drifted
+  to 1.24e11 instructions and 6.4 s user CPU and stopped at the two type
+  errors before code generation. The ancestry caches, function-parent walk
+  and shared conversion memo reduced that to 6.37e10 instructions (-48%) and
+  about 3.7 s user, with the same diagnostics. Those figures are not
+  comparable to the full-compilation wall times above.
 * **gitbucket, 354 sources**: about 20 s on a quiet machine, 2.86e11
   instructions retired, after the linearization / base-type caches of
   2026-09-12 (from 154 s and 2.57e12). Macro expansion is under 1 s of that.
