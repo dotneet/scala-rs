@@ -3800,15 +3800,90 @@ impl PickleSupply {
     /// from it and no symbol it allocates is attached to a class -- so it is
     /// only ever the answer to "which method in the class file is this".
     ///
+    /// A member inherited from a *generic* declaring class is converted from
+    /// that class's own declaration instead (see
+    /// [`PickleSupply::generic_declaration`]), since the receiver's view has
+    /// already replaced the declaring class's type parameters.
+    ///
     /// `None` when some parameter does not convert at all, which is the same
     /// as the caller already having failed.
+    #[allow(clippy::too_many_arguments)]
     fn decl_site_want(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        internal: &str,
+        pickle_owner: &str,
+        owner_module: bool,
+        name: &str,
+        scope: &HashMap<String, Type>,
+        shape: &Shape,
+    ) -> Option<Vec<Option<String>>> {
+        let declared = self.generic_declaration(
+            st,
+            bin,
+            class_sym,
+            internal,
+            pickle_owner,
+            owner_module,
+            name,
+            scope,
+            shape,
+        );
+        let seen = self.decl_site_params(st, bin, scope, shape);
+        // A declaration that mentions something only the receiver's view can
+        // name (an enclosing class's parameter) falls back to that view.
+        let Some(declared) =
+            declared.and_then(|(scope, shape)| self.decl_site_params(st, bin, &scope, &shape))
+        else {
+            return seen.map(|tys| tys.iter().map(|t| erased_param_desc(st, t)).collect());
+        };
+        let declared: Vec<Option<String>> =
+            declared.iter().map(|t| erased_param_desc(st, t)).collect();
+        let Some(seen) = seen else {
+            return Some(declared);
+        };
+        // `class IntBox extends Ops[Int]` sees `first(x: Int, y: Int)`, whose
+        // declaration takes two references. Erasure adapts an argument to the
+        // installed member's parameter type, so a member installed with the
+        // receiver's `Int` would pass a bare `int` to `(Object, Object)`
+        // (VerifyError). Such a member stays with the declaring class, whose
+        // own `A` is what makes erasure box the argument.
+        let passes_unboxed = |t: &Type| match t {
+            Type::Boolean
+            | Type::Byte
+            | Type::Short
+            | Type::Char
+            | Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double => true,
+            Type::Class { sym, .. } => st.is_value_class(*sym),
+            _ => false,
+        };
+        let seen_want: Vec<Option<String>> =
+            seen.iter().map(|t| erased_param_desc(st, t)).collect();
+        if seen
+            .iter()
+            .zip(&seen_want)
+            .zip(&declared)
+            .any(|((t, seen), declared)| seen != declared && passes_unboxed(t))
+        {
+            return Some(seen_want);
+        }
+        Some(declared)
+    }
+
+    /// [`PickleSupply::decl_site_want`] for one reading of the parameters:
+    /// their types, converted at the declaration site.
+    fn decl_site_params(
         &mut self,
         st: &mut SymbolTable,
         bin: &mut BinaryIndex,
         scope: &HashMap<String, Type>,
         shape: &Shape,
-    ) -> Option<Vec<Option<String>>> {
+    ) -> Option<Vec<Type>> {
         let was = std::mem::replace(&mut self.decl_site_erasure, true);
         let mut want = Vec::new();
         let mut ok = true;
@@ -3819,7 +3894,7 @@ impl PickleSupply {
                         if p.by_name && !matches!(t, Type::ByName(_)) {
                             t = Type::ByName(Box::new(t));
                         }
-                        want.push(erased_param_desc(st, &t));
+                        want.push(t);
                     }
                     None => {
                         ok = false;
@@ -3833,6 +3908,104 @@ impl PickleSupply {
         }
         self.decl_site_erasure = was;
         ok.then_some(want)
+    }
+
+    /// The declaring class's own shape of an inherited member, with a scope
+    /// in which that class's type parameters stand for themselves.
+    ///
+    /// `SigCache::lookup` hands a member back already substituted into the
+    /// receiver's vocabulary: `trait Ops[A] { def first(x: A, y: A): A }`
+    /// seen from `class StrBox extends Ops[String]` reads `first(x: String,
+    /// y: String)`. That is the type a caller must satisfy, but the class
+    /// file only has `Ops.first(Object, Object)` and the erased mixin
+    /// forwarder `StrBox.first(Object, Object)` -- the JVM erases `A` at the
+    /// declaration, whatever a subclass binds it to. Asking for `(String,
+    /// String)` found neither, the member was never supplied, and the call
+    /// fell back to the forwarder's erased `Object` result ("found: Any
+    /// required: String"). A one-parameter `first(x: A)` happened to survive
+    /// through `Ops`'s own completion; two parameters did not.
+    ///
+    /// So the raw declaration is recovered from the declaring pickle: the
+    /// one member of that name whose substitution (the receiver's
+    /// linearization step for the owner) is exactly the shape being
+    /// installed. Its type parameters get fresh symbols, which erase as any
+    /// type parameter does (an unnamed reference slot, or a primitive bound).
+    /// Only the erasure of what is converted here is used; see
+    /// [`PickleSupply::decl_site_want`].
+    ///
+    /// `None` for a member declared on the receiver itself, a declaring class
+    /// with no type parameters, or when the raw declaration is not uniquely
+    /// identified -- the receiver's view is then all there is.
+    #[allow(clippy::too_many_arguments)]
+    fn generic_declaration(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        internal: &str,
+        pickle_owner: &str,
+        owner_module: bool,
+        name: &str,
+        scope: &HashMap<String, Type>,
+        shape: &Shape,
+    ) -> Option<(HashMap<String, Type>, Shape)> {
+        let receiver_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let receiver = self.pickled_full_name(bin, internal, receiver_module)?;
+        if receiver == pickle_owner && receiver_module == owner_module {
+            return None;
+        }
+        let sig = {
+            let mut src = BinSource(bin);
+            self.sigs
+                .class_sig(&mut src, pickle_owner, owner_module)
+                .ok()?
+        };
+        if sig.tparams.is_empty() {
+            return None;
+        }
+        let subst = {
+            let mut src = BinSource(bin);
+            let mut errs = Vec::new();
+            self.sigs
+                .linearization(&mut src, &receiver, receiver_module, &mut errs)
+                .into_iter()
+                .find(|step| step.class_name == pickle_owner && step.module == owner_module)?
+                .subst
+        };
+        let mut declared: Option<Shape> = None;
+        for member in sig.members_named(name) {
+            if member.kind != MemberKind::Def {
+                continue;
+            }
+            let seen = read_shape(&scala_rs_pickle::sym::apply_subst(&member.ty, &subst))
+                .and_then(pin_undetermined_tparams);
+            if !seen.is_some_and(|seen| same_value_params(&seen, shape)) {
+                continue;
+            }
+            // Two declarations that the receiver's binding makes alike are
+            // two overloads to the caller; neither is "the" declaration.
+            if declared.is_some() {
+                return None;
+            }
+            declared = Some(read_shape(&member.ty).and_then(pin_undetermined_tparams)?);
+        }
+        let declared = declared?;
+        let mut scope = scope.clone();
+        let mut owner_tparams = Vec::new();
+        for tp in &sig.tparams {
+            // A method type parameter shadows the class's of the same name.
+            if declared.tparams.iter().any(|m| m.name == tp.name) {
+                continue;
+            }
+            let tp = shape_tparam(tp);
+            let id = alloc_shape_tparam(st, SymbolId::NONE, &tp);
+            scope.insert(tp.name.clone(), Type::TypeParam(id));
+            owner_tparams.push((tp, id));
+        }
+        for (tp, id) in &owner_tparams {
+            self.resolve_shape_tparam_bounds(st, bin, &scope, tp, *id);
+        }
+        Some((scope, declared))
     }
 
     /// JVM erases a type parameter of the declaring owner to `Object`, even
@@ -4315,7 +4488,17 @@ impl PickleSupply {
             .into_iter()
             .find(|file| bin.find_class(file).ok().flatten().is_some());
         let decl_params = self
-            .decl_site_want(st, bin, &scope, shape)
+            .decl_site_want(
+                st,
+                bin,
+                class_sym,
+                internal,
+                pickle_owner,
+                owner_module,
+                name,
+                &scope,
+                shape,
+            )
             .unwrap_or_else(|| want.clone());
         let declared = owner_file.as_ref().and_then(|owner| {
             self.erased_desc_return(
@@ -4380,17 +4563,14 @@ impl PickleSupply {
             // overload for (Mirrors.RuntimeClass)Symbols.ClassSymbol".
             //
             // So: keep the *caller's* view as the member's type, and go back
-            // to the declaration's view only to find the bytes to call. Paid
-            // for only where the first search already failed, and skipped
+            // to the declaration's view (`decl_params`, above) only to find
+            // the bytes to call, searched from the receiver this time. Skipped
             // outright when the two views agree -- which they do for every
             // member whose signature names no such alias.
-            None => {
-                let want_decl = self.decl_site_want(st, bin, &scope, shape);
-                match want_decl {
-                    Some(w) if w != want => self.erased_desc(bin, internal, jvm_member, &w),
-                    _ => None,
-                }
+            None if decl_params != want => {
+                self.erased_desc(bin, internal, jvm_member, &decl_params)
             }
+            None => None,
         };
         let Some(found) = found else {
             trace(format_args!(
@@ -5872,6 +6052,19 @@ fn alloc_shape_tparam(st: &mut SymbolTable, owner: SymbolId, shape: &ShapeTParam
         .collect();
     st.get_mut(id).tparams = inner;
     id
+}
+
+/// Whether two shapes take the same value parameters, clause by clause.
+fn same_value_params(a: &Shape, b: &Shape) -> bool {
+    a.clauses.len() == b.clauses.len()
+        && a.clauses.iter().zip(&b.clauses).all(|(a, b)| {
+            a.implicit == b.implicit
+                && a.params.len() == b.params.len()
+                && a.params
+                    .iter()
+                    .zip(&b.params)
+                    .all(|(a, b)| a.ty == b.ty && a.by_name == b.by_name)
+        })
 }
 
 fn sig_type_is_owner_tparam_application(t: &SigType, owner_tparams: &HashSet<String>) -> bool {
