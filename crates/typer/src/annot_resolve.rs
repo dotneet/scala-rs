@@ -150,10 +150,16 @@ impl Typer {
         // strict diagnostics there: the private runtime intentionally omits
         // many standard annotation classes, so an unresolved name must not
         // turn into a new source error just to improve the pickle.
+        // Lenient name lookup is not enough: a qualified spelling such as
+        // `@scala.specialized` still reports a missing package member, so the
+        // speculative lookup drops whatever it reported.
         let ty = if self.library_abi {
             self.with_strict_sig_names(|s| s.tree_to_type(&tpt))
         } else {
-            self.tree_to_type(&tpt)
+            let mark = self.diags.len();
+            let ty = self.tree_to_type(&tpt);
+            self.diags.truncate(mark);
+            ty
         };
         if ty.is_error() || (!self.library_abi && !is_annotation_class_type(&ty)) {
             return None;
