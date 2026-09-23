@@ -6,3 +6,5 @@ out/
 /tmp
 .claude/worktrees/
 .worktrees/
+.env
+.env.*
