@@ -3132,6 +3132,17 @@ impl Typer {
             if self.first_clause_is_implicit(id) {
                 continue;
             }
+            // A conversion cannot produce the requested class if its fixed
+            // result class is unrelated to it. Skip its witness warm-up before
+            // solving generic input parameters or scanning implicit clauses;
+            // neither operation can change that result class head.
+            let result = match &self.st.get(id).ty {
+                Type::Method { ret, .. } | Type::Function { ret, .. } => ret.as_ref(),
+                ty => ty,
+            };
+            if !self.plausibly_inhabits(result, to) {
+                continue;
+            }
             let Some(param) = self.conversion_arg_ty(id) else {
                 continue;
             };
@@ -5832,6 +5843,87 @@ mod memo_tests {
         assert!(typer.implicits_in_scope().contains(&method));
         typer.warm_implicit_candidates(&[wanted_type]);
         assert!(!typer.implicit_instances.contains_key(&method));
+    }
+
+    #[test]
+    fn conversion_warmup_skips_unrelated_results_but_keeps_subclasses() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let owner = typer
+            .st
+            .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
+        let input = typer
+            .st
+            .alloc("Input", root, SymKind::Class, Flags::EMPTY, "Input");
+        let wanted = typer
+            .st
+            .alloc("Wanted", root, SymKind::Class, Flags::EMPTY, "Wanted");
+        let unrelated = typer.st.alloc(
+            "Unrelated",
+            root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "Unrelated",
+        );
+        let child = typer
+            .st
+            .alloc("Child", root, SymKind::Class, Flags::EMPTY, "Child");
+        let evidence = typer
+            .st
+            .alloc("Evidence", root, SymKind::Class, Flags::EMPTY, "Evidence");
+        typer.st.get_mut(child).parents.push(Type::Class {
+            sym: wanted,
+            args: vec![].into(),
+        });
+        let class_ty = |sym| Type::Class {
+            sym,
+            args: vec![].into(),
+        };
+        let input_ty = class_ty(input);
+        let wanted_ty = class_ty(wanted);
+        let evidence_ty = Type::Class {
+            sym: evidence,
+            args: vec![Type::Int].into(),
+        };
+        let witness = typer.st.alloc(
+            "witness",
+            owner,
+            SymKind::Method,
+            Flags::IMPLICIT,
+            "witness",
+        );
+        let tp = typer
+            .st
+            .alloc("A", witness, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(witness).tparams = vec![tp];
+        typer.st.get_mut(witness).ty = Type::Method {
+            paramss: vec![],
+            ret: TyBox::new(Type::Class {
+                sym: evidence,
+                args: vec![Type::TypeParam(tp)].into(),
+            }),
+        };
+        let conversion = typer.st.alloc(
+            "conversion",
+            owner,
+            SymKind::Method,
+            Flags::IMPLICIT,
+            "conversion",
+        );
+        let method_ty = |result| Type::Method {
+            paramss: vec![vec![input_ty.clone()], vec![evidence_ty.clone()]],
+            ret: TyBox::new(result),
+        };
+        typer.st.get_mut(conversion).ty = method_ty(class_ty(unrelated));
+        typer.st.this_class = owner;
+        assert!(typer.implicits_in_scope().contains(&conversion));
+
+        typer.warm_conversion_witnesses(&input_ty, &wanted_ty);
+        assert!(!typer.implicit_instances.contains_key(&witness));
+
+        typer.st.get_mut(conversion).ty = method_ty(class_ty(child));
+        typer.warm_conversion_witnesses(&input_ty, &wanted_ty);
+        assert!(typer.implicit_instances.contains_key(&witness));
     }
 
     #[test]
