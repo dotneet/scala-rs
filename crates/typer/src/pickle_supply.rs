@@ -31,6 +31,16 @@ use crate::symbol::{MacroBinding, MacroTarg, SymKind, SymbolTable};
 /// `SCALA_RS_PICKLE_DEBUG=1` traces why a member was or was not supplied.
 /// Completion is silent otherwise: a member it declines to supply surfaces as
 /// the typer's ordinary "is not a member".
+/// Whether a converted method result is an abstract type member, applied or
+/// not (`Repr[A]`, `Elem`).
+fn is_type_member_result(ret: &Type) -> bool {
+    match ret {
+        Type::TypeMember(_) => true,
+        Type::Applied { ctor, .. } => matches!(**ctor, Type::TypeMember(_)),
+        _ => false,
+    }
+}
+
 pub(crate) fn trace(args: std::fmt::Arguments<'_>) {
     // Read once. This is called from the middle of member completion, and
     // `var_os` walks the process environment on every call.
@@ -4339,14 +4349,27 @@ impl PickleSupply {
         // name on the receiver's class, and an enclosing class's
         // `Outer.this.Repr[A]` would otherwise pick up a same-named member of
         // the inner receiver instead.
+        //
+        // A member declared on the class itself is pickled bare (`Repr`); one
+        // inherited from a base trait is pickled under its owner
+        // (`lib.Ops.Repr` for `Mixed.this.Repr` when `Ops` declares `Repr`).
+        // Either way it is `this`'s type member, which the receiver reads by
+        // its simple name. A dotted name counts only when it converted to an
+        // abstract type member, so an inner class spelled the same way does
+        // not.
         let result_type_member_app = match (result_prefix, &shape.ret) {
             (Some(SigType::This(this_owner)), SigType::Ref { sym, args })
-                if this_owner == pickle_owner
-                    && !sym.contains('.')
-                    && !scope.contains_key(sym) =>
+                if this_owner == pickle_owner && !scope.contains_key(sym) =>
             {
-                self.conv_all(st, bin, &scope, args, 0)
-                    .map(|args| (sym.clone(), args))
+                let member = match sym.rsplit_once('.') {
+                    None => Some(sym.as_str()),
+                    Some((_, member)) if is_type_member_result(&ret) => Some(member),
+                    Some(_) => None,
+                };
+                member.and_then(|member| {
+                    self.conv_all(st, bin, &scope, args, 0)
+                        .map(|args| (member.to_string(), args))
+                })
             }
             _ => None,
         };
