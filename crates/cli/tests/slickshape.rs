@@ -180,6 +180,22 @@ fn scalac_run(scalac: &Path, name: &str, cp: Option<&str>) -> (bool, String) {
     (output.status.success(), msgs)
 }
 
+fn scalac_compile_fixture(scalac: &Path, name: &str, out: &Path, cp: &str) -> (bool, String) {
+    let output = Command::new(scalac)
+        .args(["-cp", cp, "-d", out.to_str().unwrap()])
+        .arg(fixtures_dir().join(format!("{name}.scala")))
+        .output()
+        .expect("run scalac");
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
 fn run_main(cp: &str) -> String {
     let output = Command::new("java")
         .args(["-Xverify:all", "-cp", cp, "Main"])
@@ -293,6 +309,42 @@ fn slicks_shape_witnesses_resolve_through_its_published_jar() {
         let (ok, msgs) = scalac_run(&scalac, "sh_shape_jar", Some(&classpath(&jars)));
         assert!(ok, "real scalac rejected sh_shape_jar:\n{msgs}");
     }
+}
+
+/// A nested higher-kinded adapter compiled by nsc remains usable from a
+/// separately compiled client that uses Slick's binary `Rep`. Keeping the
+/// adapter binary exercises ScalaSignature loading.
+#[test]
+fn nested_higher_kinded_adapter_from_scalac_library_resolves_with_binary_slick() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip slick_nested_hk: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip slick_nested_hk: slick 3.4.1 not in the local Coursier cache");
+        return;
+    };
+    let Some(scalac) = real_scalac() else {
+        eprintln!("skip slick_nested_hk: scalac 2.13.16 not present");
+        return;
+    };
+    let cp = format!("{}:{}", lib.display(), classpath(&jars));
+    let provider = tmp_dir("slick_nested_hk_provider");
+    let (ok, msgs) = scalac_compile_fixture(&scalac, "slick_nested_hk_lib", &provider, &cp);
+    assert!(ok, "scalac provider compilation failed:\n{msgs}");
+
+    let client_cp = format!("{}:{cp}", provider.display());
+    let (ok, msgs, out) = compile(
+        "slick_nested_hk_use",
+        &["-cp", &client_cp, "--scala-library", lib.to_str().unwrap()],
+    );
+    assert!(ok, "scala-rs client compilation failed:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let (ok, msgs) = scalac_run(&scalac, "slick_nested_hk_use", Some(&client_cp));
+    assert!(ok, "scalac client compilation failed:\n{msgs}");
+    let _ = fs::remove_dir_all(&provider);
+    let _ = fs::remove_dir_all(&out);
 }
 
 /// A projection slick has no `Shape` for is still a missing implicit, and an

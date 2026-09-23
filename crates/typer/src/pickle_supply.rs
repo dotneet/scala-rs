@@ -2614,7 +2614,7 @@ impl PickleSupply {
         for tp in &tps {
             let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
             st.get_mut(t).ty = Type::TypeParam(t);
-            set_tparam_arity(st, t, tparam_arity(tp));
+            set_tparam_kind(st, t, tp);
             scope.insert(tp.name.clone(), Type::TypeParam(t));
             tparams.push(t);
         }
@@ -4897,7 +4897,7 @@ impl PickleSupply {
                 .map(|tp| {
                     let t = st.alloc(&tp.name, id, SymKind::TypeParam, variance_flags(tp), "");
                     st.get_mut(t).ty = Type::TypeParam(t);
-                    set_tparam_arity(st, t, tparam_arity(tp));
+                    set_tparam_kind(st, t, tp);
                     t
                 })
                 .collect();
@@ -5913,7 +5913,7 @@ fn adopt_tparam_kinds(
                 "",
             );
             st.get_mut(id).ty = Type::TypeParam(id);
-            set_tparam_arity(st, id, tparam_arity(tp));
+            set_tparam_kind(st, id, tp);
             fresh.push(id);
         }
         st.get_mut(class_sym).tparams = fresh;
@@ -5923,9 +5923,7 @@ fn adopt_tparam_kinds(
         return;
     }
     for (id, tp) in ids.into_iter().zip(&sig.tparams) {
-        if st.get(id).tparams.is_empty() {
-            set_tparam_arity(st, id, tparam_arity(tp));
-        }
+        set_tparam_kind(st, id, tp);
         st.get_mut(id).flags = st.get(id).flags.with(variance_flags(tp));
         adopt_primitive_bound(st, id, tp);
     }
@@ -5968,20 +5966,40 @@ fn adopt_primitive_bound(st: &mut SymbolTable, id: SymbolId, tp: &scala_rs_pickl
     st.get_mut(id).bound_hi = Some(prim);
 }
 
-/// Make `id` a type constructor of `arity` parameters. The names are
-/// placeholders: only the count is ever read (`SymbolTable::kind_arity`).
-fn set_tparam_arity(st: &mut SymbolTable, id: SymbolId, arity: usize) {
-    if arity == 0 {
+/// Copy a type parameter's kind from the pickle. Names are immaterial to
+/// `kind_arity`, but the tree is recursive: `F[_[_]]` needs the placeholder
+/// for `F`'s first parameter to itself be a constructor. The JVM signature
+/// only records the outer parameter count, so a binary class starts with this
+/// information missing at every depth.
+fn set_tparam_kind(st: &mut SymbolTable, id: SymbolId, tp: &scala_rs_pickle::sym::TParam) {
+    let SigType::Poly { tparams, .. } = &tp.bounds else {
+        return;
+    };
+    if tparams.is_empty() {
         return;
     }
-    let inner: Vec<SymbolId> = (0..arity)
-        .map(|i| {
-            let x = st.alloc(format!("_${i}"), id, SymKind::TypeParam, Flags::EMPTY, "");
-            st.get_mut(x).ty = Type::TypeParam(x);
-            x
-        })
-        .collect();
-    st.get_mut(id).tparams = inner;
+    let existing = st.get(id).tparams.clone();
+    let inner = if existing.is_empty() {
+        let inner: Vec<SymbolId> = tparams
+            .iter()
+            .map(|tp| {
+                let x = st.alloc(&tp.name, id, SymKind::TypeParam, variance_flags(tp), "");
+                st.get_mut(x).ty = Type::TypeParam(x);
+                x
+            })
+            .collect();
+        st.get_mut(id).tparams = inner.clone();
+        inner
+    } else if existing.len() == tparams.len() {
+        existing
+    } else {
+        // The erased classfile and pickle disagree about this kind. Preserve
+        // the existing view rather than silently replacing unrelated symbols.
+        return;
+    };
+    for (inner_id, inner_tp) in inner.into_iter().zip(tparams) {
+        set_tparam_kind(st, inner_id, inner_tp);
+    }
 }
 
 /// A type parameter's own kind arity. nsc pickles `F[_]` as a `POLYtpe` over
@@ -7271,7 +7289,7 @@ impl PickleSupply {
         for tp in &tps {
             let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
             st.get_mut(t).ty = Type::TypeParam(t);
-            set_tparam_arity(st, t, tparam_arity(tp));
+            set_tparam_kind(st, t, tp);
             scope.insert(tp.name.clone(), Type::TypeParam(t));
             tparams.push(t);
         }
