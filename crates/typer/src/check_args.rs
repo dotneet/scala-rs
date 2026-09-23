@@ -1695,17 +1695,6 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         };
-        // A parameterless getter is selected without an argument list.
-        // Adding () would instead invoke a Function0 returned by that getter.
-        if matches!(&self.st.get(gid).ty, Type::Method { paramss, .. } if paramss.is_empty()) {
-            self.type_expr(&mut gfun, &Type::NoType);
-            return Some(gfun);
-        }
-        let getter_pt = Type::Method {
-            paramss: vec![],
-            ret: Box::new(Type::NoType),
-        };
-        self.type_expr(&mut gfun, &getter_pt);
         // A parameter whose type is still a type parameter of the method
         // being applied is not an expectation the getter has to meet -- it is
         // what the getter's result *determines*. nsc infers the method's type
@@ -1723,6 +1712,22 @@ impl Typer {
         } else {
             Type::NoType
         };
+        // A parameterless getter is selected without an argument list.
+        // Adding () would instead invoke a Function0 returned by that getter.
+        // Its result still has to meet the parameter type: a class-level
+        // default `List("a")` for `one: List[A]` is wrong in `new Box[Int]()`.
+        // It is adapted after selection, not typed against the parameter
+        // type: a `() => Long` expectation would eta-expand the getter itself.
+        if matches!(&self.st.get(gid).ty, Type::Method { paramss, .. } if paramss.is_empty()) {
+            self.type_expr(&mut gfun, &Type::NoType);
+            self.adapt(&mut gfun, &expected);
+            return Some(gfun);
+        }
+        let getter_pt = Type::Method {
+            paramss: vec![],
+            ret: Box::new(Type::NoType),
+        };
+        self.type_expr(&mut gfun, &getter_pt);
         // One `Apply` per clause the getter declares. A getter for a *later*
         // clause keeps the method's currying -- `def join(a: String)(b: String
         // = "-")(c: String = a + b)` pickles `join$default$3` as
