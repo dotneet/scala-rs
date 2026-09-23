@@ -1572,10 +1572,20 @@ impl Typer {
                             );
                             let current = param_at(&params, ai).cloned();
                             current.and_then(|current| {
-                                if solved.is_empty() {
+                                let ids: Vec<_> = solved.iter().map(|(id, _)| *id).collect();
+                                // Only a parameter the earlier arguments
+                                // settled carries information here. When the
+                                // formal mentions none of them, the result is
+                                // just the formal with its open variables made
+                                // `_`, and `m(10, List("a"))` for
+                                // `m[S, A](init: S, xs: List[A])` then typed
+                                // `List("a")` against `List[_]`, solving `A`
+                                // as the wildcard itself.
+                                let mut mentioned = Vec::new();
+                                collect_tparams(&current, &mut mentioned);
+                                if !mentioned.iter().any(|tp| ids.contains(tp)) {
                                     return None;
                                 }
-                                let ids: Vec<_> = solved.iter().map(|(id, _)| *id).collect();
                                 let tys: Vec<_> = solved.iter().map(|(_, ty)| ty.clone()).collect();
                                 let mut prototype =
                                     crate::symbol::subst_tparams_slice(&ids, &tys, &current);
@@ -1613,7 +1623,9 @@ impl Typer {
                             open.dedup();
                             (open.len(), usize::from(type_mentions_wildcard(ty)))
                         };
-                        if let Some(merged) = merge_argument_prototypes(&pt_arg, &sequential) {
+                        let chosen = if let Some(merged) =
+                            merge_argument_prototypes(&pt_arg, &sequential)
+                        {
                             merged
                         } else if pt_arg.is_no_type()
                             || pt_arg.is_error()
@@ -1622,7 +1634,23 @@ impl Typer {
                             sequential
                         } else {
                             pt_arg
+                        };
+                        // The wildcards stand for variables no earlier
+                        // argument settled, exactly as a lenient prototype's
+                        // do: an argument that takes one into its own type
+                        // (`List("a")` at `List[_]` for `xs: List[A]`) is
+                        // re-typed without the hint below.
+                        let written_wildcard = match &fun_ty_for_pretype {
+                            Type::Method { paramss, .. } => paramss
+                                .first()
+                                .and_then(|ps| param_at(ps, ai))
+                                .is_some_and(type_has_wildcard),
+                            _ => false,
+                        };
+                        if type_has_wildcard(&chosen) && !written_wildcard {
+                            lenient = true;
                         }
+                        chosen
                     }
                     None => pt_arg,
                 };
