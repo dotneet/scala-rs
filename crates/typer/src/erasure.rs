@@ -1476,6 +1476,14 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 erase_tree(a, st, None);
             }
         }
+        // `x @ p`: the inner pattern's types have to be erased as well. Since
+        // a typed pattern binds at the scrutinee's intersection, `v @ (_: Int)`
+        // on a `T` leaves the inner `_` typed `Int with T`; unerased, the
+        // backend read that as a reference and stored the unboxed `int` into
+        // an `astore` slot (`VerifyError: Bad type on operand stack`).
+        TreeKind::Bind { body, .. } => {
+            erase_tree(body, st, None);
+        }
         TreeKind::This { .. } => {
             if let Some(cls) = value_class_of(&tree.ty, st) {
                 let orig = tree.ty.clone();

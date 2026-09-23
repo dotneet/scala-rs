@@ -43,6 +43,12 @@ object Main {
     case p @ Some(v @ (_: Int)) => s"some ${p.get} $v"
     case _ => "o"
   }
+  // A type test on a type-parameter scrutinee binds at `T with Int`, whose
+  // erasure is still `int`.
+  def generic[T](x: T): String = x match {
+    case i @ (_: Int) => "gen" + (i + 1)
+    case _ => "o"
+  }
   def tuple(x: Any): String = x match {
     case p @ (a, b) => s"${p._1} $a $b"
     case _ => "o"
@@ -69,6 +75,8 @@ object Main {
     println(extractor(Some(7)))
     println(extractor(Some("x")))
     println(extractor(null))
+    println(generic(41))
+    println(generic("x"))
     println(tuple((1, 2)))
     println(tuple(null))
     println(caught())
