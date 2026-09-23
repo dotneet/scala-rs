@@ -490,12 +490,20 @@ impl Typer {
     ) -> Option<(SymbolId, Type)> {
         let recv = self.st.dealias(recv);
         let cls = self.st.class_sym_of(&recv)?;
-        let cands: Vec<SymbolId> = self
+        self.ensure_java_loaded(cls, span);
+        let mut cands: Vec<SymbolId> = self
             .st
             .lookup_member(cls, name)
             .into_iter()
             .filter(|&m| matches!(self.st.get(m).kind, SymKind::Method | SymKind::Term))
             .collect();
+        if cands.is_empty() {
+            cands = self
+                .supply_from_pickle(&recv, name)
+                .into_iter()
+                .filter(|&m| matches!(self.st.get(m).kind, SymKind::Method | SymKind::Term))
+                .collect();
+        }
         for &c in &cands {
             self.complete_lazy_sig(c, span);
         }

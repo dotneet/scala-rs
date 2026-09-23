@@ -890,7 +890,9 @@ fn read_tmp_member(
     // Char)`'s `get` is the `char` in the local. (Erasure rewrites such reads
     // in source trees; this one never went through it.)
     let m = ctx.st.get(member);
-    if m.kind == SymKind::Term && ctx.st.is_value_class(m.owner) {
+    if ctx.st.is_value_class(m.owner)
+        && (m.kind == SymKind::Term || m.name == ctx.st.value_class_getter(m.owner))
+    {
         load(asm, tmp.slot, tmp.sort);
         return;
     }

@@ -12,6 +12,7 @@ object Main {
     println(NsEmpty())
     println(NsEmpty.apply())
     println(NsEmpty().copy())
+    println(NsTaggedFactory.make[String]())
     val t: NsTicker = NsKeys
     println(t.tick())
   }

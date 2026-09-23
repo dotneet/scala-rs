@@ -2,6 +2,11 @@
 // `pp_ours.scala`: a `MethodType` over an empty list has to arrive as one.
 case class NsEmpty()
 
+object NsTaggedFactory {
+  def make[T: scala.reflect.ClassTag](): String =
+    implicitly[scala.reflect.ClassTag[T]].runtimeClass.getSimpleName
+}
+
 trait NsTicker {
   def tick(): Int
   def label: String

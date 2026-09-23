@@ -5946,13 +5946,11 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
         // shape: Shape[FlatShapeLevel, M, _, P2], ol: OptionLift[P2, O]): P`
         // is the shape: `P2` is whatever the `Shape` found for `M` packs to.
         // A clause that is never filled is `reject_unapplied_implicit_clause`'s
-        // missing implicit, not an eta-expansion.
-        if named_by_an_implicit
-            && shape
-                .clauses
-                .iter()
-                .any(|c| !c.implicit && !c.params.is_empty())
-        {
+        // missing implicit, not an eta-expansion. The explicit clause may be
+        // empty: `def make[T: ClassTag]()` still has the application `()`
+        // before its synthesized implicit clause, and that application is the
+        // source-level boundary the classfile fallback cannot preserve.
+        if named_by_an_implicit && shape.clauses.iter().any(|c| !c.implicit) {
             keep(&mut kept);
             continue;
         }

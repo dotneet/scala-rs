@@ -72,6 +72,21 @@ fn run_java(out: &Path, jar: &Path) -> String {
     String::from_utf8_lossy(&o.stdout).to_string()
 }
 
+fn run_java_with_library(out: &Path, library: &Path, jar: &Path) -> String {
+    let cp = format!("{}:{}:{}", out.display(), library.display(), jar.display());
+    let o = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("run java");
+    assert!(
+        o.status.success(),
+        "java Main failed:\n{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8_lossy(&o.stdout).to_string()
+}
+
 /// Compile `name` with scalac (when `scalac_path` is given) or scala-rs.
 fn compile(name: &str, scalac_path: Option<&Path>, jar: &Path, out: &Path) -> Output {
     let src = fixtures_dir().join(format!("{name}.scala"));
@@ -165,6 +180,83 @@ fn scalac_agrees_lsurf_extract() {
     if let Some(sc) = scalac() {
         check_runs("lsurf_extract", Some(&sc));
     }
+}
+
+#[test]
+fn binary_value_class_extractor_runs() {
+    let (Some(sc), Some(scala_jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip: scalac or scala-library jar not present");
+        return;
+    };
+    let dir = tmp_dir("binary_extract");
+    let library_classes = dir.join("library-classes");
+    let library_jar = dir.join("binary-extractor.jar");
+    let reference = dir.join("reference");
+    let ours = dir.join("ours");
+    for path in [&library_classes, &reference, &ours] {
+        fs::create_dir_all(path).unwrap();
+    }
+
+    let producer = fixtures_dir().join("lsurf_binary_extract_lib.scala");
+    let consumer = fixtures_dir().join("lsurf_binary_extract.scala");
+    let status = Command::new(&sc)
+        .args(["-d", library_classes.to_str().unwrap()])
+        .arg(&producer)
+        .status()
+        .expect("compile binary extractor producer with scalac");
+    assert!(
+        status.success(),
+        "scalac failed on binary extractor producer"
+    );
+    let status = Command::new("jar")
+        .current_dir(&library_classes)
+        .args(["cf", library_jar.to_str().unwrap(), "."])
+        .status()
+        .expect("package binary extractor producer");
+    assert!(status.success(), "jar failed on binary extractor producer");
+
+    let status = Command::new(&sc)
+        .args([
+            "-classpath",
+            library_jar.to_str().unwrap(),
+            "-d",
+            reference.to_str().unwrap(),
+        ])
+        .arg(&consumer)
+        .status()
+        .expect("compile binary extractor consumer with scalac");
+    assert!(
+        status.success(),
+        "scalac failed on binary extractor consumer"
+    );
+    let expected = run_java_with_library(&reference, &library_jar, &scala_jar);
+
+    let output = Command::new(bin())
+        .arg("compile")
+        .arg(&consumer)
+        .args(["-d", ours.to_str().unwrap()])
+        .args(["-cp", library_jar.to_str().unwrap()])
+        .args(["--scala-library", scala_jar.to_str().unwrap()])
+        .output()
+        .expect("compile binary extractor consumer with scala-rs");
+    assert!(
+        output.status.success(),
+        "scala-rs failed on binary extractor consumer:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual = run_java_with_library(&ours, &library_jar, &scala_jar);
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual,
+        fs::read_to_string(
+            fixtures_dir()
+                .join("expected")
+                .join("lsurf_binary_extract.txt")
+        )
+        .unwrap()
+    );
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

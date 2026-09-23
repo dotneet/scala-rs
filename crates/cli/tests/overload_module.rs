@@ -106,3 +106,61 @@ fn overload_module_matches_scalac() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn bounded_by_name_candidate_is_pruned_before_specificity() {
+    let root = std::env::temp_dir().join(format!(
+        "scala-rs-overload-bound-prunes-{}-{}",
+        std::process::id(),
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let source = fixtures.join("overload_module_bound_prunes.scala");
+    let expected = fs::read(
+        fixtures
+            .join("expected")
+            .join("overload_module_bound_prunes.txt"),
+    )
+    .unwrap();
+    let jar = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
+
+    for ours in [false, true] {
+        let out = root.join(format!("{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let mut cmd = if ours {
+            let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
+            c.args(["compile", "--scala-library", jar]);
+            c
+        } else {
+            Command::new("/tmp/scala-2.13.16/bin/scalac")
+        };
+        let result = cmd.arg(&source).arg("-d").arg(&out).output().unwrap();
+        assert!(
+            result.status.success(),
+            "ours={ours}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{}:{jar}", out.display()),
+                "Main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "ours={ours}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, expected, "ours={ours}");
+    }
+    fs::remove_dir_all(root).unwrap();
+}

@@ -2412,6 +2412,12 @@ impl Typer {
             } else {
                 inst
             };
+            if inst
+                .iter()
+                .any(|(tp, solution)| !self.undet_solution_in_bounds(*tp, solution))
+            {
+                return false;
+            }
             if inst.is_empty() {
                 params
             } else {
