@@ -161,8 +161,9 @@ pub(crate) struct ImplicitMemo {
 /// substitution over the candidate's whole signature, a third of a gitbucket
 /// build. [`ImplicitMemo`] keeps them only for one search.
 ///
-/// An answer is a function of the candidate, the type, the prefix and
-/// `this_class`, read against the symbol graph, so an entry lives while
+/// An answer is a function of the candidate, the type and the prefix, read
+/// against the symbol graph (none of it reads `this_class`, so a view is
+/// shared by every class that imports the same prefix), and an entry lives while
 /// neither [`SymbolTable::mutation_gen`] nor the number of abstract
 /// projections has moved: `abs_projection_of` is the one side table the
 /// substitution reads, and entering a projection mutates no existing symbol.
@@ -190,7 +191,6 @@ pub(crate) enum SeenKind {
 struct SeenEntry {
     kind: SeenKind,
     id: SymbolId,
-    this_class: SymbolId,
     prefix: Type,
     /// The type that was read, when it is not `id`'s own declared type.
     ty: Option<Type>,
@@ -1195,7 +1195,7 @@ impl Typer {
         if owner.is_none() || !self.st.get(owner).is_class_like() {
             return None;
         }
-        let prefix = self.term_import_prefix_for(owner).map(|q| q.ty)?;
+        let prefix = self.term_import_prefix_ty(owner)?;
         if prefix.is_no_type() || prefix.is_error() {
             return None;
         }
@@ -1219,14 +1219,12 @@ impl Typer {
             return std::rc::Rc::new(compute());
         }
         let epoch = (self.st.mutation_gen.get(), self.st.abs_projection_of.len());
-        let this_class = self.st.this_class;
         let declared = declared.map(|d| (d, &self.st.get(d).ty));
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = rustc_hash::FxHasher::default();
             kind.hash(&mut h);
             id.0.hash(&mut h);
-            this_class.0.hash(&mut h);
             hash_type(prefix, &mut h);
             match declared {
                 Some((d, _)) => d.0.hash(&mut h),
@@ -1246,7 +1244,6 @@ impl Typer {
                     bucket.iter().find(|e| {
                         e.kind == kind
                             && e.id == id
-                            && e.this_class == this_class
                             && same_ty(e)
                             && e.prefix == *prefix
                     })
@@ -1278,7 +1275,6 @@ impl Typer {
         cache.map.entry(key).or_default().push(SeenEntry {
             kind,
             id,
-            this_class,
             prefix: prefix.clone(),
             ty: declared.is_none().then(|| ty.clone()),
             seen: seen.clone(),
@@ -3029,6 +3025,7 @@ impl Typer {
         ids.extend(self.companion_implicits(to));
         ids.sort_by_key(|id| id.0);
         ids.dedup();
+        let mut idle: Vec<(Vec<Type>, u64)> = Vec::new();
         for id in ids {
             if self.first_clause_is_implicit(id) {
                 continue;
@@ -3051,8 +3048,21 @@ impl Typer {
             for want in &wanted {
                 self.warm_implicit_scope(want);
             }
-            if !wanted.is_empty() {
-                self.warm_implicit_candidates(&wanted);
+            if wanted.is_empty() {
+                continue;
+            }
+            // Many conversions in scope want the same witnesses (every cats
+            // syntax conversion over `F[_]` wants a type class of `F`), and
+            // a warm pass over all of them is a walk over every candidate in
+            // scope. One that changed no symbol, asked again of the same
+            // symbols from the same scope, can only change nothing again.
+            let gen = self.st.mutation_gen.get();
+            if idle.iter().any(|(w, g)| *g == gen && *w == wanted) {
+                continue;
+            }
+            self.warm_implicit_candidates(&wanted);
+            if self.st.mutation_gen.get() == gen {
+                idle.push((wanted, gen));
             }
         }
     }
@@ -3714,7 +3724,7 @@ impl Typer {
             let mut hits = Vec::new();
             for id in ids {
                 let owner = self.st.get(id).owner;
-                if let Some(prefix) = self.term_import_prefix_for(owner).map(|q| q.ty) {
+                if let Some(prefix) = self.term_import_prefix_ty(owner) {
                     let ty = self.st.get(id).ty.clone();
                     self.warm_receiver_type_members(&prefix, &ty);
                 }

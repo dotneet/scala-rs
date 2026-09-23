@@ -3380,7 +3380,10 @@ impl SymbolTable {
     ) -> std::borrow::Cow<'t, Type> {
         let tps = &self.get(owner).tparams;
         let out = subst_tparams_cow(tps, args, ty);
-        if self.abs_projection_of.is_empty() {
+        // `subst_projections` answers a copy of its input when nothing in it
+        // is a projection, and comparing that copy with the input cost a
+        // clone and a deep comparison on every parent of every subtype walk.
+        if self.abs_projection_of.is_empty() || !self.mentions_abs_projection(&out) {
             return out;
         }
         match self.subst_projections(tps, args, &out) {
@@ -3609,6 +3612,27 @@ impl SymbolTable {
     }
 
     /// Does `ty` mention an abstract projection anywhere?
+    /// [`Self::mentions_path_member`] and [`Self::mentions_abs_projection`]
+    /// in one walk.
+    fn mentions_path_members_or_projections(&self, ty: &Type) -> (bool, bool) {
+        let (want_paths, want_projections) = (
+            !self.path_member_decl.is_empty(),
+            !self.abs_projection_of.is_empty(),
+        );
+        if !want_paths && !want_projections {
+            return (false, false);
+        }
+        let (mut paths, mut projections) = (false, false);
+        any_type(ty, &mut |t| {
+            if let Type::TypeMember(id) = t {
+                paths |= want_paths && self.path_member_decl.contains_key(id);
+                projections |= want_projections && self.abs_projection_of.contains_key(id);
+            }
+            paths == want_paths && projections == want_projections
+        });
+        (paths, projections)
+    }
+
     pub fn mentions_abs_projection(&self, ty: &Type) -> bool {
         if self.abs_projection_of.is_empty() {
             return false;
@@ -5807,22 +5831,22 @@ impl SymbolTable {
         /// than this many nested joins is the pathological case, not a real
         /// answer anybody reads.
         const MAX_LUB_DEPTH: u32 = 6;
-        let a = a.widen_constant();
-        let b = b.widen_constant();
+        let (a_widened, b_widened) = (a.widen_constant_cow(), b.widen_constant_cow());
+        let (a, b): (&Type, &Type) = (&a_widened, &b_widened);
         if a == b {
-            return a;
+            return a.clone();
         }
         if a.is_error() || a.is_no_type() || matches!(a, Type::Nothing) {
-            return b;
+            return b.clone();
         }
         if b.is_error() || b.is_no_type() || matches!(b, Type::Nothing) {
-            return a;
+            return a.clone();
         }
         if self.is_sub_type(&a, &b) {
-            return b;
+            return b.clone();
         }
         if self.is_sub_type(&b, &a) {
-            return a;
+            return a.clone();
         }
         // A previous invariant join may already have introduced an
         // existential argument. Join its upper bound with the next branch,
@@ -6506,8 +6530,13 @@ impl SymbolTable {
         // and refusing it would invent errors nsc does not have. Two members
         // that *both* carry a path are deliberately left to the arms below --
         // `p.T` and `q.T` are different types, which is the whole point.
+        // Both questions below are one walk per side: they were four walks of
+        // both types at every level of every subtype check, a tenth of a
+        // slick build between them.
+        let (paths_a, projections_a) = self.mentions_path_members_or_projections(a);
+        let (paths_b, projections_b) = self.mentions_path_members_or_projections(b);
         if !self.path_member_decl.is_empty() {
-            let (pa, pb) = (self.mentions_path_member(a), self.mentions_path_member(b));
+            let (pa, pb) = (paths_a, paths_b);
             if pa != pb {
                 return if pa {
                     self.is_sub_type(&self.drop_path_members(a), b)
@@ -6525,10 +6554,7 @@ impl SymbolTable {
         // projections through *different* prefixes are left to the arms
         // below and stay distinct, which is what makes the reduction sound.
         if !self.abs_projection_of.is_empty() {
-            let (pa, pb) = (
-                self.mentions_abs_projection(a),
-                self.mentions_abs_projection(b),
-            );
+            let (pa, pb) = (projections_a, projections_b);
             if pa != pb {
                 return if pa {
                     self.is_sub_type(&self.drop_abs_projections(a), b)

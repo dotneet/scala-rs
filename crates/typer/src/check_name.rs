@@ -627,27 +627,43 @@ impl Typer {
     }
 
     pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<Tree> {
+        self.term_import_prefix_with(owner, |q| q.cloned())
+    }
+
+    /// The type of [`Self::term_import_prefix_for`]'s tree, which is all the
+    /// implicit search reads of it. Cloning the whole qualifier tree to take
+    /// its type was most of this lookup's cost there.
+    pub(crate) fn term_import_prefix_ty(&self, owner: SymbolId) -> Option<Type> {
+        self.term_import_prefix_with(owner, |q| q.map(|q| q.ty.clone()))
+    }
+
+    fn term_import_prefix_with<R>(
+        &self,
+        owner: SymbolId,
+        read: impl FnOnce(Option<&Tree>) -> R,
+    ) -> R {
         if owner.is_none() || self.term_import_prefixes.is_empty() {
-            return None;
+            return read(None);
         }
         if self.st.has_ambient_type_context() {
-            return self.term_import_prefix_uncached(owner);
+            return read(self.term_import_prefix_uncached(owner).as_ref());
         }
         let active = {
             let memo = self.import_prefix_memo.borrow();
             if let Some(hit) = memo.entries.get(&owner) {
-                return hit.clone();
+                return read(hit.as_ref());
             }
             memo.depth != 0
         };
         let result = self.term_import_prefix_uncached(owner);
+        let out = read(result.as_ref());
         if active {
             self.import_prefix_memo
                 .borrow_mut()
                 .entries
-                .insert(owner, result.clone());
+                .insert(owner, result);
         }
-        result
+        out
     }
 
     fn term_import_prefix_uncached(&self, owner: SymbolId) -> Option<Tree> {

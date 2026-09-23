@@ -321,6 +321,14 @@ impl Type {
             t => t.clone(),
         }
     }
+
+    /// [`Type::widen_constant`], borrowing everything that is not a constant.
+    pub fn widen_constant_cow(&self) -> std::borrow::Cow<'_, Type> {
+        match self {
+            Type::Constant(lit) => std::borrow::Cow::Owned(Type::lit_underlying(lit)),
+            t => std::borrow::Cow::Borrowed(t),
+        }
+    }
 }
 
 impl fmt::Display for Type {
