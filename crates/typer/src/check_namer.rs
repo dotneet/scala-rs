@@ -9,7 +9,7 @@
 //! parents far enough that member signatures have somewhere to look.
 
 use crate::check::*;
-use crate::symbol::SymKind;
+use crate::symbol::{BindRank, SymKind};
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
@@ -1730,7 +1730,17 @@ impl Typer {
                         if n.ends_with('$') {
                             continue;
                         }
-                        self.st.enter_in_current(&n, m);
+                        // The header pass must use the same package-member
+                        // precedence as the signature and body passes. An
+                        // import in this unit outranks a definition from a
+                        // different unit, including when a later signature
+                        // is first resolved while checking class headers.
+                        let rank = if self.unit_defines(tree.sym, &n) {
+                            BindRank::Definition
+                        } else {
+                            BindRank::PackageElsewhere
+                        };
+                        self.st.enter_in_current_ranked(&n, m, rank);
                     }
                 }
                 let mut changed = false;

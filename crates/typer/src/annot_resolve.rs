@@ -30,7 +30,7 @@ impl Typer {
     /// Resolve the annotations written on `tree` (a definition) and on its
     /// parameters and type parameters.
     pub(crate) fn resolve_annotation_types(&mut self, tree: &Tree) {
-        if !self.library_abi || self.sigs_only {
+        if self.sigs_only {
             return;
         }
         let mut annots: Vec<(SymbolId, usize, Tree)> = Vec::new();
@@ -133,12 +133,23 @@ impl Typer {
             TreeKind::Ident { .. } | TreeKind::Select { .. } => fun.clone(),
             _ => return None,
         };
-        let ty = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
-        if ty.is_error() {
+        // Even in private-runtime mode, a source annotation may name a class
+        // imported from the user's binary dependencies. Resolve it without
+        // strict diagnostics there: the private runtime intentionally omits
+        // many standard annotation classes, so an unresolved name must not
+        // turn into a new source error just to improve the pickle.
+        let ty = if self.library_abi {
+            self.with_strict_sig_names(|s| s.tree_to_type(&tpt))
+        } else {
+            self.tree_to_type(&tpt)
+        };
+        if ty.is_error() || (!self.library_abi && !is_annotation_class_type(&ty)) {
             return None;
         }
-        for arg in args {
-            self.resolve_classof_types(arg);
+        if self.library_abi {
+            for arg in args {
+                self.resolve_classof_types(arg);
+            }
         }
         Some(ty)
     }
@@ -161,5 +172,13 @@ impl Typer {
         for k in &kids {
             self.resolve_classof_types(k);
         }
+    }
+}
+
+fn is_annotation_class_type(ty: &Type) -> bool {
+    match ty {
+        Type::Class { .. } => true,
+        Type::Applied { ctor, .. } => matches!(ctor.as_ref(), Type::Class { .. }),
+        _ => false,
     }
 }
