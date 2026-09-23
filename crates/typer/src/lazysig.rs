@@ -475,9 +475,8 @@ impl Typer {
 
         match block_tail {
             Some(tail) => {
-                self.st
-                    .scopes
-                    .truncate(p.block_depth.unwrap_or(self.st.scopes.len()));
+                let depth = p.block_depth.unwrap_or(self.st.scopes.len());
+                self.st.scopes.truncate(depth);
                 self.st.scopes.extend(tail);
             }
             None => self.swap_back_scopes(saved_scopes),
@@ -817,13 +816,14 @@ impl Typer {
                 }
             }
         }
-        self.st.scopes = stack;
-        saved
+        self.st.scopes = stack.into();
+        std::mem::take(&mut *saved)
     }
 
     pub(crate) fn swap_back_scopes(&mut self, saved: Vec<Scope>) {
         let mut cur = std::mem::take(&mut self.st.scopes);
-        cur.truncate(self.lazy_base_scopes.min(cur.len()));
+        let keep = self.lazy_base_scopes.min(cur.len());
+        cur.truncate(keep);
         cur.extend(saved);
         self.st.scopes = cur;
     }

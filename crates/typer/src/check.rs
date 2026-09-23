@@ -857,6 +857,8 @@ pub struct Typer {
     /// Candidate types as seen from a prefix; see [`crate::implicits::SeenCache`].
     pub(crate) seen_cache: std::cell::RefCell<crate::implicits::SeenCache>,
     pub(crate) implicit_class_parts: std::cell::RefCell<crate::implicits::ImplicitClassParts>,
+    /// The implicits in scope per context; see [`crate::implicits::InScopeCache`].
+    pub(crate) in_scope_cache: std::cell::RefCell<crate::implicits::InScopeCache>,
     /// The companion object an implicit was reached *through*, for the ones a
     /// companion only inherits (`object Shape extends RepShapeImplicits`).
     /// Emitting a bare name for those loads `this` and casts it to the trait
@@ -1313,6 +1315,7 @@ impl Typer {
             implicit_memo: std::cell::RefCell::new(Default::default()),
             seen_cache: std::cell::RefCell::new(Default::default()),
             implicit_class_parts: std::cell::RefCell::new(Default::default()),
+            in_scope_cache: std::cell::RefCell::new(Default::default()),
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
             implicit_macros_disabled: false,
             implicit_search_depth: 0,

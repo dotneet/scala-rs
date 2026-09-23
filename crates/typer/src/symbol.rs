@@ -820,6 +820,70 @@ pub struct Binding {
     pub origin: u64,
 }
 
+/// The scope stack, stamped with a version that changes whenever it is
+/// handed out for writing.
+///
+/// Answers computed from the scopes -- the implicits in scope, above all,
+/// which nsc caches per context -- are kept against the version. Every write
+/// goes through `DerefMut`, including the thirty-odd places that reach into
+/// the stack directly, so none can be missed. A stack saved and put back
+/// unchanged keeps its version, which is right: its contents are those the
+/// version was stamped on. Versions come from one counter, so two stacks
+/// only share one when one is an unmodified copy of the other.
+#[derive(Clone, Debug)]
+pub struct Scopes {
+    list: Vec<Scope>,
+    version: u64,
+}
+
+fn next_scope_version() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Scopes {
+    pub fn new(list: Vec<Scope>) -> Scopes {
+        Scopes {
+            list,
+            version: next_scope_version(),
+        }
+    }
+
+    /// Changes whenever the stack or any scope in it may have changed.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl Default for Scopes {
+    fn default() -> Scopes {
+        Scopes::new(Vec::new())
+    }
+}
+
+impl From<Vec<Scope>> for Scopes {
+    fn from(list: Vec<Scope>) -> Scopes {
+        Scopes::new(list)
+    }
+}
+
+impl std::ops::Deref for Scopes {
+    type Target = Vec<Scope>;
+    #[inline]
+    fn deref(&self) -> &Vec<Scope> {
+        &self.list
+    }
+}
+
+impl std::ops::DerefMut for Scopes {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Vec<Scope> {
+        self.version = next_scope_version();
+        &mut self.list
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     /// Template whose members and body imports this scope exposes.
@@ -1046,7 +1110,7 @@ pub struct SymbolTable {
     /// nothing installs a member on the strength of it.
     pub sam_known_overrides: rustc_hash::FxHashMap<u32, Vec<String>>,
     pub symbols: Vec<Symbol>,
-    pub scopes: Vec<Scope>,
+    pub scopes: Scopes,
     pub root: SymbolId,
     pub scala_pkg: SymbolId,
     pub predef: SymbolId,
@@ -1548,7 +1612,7 @@ impl SymbolTable {
                 unspecialized: false,
                 local_scope: None,
             }],
-            scopes: vec![Scope::default()],
+            scopes: Scopes::new(vec![Scope::default()]),
             root: SymbolId(0),
             scala_pkg: SymbolId(0),
             predef: SymbolId(0),
@@ -9617,5 +9681,31 @@ mod reach_cache_tests {
                 args: vec![Type::Int, Type::String].into(),
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod scope_version_tests {
+    use super::*;
+
+    /// Anything computed from the scopes is kept against their version, so
+    /// every write has to move it -- including a write through a reference
+    /// taken from the stack -- and an unmodified copy has to keep it.
+    #[test]
+    fn every_write_moves_the_scope_version() {
+        let mut st = SymbolTable::new();
+        let x = st.alloc("x", st.root, SymKind::Term, Flags::IMPLICIT, "");
+        let before = st.scopes.version();
+        let saved = st.scopes.clone();
+        assert_eq!(saved.version(), before);
+        let _ = st.scopes.len();
+        assert_eq!(st.scopes.version(), before);
+        st.enter_in_current("x", x);
+        let entered = st.scopes.version();
+        assert_ne!(entered, before);
+        st.scopes.last_mut().unwrap().enter("y", x);
+        assert_ne!(st.scopes.version(), entered);
+        st.scopes = saved;
+        assert_eq!(st.scopes.version(), before);
     }
 }

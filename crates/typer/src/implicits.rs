@@ -153,6 +153,26 @@ pub(crate) struct ImplicitMemo {
     candidate_tys: rustc_hash::FxHashMap<u32, Option<std::rc::Rc<Type>>>,
 }
 
+/// [`Typer::implicits_in_scope`] across searches: nsc's per-context
+/// `Context.implicitss`.
+///
+/// The walk covers every enclosing scope, `this`'s whole ancestry and the
+/// package object, then shadows inherited members by their types as seen
+/// from `this` -- about a sixth of a gitbucket build, answered afresh by every
+/// search that started outside another. It is a function of the scope stack
+/// ([`crate::symbol::Scopes::version`]), `this_class`, the class `this`
+/// means there, whether a super-constructor call is being typed, and the
+/// symbol graph, so an entry lives while neither
+/// [`SymbolTable::mutation_gen`] nor the number of symbols moves (a member is
+/// entered into its owner without handing the owner out for mutation). Under
+/// an ambient expansion guard the walk can see a truncated alias and is not
+/// kept.
+#[derive(Default)]
+pub(crate) struct InScopeCache {
+    epoch: (u64, usize),
+    map: rustc_hash::FxHashMap<(u64, SymbolId, SymbolId, bool), std::rc::Rc<Vec<SymbolId>>>,
+}
+
 /// Types of implicit candidates as seen from a prefix, kept across searches:
 /// [`Typer::at_import_prefix_of`]'s view through an `import <value>._`, and
 /// [`Typer::shadow_inherited_implicits`]'s view from `this`.
@@ -563,13 +583,45 @@ impl Typer {
         match cached {
             Some(Some(hit)) => return hit.as_ref().clone(),
             Some(None) => {
-                let out = self.implicits_in_scope_uncached();
-                self.implicit_memo.borrow_mut().in_scope = Some(std::rc::Rc::new(out.clone()));
-                return out;
+                let out = self.implicits_in_scope_cached();
+                self.implicit_memo.borrow_mut().in_scope = Some(out.clone());
+                return out.as_ref().clone();
             }
             None => {}
         }
-        self.implicits_in_scope_uncached()
+        self.implicits_in_scope_cached().as_ref().clone()
+    }
+
+    /// [`Self::implicits_in_scope_uncached`] through [`InScopeCache`].
+    fn implicits_in_scope_cached(&self) -> std::rc::Rc<Vec<SymbolId>> {
+        if self.st.has_ambient_type_context() {
+            return std::rc::Rc::new(self.implicits_in_scope_uncached());
+        }
+        let epoch = (self.st.mutation_gen.get(), self.st.symbols.len());
+        let key = (
+            self.st.scopes.version(),
+            self.st.this_class,
+            self.this_owner(None),
+            self.parent_ctor_scope,
+        );
+        {
+            let cache = self.in_scope_cache.borrow();
+            if cache.epoch == epoch {
+                if let Some(hit) = cache.map.get(&key) {
+                    return hit.clone();
+                }
+            }
+        }
+        let out = std::rc::Rc::new(self.implicits_in_scope_uncached());
+        if (self.st.mutation_gen.get(), self.st.symbols.len()) == epoch {
+            let mut cache = self.in_scope_cache.borrow_mut();
+            if cache.epoch != epoch {
+                cache.epoch = epoch;
+                cache.map.clear();
+            }
+            cache.map.insert(key, out.clone());
+        }
+        out
     }
 
     fn implicits_in_scope_uncached(&self) -> Vec<SymbolId> {
@@ -797,7 +849,7 @@ impl Typer {
             let declared = &self.st.get(id).ty;
             let ty = self.seen_cached(SeenKind::ValueFromThis, id, Some(id), &receiver, declared, || {
                 match self.st.subst_as_seen_from(&receiver, declared) {
-                    Type::Method { paramss, ret } if paramss.is_empty() => <scala_rs_parser::Type as Clone>::clone(&*ret),
+                    Type::Method { paramss, ret } if paramss.is_empty() => ret.into_inner(),
                     other => other,
                 }
             });
