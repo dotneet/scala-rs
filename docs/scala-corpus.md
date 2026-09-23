@@ -1,50 +1,11 @@
 # scala/scala's own test corpus
 
-## Why `pos` does not pass `-no-specialization`
-
-*Superseded in part: `@specialized` is now accepted and recorded rather than
-rejected (stage 1 of [`docs/specialization.md`](specialization.md)), so the
-parse error this section is about no longer happens. The reasoning is kept
-because it is why the corpus still does not pass the flag, and because the
-numbers below are what the "before" side of that change was measured against.*
-
-70 of `pos`'s 534 failures were `unimplemented syntax: annotation specialized`,
-and `-no-specialization` would have turned all of them green. The corpus does
-not pass it, on purpose.
-
-`-no-specialization` is nsc's own flag, and it means *ignore the annotation* —
-not *implement specialization*. nsc implements it: `@specialized` there means
-`Foo$mcI$sp` classes get emitted and the ABI changes. Passing the flag here
-would count "we ignored what the test was testing" as a pass.
-
-`tests/cats_measure.sh` and `tests/scalalib_measure.sh` do pass it, and that was
-also on purpose: those two ask "where is type checking", a single parse error
-aborted the whole run, and both codebases annotate everywhere. Without the flag
-cats reported 71 errors and the library 84 — numbers that mean "nothing was
-typechecked", not "almost nothing is wrong". The flag bought a meaningful
-type-checking number at the cost of an ABI that differs from nsc's, which is
-the right trade for a progress measure and the wrong one for a conformance
-score.
-
-**That cost is no longer being paid for anything.** With the annotation
-accepted, both codebases report the same number with the flag and without it
-(cats 907, `src/library` 1644), because the flag's only remaining effect is to
-drop an annotation nothing acts on. See the stage-1 section of
-`docs/specialization.md`; the two scripts still pass it, but no longer need to.
-
-What stays true is the part about the corpus: accepting the annotation is not
-implementing the phase. `tests/spec_classfiles.sh` is the ledger that says how
-far short we are — scalac emits 700 `$sp` classes over `pos/spec-*` where we
-emit none.
-
 Where this compiler stands on the tests scalac is developed against:
 `test/files/{pos,neg,run}` from [scala/scala](https://github.com/scala/scala).
-This is a survey, not a campaign. `tests/conform/` is 86 differential probes we
-wrote by hand; this is 5324 programs somebody else wrote, with expected output,
-and it costs nothing to keep re-running.
-
-scala-rs implements a subset, so most of the corpus is expected to fail. The
-number is the product.
+`tests/conform/` holds differential probes we wrote by hand; this is 5324
+programs somebody else wrote, with expected output, and it costs nothing to
+keep re-running. scala-rs implements a subset, so much of the corpus is
+expected to fail; the number is the product.
 
 ## The material
 
@@ -75,7 +36,7 @@ output normalisation, no `.javaopts`, and no separate-JVM handling. The `neg`
 `.check` files *are* compared, but by message head rather than by full text —
 see [`neg`, against the `.check` text](#neg-against-the-check-text).
 
-## Two things the corpus is not, contrary to what we assumed
+## Two things the corpus is not
 
 * **There is not one `.flags` file left in 2.13.16** (nor a `.javaopts`). Per-test
   compiler options moved into the source as a scala-cli style header:
@@ -85,8 +46,8 @@ see [`neg`, against the `.check` text](#neg-against-the-check-text).
   ```
 
   926 sources carry one (291 under `pos`, 459 under `neg`, 176 under `run`).
-  Five stragglers
-  still use the intermediate `//scalac: ...` spelling. The runner parses both.
+  Five stragglers still use the intermediate `//scalac: ...` spelling. The
+  runner parses both.
 
 * **477 of the sources are `.java`.** A test unit with a Java source next to it
   needs javac and a mixed compilation round; those are skipped, not failed.
@@ -101,10 +62,9 @@ see [`neg`, against the `.check` text](#neg-against-the-check-text).
 
 The `neg` rule in that table is an **upper bound**, and it is the number the
 pass/fail column of the log still carries. A `neg` pass under it can be for the
-wrong reason — a parse error where scalac reports a type error counts. Since
-2026-09-05 the log also carries both sides' diagnostics and the report scores
-the wording on top; the two numbers are printed side by side and neither
-replaces the other. See [`neg`, against the `.check` text](#neg-against-the-check-text).
+wrong reason — a parse error where scalac reports a type error counts. The log
+also carries both sides' diagnostics, and the report scores the wording on top;
+see [`neg`, against the `.check` text](#neg-against-the-check-text).
 
 `errors=0` is not enough for `pos`: a compiler that fell over quietly also
 reports no errors. The classfile count is the same second reading the
@@ -117,15 +77,60 @@ from the denominator.
 
 | reason | meaning |
 |---|---|
-| `unsupported-flag <opt>` | the `//> using options` header asks for a flag we do not implement. `-Werror`, `-Xlint:*`, `-opt:*`, `-Xplugin:*`, `-Ystop-after:*` all change what scalac accepts or reports, so the test is not a fair question. `-Xsource:3`, `-Xfatal-warnings`, `-language:*`, `-Xsource-features:*`, `-Xasync` are passed through; `-deprecation`, `-unchecked`, `-feature`, `-nowarn`, `-explaintypes` are dropped as harmless |
+| `unsupported-flag <opt>` | the options header asks for a flag we do not implement (`-Xlint:*`, `-opt:*`, `-Xplugin:*`, `-Ystop-after:*`, …), which changes what scalac accepts or reports. `-Xsource:3`, `-Xsource:3-cross`, `-Xfatal-warnings`, `-Xasync`, `-language:*`, `-Xsource-features:*`, `-deprecation`, `-feature`, `-nowarn` and `-unchecked` are passed through (`-Werror` as `-Xfatal-warnings`); `-usejavacp` and `-explaintypes` are dropped |
 | `java-sources` | a `.java` file belongs to the test |
 | `needs-partest-or-junit` | the source imports `scala.tools.partest`, `scala.tools.nsc` or `org.junit` — it drives the compiler or a test framework we do not ship |
 | `crash` | scala-rs panicked, overflowed its stack, or exited with something other than 0/1 |
-| `timeout` / `run-timeout` | 40 s to compile, 20 s to run |
+| `timeout` / `run-timeout` | `CORPUS_TIMEOUT` (40 s) to compile, `CORPUS_RUN_TIMEOUT` (20 s) to run |
 | `no-scala-sources` | a `.script` or `.pastie` unit |
 
 A `crash` is a skip so that it does not silently inflate a `neg` pass rate, but
-it is a defect: see the counts below.
+it is a defect.
+
+## Why `pos` does not pass `-no-specialization`
+
+`-no-specialization` is nsc's own flag, and it means *ignore the annotation* —
+not *implement specialization*. nsc implements it: `@specialized` there means
+`Foo$mcI$sp` classes get emitted and the ABI changes. Passing the flag to the
+corpus would count "we ignored what the test was testing" as a pass, so the
+corpus does not pass it.
+
+`tests/cats_measure.sh` and `tests/scalalib_measure.sh` do pass it, because
+they ask "where is type checking" rather than "is the ABI nsc's". The
+annotation is now accepted and recorded
+([specialization.md](specialization.md)), and when last compared the flag no
+longer changed their error counts. Accepting the annotation is not
+implementing the phase, though: `tests/spec_classfiles.sh` is the ledger that
+compares the `$sp` classes scalac emits for `pos/spec-*` with ours.
+
+## `neg`, against the `.check` text
+
+The `.check` files say what scalac reports, down to the line and column. Full
+text cannot be compared usefully:
+
+* scalac splits a message over several lines — `type mismatch;` carries its
+  `found`/`required` on continuation lines — while we print one line per
+  diagnostic;
+* the two type printers disagree on constants (`found : String("Hello")`
+  against `found: "Hello"`), which measures the printer, not the type checker;
+* the caret line and the column differ almost everywhere.
+
+What *is* comparable is the **head** of the message: everything before the
+first `;` and before the end of the first sentence, case- and whitespace-folded.
+`tests/scala_corpus_report.sh` scores three tiers on it, each strictly inside
+the previous one:
+
+| | |
+|---|---|
+| **T1** | every diagnostic the `.check` expects has a match, as a multiset (four expected copies need four of ours), ignoring where it was reported |
+| **T2** | … and each match is at the file and line scalac reports it at |
+| **T3** | … and we emit nothing beyond the expected count |
+
+Warning lines in a `.check` are used only when it holds no error line at all —
+that is the shape of a test that fails because a warning was promoted. A head
+match is not proof that the two compilers rejected for the same reason (two
+different `type mismatch`es at the same line score as agreement), so T2 is a
+much tighter bound than "any error", not an exact one.
 
 ## Running it
 
@@ -135,16 +140,14 @@ CORPUS_LOG=$MYDIR/corpus.tsv tests/scala_corpus.sh
 
 Default is a **sample**: 250 tests per category, spaced evenly over the
 alphabetical order so the same tests come back every run and two measurements
-are comparable. Under a minute (42 s at `CORPUS_JOBS=6`), and close enough to
-be useful — the same tree that scores 63.9 / 61.4 / 28.7 on the whole corpus
-scores 65.5 / 56.7 / 28.2 on the sample. The whole corpus is
+are comparable. The whole corpus is
 
 ```
 CORPUS_LOG=$MYDIR/corpus.tsv CORPUS_SIZE=full tests/scala_corpus.sh
 ```
 
-and takes ten to fifteen minutes at `CORPUS_JOBS=6`. Do not run it next to a
-slick measurement.
+which takes many times longer. Do not run it next to a compile measurement:
+a compile that exceeds its timeout under load is recorded as a skip.
 
 | variable | default | |
 |---|---|---|
@@ -171,1352 +174,53 @@ tests/scala_corpus_report.sh $MYDIR/corpus.tsv [top-N]
 
 `scala_corpus.sh` calls the report itself unless `CORPUS_NO_REPORT` is set.
 
+## Comparing two runs
+
+Aggregate pass counts hide a pass lost in one place and gained in another.
+Compare by test identity:
+
+```
+python3 tests/compare_corpus.py <baseline.tsv> <candidate.tsv>
+```
+
+It exits 1 on a lost pass or a newly skipped test and 2 on malformed or
+incomparable ledgers, and prints the details as JSON. The accepted ledgers are
+in `tests/baselines/`; `tests/BASELINE.md` names the current one. The merge
+gate (`tests/verify_merge.sh`) runs the full corpus with longer timeouts and
+compares it this way; a loss fails the gate unless the test passes on the
+gate's serial re-run of just that test.
+
 ## Where we stand
 
-> **Current status.** The accepted numbers are in `tests/BASELINE.md`: at gate
-> `ff08907d` (2026-09-14) the full corpus passes **1251 `pos` / 813 `neg` /
-> 1018 `run`** of the same 5324 identities, and the saved ledger is
-> `tests/baselines/corpus-ff08907d.tsv`. The merge gate
-> (`tests/verify_merge.sh`) runs the full corpus and compares it by test
-> identity against the ledger `tests/BASELINE.md` names, with
-> `python3 tests/compare_corpus.py <baseline.tsv> <candidate.tsv>`; a lost
-> pass (including a pass that became a timeout skip) fails the gate unless it
-> passes on the gate's serial re-run of that test. Everything below in this section is the 2026-09-05
-> survey and is kept as measured.
-
-Measured on `agent/scalacorpus` merged with `main` at `10bd2d5`, 2026-09-05,
-whole corpus, `CORPUS_JOBS=6`, about fifteen minutes.
-
-| | total | pass | fail | skip | pass rate (of non-skipped) |
-|---|---|---|---|---|---|
-| `pos` | 1859 | 965 | 545 | 349 | **63.9 %** |
-| `neg` | 1405 | 634 | 399 | 372 | **61.4 %** |
-| `run` | 2060 | 433 | 1074 | 553 | **28.7 %** |
-| all | 5324 | 2032 | 2018 | 1274 | 50.2 % |
-
-The breakdowns in this section are all from that run. The numbers themselves
-have since moved — `main` at `d4131b0` scores 974 / 634 / 434 pass, and the
-cycle-detection slice below takes `pos` to 977 and `neg` to 640 — but the
-shape of the tail has not, so the tables are left as they were measured
-rather than half-updated.
-
-### `pos` — 545 programs scalac compiles and we do not
-
-| count | first diagnostic |
-|---|---|
-| 97 | `type mismatch` |
-| 70 | `unimplemented syntax: annotation specialized` |
-| 5 | `whitebox macros are not implemented` |
-| 5 | `not found: type TypeTag` |
-| 5 | `no implicit: could not find implicit value of type ...` |
-| 5 | `expected =, found lbrace` |
-| 4 | `object creation impossible.` |
-| 4 | `not found: type Manifest` |
-| 4 | `no matching overload for constructor Seq` |
-| 4 | `expected expression, found comma` |
-
-The tail is long and flat: past the two big rows, 545 failures spread over some
-300 distinct first diagnostics. There is no single missing feature here, which
-is itself the finding — `pos` is measuring the width of the subset, not one hole.
-
-`@specialized` is the largest *single* cause at 70 `pos` plus 34 `run`, and it is
-a deliberate refusal (`annotation_compiler_unsupported` in `crates/parser/src/parse.rs`),
-not a bug. Specialization changes the classes and signatures that come out, so
-accepting and ignoring it would be a stub. It is worth knowing that one
-deliberate diagnostic costs about 104 corpus tests.
-
-### `neg` — 399 programs scalac rejects and we accept
-
-This is the more serious column, and the `.check` files say exactly which check
-we are not performing:
-
-| count | what scalac says |
-|---|---|
-| 26 | `type mismatch;` |
-| 8 | `double definition:` |
-| 6 | `match may not be exhaustive.` |
-| 5 | `pattern type is incompatible with expected type;` |
-| 5 | `incompatible type in overriding` |
-| 5 | `ambiguous reference to overloaded definition,` |
-| 4 | `unreachable code` |
-| 4 | `name clash between defined and inherited member:` |
-| 4 | `The outer reference in this type test cannot be checked at run time.` |
-| 4 | `No ClassTag available for T` |
-| 3 | `patterns after a variable pattern cannot match (SLS 8.1.1)` |
-| 3 | `macro implementation has incompatible shape:` |
-| 3 | `illegal inheritance;` |
-| 3 | `encountered unrecoverable cycle resolving import.` |
-| 3 | `Companions X and X must be defined in same file:` |
-
-The 26 `type mismatch` misses are not one root. Four sampled by hand came out
-as four different holes:
-
-* `neg/unit2anyref` — `val x: AnyRef = ()` is accepted. So is `val x: AnyRef = 1`.
-  Conformance lets a primitive and `Unit` widen to `AnyRef`, which nsc does not.
-* `neg/val_infer` — an inferred override result type is not checked against the
-  base declaration (`def foo = ""` overriding `def foo: Int`).
-* `neg/t909` — a constant pattern's type is not checked against the scrutinee
-  (`case Foo("Hello")` against `Foo(x: Int)`).
-* `neg/sip23-null` — `null` is accepted where a singleton type `x.type` is required.
-
-The `neg` *passes* need the same scepticism, which is why the report prints
-them by diagnostic: 74 of the 634 reject with a `type mismatch`, but a good
-number of the rest reject because of an unrelated hole (`not found: type TypeTag`,
-`unimplemented syntax: ...`) rather than the error the test is about. The `neg`
-number is an upper bound on our real rejection conformance; the `.check` text
-has since been compared and says how far off it is — 640 down to 99. See
-[`neg`, against the `.check` text](#neg-against-the-check-text).
-
-### `run` — 1074 failures, in three quite different kinds
-
-| count | |
-|---|---|
-| 786 | does not compile |
-| 194 | compiles, then the JVM or the test's own assertion rejects it |
-| 94 | compiles and runs, prints something else |
-
-The 194 are the alarming ones — bytecode we emit that does not do what it says:
-
-| count | |
-|---|---|
-| 47 | `java.lang.VerifyError` |
-| 32 | `java.lang.NoSuchMethodError` |
-| 28 | `java.lang.AssertionError` (the test's own `assert`) |
-| 18 | `java.lang.ClassCastException` |
-| 15 | main method not found in class `Test` |
-| 9 | `java.io.NotSerializableException` |
-| 7 | `java.lang.NoClassDefFoundError` |
-| 7 | `java.lang.AbstractMethodError` |
-| 4 | `java.lang.IllegalAccessError` |
-
-The 15 "main method not found" share one root, and it is small: **we do not emit
-static forwarders into a companion class.** `run/t363.scala` is nothing but
-
-```scala
-object Test { def main(args: Array[String]): Unit = println("...") }
-class Test { def kurtz() = "..." }
-```
-
-nsc puts a `public static void main(String[])` forwarder in `Test.class` when
-the module has a companion class (it only emits a separate mirror class when
-there is none). We emit `Test.class` with just `kurtz`, so `java Test` cannot
-start. Reproduced directly with `javap`; it is not an artefact of the runner.
-
-### Eight stack overflows — fixed, see below
-
-Not counted as failures — they are skips, because a crash must not quietly
-inflate a `neg` pass rate — but they were the clearest defect the corpus found:
-
-```
-neg/t10530  neg/t2918  neg/t5093  neg/t5878
-pos/matthias4  pos/t1357  pos/t2994a  pos/t690
-```
-
-All eight are cyclic type references, and the four `neg` ones are tests whose
-whole point is that scalac says `illegal cyclic reference involving type A`
-(`neg/t2918` is two lines: `def g[X, A[X] <: A[X]](x: A[X]) = x`). There was no
-cycle detection in type resolution, so we recursed until the stack ended. This
-is the same failure mode as the `SymbolTable::lub` overflow that made a
-gitbucket measurement report `errors=0 classes=0`.
-
-There were no timeouts at 40 s.
-
-## Cycle detection (2026-09-05)
-
-`crates/typer/src/cyclic.rs` and `symbol::enter_chase` closed all eight. The
-corpus is now free of crashes.
-
-### What the eight actually were, and they were not one bug
-
-| | |
-|---|---|
-| `neg/t2918`, `neg/t5093` | a type parameter bounded by itself, `A[X] <: A[X]`. `erase_ty` ↔ `widen_type_param` and `class_sym_of` both looped |
-| `neg/t5878`, `neg/t10530` | value classes that wrap each other. A value class erases to what it wraps, so the pair has no erasure and `erase_ty` unboxed one into the other for ever |
-| `pos/t1357` | a recursive existential (`T forSome { type T <: Tuple2[BT[E, T], BT[E, T]] }`) reached through a `Tuple` alias, whose erasure *does* visit its arguments |
-| `pos/t690`, `pos/matthias4` | `class_sym_of` following an abstract member's bound back to itself |
-| `pos/t2994a` | Peano naturals: `type a[s[_], z] = s[n#a[s, z]]` grows one layer per higher-kinded expansion |
-
-### The rules, all read off `/tmp/scala-2.13.16/bin/scalac`
-
-nsc marks a symbol `LOCKED` while it completes it and raises `CyclicReference`
-on re-entry. Two halves of that are reproduced.
-
-**Bounds.** An *upper* bound whose **head** is the type it bounds is
-`cyclic aliasing or subtyping involving type X`. Heads only: the walk steps
-through an application, an annotation and the parents of a compound, and stops
-at a class — which is what keeps F-bounded polymorphism (`trait Ord[A <: Ord[A]]`)
-and `type X <: List[X]` legal, both of which scalac accepts. Aliases
-(`type U = U`, `type X = List[X]`) were already covered by
-`check::expand_one_alias`.
-
-The two bounds are **not** symmetric, and reading them the same way cost
-`pos/contrib701` before the difference was probed:
-
-```scala
-trait B { type A[T] >: A[A[T]] }      // accepted — this is all of pos/contrib701
-trait B { type A    >: A       }      // illegal cyclic reference involving type A
-trait B { type A[T] <: A[T]    }      // cyclic aliasing or subtyping involving type A
-```
-
-An *applied* self-reference is a cycle in the upper bound and not in the lower
-one, so the lower bound only counts a **bare** self-reference, and it carries
-nsc's other message.
-
-**Value classes.** `value class may not wrap another user-defined value class`,
-nsc's `validateDerivedValueClass`. The predicate was probed rather than
-assumed: a compound counts when *any* parent is a value class (`Tr with VA` as
-well as `VA with Tr`), and a type parameter counts when its upper bound is one
-(`class B[T <: A](val a: T) extends AnyVal`), while `Tr with Int` does not.
-
-**The walks defend themselves.** `class_sym_of`, `widen_type_param`,
-`erase_ty` and `expand_applied_hk_alias` all replace an abstract type by what
-it stands for. `symbol::enter_chase` is `LOCKED` for those four: re-entry
-answers "no more information" rather than raising, because erasure also runs
-over signatures the typer never checked — a pickle or a class file can carry a
-cycle nobody in this compilation wrote. The four are kept apart by a `Chase`
-tag; `class_sym_of` looking through `X` while erasure is unfolding `X` is not
-a cycle and must not be told that it is.
-
-`lub_at`'s depth cap of 6 was left alone. It is not a stand-in for cycle
-detection: nsc bounds the same recursion with `Depth`/`maxDepth` and answers
-`Any` when it runs out, and what grows there is the type *arguments*, not a
-symbol that repeats — a symbol-keyed guard would never fire.
-
-### What it moved
-
-Whole corpus, before and after, on the same tree otherwise (`main` at `d4131b0`
-merged in):
-
-| | pass | fail | skip | rate |
-|---|---|---|---|---|
-| `pos` before | 974 | 536 | 349 | 64.5 % |
-| `pos` after | **977** | 537 | 345 | **64.5 %** |
-| `neg` before | 634 | 399 | 372 | 61.4 % |
-| `neg` after | **640** | 397 | 368 | **61.7 %** |
-| `run` before/after | 434 | 1073 | 553 | 28.8 % |
-
-Twelve tests changed status and nothing regressed:
-
-```
-neg/t10530  skip -> pass   value class may not wrap another user-defined value class
-neg/t2918   skip -> pass   cyclic aliasing or subtyping involving type A
-neg/t5093   skip -> pass   cyclic aliasing or subtyping involving type C
-neg/t5878   skip -> pass   value class may not wrap another user-defined value class
-neg/t6337   fail -> pass   value class may not wrap another user-defined value class
-neg/t798    fail -> pass   cyclic aliasing or subtyping involving type Bracks
-pos/cls1    fail -> pass
-pos/t1090   fail -> pass
-pos/t1357   skip -> pass
-pos/matthias4  skip -> fail   type AObject is not a member of <notype>
-pos/t2994a     skip -> fail   incompatible type in overriding type a
-pos/t690       skip -> fail   incompatible type in overriding type T
-```
-
-The three `pos` rows that went `skip -> fail` are **not** a regression: they
-were crashes, and a crash is excluded from the denominator while a failure is
-not. Each is now a diagnostic on a program scalac accepts, which is a hole to
-narrow rather than a compiler that dies. They are three different holes — a
-path-dependent `val a: _a; type A <: a.AObject` prefix, and two as-seen-from
-bugs — and none of them is cycle detection.
-
-`pos/cls1` and `pos/t1090` came from the one real bug this slice turned up:
-`term_path_type` read `Outer.this` as plain `this`, so
-`trait Outer { type T; trait Inner { type T <: Outer.this.T } }` bounded
-`Inner`'s own `T` by itself. That invented cycle is why `pos/t690` overflowed;
-with the qualifier honoured, the shape compiles.
-
-slick (`files=184 errors=0 files_with_errors=0 classes=1596`), `slick_run`
-(`progs=12 ok=12 diff=0 fail=0`), cats and gitbucket
-(`errors=1859 files_with_errors=186`) are byte-identical before and after,
-which is the check that mattered: this slice adds two rejection rules.
-
-The cats pair was measured at `errors=71 files_with_errors=16` on both sides,
-before `tests/cats_measure.sh` started passing `-no-specialization`; that 71
-was a parse abort and not a type-checking figure (see the note at the top of
-`docs/cats.md`). Re-measured with the current script on the merged tree, cats
-is `errors=2929 files_with_errors=151` — main's own recorded number, to the
-error.
-
-## `neg`, against the `.check` text
-
-### Why the old number was an upper bound, and what replaces it
-
-`neg` passed on "scala-rs reported at least one error". 640 of 1037 non-skipped
-tests did, 61.7 %. That counts a rejection for the wrong reason, and the wrong
-reason is common: **98 of those 640 were rejected by a parse error or an
-explicit "unimplemented" refusal**, so the program never reached the check the
-test exists to exercise.
-
-The `.check` files say what scalac reports, down to the line and column. Full
-text cannot be compared, and it is worth being precise about why rather than
-calling it "close enough":
-
-* scalac splits a message over several lines — `type mismatch;` carries its
-  `found`/`required` on continuation lines, `match may not be exhaustive.`
-  carries "It would fail on the following input" on the next — while we print
-  one line per diagnostic. The line structure is not a difference in what was
-  checked.
-* the two type printers disagree on constants: scalac writes
-  `found : String("Hello")`, we write `found: "Hello"`. Comparing that tail
-  measures the printer, not the type checker.
-* the caret line and the column differ almost everywhere.
-
-What *is* comparable is the **head** of the message: everything before the
-first `;` and before the end of the first sentence, case- and whitespace-folded.
-Three tiers are scored on it, each strictly inside the previous one:
-
-| | |
-|---|---|
-| **T1** | every diagnostic the `.check` expects has a match, as a multiset (four expected copies need four of ours), ignoring where it was reported |
-| **T2** | … and each match is at the file and line scalac reports it at |
-| **T3** | … and we emit nothing beyond the expected count |
-
-Warning lines in a `.check` are used only when it holds no error line at all —
-that is the shape of a test that fails because a warning was promoted. Taking
-warnings *alongside* errors would score us on lints nobody claims we implement.
-
-### The numbers
-
-Whole corpus at `main` `1a494fb`, 2026-09-05, `CORPUS_KINDS=neg CORPUS_SIZE=full`,
-1405 units, 368 skipped, 1037 judged:
-
-| | count | of 1037 |
-|---|---|---|
-| **T0** any error at all — the old rule | **640** | **61.7 %** |
-| **T1** expected messages reproduced | **104** | **10.0 %** |
-| **T2** … at the expected file and line | **99** | **9.5 %** |
-| **T3** … and nothing extra | **79** | **7.6 %** |
-
-Both ends of that are real. T0 says we reject 640 programs that must be
-rejected; T2 says we reject 99 of them *for the reason the test is about*. The
-gap, 541 tests, is the size of the accounting error the old number carried.
-
-Five tests have no `error:` or `warning:` line in their `.check` at all and are
-left out of T1–T3 while staying in the 1037 and in T0.
-
-### Where the other 938 go
-
-| count | |
-|---|---|
-| 380 | **a** — we accept the program; no diagnostic at all |
-| 472 | **b** — we reject it, but for none of the expected reasons |
-| 76 | **c** — partial: some of the expected diagnostics reproduced |
-| 5 | **d** — right messages, wrong file or line |
-| 20 | **e** — right messages and lines, plus extra of our own |
-| 79 | **f** — exact match |
-
-(T2 = 99 is d + e + f; T3 = 79 is f. The five `.check`-less tests are not in
-this table.)
-
-**b is the interesting one and it has no shape.** 472 tests, **341 distinct
-first diagnostics** on our side and 345 distinct on scalac's. The largest single
-row is 17. 83 of the 472 are a parse or syntax refusal from us — the test is
-rejected before type checking starts.
-
-What we said instead of what was expected, most frequent first:
-
-| count | scalac expects | we said |
-|---|---|---|
-| 5 | `the splice cannot be resolved statically` | `value currentMirror is not a member of package scala.reflect.runtime` |
-| 4 | `forward reference to value a extends over definition of value b` | `not found: value a` |
-| 3 | `no TypeTag available for T` | `not found: type TypeTag` |
-| 3 | `incompatible type in overriding` | `type mismatch` |
-| 3 | `missing parameter type` | `missing parameter type for expanded function` |
-| 3 | `expected class or object definition` | `expected newline or \`` |
-| 3 | `type mismatch` | `implicit conversion method foo1 should be enabled by making the implicit value visible` |
-
-Only the last three rows are "the same check, different words". The rest are a
-different check firing first.
-
-**a — the 380 programs we accept.** Bucketed by what scalac says, this is the
-list of checks we do not perform, and it is the same flat tail the earlier
-survey found: `type mismatch` 21, `double definition:` 8,
-`match may not be exhaustive` 6, `ambiguous reference to overloaded definition,`
-5, `incompatible type in overriding` 5,
-`pattern type is incompatible with expected type` 5,
-`no ClassTag available for T` 4, `unreachable code` 4,
-`the outer reference in this type test cannot be checked at run time` 4,
-`name clash between defined and inherited member:` 4, then singletons.
-
-**c — 26 of the 76 partials are a subset, not a disagreement.** Everything we
-say is a diagnostic the `.check` expects; we just say it fewer times.
-`neg/accesses` expects four `weaker access privileges in overriding` and gets
-one; `neg/cyclics` expects three `illegal cyclic reference` and gets the first;
-`neg/t3481` expects five `type mismatch` and gets two. These are not one root —
-they are three different places where the first error of a kind suppresses the
-rest — but they are the cheapest tests to move, because the check itself is
-already implemented and correct.
-
-**e — 20 tests fail only T3**, because we emit more diagnostics than the
-`.check` has. That is cascade, not a missing check.
-
-### What this says to fix next
-
-The honest headline is that **there is no big lever here**. The `neg` tail is as
-flat as the `pos` tail: ~340 distinct wrong reasons over 472 tests. In rough
-order of cost per test moved:
-
-1. **Report every occurrence of a check, not the first** — 26 tests in bucket
-   c, and the checks already exist. Three or four separate suppression sites.
-2. **Cascade suppression** — 20 tests in bucket e, T3 only.
-3. **The 98 T0 passes that are parse or "unimplemented" refusals** are noise in
-   the headline number rather than a fix; knowing they are there is the point.
-4. Everything else is one test at a time.
-
-## Three checks we were not performing (2026-09-05, `agent/accepttoomuch`)
-
-Bucket **a** — the 380 `neg` tests we compiled without a word — was the target.
-It is now 364, and the three holes closed were worth more than that count
-suggests, because two of them were holes in *every* program rather than in one
-check.
-
-### 1. A written type annotation naming nothing
-
-`def f(x: Zork): Int = 3` compiled. So did `val x: Zork`, `def f(x: Int): Zork`
-and `def f(x: List[Zork])`. Only a template's parents, its self type and the
-class a `new` builds resolved strictly (`Typer::strict_type_names`); everywhere
-else an unresolved name stayed a `Type::Named` placeholder and the rest of the
-run went on with it. `type_val_sig` and `type_def_sig` now resolve under the
-same flag.
-
-Three things had to be true for that not to break working code, and each one
-was found by a measurement rather than by reading:
-
-* **An existential binds its own names.** `subst_quantified` runs *after* the
-  body is resolved, so `val x: A[X] forSome { type X }` has `X` standing for
-  nothing while the body is being built. Six `pos` tests regressed on the first
-  attempt (`exbound`, `depexists`, `t0905`, `t1048`, `t1560`, `t5022`). The
-  quantified names are now announced before the clause is resolved.
-* **A wildcard import whose members we cannot enumerate leaves the scope
-  open.** gitbucket writes `import gitbucket.core.model.Profile.profile.blockingApi._`
-  and then 259 signatures naming `Session`, a type member reached through that
-  path. `import p._` is only enumerable when `p` is a package or an object; a
-  prefix that did not resolve, or a *value* whose type is a jar class read one
-  name at a time, is not. In such a file the rule stands down
-  (`Typer::opaque_import_files`). Without it gitbucket went from 1693
-  diagnostics to 2230.
-* **nsc's error type is absorbing.** When the type *constructor* names nothing,
-  its arguments are not reported as well — `-Ykind-projector` leaves an
-  unrecognised `Functor[λ[α => Box[α], β]]` untouched, and `α`/`β` are then
-  names nobody wrote a binder for. One diagnostic, not three.
-
-### 2. A local `type` alias had no symbol at all
-
-A block ran the namer over its `class` and `object` statements only, so
-
-```scala
-type Branches = List[(F[Boolean], F[A])]
-def step(branches: Branches): F[Either[Branches, A]] = ...
-```
-
-— cats' `Monad.ifElseM` — left `Branches` standing for nothing. That was
-invisible while an unresolved name in a signature was tolerated. A block now
-resolves its type aliases first, the way a template does, and **cats went from
-1128 diagnostics to 1108 on the strength of that one fix**.
-
-The pre-pass stops at the first `import`: an import inside a block takes effect
-where it stands, and `pos/t5305` writes `import O.{F, v}` before
-`type x = { type l = (F, v.type) }`.
-
-### 3. Two overloads that erasure merges into one descriptor
-
-nsc's `RefChecks.checkNoDoubleDefs`, now `crates/typer/src/double_def.rs`. Eight
-`neg` tests, and eight class files we were emitting with two identical methods.
-
-The rule is over the **descriptor**, and both halves of that were probed
-against `/tmp/scala-2.13.16/bin/scalac` rather than assumed:
-
-* parameter clauses are flattened, a repeated parameter is the `Seq` it
-  becomes, a value class is what it wraps, and a singleton type is its
-  underlying type — `neg/t6443c`, `neg/t0259`, `neg/valueclasses-doubledefs`,
-  `neg/t8323`;
-* the **result** type is part of it, and the JVM lets two methods differ in it
-  alone. `scala.Function.uncurried` is five overloads that all take one
-  `Function1`; scalac accepts those and rejects
-  `def g(x: List[Int]): Int` beside `def g(x: List[String]): Int`. Leaving the
-  result out of the key cost twelve false diagnostics on
-  `src/library/scala/Function.scala` alone;
-* a **macro def** has no bytecode, so two of them cannot collide. scalac
-  accepts `pos/t7776`'s two `app` macros and rejects the same pair written as
-  ordinary methods.
-
-The check is deliberately narrow otherwise: only members the source of one
-template wrote, never a synthetic, a bridge or an accessor, and never a
-signature holding a `NoType`, an `Error` or an unresolved `Type::Named`.
-
-### What it moved
-
-Whole corpus, `main` at `74ed830` merged in, `CORPUS_SIZE=full CORPUS_JOBS=6`.
-Both columns are that same merged tree against `main` alone at `74ed830`, so
-the other slices that landed while this one ran are in *both* numbers:
-
-| | before | after |
-|---|---|---|
-| `pos` pass | 977 | **980** |
-| `neg` **T0** any error | 640 (61.7 %) | **656 (63.3 %)** |
-| `neg` **T1** expected messages reproduced | 104 (10.0 %) | **115 (11.1 %)** |
-| `neg` **T2** … at the expected line | 99 (9.5 %) | **110 (10.6 %)** |
-| `neg` **T3** … and nothing extra | 79 (7.6 %) | **89 (8.6 %)** |
-| bucket **a** — accepted with no diagnostic | 380 | **364** |
-
-Nothing regressed in either column. The three `pos` gains are `generic-sigs`,
-`t9326a` and `tcpoly_typesub`; the sixteen `neg` gains are `func-max-args`,
-`overloaded-unapply`, `patmat-type-check`, `t0259`, `t1565`, `t2779`, `t3653`,
-`t588`, `t6443c`, `t7602`, `t8300-overloading`, `t8323`, `t8890`,
-`valueclasses-doubledefs`, `valueclasses-pavlov`, `volatile_no_override`.
-
-The four project measurements, which are what a rejection rule has to be
-judged on:
-
-| | before | after |
-|---|---|---|
-| slick | `files=184 errors=0 files_with_errors=0 classes=1596` | identical |
-| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` | identical |
-| cats | `errors=1128 files_with_errors=141` | **1108 / 139** |
-| gitbucket | `errors=1391 files_with_errors=184` | **1373 / 184** |
-| `src/library` `-no-specialization` | `errors=1969 files_with_errors=172` | **1903 / 172** |
-
-Three of the four went *down*, which is the shape a rejection rule should have
-when the rejection is real and the compiler was hiding a resolution failure
-behind a placeholder. Measured on the earlier base `cad281b`, where gitbucket
-was 1693 and `src/library` 1997, the same three moved the same way (1675 and
-1944 -- 1903 once the erased *result* joined the double-definition key).
-
-### One thing this exposed and did not fix
-
-**`scala.Singleton` is not resolvable.** It has no class file — the jar has
-none, and `src/library-aux` is scaladoc-only — so it was one of the names that
-survived as a placeholder. `val x: Singleton` is now `not found: type
-Singleton`, which is honest but is a diagnostic scalac does not have. Five
-`pos` tests report it (`scala-singleton`, `sip23-singleton-sub`,
-`sip23-singleton-view`, `t4914`, `t7520`); all five were already failing for
-the same underlying reason, so the pass rate did not move. It needs a compiler-
-defined symbol, the way `Any`/`AnyRef`/`Nothing` have one.
-
-## The `run` failures, classified (2026-09-05)
-
-`run` is the weakest of the three categories — 444 of 2060 — and until now it
-was the only one nobody had broken down by symptom. Here it is. The 1063
-failures split into two piles that deserve very different priorities.
-
-### Pile one: we are wrong (237)
-
-These compile, they load, they run, and the answer is not scalac's. A program
-we *reject* costs the user a diagnostic. A program we accept and get wrong
-costs them a debugging session, and none of our other checks catch it.
-
-| symptom | count | what it means |
-| --- | ---: | --- |
-| `output-mismatch` | 93 | ran to completion, stdout differs from `.check` |
-| `AssertionError` | 28 | the test's own `assert` failed — same thing, louder |
-| `VerifyError` (all shapes) | 44 | the JVM refuses the classfile we wrote |
-| `ClassCastException` | 19 | erasure or a cast we inserted |
-| `NoSuchMethodError` | 33 | the call site and the callee disagree |
-| `AbstractMethodError` | 8 | a forwarder or bridge we did not emit |
-| `IncompatibleClassChangeError` / `NoClassDefFoundError` | 5 | |
-
-Two of these deserve a note. **`AbstractMethodError` and `NoSuchMethodError`
-are invisible to the verifier** — a call through an interface type is not
-type-checked by it — which is exactly how a value-class defect once walked past
-all six detection methods and surfaced only at run time. And `output-mismatch`
-is invisible to *everything* except running the program against expected
-output, which is what this category exists to do.
-
-### The 116 that type-check and then fail to link (2026-09-05)
-
-The `VerifyError` / `ClassCastException` / `NoSuchMethodError` /
-`AbstractMethodError` / `IncompatibleClassChangeError` rows above are one
-sub-pile: 116 tests that compile, write classfiles, and are then rejected by
-the JVM. Grouped by *cause* rather than by symptom they came to far fewer than
-116 roots. Nine were fixed, taking 16 of the 116 from failing to passing (0
-before); the rest are recorded here so the next pass does
-not re-derive them.
-
-Fixed, with the number of the 116 each moved to passing:
-
-| root | tests |
-| --- | ---: |
-| no stack map frame at bytecode offset 0 (a `while (true)` at the head of a method) | 4 |
-| `athrow` appended after a `Nothing`-typed tree whose *generated* value is not a `Throwable` | 1 |
-| `NonLocalReturnControl.value()` returned without the cast the method descriptor promises | 3 |
-| a case class's companion `unapply` was never emitted | 3 |
-| `<Trait>$$$outer()` unimplemented when the enclosing instance is an enclosing *object* | 1 |
-| a trait parent's own superclass did not become the template's superclass (SLS 5.1.2) | 0 (unblocks `t11736`, `t2544`) |
-| a value class's companion `apply` emitted with the boxed descriptor instead of the erased one | 2 |
-| a `class`/`object` declared inside a *local* class never reached a classfile | 1 |
-| a named import of a member the object only *inherits* lost its receiver | 1 |
-
-Still open, in descending size:
-
-* **`uninitializedThis` reaching an instruction before the super call (7).**
-  `t0911`, `t1909b`, `t1909c`, `t4300`, `t6506`, `t6957`, `t11736`. One theme,
-  several causes: a local `def` lifted out of a constructor argument is emitted
-  as an *instance* method and called on `this` (nsc makes it `private static`
-  when it has no free `this`); an anonymous class created in a super-constructor
-  argument takes `$outer = this` (nsc drops the outer pointer when the class
-  never uses it); `new b.C(){}` on a trait nested in a class reaches for `this`
-  rather than for `b`.
-* **Java varargs (2).** `t1360`, `t3199b`. `java.util.Arrays.asList(seq: _*)`
-  needs `seq.toArray(ClassTag)` and a `checkcast [Ljava/lang/Object;` (or
-  `ScalaRunTime.toObjectArray` for a primitive element); we pass the `Seq`.
-* **Name-based extractors (4).** `string-extractor`, `t7850c`, `t7850d`,
-  `value-class-extractor-seq`. The pattern matcher assumes `unapply` returns an
-  `Option` and calls `Option.get` on whatever comes back.
-* **`try`/`finally` operand stack (3).** `Course-2002-06`, `finally`,
-  `exceptions-2`.
-* **`Iterator` in term position (1).** `t3269`. The bare name resolves to the
-  *trait* rather than to `object Iterator` — `scala.collection.Iterator.empty`
-  and `Iterator(1, 2, 3)` both emit the module receiver, `Iterator.empty` emits
-  none, so the method is invoked on an empty stack. `scala.package.Iterator` is
-  a `val` in the `scala` package object; the type alias of the same name is
-  what our lookup finds.
-* **A case class read back from a pickle loses its `CASE` flag.**
-  `crates/backend/src/pickle.rs` *writes* it (bit 11 of the extra flag word);
-  nothing on the reading side sets `Flags::CASE`. So a case class on the
-  classpath is matched through its extractor rather than as a constructor
-  pattern, and `productArity`, `copy` and `==` are all decided from a symbol
-  that does not know it is a case class. `Typer::case_ctor_field_types` works
-  around the one consequence that had a test; the flag itself is still lost.
-* **Macro defs read back from a classfile (≈19).** Every `macro-*` test here
-  fails with `NoSuchMethodError` on the macro *def* itself: round two reads
-  `Macros` from a classfile, where the `MACRO` flag and the `@macroImpl`
-  binding are not pickled, so the call is emitted as a real invocation instead
-  of being expanded. This is §5 of `docs/macros.md`, not a codegen bug.
-
-One finding worth more than its single test: **`t10594` is a silently broken
-classfile.** `Assembler::finish` back-patches a conditional branch by
-truncating the offset to `i16`, so a method whose body exceeds 32 KB gets a
-branch to a negative address (`Expecting a stackmap frame at branch target
--7611`). nsc's ASM widens such branches automatically. Nothing in the battery
-detects this short of running the program — `javap -p` and the loader check
-both stop at the constant pool — so a large generated method can be wrong with
-no signal at all.
-
-### The 113 that ran and printed the wrong answer, re-classified (2026-09-05)
-
-The `output-mismatch` (84) and `AssertionError` (29) rows above are the pile
-nothing but running the program can see. Taking the diff of all 113 and
-grouping by *cause* rather than by symptom splits them three ways, and the
-split matters because only one third is a defect at all:
-
-| group | count | what it is |
-| --- | ---: | --- |
-| **scalac warnings we do not emit** | 28 | the program's stdout is byte-identical to scalac's; the `.check` also carries a compile-time warning (`match may not be exhaustive`, `unreachable code`, `a pure expression does nothing`, the `N deprecations` summary). partest concatenates the compiler log with the run output before comparing, so these can never pass until the warning exists. Not a wrong answer. |
-| **`@specialized`** | 7 | `t3575`, `t5488`, `t5488-fn`, `t5500`, `t5500b`, `t10277`, `t10277b` print `$mc..$sp` member names. Stage 2; see `docs/specialization.md`. |
-| **genuinely wrong or dead at run time** | 78 | the rest |
-
-Nine roots out of the third group were fixed (the `agent/runwrong` merge),
-taking **11** of the 113 from failing to passing and two more (the
-`blame_eye_triple_eee` pair) from a wrong answer to warnings-only:
-
-| root | tests |
-| --- | ---: |
-| a class with more than 32 `lazy val`s reused bit 0 of `bitmap$0` (`1 << 32` is `1 << 0`), so every `lazy val` past the 32nd returned the field's default | 1 |
-| a trait's `private` member answered member lookups from a subclass, and whichever parent the traversal reached first won | 2 |
-| a case class's `equals` did not end with `that.canEqual(this)` | 1 |
-| `@volatile` on a trait's field was dropped when the field was copied into the class that mixes it in | 2 |
-| `final` on a trait's `val` did not reach the mixin getter/setter | 2 |
-| `@scala.annotation.varargs` emitted no Java-shaped `f(T[])` entry point | 2 |
-| an empty repeated argument was an empty `ArraySeq`, not `Nil` | 1 |
-| `'sym` was emitted as the bare `String`, not `Symbol.apply("sym")` | 0 (both tests are warnings-only) |
-| a stable-identifier pattern naming an *imported classfile member* compiled to no test at all | 2 |
-
-The last one is the one to remember. `import Int.MaxValue; 5 match { case
-MaxValue => a; case _ => b }` evaluated to `a`. The name resolves to the
-`val`'s accessor — a nullary *method* — so the pattern's type was
-`Type::Method`, and `uncurry`'s `eta_if_method` eta-expanded **the pattern
-itself** into `() => Int`. `gen_pattern` has no case for a `Function` tree, so
-it emitted no comparison and the arm became irrefutable. A phase meant for
-expressions reached into pattern position, and the symptom was a silently
-deleted test rather than a crash.
-
-Roots left in the third group, largest first:
-
-* ~~**No `Signature` attribute is ever emitted**~~ (`t7521b`, `t8756`). Done,
-  2026-09-06, `agent/signature`: JVMS 4.7.9 signatures are emitted for classes,
-  methods, constructors and fields, built before this compiler's destructive
-  erasure phase and attached only where they erase back to the descriptor they
-  sit next to. Both tests reproduce their `.check` exactly. See
-  [`language-support.md`](language-support.md) for what is and is not spelled.
-* **Constructor-parameter elision** (`t12002`, `t6793b`): nsc drops a
-  `private[this]` parameter field that nothing reads after the constructor,
-  and aliases a parameter passed straight through to a superclass field.
-* **`ClassManifest` / `Manifest` materialisation with type arguments**
-  (`t6329_vanilla`, `t6329_vanilla_bug`, `valueclasses-classmanifest-*`).
-* **Runtime-reflection fidelity of what we pickle** (`reflection-methodsymbol-params`,
-  `t6733`, `reflection-magicsymbols-vanilla`): an empty parameter list is
-  pickled as *no* parameter list, `$init$` is pickled as a constructor.
-* **`Q.super.m` where `Q` is an enclosing class** (`NestedClasses`): nsc
-  synthesises `Q$$super$m` on `Q` and calls it through `$outer`; we emit a
-  plain `invokespecial` on the *inner* class's superclass, so
-  `AAA1.super.f` ran `BBB.f`.
-* **Outer-aware equality for a case class nested in a trait** (`t6911`), and
-  the outer check in a type test generally (`t7171`).
-* ~~**`@SerialVersionUID`**~~ (`t6988`). Done, 2026-09-06, `agent/signature`:
-  the `private static final long serialVersionUID` and its JVMS 4.7.2
-  `ConstantValue`, with the argument constant-folded.
-* Singletons: `classOf` with its type argument inferred from the expected type
-  (`t4871`), erasure of `Unit with AnyRef` (`t5568`), a redundant parent left
-  in the interface list (`t8931`), overload resolution between `AnyVal` and
-  `Double` (`t12560`), implicit specificity (`t2509-1`), `Contra[C]`
-  class-tag variance (`t7768`).
-
-### The wrong-answer pile, opened a third time (2026-09-06, `agent/runwrong3`)
-
-The same 121 tests — `output-mismatch` (97) plus `AssertionError` (24) — were
-re-run one by one on `b819eb1`, keeping each program's output beside its
-`.check`. The split is not the one either earlier pass reported, and the
-difference is worth writing down because it changes what "fix this pile" means.
-
-| group | count |
-| --- | ---: |
-| the `.check` carries compiler diagnostics; the *program's* output already matches ours exactly | **32** |
-| the test's own `assert` failed (no `.check` to compare) | **25** |
-| a genuinely different answer | **65** |
-
-The first row is the one to read carefully, because **no compiler change can
-turn any of those 32 green with the runner as it stands.** partest builds one
-log per `run` test out of the compiler's output *and* the program's, and
-compares that; `tests/scala_corpus.sh` compares only `stdout` (or `stdout` and
-`stderr` concatenated) and never looks at `$WORK/round$r.log` at all. So a
-`.check` whose first lines are
-
-```
-patmat-behavior.scala:82: warning: fruitless type test: …
-```
-
-cannot match, and would still not match on the day scala-rs emits that warning.
-Making them reachable is two separate pieces of work: teach the runner to
-prepend the compile log, *then* implement the warning. Doing the second without
-the first moves nothing, and doing the first alone will move nothing either —
-but it will stop 32 tests being counted as "we print the wrong answer", which
-they are not.
-
-Earlier passes put this group at 23 and then 28. It has not grown; the counting
-did. A `.check` line is a diagnostic when the *message* line is dropped along
-with the source echo and the caret line beneath it, and dropping only the
-message line leaves two lines of noise that make the comparison fail for a
-reason that has nothing to do with the program.
-
-Three roots were fixed here, all in what a *reader* of our output sees rather
-than in what the program computes, and all invisible to every other check in
-the battery — the classfiles load, verify and lint identically either way:
-
-| root | tests |
-| --- | ---: |
-| `c.prefix` reached a macro implementation as the source `Ident`, where nsc hands over a *typed* tree: a name that resolves to a member of an enclosing template is `Main.this.macros` | 5 |
-| a constructor's pickled result type had no prefix, so `class A` in `object Test` read back as `def <init>(): A` instead of `def <init>(): Test.A` | 3 |
-| an `object`'s module class had no primary constructor in the pickle, so reflection found no `termNames.CONSTRUCTOR` in an object's signature | 2 |
-
-The first is `macro-term-declared-in-{anonymous,class-object,object-object,refinement}`
-and `macro-expand-override`; the argument trees deliberately keep their bare
-`Ident`s, because those are spliced into the expansion and type-checked again
-at the call site, where an unqualified name still means what the source meant.
-The second is `t5256b`, `t5256e`, `t5256f` (`t5256c` needs a *local* class's
-`A$1` naming as well and is unmoved). The third is
-`reflection-enclosed-inner-nested-basic` and `-nested-nested-basic`, whose only
-difference was a missing `constructor BB` at the head of `info.decls`.
-
-Two findings recorded rather than fixed:
-
-* **`scala.StringContext.s` does not exist.** Our prelude declares
-  `def s(args: Any*): String` on it; 2.13.16's `StringContext` has only
-  `s(): StringContext$s$` (the extractor object) and `standardInterpolator`,
-  and nsc *intrinsifies* both `s"…"` and an explicitly written `sc.s(args)`.
-  Measured on 2.13.16: `StringContext("p1","p2").s("e1")` folds to the
-  constant `"p1e1p2"`, and with a non-constant argument it becomes
-  `StringContext$.standardInterpolator(StringContext$.processEscapes _,
-  args, sc.parts)`. So any program that writes
-  `sc.s(…)` by hand links against a method that is not there
-  (`run/interpolationArgs`, `NoSuchMethodError`). `s"…"` itself is fine; it
-  never goes through that symbol.
-* **`run/identifierCase` is a silently wrong pattern match**, which is the
-  worst shape a defect can take. `case ǅul =>` — a titlecase leading letter —
-  must be a stable identifier and ours is read as a variable, so the first
-  arm matches everything. nsc's rule is `Character.isLowerCase` on the first
-  character, and `ª` (U+00AA) *is* lower case by that test while `ǅ` (U+01C5,
-  category Lt) is not.
-
-The rest of the 65 group by cause as before: `@specialized` (7, stage 2),
-`Manifest`/`ClassManifest` materialisation carrying type arguments (4), runtime
-reflection fidelity of curried and empty parameter lists (`reflection-methodsymbol-params`,
-`t6733`, `fail-non-value-types` — the pickler flattens `paramss` into one
-`METHODtpe` on purpose, and `Type::Method` still carries the clause boundaries
-it would need), toolbox error messages arriving as `null` (4), and a long flat
-tail.
-
-### Pile two: we do not implement it (≈500)
-
-| symptom | count |
-| --- | ---: |
-| `scala.reflect.runtime` surface (`currentMirror`, `runtimeMirror`, `TypeTag`, `Manifest`, `Universe#Transformer`) | ≈200 |
-| `reify { … }` beyond literals | ≈90 |
-| `@specialized` | 37 |
-| whitebox macros | 12 |
-| quasiquotes | ≈10 |
-
-These are honest gaps with honest diagnostics. They are worth doing, and the
-reflection block is nearly all supply — the jar is already on the corpus
-classpath — but a missing feature that says so is not a defect in the sense
-pile one is.
-
-`553` more `run` tests are skipped rather than failed (unsupported harness
-shapes: `.javaopts`, separate JVMs, `filters`); see the limits section below.
-
-### What the 121 "wrong answer" tests turned out to be (2026-09-05)
-
-The 93 `output-mismatch` plus 28 `AssertionError` rows above were read one by
-one. Only about half of them are a wrong answer at all:
-
-| | count | |
-| --- | ---: | --- |
-| the `.check` has no final newline and nothing else differs | 16 | **not ours** — see below |
-| the `.check` carries scalac *warnings* we do not emit; the program's own output already matches | 23 | exhaustivity, unreachability, deprecation summaries, `pure expression does nothing` |
-| a genuinely different answer | 56 | |
-| the test's own `assert` failed (no `.check`) | 26 | |
-
-The first row was a defect in **this harness**, not in the compiler. partest
-compares the two outputs as line sequences; `tests/scala_corpus.sh` compared
-them byte-exactly, and sixteen `.check` files in the tree simply have no final
-newline (`run/t429.check` is `AyB5`). Every one of those sixteen programs is
-reproduced exactly by scala-rs. The comparison now normalises the final
-newline on both sides and nothing else — a *blank* trailing line still counts,
-as it does in partest.
-
-The second row is worth stating plainly because it inflates the pile: 23 of
-the 93 are "we do not implement this warning", which belongs with pile two,
-not with "the answer is wrong".
-
-Six roots behind the remaining ones were fixed on `agent/runmismatch`; they
-took `run` from 459 to 468 with the same harness on both sides. Five were in
-pattern matching or its desugaring, and all five had the same shape — a test
-the compiler *skipped*, so the case matched everything:
-
-* an `Ident` pattern that resolves to a value was compiled as a binding
-  (`case VAL =>` matched every input), because a resolved `val` and a fresh
-  pattern variable are both `SymKind::Term`;
-* a backquoted name in a pattern was read as a variable;
-* a compound type pattern tested only its dominant parent, because that is all
-  erasure keeps;
-* a `for` generator whose pattern is refutable got no `withFilter`;
-* `lub(Unit, A)` came out `Unit`, so a `match` with a `()` case compiled to a
-  method returning `void` and discarded every case's value.
-
-The sixth was two smaller ones: a `case class` companion inherited
-`AbstractFunctionN.toString`, and an assignment to a `var` constructor
-parameter in the class body wrote the constructor's local while the field kept
-the argument.
-
-What did **not** hold up: the guess that the 93 were mostly one or two roots.
-They are not. After these six, the remaining `output-mismatch` failures are
-spread over pickle fidelity (`reflection-methodsymbol-params`, `t6733`:
-curried parameter lists and `private[this]` flags do not survive our
-`ScalaSignature`), missing generic `Signature` attributes on methods
-(`t8756`, `t7521b`), missing `writeReplace` on serializable lambdas
-(`t6260c`), `classOf[T[_]]` erasing to `Object` (`classof`), symbol literals
-(`t4601`), and a long flat tail. Sizing any of those from the cluster count
-would repeat the mistake this section exists to record.
-
-## The `neg` upper bound, caught in the act (2026-09-05)
-
-The `neg` column has always carried a caveat: it counts a test as passing when
-we report *any* error, so a rejection for the wrong reason counts. On
-2026-09-05 that caveat produced a visible, instructive number.
-
-Supplying `scala.reflect.runtime`'s `TypeTag` (`agent/rtmirror`) took `neg`
-from **656 to 652**. The four tests it "lost" are
-`interop_{abs,}typetags_arenot_class{tags,manifests}`, and all four look like
-this:
-
-```scala
-import scala.reflect.runtime.universe._
-import scala.reflect.{ClassTag, classTag}
-object Test extends App {
-  def typeTagIsnotClassTag[T: TypeTag] = println(classTag[T])  // scalac: No ClassTag available for T
-}
-```
-
-They were passing because the **import** failed. Not because we applied the
-rule the test is about. Supplying `TypeTag` removed the spurious error and left
-the program with nothing to object to — so we now compile it, and scalac still
-rejects it.
-
-The rule is genuinely missing, and it was missing before, which is easy to
-check without any of the reflection material at all:
-
-```scala
-import scala.reflect.{ClassTag, classTag}
-object Test { def f[T]: Unit = println(classTag[T]) }
-```
-
-A binary built before the reflection change accepts this too. So nothing
-regressed; a hole that four tests had been papering over became visible, which
-is what the column is for. **`classTag[T]` / `implicitly[ClassTag[T]]` for an
-abstract `T` with no `ClassTag` in scope must be an error**, and a `TypeTag` in
-scope must not satisfy it. That is a *rejection* rule, and this project's
-history says a new rejection rule breaks more than it fixes — so it wants the
-slick, cats, gitbucket and library measurements in hand, the way the three
-rules in [the section above](#three-checks-we-were-not-performing-2026-09-05-agentaccepttoomuch)
-were done.
-
-The lesson for verification is narrower and sharper: **a change that supplies
-new symbols has to run `neg` in full, not a sample.** A 250-test sample did not
-contain any of these four.
-
-Done the same day — see
-[the next section](#the-classtag-rule-added-2026-09-05-agentclasstag). It moved
-eight, not four.
-
-## The `ClassTag` rule, added (2026-09-05, `agent/classtag`)
-
-The rule the section above asked for. Measured on the merged tree against
-`main` at `81b756a` (which already carries stage 1 of `@specialized`, so both
-columns have it): `neg` 647 → **655**; `pos` 1042 and `run` 508 are unchanged,
-the same sets of tests. The eight are `classtags_contextbound_{a,b,c}`,
-`classtags_dont_use_typetags` and the four
-`interop_{abs,}typetags_arenot_class{tags,manifests}`. The same eight, and the
-same "nothing else moved", came out of the earlier A/B against `dc6fdc9`
-(`neg` 653 → 661, `pos` 983, `run` 490).
-
-A `ClassTag` is *built*, out of the **erasure** of the type it tags
-(`Implicits.manifestOfType`, `full = false`), so the rule is about erasure and
-not about the implicit scope. Every case below was probed against
-`/tmp/scala-2.13.16/bin/scalac`, not read off nsc's source:
-
-* a **class**, however applied, has a tag — `List[T]`, `Map[T, T]`, `List[_]`
-  and `Array[Int]` all compile with `T` abstract, because the arguments are
-  erased away rather than looked for;
-* an **abstract type** has none: a method's own parameter, one with an upper
-  bound (`T <: String`), a class's parameter, an abstract `type` member, and
-  `({ type L = T })#L`. So does a higher-kinded parameter applied — `CC[A]` in
-  `ClassTagIterableFactory.fill` is `No ClassTag available for CC[A]` in
-  scalac too;
-* an **intersection** erases to `intersectionDominator`, which prefers a
-  parent that is a class, so `T with AnyRef` *is* tagged (as `Object`). The
-  first cut of this rule refused it, and only the probe said so;
-* a **singleton** widens to its class.
-
-Two things that a reading of the rule gets wrong, and a measurement caught:
-
-**`Array[E]` does not recurse structurally.** nsc's `findSubManifest` is a
-whole implicit search, which itself ends in the materialiser, so
-`ClassTag[Array[Array[T]]]` is available exactly when `ClassTag[T]` is. A
-structural rule cost `src/library/scala/Array.scala` eleven diagnostics —
-every `ofDim` and `fill` above one dimension. And the tag it builds is the
-element's **wrapped** (`ClassTag#wrap`, which is
-`ClassTag(ScalaRunTime.arrayClass(…))`), not a `classOf` of the array type: we
-had been answering `def f[T: ClassTag] = implicitly[ClassTag[Array[T]]]` with
-`int` where scalac says `[I`. `ClassTag#wrap` was not in the prelude
-(`crates/typer/src/prelude_classtag.rs` now declares it).
-
-**An undetermined type parameter is not an abstract type.** nsc instantiates a
-call's undetermined parameters before it asks for a tag, so `bar(Array(): _*)`
-is `Array[Nothing]` and `ClassTag.Nothing` answers it. Our inference leaves
-the callee's own `Type::TypeParam` in place instead, and refusing those cost
-`pos/t3859`, `pos/t5692c` and `pos/t5859`. `tparam_in_scope` — which already
-existed for the same distinction in argument inference — is the test: the
-enclosing definition's parameters are in the scope, a callee's are not.
-
-The measurements a rejection rule is judged on, `main` at `81b756a` against
-the merged branch:
-
-| | before | after |
-|---|---|---|
-| slick | `errors=0 files_with_errors=0 classes=1596` | identical |
-| `tests/slick_run.sh` | `progs=12 ok=12 attempts=36/36` | identical |
-| cats | `errors=907 files_with_errors=108` | identical |
-| gitbucket | `errors=1193 files_with_errors=184` | identical |
-| `src/library` | `errors=1644 files_with_errors=171` | **1653** / 171 |
-
-The nine are all *second* diagnostics on lines that already carried one — no
-file and no line newly fails — and each is a pre-existing bug this rule
-stopped papering over:
-
-* six in `immutable/HashSet.scala`. `new BitmapIndexedSetNode[A](…,
-  Array(getPayload(1)), …)` takes an `Array[Any]`, and **a constructor
-  argument does not receive the parameter's type as its expected type** the
-  way a method argument does. `take(Array(a))` types `Array.apply[Any]`;
-  `new Box(Array(a))` types `Array.apply[A]` and already reported
-  `found: Array[A] required: Array[Any]`. Now it reports the missing tag
-  as well;
-* three in `collection/Factory.scala`. `ClassTagIterableFactory` supplies the
-  `ClassTag[CC[X]]` that nsc cannot build, as
-  `private[this] implicit def ccClassTag[X]` — and our variance check rejects
-  that declaration (`private[this]` is exempt from variance in nsc), so the
-  implicit is not there to be found.
-
-### One more thing this exposed and did not fix
-
-**An explicit type argument on a parameterless method is dropped when an
-implicit in scope can unify with the undetermined parameter.** Inside
-`def z[T: ClassTag]`, `classTag[String].runtimeClass` returns the *evidence*
-— `int` at `z[Int]` — and so does `myTag[String]` for a user-written
-`def myTag[U](implicit ct: ClassTag[U]): ClassTag[U]`. scalac says
-`java.lang.String` for both. It is not caused by the rule above (a binary
-built before it does the same), and it is a wrong *answer* rather than a
-missing diagnostic, which puts it in [pile one](#pile-one-we-are-wrong-237).
-`implicitly[ClassTag[X]]` is unaffected, which is why the fixture uses it.
-
-## The value-class restrictions, added (2026-09-05, `agent/valueclass`)
-
-`neg/valueclasses` is thirty lines that are nothing but SLS 5.1.7 / SIP-15
-violations, and we compiled it to 33 class files without a diagnostic. It was
-in bucket **a** — accepted with no word — and it only became visible when
-`@specialized` stopped being a parse error: line 29 of that file carries one,
-and the parse error had been standing in for all fifteen checks.
-
-`crates/typer/src/valueclass.rs` is nsc's `Typers.validateDerivedValueClass`.
-Its module header carries the reasoning; three things in it were read off nsc
-or off a measurement rather than assumed, and each one would have been a
-regression:
-
-* **The parameter rules read the symbol's flags, not the written modifiers.**
-  The namer has already applied nsc's two rules about what a constructor
-  parameter *becomes* — a bare one is `private[this]`, and a `case class`
-  makes all of them public `val`s. Reading the modifiers instead cost cats one
-  false diagnostic (817, back to 816) on `final case class
-  ShowInterpolator(_sc: StringContext) extends AnyVal`.
-* **The nine primitive value classes are exempt** from the parameter rules, as
-  in nsc (`isPrimitiveValueClass`). `src/library`'s own `final abstract class
-  Int private extends AnyVal` has no parameter at all, and
-  `tests/scalalib_measure.sh` is the check that says so.
-* **A `trait` gets one message, not two.** Nothing in
-  `validateDerivedValueClass` returns early, and a trait also fails the
-  one-val-parameter rule; the filter is in the *reporter*
-  (`FilteringReporter.duplicateOk`: "after an error, no further messages at
-  that position are issued"). Reproducing that compiler-wide would touch every
-  diagnostic, so it is reproduced over this check's own output.
-
-Only the eight messages `neg/valueclasses.check` records are implemented. The
-rest of nsc's `checkEphemeral` — nested class / trait / object, secondary
-constructor, redefined `equals` / `hashCode`, qualified `super`, a body
-statement that is not a definition — is not; see `docs/not-implemented.md`.
-`neg/valueclasses-impl-restrictions` is still rejected for a different reason
-(`no matching overload for String`), not for those.
-
-Measured on `main` at `b82b5a2`, both columns from the same tree:
-
-| | before | after |
-|---|---|---|
-| `pos` full | 1045 | **1045** |
-| `neg` **T0** any error, full | 655 | **658** |
-| `neg` **T1** expected messages reproduced | 121 | **123** |
-| `neg` **T2** … at the expected line | 116 | **118** |
-| `neg` **T3** … and nothing extra | 95 | **97** |
-
-The three `neg` gains are `valueclasses`, `t6357` and `anyval-anyref-parent`;
-nothing was lost. The first two are T3 — every message scalac writes, at its
-line, and nothing else. `anyval-anyref-parent` is not, because three of the six
-diagnostics scalac reports there (`Any does not have a constructor`, two
-`illegal inheritance; superclass …`) are still missing.
-
-The four project measurements, which is what a rejection rule has to be judged
-on, are all unchanged: slick `files=184 errors=0 files_with_errors=0
-classes=1490`, `slick_run.sh` `progs=12 ok=12 attempts=36/36`, cats `816 / 107`,
-gitbucket `1736 / 185`, `src/library` `1653 / 171`. `tests/spec_classfiles.sh`
-is unchanged as well (`tests=37 match=2 differ=26 no_compile=9`).
-
-One extra check, because this is a rejection rule and the four measures above
-do not contain many value classes: every corpus `pos/` and `run/` source that
-mentions `extends AnyVal` — 131 files, all of which scalac accepts — was
-compiled and grepped for the eight new messages. **Zero hits.**
-
-## Four tests that were passing for the wrong reason (2026-09-08, `agent/negchecks`)
-
-`agent/libnotype` fixed three real defects — a case-insensitive directory
-classpath fabricating `package scala.Math`, a blank line not ending an
-expression, and `new X` resolved in the term namespace — and four `neg` tests
-went from pass to fail as a direct result. They had been "passing" **because
-of** the bogus errors. The coordinator checked each `.check` file first, and
-the diagnostics we used to emit appear in none of them:
-
-| test | what scalac reports | what we used to say |
-|---|---|---|
-| `neg/anytrait` | `field definition is not allowed in universal trait extending from class Any` | `recursive value x needs type` |
-| `neg/valueclasses-impl-restrictions` | `implementation restriction: nested object / trait / class is not allowed in value class` | `no matching overload for String with arguments ((<notype>) => <notype>)` |
-| `neg/t8002-nested-scope` | `method x in class C cannot be accessed as a member of C from object C` | `value x is not a member of C$` |
-| `neg/name-lookup-stable` | `reference to PrimaryKey is ambiguous; …` | `no matching overload for Nothing with arguments (PrimaryKey$)` |
-
-That is the most useful thing a `neg` test can tell you and the pass/fail
-column cannot: **a green `neg` test is not evidence.** Four of them had been
-green for years on diagnostics that had nothing to do with the rule each test
-is named after, and the only reason anyone found out is that the wrong
-diagnostics were removed.
-
-Three of the four are now implemented, and the fourth is reduced.
-
-### `checkEphemeral` is one function with two callers
-
-`neg/anytrait` and `neg/valueclasses-impl-restrictions` look like two rules and
-are one. nsc's `Typers.checkEphemeral` opens with
-
-```scala
-val isValueClass = !clazz.isTrait
-def where = if (isValueClass) "value class" else "universal trait extending from class Any"
-```
-
-and is called twice: from `validateDerivedValueClass` for a value class, and
-from `typedClassDef` for a **universal trait** (`clazz.isTrait &&
-clazz.info.parents.nonEmpty && clazz.info.firstParent.typeSymbol == AnyClass`,
-SLS 5.3.3). The flag does more than pick a noun — when it is false a nested
-class or trait is *allowed*, and the deep traversal of `def` bodies does
-nothing at all (`checkEphemeralDeep.traverse` opens with `if (isValueClass)`).
-Writing the two message sets apart is how they drift, so
-`crates/typer/src/valueclass.rs` takes the flag, exactly as nsc does.
-
-Three things in it were read off nsc rather than assumed, and each would have
-been a wrong rejection:
-
-* **Anonymous classes are exempt** (`!cd.symbol.isAnonymousClass`,
-  scala/bug#7571). `neg/valueclasses-impl-restrictions.scala` contains a `new
-  I2 { val q = x.s }` and a `PartialFunction` literal *inside* value classes,
-  on lines its `.check` file deliberately does not mention, and both are
-  anonymous classes. Our parser builds the first as a `ClassDef` named `$anon`
-  carrying `SYNTHETIC`; both marks are tested, because either alone is a guess.
-* **The deep half runs on `def` right-hand sides only** — not on a `val`'s
-  (already "field definition"), and not into a nested class that was itself
-  just reported. `object X` on line 3 of that file is inside `def lazyString`,
-  which is the only reason it is reported at all.
-* **`Import`, `TypeDef` and `EmptyTree` are on nsc's "OK" list** in both modes,
-  so a value class may declare a type alias and a universal trait may declare
-  a nested class.
-
-Both tests now score **T3** — every message scalac writes, at its line, and
-nothing else.
-
-The nested-object half of this rule already existed, in
-`crates/typer/src/localobj.rs`, where it could not work. That pass runs from
-the driver behind `if !has_errors(&diags)`, so the moment the typer rejected a
-value class for a nested *trait*, the nested-*object* message vanished with
-it — and the reverse had already been true: adding the typer check silently
-suppressed `localobj`'s "a local `object` that reads the enclosing instance"
-message in the same file. **A rejection rule cannot live behind a
-`!has_errors` guard.** It has moved into `valueclass.rs`, and
-`tests/fixtures/nestedobj_bad.scala` now carries only the not-implemented
-shape that check is actually for.
-
-### A companion has to be co-defined, and for locals that means the same block
-
-`neg/t8002-nested-scope` is eleven lines:
-
-```scala
-class C {
-  def foo = {
-    class C { private def x = 0 }
-    { val a = 0
-      object C { new C().x } }
-  }
-}
-```
-
-The inner `object C` is **not** the companion of the inner `class C`, because
-they are in different blocks — and nsc's comment in `Contexts.lookupSibling`
-is this exact program:
-
-```text
-// Must be owned by the same Scope, to ensure that in
-// `{ class C; { ...; object C } }`, the class is not seen as a companion
-// of the object.
-```
-
-Two blocks of one method share an owner, so the owner cannot tell them apart
-and `Checker::companion_scope` granted the pair private access.
-`Symbol::local_scope` now records the block each local class or object was
-declared directly in — `(file index, the block's NodeId)`, written by the
-`Block` arm of `Typer::type_expr_inner`, which is where the namer already runs
-over the block's `ClassDef` / `ModuleDef` statements — and `companion_scope`
-requires a match. Both being `None` (a template member, or top level) leaves
-every ordinary companion pair exactly as it was.
-
-**The wording was ours, not scalac's, and deliberately so; the follow-up slice
-`agent/accessmsg` fixed it.** The rule slice scored this test **T0** because
-we said `value x cannot be accessed as a member of C from C$` where scalac
-says `method x in class C cannot be accessed as a member of C from object C` —
-the same line, the same reason, a different sentence. That difference is nsc's
-`fullLocationString` ("method x in class C") and `directObjectString` ("object
-C" for a module class), and it applied to *every* access diagnostic this
-compiler emitted, not to this rule, so it was one cross-cutting change of its
-own rather than four other slices' fixtures edited under five parallel slices.
-
-See "[Access diagnostics now read like nsc's](#access-diagnostics-now-read-like-nscs)"
-below: the test now scores **T3**, byte-identical to the `.check`.
-
-### Access diagnostics now read like nsc's
-
-`ContextErrors.AccessError` builds its message from three nsc primitives, and
-we now build ours from the same three:
-
-```scala
-val location = if (sym.isClassConstructor) s"in $owner0"
-               else s"as a member of ${pre.widen.directObjectString}"
-val from     = s" from ${owner0.fullLocationString}"
-underlyingSymbol(sym).fullLocationString + " cannot be accessed " + location + from
-```
-
-* `fullLocationString` is `<kind> <name> in <owner kind> <owner>` — "method x
-  in class C", "variable foo in class Sub2", "object Inner in object Outer".
-  The kind comes from `Symbol#kindString` in its sanitized spelling, and nsc
-  reaches the member through `underlyingSymbol` first, so a `val`'s getter
-  answers as the field: "value", "variable" for a `var`, "lazy value" for a
-  `lazy val`, never "getter"/"setter". The location is one level and is
-  dropped for the root and the empty package, which is why a top-level access
-  in the empty package reads plain "class Q3" and one inside `package xflags`
-  reads "object Use in package xflags".
-* `directObjectString` spells a module `object C` where it is the direct
-  object of the sentence, instead of the `C.type` (`C$` for us) it prints
-  everywhere else.
-* A constructor takes `in <owner>` in place of `as a member of <prefix>`. That
-  branch was written here before anything reached it -- private and protected
-  constructors were accepted outright. `agent/intrinsicqual` added the check
-  and closed `neg/sensitive`, `neg/t4987` and `neg/protected-constructors`;
-  `agent/ctorgaps` closed the fourth, `neg/t6601`, which is a separate
-  compilation and needed the *pickle reader* to mark the constructor rather
-  than drop it. All four now reproduce their `.check` sentence.
-
-`agent/ctorgaps` also closed `neg/t7870`, which is not an access test at all
-but the same area: `class C(a: Int = 0, b: Any) { def this(a: Int = 0) = … }`
-is nsc's "multiple overloaded alternatives of constructor C define default
-arguments", and we now report it in nsc's words at nsc's line.
-
-Over the 26 `neg` tests whose `.check` contains `cannot be accessed`, the
-wording score moved **T1/T2/T3 = 0 → 3** (13.6% of the 22 scored) with T0
-unchanged at 13: `neg/t8002-nested-scope`, `neg/t3714-neg` and `neg/t3871`
-are now byte-identical to their `.check` files. The error *count* does not
-move at all, and is not supposed to — this slice changes what the diagnostic
-says, not which programs are rejected.
-
-One difference is left, and it is not this message's: nsc qualifies the prefix
-type with its package (`as a member of object xflags.C`, `as a member of
-mism8bad.Holder`) where `SymbolTable::display_type` prints `object C` and
-`Holder`. That is how *every* type is printed in *every* diagnostic we emit,
-so it belongs to `display_type` and not to `AccessError`. nsc also appends an
-indented "Access to protected method secret not permitted because …"
-explanation for the `protected` cases; we print the sentence only.
-
-### The fourth is reduced, not implemented
-
-`neg/name-lookup-stable` needs an ambiguity between a definition and an import
-at a *deeper nesting level*. `agent/impprio` implemented SLS 2's four
-precedence levels and named this as the piece it could not reach — it needs a
-depth, not just a rank. Sixteen lines, and it is a **wrong program** rather
-than a missing diagnostic:
-
-```scala
-object ColumnOption { def PrimaryKey: String = "imported" }
-class A {
-  def PrimaryKey: String = "defined"
-  def pick: String = { import ColumnOption._; PrimaryKey }
-}
-```
-
-scalac 2.13.16 rejects `pick`; we compile it and print `imported`. What it
-needs, and the two things the *message* needs that nothing records yet, are
-written up in [docs/not-implemented.md](not-implemented.md). The short version:
-`SymbolTable::scopes` already carries the depth as its own index, so the
-comparison is between the innermost scope binding the name at
-`BindRank::Explicit` / `Wildcard` and the innermost one binding it at
-`Definition`, with `BindRank::PackageElsewhere` as nsc's documented level-4
-exception.
-
-### Measured
-
-Every new rule here **rejects more**, which is the direction that costs working
-programs, so each one ships with the *legal neighbour* of the illegal shape as
-a **running** fixture — a universal trait with only `def`s, a value class with
-a nested type alias and an anonymous class and a `PartialFunction` literal, a
-companion reading `private` state on another instance — whose expected output
-is real scalac 2.13.16's and which the **pre-slice binary also compiles and
-prints unchanged**. That last clause is the guard: a positive fixture that
-only passes after the change proves nothing about over-reach.
-
-The four corpus tests, run alone before and after on the same tree
-(`CORPUS_KINDS=neg CORPUS_SIZE=full`, own `CORPUS_LOG`):
-
-| test | at `acec3f09` | at `961afe45` | scored |
-|---|---|---|---|
-| `neg/anytrait` | fail (accepted) | **pass** | T3 |
-| `neg/valueclasses-impl-restrictions` | fail (accepted) | **pass** | T3 |
-| `neg/t8002-nested-scope` | fail (accepted) | **pass** | T0 (wording, above) |
-| `neg/name-lookup-stable` | fail (accepted) | fail (accepted) | — |
-
-`tests/verify_merge.sh`, run twice: once on this slice alone (`961afe45`) and
-again after `git merge main` brought `agent/neglit` in (`adc144c4`). Every
-number against the coordinator's `acec3f09` baseline:
-
-| | baseline | `961afe45` | after merging main |
-|---|---|---|---|
-| `src/library` | 971 / 147 | **971 / 147** | 970 / 147 (neglit's gain) |
-| gitbucket | 270 / 79 | **270 / 79** | **270 / 79** |
-| cats | 185 / 71 | **185 / 71** | **185 / 71** |
-| slick | `errors=0 classes=1490` | **identical** | **identical** |
-| `slick_run.sh` (MODE=b) | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | **identical** | **identical** |
-| slick subset + verify | — | `verified=1490 failed=0 lint_problems=0` | same |
-| `cargo test --workspace --release` | — | 255 rows, **2457 passed, 0 failed** | 256 rows, **2469 passed, 0 failed** |
-| corpus full | — | `pos 1095`, `neg 673`, `run 623` | identical |
-
-`main` moved again while that second gate ran (`agent/pickleparams`), so the
-branch tip carries a third merge. It is a clean auto-merge — `README.md` and
-`crates/typer/src/symbol.rs` are the two files both sides touched and neither
-conflicted — and `cargo test --workspace --release` on it is 257 rows, **2475
-passed, 0 failed**. The four measures and the corpus were not re-run a third
-time: with five slices landing in parallel that is a treadmill, and the
-coordinator's gate at merge time is the authoritative one.
-
-**Three rejection rules and not one number moved.** That is the result worth
-recording: the direction these rules push is the one that turns working
-programs into errors, and 1414 files of real Scala across four projects say
-they do not.
-
-The gate's verdict is nonetheless `VERDICT=FAIL`, `corpus losses=1` against
-`tests/baselines/corpus-4d613d25.tsv`, on both runs. The loss is
-`neg/name-lookup-stable` — the fourth test, which was *already* failing at
-`acec3f09` (the ledger predates `agent/libnotype`, so it still records that
-test as a pass earned by a bogus `no matching overload for Nothing`). The
-other eleven changes against that ledger are all gains and all
-`agent/libnotype`'s. Nothing in this slice regressed anything: the loss count
-went from 4 to 1 and the gate will read `PASS` again once the ledger is
-refreshed or the fourth rule lands.
-
-
-
-## What would move the number most
-
-0. **`@specialized`, for real.** With `run` now classified, this is the
-   largest single identified lever left in the corpus: 70 `pos` + 37 `run` =
-   **107 tests**, and it is the *only* one of that size. The tails of all three
-   categories are otherwise flat — after specialization the next-biggest `pos`
-   cluster is 5 tests, and the next-biggest `neg` one is a `type mismatch`
-   bucket of 37 that is many unrelated roots. See
-   [the section at the top](#why-pos-does-not-pass--no-specialization) for why
-   `-no-specialization` is not a substitute: the flag means *ignore the
-   annotation*, and nsc's `specialize` phase emits `Foo$mcI$sp` classes and
-   changes the ABI. This is a real phase, not a diagnostic to delete.
-1. **Static forwarders into a companion class.** Fifteen `run` tests, one
-   well-understood rule, contained to the backend.
-2. **`AnyRef` conformance.** `val x: AnyRef = 1` compiling is a hole under
-   everything else; but it is a *rejection* rule, and this project's history
-   says a new rejection rule breaks more than it fixes. Do it with the slick,
-   cats and gitbucket measurements in hand. (The three rules in
-   [the section above](#three-checks-we-were-not-performing-2026-09-05-agentaccepttoomuch)
-   were added that way and three of the four measurements improved — but two of
-   them only after a guard that a measurement, not a reading of the code, said
-   was needed.)
-3. ~~**Compare the `neg` `.check` text.**~~ Done, 2026-09-05. The real figure is
-   9.5 % (T2), not 61.7 %. What it turned up is that the `neg` tail is as flat
-   as the `pos` one; the ranked follow-ups are at the end of
-   [that section](#what-this-says-to-fix-next).
-4. **The 237 in [pile one](#pile-one-we-are-wrong-237).** Programs we accept
-   and then get wrong. This is now the top lever, ahead of anything that adds
-   a feature: every one of them is a case where a user would ship the wrong
-   behaviour with no diagnostic to warn them.
+The accepted numbers are in `tests/BASELINE.md`, not here. At gate `ff08907d`
+(2026-09-14) the full corpus passes **1251 `pos` / 813 `neg` / 1018 `run`** of
+the same 5324 identities, and the saved ledger is
+`tests/baselines/corpus-ff08907d.tsv`.
+
+The remaining failures fall into kinds that need different work, and
+`tests/scala_corpus_report.sh` buckets them by first diagnostic:
+
+* `pos` — programs scalac compiles and we reject. The tail is flat: after the
+  specialization tests, most buckets are a handful of tests with unrelated
+  roots.
+* `neg` — programs scalac rejects and we accept (a missing rejection rule), and
+  programs we reject for a different reason than scalac (visible in T1–T3).
+  Adding a rejection rule is measured against slick, cats, gitbucket and the
+  library before it is accepted, because a new rule tends to reject legal code
+  too.
+* `run` — programs that compile and then fail to link or verify, that print the
+  wrong answer, or that need a feature we do not implement. The first two are
+  the most serious, since a user gets wrong behaviour with no diagnostic.
+* specialization — `tests/spec_classfiles.sh` records the classes scalac emits
+  for `pos/spec-*` and we do not; see [specialization.md](specialization.md).
+
+Pick one reproduced cause per change; a bucket's test count is an upper bound
+on what fixing it yields, not a prediction.
 
 ## Known limits of this runner
 
 * The `neg` pass/fail column is still "any error"; the wording comparison is a
-  separate set of numbers in the report, and it compares message *heads*, not
-  full text. A head match is not proof the two compilers rejected for the same
-  reason — two different `type mismatch`es at the same line score as agreement.
-  It is a much tighter bound than "any error", not an exact one.
+  separate set of numbers in the report.
 * Directory tests are compiled as one round unless the sources are named
   `..._1.scala`, `..._2.scala`; then they are compiled in numbered rounds with
   each round's output on the next round's classpath. partest's finer grouping
@@ -1526,4 +230,13 @@ refreshed or the fourth rule lands.
 * `run` compares stdout, or stdout and stderr concatenated, against the
   `.check`. partest merges the two streams in real order; a test that
   interleaves them can be scored as a mismatch here.
-* A `.java` beside a test is a skip; wiring in `javac` would recover 318 units.
+* A `.java` beside a test is a skip; wiring in `javac` would recover those
+  units.
+
+## History
+
+Earlier versions of this page recorded dated surveys: per-bucket failure
+tables, the classification of the `run` failures, and per-slice write-ups
+(cycle detection, the `ClassTag` and value-class rules, the `neg` wording
+numbers). Code comments and tests that cite those sections refer to that
+record; read it with `git log -p -- docs/scala-corpus.md`.
