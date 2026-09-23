@@ -233,6 +233,12 @@ fn sorted_map_overloads_after_generic_collection_loading() {
         JAR,
     );
 }
+
+#[test]
+fn map_view_collect_keeps_generic_overload_after_plain_map() {
+    matrix(&[("mapview_collect_warm", true)], false);
+}
+
 #[test]
 fn lazy_class_tag_factory_preserves_required_evidence() {
     matrix(
