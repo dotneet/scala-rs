@@ -4082,7 +4082,34 @@ impl PickleSupply {
                 self.param_singleton_symbols.insert(key, *ps);
             }
         }
+        // `def get[A](a: A): Outer.this.Repr[A]` in a nested class pickles the
+        // member bare, and `self_type_member` would read `Repr` on the nested
+        // class, where a same-named alias (`type Repr[A] = Vector[A]`) is a
+        // different type. The `This` prefix names the class to read it on.
+        let enclosing_self = match (result_prefix, &shape.ret) {
+            (Some(SigType::This(this_owner)), SigType::Ref { sym, .. })
+                if this_owner != pickle_owner
+                    && !sym.contains('.')
+                    && !scope.contains_key(sym) =>
+            {
+                self.ensure_class(st, bin, this_owner, false)
+                    .map(|cls| Type::Class {
+                        sym: cls,
+                        args: st
+                            .get(cls)
+                            .tparams
+                            .iter()
+                            .map(|t| Type::TypeParam(*t))
+                            .collect(),
+                    })
+            }
+            _ => None,
+        };
+        let saved_self = enclosing_self.map(|t| self.self_ty.replace(t));
         let ret = self.conv(st, bin, &scope, &shape.ret);
+        if let Some(saved_self) = saved_self {
+            self.self_ty = saved_self;
+        }
         self.param_singletons = saved_singletons;
         self.param_singleton_symbols = saved_singleton_symbols;
         let Some(mut ret) = ret else {
@@ -4092,9 +4119,15 @@ impl PickleSupply {
             ));
             return None;
         };
+        // Only the declaring class's own `this`: member selection re-reads the
+        // name on the receiver's class, and an enclosing class's
+        // `Outer.this.Repr[A]` would otherwise pick up a same-named member of
+        // the inner receiver instead.
         let result_type_member_app = match (result_prefix, &shape.ret) {
-            (Some(SigType::This(_)), SigType::Ref { sym, args })
-                if !sym.contains('.') && !scope.contains_key(sym) =>
+            (Some(SigType::This(this_owner)), SigType::Ref { sym, args })
+                if this_owner == pickle_owner
+                    && !sym.contains('.')
+                    && !scope.contains_key(sym) =>
             {
                 self.conv_all(st, bin, &scope, args, 0)
                     .map(|args| (sym.clone(), args))
