@@ -82,3 +82,41 @@ object S {
     };
     assert_eq!(out, "Tag!\nTag!\n");
 }
+
+/// nsc's case class `copy` is `copy[A](value: A = …): Wrapper[A]`, so a
+/// client may change the type arguments. Pickled monomorphic with a raw
+/// result, scalac rejected `copy(value = 1)` with `required: String`.
+#[test]
+fn generic_case_class_copy_takes_its_own_type_parameters() {
+    let Some(out) = scalac_client_output(
+        "scalac-client-generic-case-copy",
+        r#"package lib
+case class Wrapper[A](value: A, tags: List[String] = Nil) {
+  def swap[B](b: B): Wrapper[B] = copy(value = b)
+}
+case class Bounded[T <: AnyVal](t: T, n: Int = 1)
+case class Two[A, B](a: A, b: B)(val extra: String)
+"#,
+        r#"import lib._
+object Main {
+  def main(args: Array[String]): Unit = {
+    val w = Wrapper("x", List("t"))
+    val w2: Wrapper[Int] = w.copy(value = 1)
+    println(w2)
+    println(w.copy())
+    println(w.swap(3))
+    println(Bounded(2).copy(t = 3L))
+    val two = Two(1, "b")("e").copy(b = 2.0)("f")
+    val d: Double = two.b
+    println(s"$two ${two.extra} $d")
+  }
+}
+"#,
+    ) else {
+        return;
+    };
+    assert_eq!(
+        out,
+        "Wrapper(1,List(t))\nWrapper(x,List(t))\nWrapper(3,List(t))\nBounded(3,1)\nTwo(1,2.0) f 2.0\n"
+    );
+}
