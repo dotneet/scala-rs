@@ -7184,11 +7184,34 @@ impl PickleSupply {
             return None;
         }
         let short = member.rsplit_once('.').map(|(_, m)| m).unwrap_or(member);
+        let mut stable_path = None;
         let pre = match scope.get(prefix) {
             Some(t) => t.clone(),
             None if prefix.ends_with(".type") => {
-                let module = prefix.strip_suffix(".type")?;
-                Type::ModuleRef(self.ensure_class(st, bin, module, true)?)
+                let path = prefix.strip_suffix(".type")?;
+                if let Some(module) = self.ensure_class(st, bin, path, true) {
+                    Type::ModuleRef(module)
+                } else {
+                    // A singleton prefix may name a stable value rather than
+                    // an object: `Owner.value.type#Owner.Member`. Resolve the
+                    // accessor on Owner's module and retain its term path so
+                    // an abstract Member remains path-dependent.
+                    let (owner_name, value_name) = path.rsplit_once('.')?;
+                    let owner = self.ensure_class(st, bin, owner_name, true)?;
+                    self.adopt_binary_class(st, bin, owner);
+                    let mut values = st.lookup_member(owner, value_name);
+                    if values.is_empty() {
+                        values = self.complete(st, bin, owner, value_name);
+                    }
+                    let value = values
+                        .into_iter()
+                        .find(|id| matches!(st.get(*id).kind, SymKind::Term | SymKind::Method))?;
+                    stable_path = Some(vec![owner, value]);
+                    Type::SingleType {
+                        prefix: Box::new(Type::ModuleRef(owner)),
+                        sym: value,
+                    }
+                }
             }
             None => {
                 // The prefix is written in the vocabulary of the class the
@@ -7226,6 +7249,9 @@ impl PickleSupply {
         // the fall-back path would have installed anyway.
         if let Type::TypeMember(id) = &t {
             if st.is_deferred_type_member(*id) {
+                if let Some(path) = stable_path.as_deref() {
+                    return Some(Type::TypeMember(st.path_member(path, *id, &pre)));
+                }
                 // An abstract member keeps its declaration identity, but its
                 // stable module prefix still contributes to implicit scope.
                 if matches!(pre, Type::ModuleRef(_)) {
