@@ -769,6 +769,24 @@ impl Typer {
             .unwrap_or(0)
             .max(crate::implicits::MAX_IMPLICIT_DEPTH);
         for &id in &cands {
+            // Detached generic signatures are needed only for candidates a
+            // search can actually try.  A concrete result class cannot
+            // satisfy an unrelated class target, even after freshening its
+            // type parameters.  The immutable fit path applies the same
+            // rejection, but doing it here avoids allocating nine copies of
+            // every irrelevant polymorphic implicit in a wide import scope.
+            let declared_result = match &self.st.get(id).ty {
+                Type::Method { ret, .. } => ret.as_ref(),
+                Type::Function { params, ret } if params.is_empty() => ret.as_ref(),
+                ty => ty,
+            };
+            if !wanted.iter().any(|w| {
+                !matches!((declared_result, w), (Type::Class { sym, .. }, Type::Class { .. })
+                    if !self.st.is_inner_class_of_class(*sym))
+                    || self.plausibly_inhabits(declared_result, w)
+            }) {
+                continue;
+            }
             completed |= self.prepare_implicit_instances(id, instance_depth);
         }
         // A derivation candidate can ask for a witness whose companion the

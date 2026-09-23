@@ -5377,6 +5377,43 @@ mod memo_tests {
     }
 
     #[test]
+    fn warming_unrelated_implicit_does_not_allocate_search_instances() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let owner = typer
+            .st
+            .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
+        let result = typer
+            .st
+            .alloc("Result", root, SymKind::Class, Flags::EMPTY, "Result");
+        let wanted = typer
+            .st
+            .alloc("Wanted", root, SymKind::Class, Flags::EMPTY, "Wanted");
+        let method = typer
+            .st
+            .alloc("derive", owner, SymKind::Method, Flags::IMPLICIT, "derive");
+        let tp = typer
+            .st
+            .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(method).tparams = vec![tp];
+        typer.st.get_mut(method).ty = Type::Method {
+            paramss: vec![],
+            ret: Box::new(Type::Class {
+                sym: result,
+                args: vec![Type::TypeParam(tp)],
+            }),
+        };
+        typer.st.this_class = owner;
+        let wanted_type = Type::Class {
+            sym: wanted,
+            args: vec![],
+        };
+        assert!(typer.implicits_in_scope().contains(&method));
+        typer.warm_implicit_candidates(&[wanted_type]);
+        assert!(!typer.implicit_instances.contains_key(&method));
+    }
+
+    #[test]
     fn annotated_recursive_tail_decreases_but_self_loop_does_not() {
         let mut typer = Typer::new(0, &TypecheckOptions::default());
         let root = typer.st.root;

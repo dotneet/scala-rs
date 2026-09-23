@@ -3227,41 +3227,45 @@ impl Typer {
     /// arguments, so typing it first would turn the call into
     /// `selectDynamic("name")` and silently infer `T` from its bound.
     pub(crate) fn try_rewrite_dynamic_type_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
-        let (mut qual, name, targs) = match &mut tree.kind {
-            TreeKind::TypeApply { fun, args } => match &mut fun.kind {
-                TreeKind::Select { qual, name } => ((**qual).clone(), name.clone(), args.clone()),
+        let dynamic = match &mut tree.kind {
+            TreeKind::TypeApply { fun, .. } => match &mut fun.kind {
+                TreeKind::Select { qual, name } => {
+                    // These compiler-defined casts are frequent in deeply
+                    // nested source and can never be dynamic selections.
+                    if matches!(name.as_str(), "asInstanceOf" | "isInstanceOf") {
+                        return false;
+                    }
+                    if qual.ty.is_no_type() {
+                        // A nested TypeApply may already be typing this
+                        // qualifier. Let its ordinary path finish first.
+                        if self.typing_qualifier {
+                            return false;
+                        }
+                        self.type_qualifier(qual, &Type::NoType);
+                    }
+                    self.is_dynamic_receiver(&qual.ty)
+                        && !self.dynamic_receiver_has_term(&qual.ty, name)
+                }
                 _ => return false,
             },
             _ => return false,
         };
-        // These compiler-defined casts are frequent in deeply nested source
-        // and can never be dynamic selections. Avoid traversing their
-        // receiver before the ordinary TypeApply path handles them.
-        if matches!(name.as_str(), "asInstanceOf" | "isInstanceOf") {
+        if !dynamic {
+            // `type_qualifier` updated the original tree in place. Cloning
+            // that whole tree here costs quadratic work on fluent chains.
             return false;
         }
-        if qual.ty.is_no_type() {
-            // The outer TypeApply may be typing a nested qualifier. Re-entering
-            // this helper while `type_qualifier` is active would type that
-            // qualifier again before the ordinary path has finished it,
-            // turning a linear chain of casts into repeated traversal.
-            if self.typing_qualifier {
-                return false;
-            }
-            self.type_qualifier(&mut qual, &Type::NoType);
-        }
-        if !self.is_dynamic_receiver(&qual.ty) || self.dynamic_receiver_has_term(&qual.ty, &name) {
-            // The classification probe completes the receiver, including any
-            // macro applications in it. Keep that tree for ordinary selection
-            // typing: discarding it repeats every expansion for each outer
-            // type application, making fluent generic chains exponential.
-            if let TreeKind::TypeApply { fun, .. } = &mut tree.kind {
-                if let TreeKind::Select { qual: original, .. } = &mut fun.kind {
-                    **original = qual;
-                }
-            }
-            return false;
-        }
+        let (qual, name, targs) = match &mut tree.kind {
+            TreeKind::TypeApply { fun, args } => match &mut fun.kind {
+                TreeKind::Select { qual, name } => (
+                    *std::mem::replace(qual, Box::new(Tree::dummy(TreeKind::Empty))),
+                    std::mem::take(name),
+                    std::mem::take(args),
+                ),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
         let span = tree.span;
         let name_lit = Tree::new(
             NodeId(0),
@@ -4771,6 +4775,60 @@ mod pickled_copy_tests {
     use crate::check::{TypecheckOptions, Typer};
     use crate::symbol::SymKind;
     use scala_rs_parser::Flags;
+
+    #[test]
+    fn ordinary_type_apply_keeps_its_qualifier_tree() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let inner = Tree::new(
+            NodeId(1),
+            Span::DUMMY,
+            TreeKind::Ident {
+                name: "value".into(),
+            },
+        );
+        let mut qual = Tree::new(
+            NodeId(5),
+            Span::DUMMY,
+            TreeKind::Select {
+                qual: Box::new(inner),
+                name: "field".into(),
+            },
+        );
+        qual.ty = Type::Int;
+        let select = Tree::new(
+            NodeId(2),
+            Span::DUMMY,
+            TreeKind::Select {
+                qual: Box::new(qual),
+                name: "method".into(),
+            },
+        );
+        let mut apply = Tree::new(
+            NodeId(3),
+            Span::DUMMY,
+            TreeKind::TypeApply {
+                fun: Box::new(select),
+                args: vec![Tree::new(
+                    NodeId(4),
+                    Span::DUMMY,
+                    TreeKind::Ident { name: "Int".into() },
+                )],
+            },
+        );
+        let qualifier_ptr = |tree: &Tree| match &tree.kind {
+            TreeKind::TypeApply { fun, .. } => match &fun.kind {
+                TreeKind::Select { qual, .. } => match &qual.kind {
+                    TreeKind::Select { qual: inner, .. } => inner.as_ref() as *const Tree,
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        let original = qualifier_ptr(&apply);
+        assert!(!typer.try_rewrite_dynamic_type_apply(&mut apply, &Type::NoType));
+        assert_eq!(qualifier_ptr(&apply), original);
+    }
 
     fn method_ty(params: Vec<Type>) -> Type {
         Type::Method {
