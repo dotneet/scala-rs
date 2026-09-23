@@ -108,6 +108,7 @@ pub const LITERALnull: u8 = 34;
 #[allow(non_upper_case_globals)]
 pub const LITERALclass: u8 = 35;
 pub const SYMANNOT: u8 = 40;
+pub const CHILDREN: u8 = 41;
 pub const ANNOTATEDTPE: u8 = 42;
 pub const ANNOTINFO: u8 = 43;
 pub const REFINEDTPE: u8 = 18;
@@ -2894,6 +2895,27 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             let mc = self.facts.module_class_of(mod_id);
             if mc != class_id && !mc.is_none() {
                 let _ = self.pickle_class(mc);
+            }
+        }
+        // A sealed parent's direct subclasses are part of its Scala
+        // signature. Macros inspecting a compiled hierarchy use this table
+        // rather than scanning class files for subclasses. Emit it after the
+        // companion, whose nested classes may supply local symbol entries.
+        if class_flags.contains(Flags::SEALED) {
+            let children = self.facts.get(class_id).children.clone();
+            if !children.is_empty() {
+                let mut body = Vec::new();
+                write_nat_to(&mut body, idx);
+                for child in children {
+                    let child = self.facts.module_class_of(child);
+                    let reference = self
+                        .sym_index
+                        .get(&child.0)
+                        .copied()
+                        .unwrap_or_else(|| self.external_class_like_ref(child));
+                    write_nat_to(&mut body, reference);
+                }
+                self.add(CHILDREN, body);
             }
         }
         idx

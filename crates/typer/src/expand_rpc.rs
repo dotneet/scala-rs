@@ -1052,6 +1052,20 @@ impl Typer {
         if let Type::ByName(result) = ty {
             return Ok(format!("(byname {})", self.type_to_wire(result)?));
         }
+        if let Type::Annotated { tpe, annot } = ty {
+            let class = match annot.as_str() {
+                "unchecked" => "scala.unchecked",
+                "uncheckedVariance" => "scala.annotation.unchecked.uncheckedVariance",
+                "switch" => "scala.annotation.switch",
+                name if name.contains('.') => name,
+                _ => return Err(format!("`{}`, an unresolved type annotation", annot)),
+            };
+            return Ok(format!(
+                "(annot {} {})",
+                quoted(class),
+                self.type_to_wire(tpe)?
+            ));
+        }
         if matches!(ty, Type::AnyRef) {
             return Ok("(ty \"java.lang.Object\")".into());
         }
@@ -1221,9 +1235,9 @@ impl Typer {
         Ok(out)
     }
 
-    /// A top-level binary object's singleton is resolved as a module, never
-    /// widened to its module class. Instance and source paths need identities
-    /// that a runtime mirror's staticModule lookup cannot supply.
+    /// A binary object's singleton is resolved as a module, never widened to
+    /// its module class. Source and instance-owned paths need identities that
+    /// a runtime mirror's staticModule lookup cannot supply.
     pub(crate) fn binary_module_type_wire(&mut self, ty: &Type) -> Option<String> {
         let id = match ty {
             Type::ModuleRef(id) => *id,
@@ -1236,14 +1250,20 @@ impl Typer {
             return None;
         }
         let s = self.st.get(id);
-        if s.kind != SymKind::ModuleClass || self.st.get(s.owner).kind != SymKind::Package {
+        if s.kind != SymKind::ModuleClass
+            || !matches!(
+                self.st.get(s.owner).kind,
+                SymKind::Package | SymKind::ModuleClass
+            )
+        {
             return None;
         }
         let name = s.jvm_name.strip_suffix('$')?;
-        if name.is_empty() || name.contains('$') {
+        if name.is_empty() {
             return None;
         }
-        Some(format!("(mod {})", quoted(&name.replace('/', "."))))
+        let full = scala_rs_pickle::names::nested_to_dotted(&name.replace('/', "."));
+        Some(format!("(mod {})", quoted(&full)))
     }
 
     /// Class-owned binary parameters retain their identity in the runtime mirror.

@@ -1013,6 +1013,20 @@ fn nested_implicit_macro_derivation_keeps_associated_types_and_stable_symbols() 
             assert_eq!(run(&out, &binary_cp), b"true\n");
         }
     }
+    let model = root.join("sealed-model-native");
+    compile("macroreflection_sealed_model", false, &model, &cp, true);
+    let sealed_cp = format!("{}:{cp}", model.display());
+    for consumer in [true, false] {
+        let out = root.join(format!("sealed-derivation-{consumer}"));
+        compile(
+            "macroreflection_sealed_derivation",
+            consumer,
+            &out,
+            &sealed_cp,
+            true,
+        );
+        assert_eq!(run(&out, &sealed_cp), b"true\n");
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
