@@ -1318,6 +1318,13 @@ pub struct SymbolTable {
     /// so any change at all -- whether or not it could have mattered -- throws
     /// them away rather than risking a stale answer. See [`LinCache`].
     pub(crate) mutation_gen: std::cell::Cell<u64>,
+    /// [`Self::mutation_gen`] less the mutations of methods, terms and type
+    /// parameters: what the class graph -- parent lists, self types, and
+    /// the class-like and type-member symbols they name -- can have changed
+    /// by. Typing a body sets the type of every local and method it meets,
+    /// so `mutation_gen` moves at nearly every statement; this moves when a
+    /// class, module, package or type member is handed out.
+    pub(crate) graph_gen: std::cell::Cell<u64>,
     /// [`crate::lin::linearize`]'s answers for the current `mutation_gen`.
     pub(crate) lin_cache: std::cell::RefCell<LinCache>,
     /// [`SymbolTable::base_type_args`]'s answers for the current
@@ -1366,9 +1373,11 @@ const BTA_BUCKET_MAX: usize = 16;
 const BTA_CACHE_MAX: usize = 100_000;
 
 /// Memo for the ancestry walks -- [`SymbolTable::class_reaches`],
-/// [`SymbolTable::is_ancestor_of`] and `pickle_supply::inherits_from` -- with
-/// the same validity rule as [`LinCache`]: an entry lives until any symbol is
-/// handed out for mutation.
+/// [`SymbolTable::is_ancestor_of`] and `pickle_supply::inherits_from`. An
+/// entry lives until a class-like or type-member symbol is handed out for
+/// mutation ([`SymbolTable::graph_gen`]): the walks read parent lists and
+/// self types, which only those carry, and a parent kept here names its
+/// class outright.
 ///
 /// Implicit search asks them once per candidate pair, subtype check and
 /// import prefix, over the same few classes, and every answer is a walk over
@@ -1484,6 +1493,7 @@ impl SymbolTable {
             binary_read: rustc_hash::FxHashSet::default(),
             sam_known_overrides: rustc_hash::FxHashMap::default(),
             mutation_gen: std::cell::Cell::new(0),
+            graph_gen: std::cell::Cell::new(0),
             lin_cache: std::cell::RefCell::new(LinCache::default()),
             bta_cache: std::cell::RefCell::new(BtaCache::default()),
             reach_cache: std::cell::RefCell::new(ReachCache::default()),
@@ -1693,7 +1703,17 @@ impl SymbolTable {
     }
 
     pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
-        self.note_mutation();
+        self.mutation_gen
+            .set(self.mutation_gen.get().wrapping_add(1));
+        // `kind` is read before the borrow is handed out. It is reassigned
+        // in one place, a Java `Class` read as a Scala module class, which
+        // is class-like before and after.
+        if !matches!(
+            self.symbols[id.0 as usize].kind,
+            SymKind::Method | SymKind::Term | SymKind::TypeParam
+        ) {
+            self.graph_gen.set(self.graph_gen.get().wrapping_add(1));
+        }
         &mut self.symbols[id.0 as usize]
     }
 
@@ -1909,6 +1929,7 @@ impl SymbolTable {
     pub(crate) fn note_mutation(&self) {
         self.mutation_gen
             .set(self.mutation_gen.get().wrapping_add(1));
+        self.graph_gen.set(self.graph_gen.get().wrapping_add(1));
     }
 
     /// `cls`'s linearization from [`LinCache`], if it was computed since the
@@ -4416,7 +4437,14 @@ impl SymbolTable {
                 }
             }
             if let Some(st) = &self.get(c).self_type {
-                keep = false;
+                // `self_type_classes` reads each component of a compound
+                // self type the way a parent is read.
+                keep &= match st {
+                    Type::Refined { parents, .. } => {
+                        parents.iter().all(crate::lin::parent_names_its_class)
+                    }
+                    other => crate::lin::parent_names_its_class(other),
+                };
                 work.extend(self.self_type_classes(st));
             }
         }
@@ -6086,7 +6114,7 @@ impl SymbolTable {
         {
             return walk().0;
         }
-        let gen = self.mutation_gen.get();
+        let gen = self.graph_gen.get();
         let key = (kind, a.0, b.0);
         {
             let cache = self.reach_cache.borrow();
@@ -6098,7 +6126,7 @@ impl SymbolTable {
         }
         let (out, keep) = walk();
         // The walk itself may have completed a symbol.
-        if !keep || self.mutation_gen.get() != gen {
+        if !keep || self.graph_gen.get() != gen {
             return out;
         }
         let mut cache = self.reach_cache.borrow_mut();

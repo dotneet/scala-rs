@@ -152,37 +152,53 @@ pub(crate) struct ImplicitMemo {
     candidate_tys: rustc_hash::FxHashMap<u32, Option<std::rc::Rc<Type>>>,
 }
 
-/// [`Typer::at_import_prefix_of`]'s answers across searches.
+/// Types of implicit candidates as seen from a prefix, kept across searches:
+/// [`Typer::at_import_prefix_of`]'s view through an `import <value>._`, and
+/// [`Typer::shadow_inherited_implicits`]'s view from `this`.
 ///
 /// `import profile.api._` brings a few hundred implicits into scope, and every
 /// search read each one through the import's prefix again: an as-seen-from
 /// substitution over the candidate's whole signature, a third of a gitbucket
 /// build. [`ImplicitMemo`] keeps them only for one search.
 ///
-/// The answer is a function of the candidate, the type, the prefix and
+/// An answer is a function of the candidate, the type, the prefix and
 /// `this_class`, read against the symbol graph, so an entry lives while
-/// neither [`SymbolTable::mutation_gen`] nor the number of symbols has moved:
-/// a new symbol can be a path member or an abstract projection the
-/// substitution reads, and entering one mutates no existing symbol. A type
-/// that still carries a `Type::Named` resolves through the scopes, and an
-/// ambient expansion guard can truncate what the walk sees; neither is kept.
+/// neither [`SymbolTable::mutation_gen`] nor the number of abstract
+/// projections has moved: `abs_projection_of` is the one side table the
+/// substitution reads, and entering a projection mutates no existing symbol.
+/// The scopes are read for a `Type::Named` and for the `TupleN` behind a
+/// `Type::Tuple`, and an ambient expansion guard can truncate the walk; a
+/// type with either is not kept, and neither is an answer under a guard.
+///
+/// A symbol's own declared type is keyed by the symbol, not by its
+/// structure: it cannot change without a mutation, and hashing and comparing
+/// a whole signature on every hit cost as much as the hits saved.
 #[derive(Default)]
-pub(crate) struct ImportSeenCache {
+pub(crate) struct SeenCache {
     epoch: (u64, usize),
-    map: rustc_hash::FxHashMap<u64, Vec<ImportSeenEntry>>,
+    map: rustc_hash::FxHashMap<u64, Vec<SeenEntry>>,
     len: usize,
 }
 
-struct ImportSeenEntry {
+/// Which view a [`SeenCache`] entry holds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SeenKind {
+    ImportPrefix,
+    ValueFromThis,
+}
+
+struct SeenEntry {
+    kind: SeenKind,
     id: SymbolId,
     this_class: SymbolId,
     prefix: Type,
-    ty: Type,
-    seen: Option<std::rc::Rc<Type>>,
+    /// The type that was read, when it is not `id`'s own declared type.
+    ty: Option<Type>,
+    seen: std::rc::Rc<Type>,
 }
 
 /// Past this many entries the cache is emptied.
-const IMPORT_SEEN_MAX: usize = 50_000;
+const SEEN_CACHE_MAX: usize = 50_000;
 
 /// A candidate's type as an implicit search reads it.
 ///
@@ -768,10 +784,12 @@ impl Typer {
             if let Some(hit) = value_types.borrow().get(&id) {
                 return hit.clone();
             }
-            let ty = self.st.subst_as_seen_from(&receiver, &self.st.get(id).ty);
-            let ty = std::rc::Rc::new(match ty {
-                Type::Method { paramss, ret } if paramss.is_empty() => *ret,
-                other => other,
+            let declared = &self.st.get(id).ty;
+            let ty = self.seen_cached(SeenKind::ValueFromThis, id, Some(id), &receiver, declared, || {
+                match self.st.subst_as_seen_from(&receiver, declared) {
+                    Type::Method { paramss, ret } if paramss.is_empty() => *ret,
+                    other => other,
+                }
             });
             value_types.borrow_mut().insert(id, ty.clone());
             ty
@@ -1161,12 +1179,18 @@ impl Typer {
     /// parameter, and `subst_as_seen_from` replaces that symbol wherever it
     /// occurs, however deeply the member is nested.
     pub(crate) fn at_import_prefix_of(&self, id: SymbolId, ty: &Type) -> Option<Type> {
-        self.at_import_prefix_rc(id, ty)
+        self.at_import_prefix_rc(id, ty, None)
             .map(|t| std::rc::Rc::try_unwrap(t).unwrap_or_else(|shared| (*shared).clone()))
     }
 
-    /// [`Self::at_import_prefix_of`], shared through [`ImportSeenCache`].
-    fn at_import_prefix_rc(&self, id: SymbolId, ty: &Type) -> Option<std::rc::Rc<Type>> {
+    /// [`Self::at_import_prefix_of`], shared through [`SeenCache`]. `declared`
+    /// says that `ty` is that symbol's own declared type.
+    fn at_import_prefix_rc(
+        &self,
+        id: SymbolId,
+        ty: &Type,
+        declared: Option<SymbolId>,
+    ) -> Option<std::rc::Rc<Type>> {
         let owner = self.st.get(id).owner;
         if owner.is_none() || !self.st.get(owner).is_class_like() {
             return None;
@@ -1175,53 +1199,91 @@ impl Typer {
         if prefix.is_no_type() || prefix.is_error() {
             return None;
         }
-        let named = |t: &Type| crate::symbol::any_type(t, &mut |p| matches!(p, Type::Named { .. }));
-        if self.st.has_ambient_type_context() || named(&prefix) || named(ty) {
-            return Some(std::rc::Rc::new(self.at_import_prefix_uncached(&prefix, ty)));
+        Some(self.seen_cached(SeenKind::ImportPrefix, id, declared, &prefix, ty, || {
+            self.at_import_prefix_uncached(&prefix, ty)
+        }))
+    }
+
+    /// `compute()`, which reads `ty` as seen from `prefix`, through
+    /// [`SeenCache`].
+    pub(crate) fn seen_cached(
+        &self,
+        kind: SeenKind,
+        id: SymbolId,
+        declared: Option<SymbolId>,
+        prefix: &Type,
+        ty: &Type,
+        compute: impl FnOnce() -> Type,
+    ) -> std::rc::Rc<Type> {
+        if self.st.has_ambient_type_context() {
+            return std::rc::Rc::new(compute());
         }
-        let epoch = (self.st.mutation_gen.get(), self.st.symbols.len());
+        let epoch = (self.st.mutation_gen.get(), self.st.abs_projection_of.len());
         let this_class = self.st.this_class;
+        let declared = declared.map(|d| (d, &self.st.get(d).ty));
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = rustc_hash::FxHasher::default();
+            kind.hash(&mut h);
             id.0.hash(&mut h);
             this_class.0.hash(&mut h);
-            hash_type(&prefix, &mut h);
-            hash_type(ty, &mut h);
+            hash_type(prefix, &mut h);
+            match declared {
+                Some((d, _)) => d.0.hash(&mut h),
+                None => hash_type(ty, &mut h),
+            }
             h.finish()
         };
+        let same_ty = |e: &SeenEntry| match (&e.ty, declared) {
+            (None, Some(_)) => true,
+            (Some(t), None) => t == ty,
+            _ => false,
+        };
         {
-            let cache = self.import_seen_cache.borrow();
+            let cache = self.seen_cache.borrow();
             if cache.epoch == epoch {
                 if let Some(hit) = cache.map.get(&key).and_then(|bucket| {
                     bucket.iter().find(|e| {
-                        e.id == id && e.this_class == this_class && e.prefix == prefix && e.ty == *ty
+                        e.kind == kind
+                            && e.id == id
+                            && e.this_class == this_class
+                            && same_ty(e)
+                            && e.prefix == *prefix
                     })
                 }) {
                     return hit.seen.clone();
                 }
             }
         }
-        let seen = std::rc::Rc::new(self.at_import_prefix_uncached(&prefix, ty));
+        let seen = std::rc::Rc::new(compute());
+        let named = |t: &Type| {
+            crate::symbol::any_type(t, &mut |p| {
+                matches!(p, Type::Named { .. } | Type::Tuple(_))
+            })
+        };
         // The substitution may itself have completed a symbol.
-        if (self.st.mutation_gen.get(), self.st.symbols.len()) != epoch {
-            return Some(seen);
+        if (self.st.mutation_gen.get(), self.st.abs_projection_of.len()) != epoch
+            || named(prefix)
+            || named(ty)
+        {
+            return seen;
         }
-        let mut cache = self.import_seen_cache.borrow_mut();
-        if cache.epoch != epoch || cache.len >= IMPORT_SEEN_MAX {
+        let mut cache = self.seen_cache.borrow_mut();
+        if cache.epoch != epoch || cache.len >= SEEN_CACHE_MAX {
             cache.epoch = epoch;
             cache.map.clear();
             cache.len = 0;
         }
         cache.len += 1;
-        cache.map.entry(key).or_default().push(ImportSeenEntry {
+        cache.map.entry(key).or_default().push(SeenEntry {
+            kind,
             id,
             this_class,
-            prefix,
-            ty: ty.clone(),
-            seen: Some(seen.clone()),
+            prefix: prefix.clone(),
+            ty: declared.is_none().then(|| ty.clone()),
+            seen: seen.clone(),
         });
-        Some(seen)
+        seen
     }
 
     fn at_import_prefix_uncached(&self, prefix: &Type, ty: &Type) -> Type {
@@ -1328,7 +1390,7 @@ impl Typer {
             .get(&id)
             .copied()
             .unwrap_or(id);
-        if let Some(seen) = self.at_import_prefix_rc(origin, ty) {
+        if let Some(seen) = self.at_import_prefix_rc(origin, ty, Some(id)) {
             return (Some(seen), true);
         }
         // A member of the companion of an inner class, reached through the
