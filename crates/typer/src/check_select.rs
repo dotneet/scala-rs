@@ -518,9 +518,13 @@ impl Typer {
         // the receiver's object instead of its declaring trait. Complete its
         // pickle metadata before codegen chooses between an instance accessor
         // and MODULE$; keep the existing term identity used by the tree.
+        // A prelude module is not such a companion: the prelude declares it
+        // completely, and the pickle's copy entered beside it made
+        // `Ordering.String` an overload of `Ordering[String]` and `String$`.
         if found.iter().any(|m| {
             let s = self.st.get(*m);
-            (m.0 < self.st.source_start || self.st.binary_read.contains(&s.owner.0))
+            m.0 >= self.st.prelude_end
+                && (m.0 < self.st.source_start || self.st.binary_read.contains(&s.owner.0))
                 && matches!(s.kind, SymKind::Module | SymKind::ModuleClass)
                 && self.st.get(s.owner).is_class_like()
         }) {
