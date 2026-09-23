@@ -848,6 +848,8 @@ pub struct Typer {
     /// already answered (`crate::implicits::ImplicitMemo`). Empty whenever no
     /// search is running.
     pub(crate) implicit_memo: std::cell::RefCell<crate::implicits::ImplicitMemo>,
+    /// [`Typer::at_import_prefix_of`]'s answers; see [`crate::implicits::ImportSeenCache`].
+    pub(crate) import_seen_cache: std::cell::RefCell<crate::implicits::ImportSeenCache>,
     /// The companion object an implicit was reached *through*, for the ones a
     /// companion only inherits (`object Shape extends RepShapeImplicits`).
     /// Emitting a bare name for those loads `this` and casts it to the trait
@@ -1299,6 +1301,7 @@ impl Typer {
             selected_implicit_fit: std::cell::RefCell::new(None),
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_memo: std::cell::RefCell::new(Default::default()),
+            import_seen_cache: std::cell::RefCell::new(Default::default()),
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
             implicit_macros_disabled: false,
             implicit_search_depth: 0,

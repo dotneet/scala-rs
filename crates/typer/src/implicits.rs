@@ -152,6 +152,38 @@ pub(crate) struct ImplicitMemo {
     candidate_tys: rustc_hash::FxHashMap<u32, Option<std::rc::Rc<Type>>>,
 }
 
+/// [`Typer::at_import_prefix_of`]'s answers across searches.
+///
+/// `import profile.api._` brings a few hundred implicits into scope, and every
+/// search read each one through the import's prefix again: an as-seen-from
+/// substitution over the candidate's whole signature, a third of a gitbucket
+/// build. [`ImplicitMemo`] keeps them only for one search.
+///
+/// The answer is a function of the candidate, the type, the prefix and
+/// `this_class`, read against the symbol graph, so an entry lives while
+/// neither [`SymbolTable::mutation_gen`] nor the number of symbols has moved:
+/// a new symbol can be a path member or an abstract projection the
+/// substitution reads, and entering one mutates no existing symbol. A type
+/// that still carries a `Type::Named` resolves through the scopes, and an
+/// ambient expansion guard can truncate what the walk sees; neither is kept.
+#[derive(Default)]
+pub(crate) struct ImportSeenCache {
+    epoch: (u64, usize),
+    map: rustc_hash::FxHashMap<u64, Vec<ImportSeenEntry>>,
+    len: usize,
+}
+
+struct ImportSeenEntry {
+    id: SymbolId,
+    this_class: SymbolId,
+    prefix: Type,
+    ty: Type,
+    seen: Option<std::rc::Rc<Type>>,
+}
+
+/// Past this many entries the cache is emptied.
+const IMPORT_SEEN_MAX: usize = 50_000;
+
 /// A candidate's type as an implicit search reads it.
 ///
 /// Borrowed from the symbol table when nothing had to be substituted -- the
@@ -1129,6 +1161,12 @@ impl Typer {
     /// parameter, and `subst_as_seen_from` replaces that symbol wherever it
     /// occurs, however deeply the member is nested.
     pub(crate) fn at_import_prefix_of(&self, id: SymbolId, ty: &Type) -> Option<Type> {
+        self.at_import_prefix_rc(id, ty)
+            .map(|t| std::rc::Rc::try_unwrap(t).unwrap_or_else(|shared| (*shared).clone()))
+    }
+
+    /// [`Self::at_import_prefix_of`], shared through [`ImportSeenCache`].
+    fn at_import_prefix_rc(&self, id: SymbolId, ty: &Type) -> Option<std::rc::Rc<Type>> {
         let owner = self.st.get(id).owner;
         if owner.is_none() || !self.st.get(owner).is_class_like() {
             return None;
@@ -1137,6 +1175,56 @@ impl Typer {
         if prefix.is_no_type() || prefix.is_error() {
             return None;
         }
+        let named = |t: &Type| crate::symbol::any_type(t, &mut |p| matches!(p, Type::Named { .. }));
+        if self.st.has_ambient_type_context() || named(&prefix) || named(ty) {
+            return Some(std::rc::Rc::new(self.at_import_prefix_uncached(&prefix, ty)));
+        }
+        let epoch = (self.st.mutation_gen.get(), self.st.symbols.len());
+        let this_class = self.st.this_class;
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            id.0.hash(&mut h);
+            this_class.0.hash(&mut h);
+            hash_type(&prefix, &mut h);
+            hash_type(ty, &mut h);
+            h.finish()
+        };
+        {
+            let cache = self.import_seen_cache.borrow();
+            if cache.epoch == epoch {
+                if let Some(hit) = cache.map.get(&key).and_then(|bucket| {
+                    bucket.iter().find(|e| {
+                        e.id == id && e.this_class == this_class && e.prefix == prefix && e.ty == *ty
+                    })
+                }) {
+                    return hit.seen.clone();
+                }
+            }
+        }
+        let seen = std::rc::Rc::new(self.at_import_prefix_uncached(&prefix, ty));
+        // The substitution may itself have completed a symbol.
+        if (self.st.mutation_gen.get(), self.st.symbols.len()) != epoch {
+            return Some(seen);
+        }
+        let mut cache = self.import_seen_cache.borrow_mut();
+        if cache.epoch != epoch || cache.len >= IMPORT_SEEN_MAX {
+            cache.epoch = epoch;
+            cache.map.clear();
+            cache.len = 0;
+        }
+        cache.len += 1;
+        cache.map.entry(key).or_default().push(ImportSeenEntry {
+            id,
+            this_class,
+            prefix,
+            ty: ty.clone(),
+            seen: Some(seen.clone()),
+        });
+        Some(seen)
+    }
+
+    fn at_import_prefix_uncached(&self, prefix: &Type, ty: &Type) -> Type {
         // Even a non-generic API can mention its outer profile's type
         // family. Read aliases through the actual imported API before
         // substituting the receiver's ordinary type parameters.
@@ -1172,11 +1260,11 @@ impl Typer {
                     if self.st.class_sym_of(&recv).is_none() {
                         recv = self.st.type_of_class(k);
                     }
-                    return Some(self.st.subst_as_seen_from_at(&recv, Some(p), &expanded));
+                    return self.st.subst_as_seen_from_at(&recv, Some(p), &expanded);
                 }
             }
         }
-        Some(self.st.subst_as_seen_from(&prefix, &expanded))
+        self.st.subst_as_seen_from(&prefix, &expanded)
     }
 
     /// An inherited implicit is declared in terms of its *owner's* type
@@ -1199,7 +1287,6 @@ impl Typer {
         }
         let (seen, memoisable) = self.implicit_candidate_ty_computed(id);
         if memoisable {
-            let seen = seen.map(std::rc::Rc::new);
             let mut memo = self.implicit_memo.borrow_mut();
             if memo.depth > 0 {
                 memo.candidate_tys.insert(id.0, seen.clone());
@@ -1210,7 +1297,7 @@ impl Typer {
             };
         }
         match seen {
-            Some(seen) => CandidateTy::Seen(std::rc::Rc::new(seen)),
+            Some(seen) => CandidateTy::Seen(seen),
             None => CandidateTy::Declared(&self.st.get(id).ty),
         }
     }
@@ -1220,7 +1307,7 @@ impl Typer {
     /// answer may be kept for the rest of the search. The
     /// `companion_prefixes` branch may not: this search writes that map as it
     /// goes, so its answer can change between two calls.
-    fn implicit_candidate_ty_computed(&self, id: SymbolId) -> (Option<Type>, bool) {
+    fn implicit_candidate_ty_computed(&self, id: SymbolId) -> (Option<std::rc::Rc<Type>>, bool) {
         // Borrowed in the common case. This runs once per candidate per
         // implicit search, and deep-cloning the declared type of every
         // candidate was the single largest source of `Type::clone` in a slick
@@ -1241,7 +1328,7 @@ impl Typer {
             .get(&id)
             .copied()
             .unwrap_or(id);
-        if let Some(seen) = self.at_import_prefix_of(origin, ty) {
+        if let Some(seen) = self.at_import_prefix_rc(origin, ty) {
             return (Some(seen), true);
         }
         // A member of the companion of an inner class, reached through the
@@ -1279,11 +1366,11 @@ impl Typer {
                             recv = self.st.type_of_class(k);
                         }
                         return (
-                            Some(self.st.subst_as_seen_from_at(&recv, Some(&pres[0]), ty)),
+                            Some(std::rc::Rc::new(self.st.subst_as_seen_from_at(&recv, Some(&pres[0]), ty))),
                             false,
                         );
                     }
-                    return (Some(crate::prefix::bare_this_views(ty, k)), false);
+                    return (Some(std::rc::Rc::new(crate::prefix::bare_this_views(ty, k))), false);
                 }
             }
         }
@@ -1293,7 +1380,7 @@ impl Typer {
         if !owner.is_none() && !self.st.get(owner).tparams.is_empty() {
             if let Some(module) = self.wildcard_module_for(origin) {
                 let recv = Type::ModuleRef(self.st.module_class_of(module));
-                return (Some(self.st.subst_as_seen_from(&recv, ty)), true);
+                return (Some(std::rc::Rc::new(self.st.subst_as_seen_from(&recv, ty))), true);
             }
         }
         if this.is_none()
@@ -1315,7 +1402,7 @@ impl Typer {
                 .collect(),
         };
         (
-            Some(self.st.subst_as_seen_from(&this_ty, ty)),
+            Some(std::rc::Rc::new(self.st.subst_as_seen_from(&this_ty, ty))),
             !companion_sensitive,
         )
     }
