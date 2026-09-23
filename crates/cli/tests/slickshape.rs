@@ -347,6 +347,41 @@ fn nested_higher_kinded_adapter_from_scalac_library_resolves_with_binary_slick()
     let _ = fs::remove_dir_all(&out);
 }
 
+/// A higher-kinded type alias used as a constructor argument survives
+/// ScalaSignature loading when the provider has already been compiled.
+#[test]
+fn binary_higher_kinded_alias_is_preserved_in_shape_parent() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip binary_hk_shape: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip binary_hk_shape: slick 3.4.1 not in the local Coursier cache");
+        return;
+    };
+    let Some(scalac) = real_scalac() else {
+        eprintln!("skip binary_hk_shape: scalac 2.13.16 not present");
+        return;
+    };
+    let cp = format!("{}:{}", lib.display(), classpath(&jars));
+    let provider = tmp_dir("binary_hk_shape_provider");
+    let (ok, msgs) = scalac_compile_fixture(&scalac, "binary_hk_shape_lib", &provider, &cp);
+    assert!(ok, "scalac provider compilation failed:\n{msgs}");
+
+    let client_cp = format!("{}:{cp}", provider.display());
+    let (ok, msgs, out) = compile(
+        "binary_hk_shape_use",
+        &["-cp", &client_cp, "--scala-library", lib.to_str().unwrap()],
+    );
+    assert!(ok, "scala-rs client compilation failed:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let (ok, msgs) = scalac_run(&scalac, "binary_hk_shape_use", Some(&client_cp));
+    assert!(ok, "scalac client compilation failed:\n{msgs}");
+    let _ = fs::remove_dir_all(&provider);
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// A projection slick has no `Shape` for is still a missing implicit, and an
 /// operator at an arity no conversion offers is still not a member. Real
 /// scalac reports the same two lines.

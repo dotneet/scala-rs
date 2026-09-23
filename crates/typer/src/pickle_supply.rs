@@ -6721,7 +6721,25 @@ impl PickleSupply {
                 ));
                 return None;
             }
-            let a = self.conv_all(st, bin, scope, args, d)?;
+            // Applying a higher-kinded type parameter retains the kinds of
+            // its arguments too. In `Tuple[F]` where `Tuple[_[_]]`, the bare
+            // `Rep` argument is a constructor, not an incomplete `Rep[?]`.
+            // Converting all arguments as ordinary values loses that kind and
+            // makes otherwise valid binary parents such as
+            // `CaseClassShape[..., Tuple[Rep], ...]` unconvertible.
+            let wants = st.tparam_arities(&bound);
+            let mut a = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                let want = wants.get(i).copied().unwrap_or(0);
+                let converted = match arg {
+                    SigType::Ref {
+                        sym: arg_sym,
+                        args: arg_args,
+                    } => self.conv_ref(st, bin, scope, arg_sym, arg_args, d, want),
+                    other => self.conv_at(st, bin, scope, other, d),
+                }?;
+                a.push(converted);
+            }
             return Some(Type::Applied {
                 ctor: Box::new(bound),
                 args: a,
