@@ -598,13 +598,29 @@ impl SymbolTable {
         };
         if !crate::symbol::any_type(
             &ty,
-            &mut |t| matches!(t, Type::Class { sym, .. } if wants(self, *sym)),
+            &mut |t| matches!(t, Type::Class { sym, .. } | Type::ModuleRef(sym) if wants(self, *sym)),
         ) {
             return ty;
         }
         let on_class = |c: Type| -> Type {
             match &c {
                 Type::Class { sym, .. } if wants(self, *sym) => with_prefix(c, pre.clone()),
+                // A member object is `pre.O.type` in nsc, never bare: the
+                // prefix is what instantiates the enclosing class for its
+                // members (`object Entry` in `Base[A]`, read from
+                // `Derived[X] extends Base[X]`, has `apply` take
+                // `Evidence[X]`). Its members' results then arrive as views
+                // too -- `c.universe.Expr.apply`'s `WeakTypeTag[T]` -- so
+                // readers of those results must look through the view
+                // (`materialize::tag_request` does) rather than this being
+                // left out.
+                Type::ModuleRef(sym) if wants(self, *sym) => with_prefix(
+                    Type::Class {
+                        sym: *sym,
+                        args: vec![],
+                    },
+                    pre.clone(),
+                ),
                 _ => c,
             }
         };
@@ -634,6 +650,7 @@ fn map_views(
 ) -> Type {
     let go = |t: &Type| map_views(t, on_class, on_prefix);
     match ty {
+        Type::ModuleRef(_) => on_class(ty.clone()),
         Type::Class { sym, args } => on_class(Type::Class {
             sym: *sym,
             args: args.iter().map(go).collect(),
