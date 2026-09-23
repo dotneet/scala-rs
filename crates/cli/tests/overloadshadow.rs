@@ -210,6 +210,65 @@ fn oshadow_bad_is_rejected() {
     );
 }
 
+/// Completing `BigDecimal.setScale` can load the enum's parameter type and
+/// place the nested module companion under its flattened package owner. A
+/// later source unit must still resolve another `BigDecimal.RoundingMode`
+/// constant from the enclosing companion.
+#[test]
+fn bigdecimal_rounding_mode_survives_prior_set_scale() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip BigDecimal rounding mode regression: scala-library unavailable");
+        return;
+    };
+    let root = tmp_dir("rounding-context");
+    let earlier = root.join("earlier.scala");
+    let later = root.join("later.scala");
+    let out = root.join("classes");
+    fs::create_dir_all(&out).expect("create output directory");
+    fs::write(
+        &earlier,
+        r#"package roundingcontext
+object Earlier {
+  def floor(x: Double): Double =
+    scala.math.BigDecimal(x).setScale(2, scala.math.BigDecimal.RoundingMode.FLOOR).toDouble
+}
+"#,
+    )
+    .expect("write earlier source");
+    fs::write(
+        &later,
+        r#"package roundingcontext
+import scala.math.{BigDecimal, Numeric}
+package object model {
+  def ceil[T](x: T, y: T, scale: Int)(implicit num: Numeric[T]): Double =
+    (BigDecimal(x.toString) / BigDecimal(y.toString))
+      .setScale(scale, BigDecimal.RoundingMode.CEILING).toDouble
+}
+"#,
+    )
+    .expect("write later source");
+
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            earlier.to_str().unwrap(),
+            later.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "compile failed:\n{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// `scala.math.BigDecimal` is backed only by the real jar; the private
 /// runtime emits no `scala/math/BigDecimal$`, so `--no-scala-library` has to
 /// keep diagnosing it instead of silently accepting it.

@@ -592,6 +592,42 @@ impl Typer {
                 found = terms;
             }
         }
+        // Some nested module companions in the Scala library are entered
+        // under their flattened package name when their module class is read
+        // from a pickle (`BigDecimal$RoundingMode` is one). The first
+        // selection can use the just-returned symbol, but later lookups on
+        // the enclosing module may find only the corresponding type alias:
+        // the module's recorded owner is the package. Recover the module
+        // class by the JVM name implied by the enclosing module and use its
+        // companion symbol. This is deliberately a fallback after ordinary
+        // member and pickle lookup, so correctly-owned nested declarations
+        // retain normal precedence.
+        let only_type_members = !found.is_empty()
+            && found
+                .iter()
+                .all(|&s| self.st.get(s).kind == SymKind::TypeMember);
+        if found.is_empty() || only_type_members {
+            if let Type::ModuleRef(owner) = &recv_ty {
+                let owner_jvm = self.st.get(*owner).jvm_name.clone();
+                if !owner_jvm.is_empty() && owner_jvm.ends_with('$') {
+                    let nested_jvm = format!("{owner_jvm}{name}$");
+                    let nested_class = crate::classpath::find_by_jvm(&self.st, &nested_jvm)
+                        .filter(|&id| self.st.get(id).kind == SymKind::ModuleClass);
+                    if let Some(nested_class) = nested_class {
+                        let sibling = self.st.companion_module(nested_class).or_else(|| {
+                            let owner = self.st.get(nested_class).owner;
+                            self.st.get(owner).members.iter().copied().find(|&m| {
+                                self.st.get(m).kind == SymKind::Module
+                                    && self.st.module_class_of(m) == nested_class
+                            })
+                        });
+                        if let Some(module) = sibling {
+                            found = vec![module];
+                        }
+                    }
+                }
+            }
+        }
         // Pickle completion can also supply a class name's companion API.
         // A value receiver must not gain those members: Seq.concat on the
         // factory is distinct from xs.concat on an instance.
