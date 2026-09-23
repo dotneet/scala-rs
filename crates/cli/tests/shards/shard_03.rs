@@ -86,6 +86,8 @@ mod inherited_extension_pickle;
 mod innerclasses;
 #[path = "../integral.rs"]
 mod integral;
+#[path = "../intersection_expected.rs"]
+mod intersection_expected;
 #[path = "../intersection_schema.rs"]
 mod intersection_schema;
 #[path = "../intrinsicqual.rs"]

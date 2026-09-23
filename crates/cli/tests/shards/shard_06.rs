@@ -12,6 +12,8 @@ mod ovl3;
 mod ovl4;
 #[path = "../ovl_exptype.rs"]
 mod ovl_exptype;
+#[path = "../parameterless_result_inference.rs"]
+mod parameterless_result_inference;
 #[path = "../parent_lambda.rs"]
 mod parent_lambda;
 #[path = "../parentcheck.rs"]

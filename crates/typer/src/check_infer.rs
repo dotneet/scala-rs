@@ -2764,19 +2764,56 @@ impl Typer {
                         }
                     }
                 }
-                for rp in rps {
-                    let head = self.st.class_sym_of(rp);
-                    for pp in pps.iter().filter(|pp| self.st.class_sym_of(pp) == head) {
-                        self.collect_expected(
-                            tps,
-                            rp,
-                            pp,
-                            variance,
-                            depth + 1,
-                            allow_covariant,
-                            out,
-                        );
+                // An abstract type parameter can have the same class head
+                // as a different one through its upper bound. Pairing both
+                // with the shared expected component makes
+                // `E with E2` against `E with Write` solve `E2 := E`, even
+                // though the shared `E` already accounts for that side of the
+                // intersection. Reserve identical components first, match
+                // remaining class heads, then align any residue by position.
+                let mut paired_r = vec![false; rps.len()];
+                let mut paired_p = vec![false; pps.len()];
+                let mut pairs = Vec::new();
+                for (ri, rp) in rps.iter().enumerate() {
+                    if let Some((pi, _)) = pps
+                        .iter()
+                        .enumerate()
+                        .find(|(pi, pp)| !paired_p[*pi] && *pp == rp)
+                    {
+                        paired_r[ri] = true;
+                        paired_p[pi] = true;
+                        pairs.push((ri, pi));
                     }
+                }
+                for (ri, rp) in rps.iter().enumerate() {
+                    if paired_r[ri] {
+                        continue;
+                    }
+                    let Some(head) = self.st.class_sym_of(rp) else {
+                        continue;
+                    };
+                    if let Some((pi, _)) = pps
+                        .iter()
+                        .enumerate()
+                        .find(|(pi, pp)| !paired_p[*pi] && self.st.class_sym_of(pp) == Some(head))
+                    {
+                        paired_r[ri] = true;
+                        paired_p[pi] = true;
+                        pairs.push((ri, pi));
+                    }
+                }
+                let remaining_r = paired_r
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, used)| (!used).then_some(i));
+                let remaining_p = paired_p
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, used)| (!used).then_some(i));
+                pairs.extend(remaining_r.zip(remaining_p));
+                for (ri, pi) in pairs {
+                    let (rp, pp) = (&rps[ri], &pps[pi]);
+                    self.collect_expected(tps, rp, pp, variance, depth + 1, allow_covariant, out);
                 }
             }
             // A compound result against one class: nsc's `A with B <: P` holds

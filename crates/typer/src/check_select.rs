@@ -1121,6 +1121,14 @@ impl Typer {
             let ty = self.java_empty_clause_for_eta(s, ty, pt);
             let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless_at(s, ty, pt, Some(&qual.ty));
+            // A parameterless polymorphic value may be typed under a relaxed
+            // prototype while an enclosing call is still inferring its own
+            // result. Its unsolved parameters must travel with that result so
+            // the enclosing argument or expected type can instantiate them.
+            if self.is_nullary_method_sym(s) && !matches!(tree.ty, Type::Method { .. }) {
+                let result = tree.ty.clone();
+                self.record_open_tparams(s, &result);
+            }
 
             if let Type::Array(elem) = &qual.ty {
                 if name == "apply" {
