@@ -1869,6 +1869,7 @@ impl<'a> Reifier<'a> {
                     vec![constructor, self.list(args?)],
                 ))
             }
+            Type::Wildcard => Ok(self.call(self.universe_member("WildcardType"), vec![])),
             Type::Class { sym, args } => self.class_type_value(*sym, args),
             Type::Function { params, ret } => {
                 let mut all: Vec<Type> = params.clone();

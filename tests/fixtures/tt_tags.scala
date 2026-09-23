@@ -47,6 +47,10 @@ object Main {
     println(show(weakTypeOf[Foo]))
     println(show(weakTypeOf[Int]))
 
+    // An existential wildcard still has a materialisable WeakTypeTag.
+    val wildcardListTag = implicitly[WeakTypeTag[List[_]]]
+    println(wildcardListTag.tpe =:= typeOf[List[_]])
+
     // The tags themselves, not just `typeOf`.
     println(show(typeTag[Bar].tpe))
     println(show(weakTypeTag[Baz].tpe))

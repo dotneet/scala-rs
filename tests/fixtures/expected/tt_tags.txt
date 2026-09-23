@@ -18,6 +18,7 @@ Null
 scala.math.BigInt
 Foo
 Int
+true
 Bar
 Baz
 true

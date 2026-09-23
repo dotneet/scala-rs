@@ -44,6 +44,79 @@ fn invariant_results_refine_broad_evidence_without_accepting_bad_arguments() {
 }
 
 #[test]
+fn binary_runwith_seq_infers_nullary_sink_type_argument() {
+    let root = std::env::temp_dir().join(format!(
+        "contextual-inference-runwith-seq-{}",
+        temp_nonce::unique_stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    ));
+    let provider = root.join("provider");
+    let scalac_out = root.join("scalac");
+    let scala_rs_out = root.join("scala-rs");
+    fs::create_dir_all(&provider).unwrap();
+    fs::create_dir(&scalac_out).unwrap();
+    fs::create_dir(&scala_rs_out).unwrap();
+
+    let provider_compile = Command::new("/tmp/scala-2.13.16/bin/scalac")
+        .args(["-cp", JAR, "-d"])
+        .arg(&provider)
+        .arg(fixture("runwith_seq_provider"))
+        .output()
+        .unwrap();
+    assert!(
+        provider_compile.status.success(),
+        "scalac provider: {}",
+        String::from_utf8_lossy(&provider_compile.stderr)
+    );
+
+    let cp = format!("{JAR}:{}", provider.display());
+    for (scalac, out) in [(true, &scalac_out), (false, &scala_rs_out)] {
+        let mut command = Command::new(if scalac {
+            "/tmp/scala-2.13.16/bin/scalac"
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !scalac {
+            command.args(["compile", "--scala-library", JAR]);
+        }
+        let result = command
+            .args(["-cp", cp.as_str(), "-d"])
+            .arg(out)
+            .arg(fixture("runwith_seq"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "consumer scalac={scalac}: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let runtime_cp = format!("{}:{cp}", out.display());
+        let run = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                runtime_cp.as_str(),
+                "ctxinfer.runwithseq.Main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "run scalac={scalac}: {}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(run.stdout, b"true\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn binary_nominal_callbacks_infer_lambda_result_types() {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

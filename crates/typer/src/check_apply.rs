@@ -1494,6 +1494,12 @@ impl Typer {
                         TreeKind::Apply { .. }
                             | TreeKind::TypeApply { .. }
                             | TreeKind::Match { .. }
+                            // A polymorphic nullary selection such as
+                            // `Factory.empty` is itself the nested factory
+                            // application. Its type arguments need the fixed
+                            // part of the enclosing formal just as an Apply's
+                            // do.
+                            | TreeKind::Select { .. }
                     ) {
                     let mut l = self.lenient_proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt);
                     // A match argument needs the formal's fixed outer shape
