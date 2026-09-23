@@ -220,29 +220,63 @@ but it needs a jar-only classpath prefix, and putting scala-library and
 scala-reflect first changes which class wins when the user's classpath
 shadows one.
 
+### Shared types, per-context implicits and shapeless (2026-09-24)
+
+**Types.** `Type`'s `Vec<Type>` fields are `TyList` and its `Box<Type>`
+fields `TyBox`: both share their contents behind an `Rc`, so a clone is a
+reference count, and both record the `TypeFlags` of what they hold when they
+are built (rustc's `TypeFlags`). "Does this type mention a type parameter /
+a type member / a name?" is a bit test on the node, `any_type_masked` skips
+subtrees without the kinds it looks for, and `subst_map` hands back a subtree
+with nothing to substitute as it is. A flag is "may contain", but a lost bit
+costs the caches keyed on it, so the flags are otherwise exact: summarising
+a refinement's declarations as "everything" cost `SeenCache` all its hits on
+gitbucket and made it 30% slower. slick -7%, gitbucket -7%.
+
+**Implicits in scope.** `SymbolTable::scopes` is a `Scopes`, stamped with a
+version every write moves (`DerefMut`), and `InScopeCache` keeps the list
+per scope version, `this_class`, the class `this` means and the
+super-constructor flag, while `mutation_gen` and the symbol count stand
+still. Four calls in five hit on gitbucket (-5%).
+
+**shapeless.** A `Generic` + `Lazy` derivation over forty nested case
+classes (`Show` for `C0` .. `C39`, each holding the previous one) expands
+`Generic.materialize` 10,000 times and `LazyMacros.mkLazyImpl` 8,300 times,
+with 34,000 round trips to the engine. It took 64 s, scalac 12 s -- and
+scalac expands *more* (42,000 times, `-Ystatistics:typer`), so the gap was
+the cost of a round trip, not their number. What it went to, and what
+changed:
+
+| where | cost | change |
+|---|---|---|
+| engine: `c.openImplicits`, asked at every level | 3/4 of the engine: the whole open-implicit stack re-sent, re-parsed and every type rebuilt by reflection | entries sent once and named by handle after; runtime types kept per wire text |
+| engine: every reflective `call` | a `class#name/arity` string built and hashed, parameter types copied | lookup by class, arity and name; parameter types kept |
+| typer: `_root_` and `inst$macro$N` | the whole unqualified-name search, probing every jar for each fresh name | answered at once |
+| typer: `package_object_of` | a package object refolded into its package per unknown name | skipped while neither has gained a member |
+| typer: `openImplicits` answers | every wanted type rewritten per answer | wire of a context-free type kept (`graph_gen`) |
+| bridge | a thread spawned per timed read | one reader thread per engine |
+
+The derivation now takes about 13 s (scalac 12 s); a fifteen-class one 3.3 s
+(scalac 7.0 s). The fixture is generated; see `crates/cli/tests/
+macrotransportbatch.rs`'s `shapeless_lazy_derivation_matches_scalac` for
+the shape. The engine is profiled with JFR through `JAVA_TOOL_OPTIONS`
+(`-Xlog:jfr+startup=error` keeps JFR's banner off the protocol's stdout); it
+is killed at the end of a run, so the recording has to be dumped before
+that.
+
 ### What is left
 
 From the profiles of 2026-09-24:
 
 * **Type checking still dominates**, within it the implicit search: views
   whose result class does declare the member still solve their type
-  arguments against every receiver (`conv_param_matches`), and
-  `implicits_in_scope` walks every scope per search -- nsc caches it per
-  context, which here would need a version counter on `SymbolTable::scopes`
-  (about thirty writers reach into it directly).
-* **The walks that ask "does this type mention X"** (`mentions_abs_projection`,
-  `mentions_path_member`) are the largest self-time entries on slick; they
-  run at every level of every subtype check. Flags cached on the type, as
-  rustc's `TypeFlags`, would make them bit tests, and need the representation
-  change below.
-* **`Type` is deep-cloned and structurally compared everywhere.** `Type::clone`,
-  its drop glue, `memmove` and the allocator are spread over the whole
-  compile, and gitbucket's remaining profile is flat with no dominator.
-  Interning types (an index, or `Rc` for shared subtrees and argument vectors)
-  is the next real step, and it reaches every part of the compiler.
-* **Memoisation keyed on "the symbol table has not changed" only pays in big
-  compilations.** A corpus test is a few lines; its time is process start-up
-  and reading the library jar.
+  arguments against every receiver (`conv_param_matches`); in a shapeless
+  derivation, the search each `c.inferImplicitValue` answers starts from
+  scratch, where nsc's derivation context shares it.
+* **`mutation_gen` moves at nearly every statement**, which bounds every
+  cache keyed on it; `graph_gen` covers the class graph only.
+* **`Method.paramss` is still `Vec<Vec<Type>>`**, and `Named.name` a
+  `String`: the remaining deep copies are there and in trees.
 * The compile is single-threaded. Parsing is trivially parallel; the typer
   shares a mutable symbol table and is not.
 
