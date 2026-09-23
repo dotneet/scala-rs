@@ -49,9 +49,8 @@ The testkit is not part of the merge gate, and `tests/BASELINE.md` does not
 track it. The slick main compile it builds on is at 184 files, 0 errors,
 1504 classes there, with `tests/slick_run.sh` at 12/12 programs.
 
-The last recorded measurement of slick's test sources, in
-[notes/handoff-2026-09-13.md](notes/handoff-2026-09-13.md) (2026-09-14, not
-merge-gated), used a 39-source layered harness that is not in this
+The last recorded measurement of slick's test sources (2026-09-14, not
+merge-gated) used a 39-source layered harness that is not in this
 repository: **357 errors in 28 files**, of which 57 in the two
 `CodeGenRoundTrip*` sources are harness artefacts (their generated roundtrip
 sources are absent). The largest real groups were `column` (23),

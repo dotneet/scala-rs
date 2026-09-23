@@ -104,8 +104,7 @@ known-failure ledger.
 ## Known gaps
 
 The main sources compile and the client programs run; cats' own test suites
-are the next layer. The last recorded measurement, in
-[notes/handoff-2026-09-13.md](notes/handoff-2026-09-13.md) (2026-09-14, not
+are the next layer. The last recorded measurement (2026-09-14, not
 merge-gated), ran cats' 155 munit suites with cats main compiled by scala-rs
 and the support/test layers compiled by real scalac:
 

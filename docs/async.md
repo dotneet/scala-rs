@@ -140,11 +140,6 @@ checked. This makes the relationships between `Future[A]` and `Awaitable[A]`,
 and between `FiniteDuration` and `Duration`, available to `Await.result`
 independently of load order.
 
-For the integration gate and before/after comparison of the initial
-implementation, see the [initial validation record](notes/async-validation-2026-09-15.md);
-for the additional validation of the generic hook and non-local return, see the
-[follow-up validation record](notes/async-hooks-validation-2026-09-16.md).
-
 ## Limitations and references
 
 The single `FutureStateMachine` that nsc generates, and its bytecode shape and

@@ -43,7 +43,7 @@ While working on `Ident(sym)` I also found an unrelated, **separate** bug: under
 
 The bug: `c.universe.Expr` reported `value Expr is not a member of Universe` and `Mirror[c.universe.type]` reported `stable identifier required, but c.universe found`. The root causes were that `PickleSupply::complete_named` discarded `MemberKind::Module` entirely (it only read `Def` and `Val` from the pickle), and that `Check::term_path_sym` accepted only `Term | Module | ModuleClass`, dropping pickle-read `val`s (which appear as `SymKind::Method` + `Flags::ACCESSOR`).
 
-I closed holes 1 and 2 of the three that `docs/macros.md` §7.13.4 named as "the holes remaining before our own `reify`". Neither is specific to `reify`; both are **general feature additions**.
+I closed two of the three holes that stood before our own `reify` (`docs/macros.md` §7.14). Neither is specific to `reify`; both are **general feature additions**.
 
 * **Supply `object`s nested inside a trait from the pickle.** `trait Exprs { object Expr { … } }` lowers to an interface method `Expr()Lscala/reflect/api/Exprs$Expr$;` plus the module's classfile, but `PickleSupply::complete_named` only reads `Def` and `Val` from the pickle and so was discarding `MemberKind::Module` wholesale. As a result `c.universe.Expr` gave `value Expr is not a member of Universe` and, under `import c.universe._`, `Expr` gave `not found: value Expr` — both **lies as diagnostics**. The accessor is placed on the class where the lookup started, and the call target is left to `erased_desc` to determine (the classfile for `api/JavaUniverse` has `interfaces: 0`, so `invokevirtual JavaUniverse.Expr()` does not resolve). Broken accessors that were merely read from a classfile (return type an unresolved `Type::Named`) are repaired.
 * **Allow `c.universe` to be written as a stable identifier in a type.** `Mirror[c.universe.type]` gave `stable identifier required, but c.universe found`. The cause was that `Check::term_path_sym` accepted only `Term | Module | ModuleClass`, so a `val` read from the pickle was dropped (in a classfile a `val` cannot be distinguished from a zero-argument `def`, so it comes through as `SymKind::Method` + `Flags::ACCESSOR`). The reader for `Type::SingleType` unwraps a zero-argument `Method` to its result type via `SymbolTable::singleton_underlying`.
@@ -69,7 +69,7 @@ The tests are 4 new ones added to `crates/cli/tests/engine.rs`.
 
 #### Remaining
 
-* **The expansion of `reify { … }` itself is still unimplemented**, and the diagnostic is still the one from `docs/macros.md` §7.8. The materials for the tree are now in place, so what remains is the synthesis plus **hygiene** (lowering static symbols to `mkIdent(mirror.staticModule(...))`, `splice` to `x.in(m).tree`, and rejecting locals by name). nsc's expansion form is recorded from actual measurement in `docs/macros.md` §7.14.
+* **The expansion of `reify { … }` itself is still unimplemented**, and the diagnostic is still the one from `docs/macros.md` §7.8 (the expansion is §7.15 now). The materials for the tree are now in place, so what remains is the synthesis plus **hygiene** (lowering static symbols to `mkIdent(mirror.staticModule(...))`, `splice` to `x.in(m).tree`, and rejecting locals by name). nsc's expansion form is recorded from actual measurement in `docs/macros.md` §7.15.
 * Writing a nested ***class*** inside a trait as a **type** (`u.Liftable[Int]`) is still `not found: type Liftable`. What I added here is only the term side.
 * Since the upper bound of `u.Mirror` (`api.Mirror[self.type]`) cannot be read from the pickle, inside a creator you have to cast to `scala.reflect.api.Mirror[u.type]` (nsc writes `u.Mirror`).
 
@@ -138,9 +138,9 @@ Three independent roots, all in the "supply" layer:
    class — `TypeTags.TypeTag`, `TypeTags.WeakTypeTag`, `Trees.Transformer`,
    and the rest of the reflect API written the same way) fell through to
    `None`. This is the *type* half of the gap `agent/reifyd` closed the *term*
-   half of (§7.13 item 1, nested `object`s); `docs/macros.md` line 1132 and
-   this file's own §"Confirming the same root cause" section had already
-   named it and left it open. Fixed by resolving the hit's owner + name
+   half of (`docs/macros.md` §7.14, nested `object`s); this file's own
+   §"Confirming the same root cause" section had already named it and left
+   it open. Fixed by resolving the hit's owner + name
    through `PickleSupply::ensure_class`, the same way `install_type_alias`
    resolves an alias's target. This alone fixed all 16 + 6 + 6 occurrences of
    `TypeTag` / `WeakTypeTag` / `Transformer` above (`u.Liftable[Int]` — a
@@ -419,7 +419,7 @@ before scoping more reify shapes.
 Three more (`macro-reify-basic`, `macro-reify-unreify`,
 `macro-undetparams-macroitself`) now compile and fail at run time on a
 *separate*, already-recorded bug: scala-rs does not write `macro_impl` into its
-own pickle (`docs/macros.md` §7.16 "What remains", item 3), so a macro **def**
+own pickle (it does now: `docs/macros.md` §5), so a macro **def**
 it compiled in an earlier round is read back as an ordinary method and the call
 site emits a real invocation. Reproducible with no `reify` in the program at
 all; `macro-reify-basic` is one implemented `@macroImpl` pickle away from

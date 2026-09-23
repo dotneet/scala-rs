@@ -91,14 +91,12 @@ no run failure outside the (empty) known-failure ledger.
 ## Known gaps
 
 * **gitbucket's own test sources do not compile yet.** The last recorded
-  measurement, in [notes/handoff-2026-09-13.md](notes/handoff-2026-09-13.md)
-  (2026-09-14, not merge-gated), found 9 errors in 5 of the 32 test sources:
+  measurement (2026-09-14, not merge-gated) found 9 errors in 5 of the 32 test sources:
   five Slick query result projections (`Query[E, Any, Seq]`), one missing
   `Context` implicit, one `DatabaseFactory.forURL` prefix error, and two
   ScalaTest emptiness ambiguities in which implicit specificity reduces every
   candidate type parameter to a wildcard.
-* Recorded as still open in
-  [notes/rh-cats-gitbucket-run.md](notes/rh-cats-gitbucket-run.md):
+* Recorded as still open when the run harnesses landed:
   `Database.forURL` resolving to `BasicBackend`'s factory through
   `import blockingApi._`, and polymorphic aliases being dealiased before
   pickling.
