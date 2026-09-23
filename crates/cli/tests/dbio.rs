@@ -271,6 +271,21 @@ fn dbio_seq_infers_intersection_effect() {
     real_scalac_dual_run("dbio_seq");
 }
 
+/// An expected intersection effect is only a lower bound for the
+/// contravariant effect parameter that an untyped `flatMap` lambda will
+/// determine. Each lambda result must be typed before that parameter is fixed;
+/// otherwise the second read in a read/read/write chain is checked as if it
+/// had to be write-only.
+#[test]
+fn dbio_flatmap_defers_contravariant_effects_to_lambda_results() {
+    real_scalac_dual_run("dbio_effect_chain");
+    compile_fails(
+        "dbio_effect_chain_bad",
+        &["--no-scala-library"],
+        "type mismatch",
+    );
+}
+
 /// `DBIO.sequence` places the action type below an inferred higher-kinded
 /// collection constructor.  An abstract action constructor (the shape of
 /// Slick's `ProfileAction`) must be aligned with its upper bound even at that

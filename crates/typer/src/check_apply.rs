@@ -2058,7 +2058,61 @@ impl Typer {
                             let inst = self.implicit_tparams_before_expected(
                                 sym, &fun.ty, &ret, pt, &param_tys, inst,
                             );
+                            let inferred_before_expected: Vec<SymbolId> =
+                                inst.iter().map(|(tp, _)| *tp).collect();
                             let inst = self.add_expected_constraints(sym, &ret, pt, inst);
+                            // An untyped lambda decides the variables that occur
+                            // only in its result. If such a variable is
+                            // contravariant in the method result, the enclosing
+                            // expected type supplies a lower bound, not the
+                            // final answer. `flatMap` effect types are the
+                            // canonical shape: expecting `Read with Write`
+                            // must not pin the inner E2 to `Write` before the
+                            // lambda has produced its own `Read with Write`.
+                            // Keep argument- and implicit-derived solutions;
+                            // defer only parameters introduced by the expected
+                            // type at this step.
+                            let mut deferred_expected_tparams = Vec::new();
+                            let inst: Vec<(SymbolId, Type)> = inst
+                                .into_iter()
+                                .filter(|(tp, _)| {
+                                    let defer = !inferred_before_expected.contains(tp)
+                                        && matches!(
+                                            self.tparam_variance_in(&ret, *tp, 1),
+                                            Some(-1)
+                                        )
+                                        && param_tys.iter().zip(&arg_tys).any(|(p, a)| {
+                                            if !mentions_no_type(a) {
+                                                return false;
+                                            }
+                                            let p = match p {
+                                                Type::ByName(inner) | Type::Repeated(inner) => {
+                                                    inner.as_ref()
+                                                }
+                                                other => other,
+                                            };
+                                            let shape = match p {
+                                                Type::Class { sym, args } => self
+                                                    .st
+                                                    .function_class_shape(*sym, args)
+                                                    .unwrap_or_else(|| p.clone()),
+                                                _ => p.clone(),
+                                            };
+                                            matches!(
+                                                shape,
+                                                Type::Function { params, ret }
+                                                    if type_mentions_tparam(&ret, *tp)
+                                                        && !params.iter().any(|p| {
+                                                            type_mentions_tparam(p, *tp)
+                                                        })
+                                            )
+                                        });
+                                    if defer {
+                                        deferred_expected_tparams.push(*tp);
+                                    }
+                                    !defer
+                                })
+                                .collect();
                             // nsc reads the expected type *after* the arguments
                             // are typed. Here the pass runs first, so a solution
                             // the expected type only knows as `_` -- the stand-in
@@ -2147,7 +2201,9 @@ impl Typer {
                                 let (ids, vals): (Vec<SymbolId>, Vec<Type>) = weak
                                     .into_iter()
                                     .filter(|(id, v)| {
-                                        open.contains(id) && !(drop_wild && type_has_wildcard(v))
+                                        open.contains(id)
+                                            && !deferred_expected_tparams.contains(id)
+                                            && !(drop_wild && type_has_wildcard(v))
                                     })
                                     .unzip();
                                 if !ids.is_empty() {

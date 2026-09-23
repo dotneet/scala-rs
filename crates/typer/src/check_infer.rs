@@ -1092,6 +1092,9 @@ impl Typer {
             Type::Refined { .. } if crate::symbol::SymbolTable::as_seen_from_view(ty).is_some() => {
                 self.tparam_variance_in(crate::prefix::strip_view(ty), tp, variance)
             }
+            Type::Refined { parents, .. } => parents.iter().fold(None, |acc, parent| {
+                merge(acc, self.tparam_variance_in(parent, tp, variance))
+            }),
             Type::Class { sym, args } => {
                 let tparams = self.st.get(*sym).tparams.clone();
                 let mut out = None;
