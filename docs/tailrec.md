@@ -103,30 +103,11 @@ not itself in tail position, a user-defined `||`, a call in a `val`'s
 right-hand side, and an overridable method whose recursion is reached through
 `||`. scalac rejects the same six.
 
-## A JIT comparison trap with Zulu 15.0.6
+## JIT caveat
 
-The default Java in this development environment was the following version.
-
-```
-openjdk version "15.0.6" 2022-01-18
-OpenJDK Runtime Environment Zulu15.38+17-CA (build 15.0.6+5-MTS)
-OpenJDK 64-Bit Server VM Zulu15.38+17-CA (build 15.0.6+5-MTS, mixed mode)
-```
-
-`TrcDeep.matching(2000000, 0)` should return 2000000, but this VM's default JIT
-returned a different small value on each run. **The same happened with the
-program emitted by scalac 2.13.16.** Do not infer an invalid compiler transform
-from scala-rs output alone.
-
-```sh
-# <out> is the directory where scala-rs or scalac compiled trc_deep.scala
-java -Xverify:all -Xss256k -cp <out>:/tmp/scala-rs-lib/scala-library-2.13.16.jar TrcDeep
-# The same classfiles return the expected value in these modes.
-java -Xint -Xverify:all -Xss256k -cp <out>:/tmp/scala-rs-lib/scala-library-2.13.16.jar TrcDeep
-java -XX:TieredStopAtLevel=1 -Xss256k -cp <out>:/tmp/scala-rs-lib/scala-library-2.13.16.jar TrcDeep
-```
-
-The default JIT of Temurin 17.0.3 was also checked with output from both
-compilers, and both ran correctly. Regression tests prefer Temurin 17 when it is
-available and use Java's `-Xint` otherwise. This does not claim to identify the
-JIT's internal cause.
+On Zulu 15.0.6 the default JIT returned wrong, run-to-run varying values for
+`TrcDeep.matching(2000000, 0)` with class files from **both** scala-rs and
+scalac 2.13.16, while `-Xint` and `-XX:TieredStopAtLevel=1` were correct and
+Temurin 17's default JIT was correct for both. Do not infer a bad transform
+from scala-rs output alone. The regression tests prefer Temurin 17 and fall
+back to `-Xint`.
