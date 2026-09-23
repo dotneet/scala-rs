@@ -78,6 +78,8 @@ mod nestedobj;
 mod no_conflict_markers;
 #[path = "../nothingcall.rs"]
 mod nothingcall;
+#[path = "../nullary_poly_intersection.rs"]
+mod nullary_poly_intersection;
 #[path = "../nullcross.rs"]
 mod nullcross;
 #[path = "../numtower.rs"]

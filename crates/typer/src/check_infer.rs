@@ -129,7 +129,54 @@ impl Typer {
             );
             ty = crate::symbol::subst_tparams_slice(&[tp], &[solved], &ty);
         }
-        ty
+        self.widen_bottom_result(ty, pt)
+    }
+
+    /// A result that came out `Nothing` only because a type parameter was
+    /// minimised there (`def one[A]: A` at `val y: Tag = one`, or `def mk[A]:
+    /// A with Marker` at a declared `Tag with Marker`) is not a call that
+    /// cannot return: the method's erased result is `Object`, and nsc's
+    /// erasure casts the value to the expected type (`checkcast Tag`). The
+    /// backend reads a `Nothing`-typed call as one that throws and emits
+    /// `checkcast Throwable; athrow` after it, so hand the reference the
+    /// expected type -- which `Nothing` conforms to -- and let the ordinary
+    /// call-result cast follow. Only for an expected type that is itself a
+    /// type: a wildcard, or a variable some enclosing call has not decided,
+    /// says nothing to cast to. Nor a user value class, whose boxed form the
+    /// call-result adaptation would unbox as its underlying primitive; nor,
+    /// under the private runtime, a primitive, which there also needs the
+    /// `$unbox` that runtime inserts around a `TypeApply` only. Those keep
+    /// `Nothing`.
+    fn widen_bottom_result(&self, ty: Type, pt: &Type) -> Type {
+        let bottom = match &ty {
+            Type::Nothing => true,
+            Type::Refined { parents, .. } => parents.iter().any(|p| matches!(p, Type::Nothing)),
+            _ => false,
+        };
+        let unboxed = match pt {
+            Type::Unit
+            | Type::Boolean
+            | Type::Byte
+            | Type::Short
+            | Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Char
+            | Type::AnyVal => !self.library_abi,
+            Type::Class { sym, .. } if self.st.is_primitive_value_class(*sym) => !self.library_abi,
+            Type::Class { sym, .. } => self.st.is_value_class(*sym),
+            _ => false,
+        };
+        if !bottom || unboxed || matches!(pt, Type::Nothing | Type::Null) || type_has_wildcard(pt) {
+            return ty;
+        }
+        let mut free = Vec::new();
+        collect_tparams(pt, &mut free);
+        if free.iter().any(|tp| !self.tparam_in_scope(*tp)) {
+            return ty;
+        }
+        pt.clone()
     }
 
     /// Type each argument against the parameter it fills and adapt it there,
