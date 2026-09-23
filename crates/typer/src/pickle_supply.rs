@@ -7997,8 +7997,25 @@ impl PickleSupply {
             // (`T#Owner.Member`). Signature substitution replaces ordinary
             // references to T, but cannot replace that embedded prefix. Keep
             // the applied alias's binders in the conversion scope as well.
+            //
+            // Only an argument that names no type parameter of the caller's
+            // scope, though. A projection through a type parameter can only
+            // be read through the parameter's bound, and binding that reading
+            // here fixes it before the parameter is ever instantiated. slick's
+            // `type Apply[N <: Nat] = HeadOf[Drop[N]]` with `type HeadOf[T <:
+            // HList] = T#Head` bound `T` to `Nat.Fold[HList, TailOf, Self]`,
+            // `N` gone, and `hlist(1)` on an `Int :: String :: HNil` came out
+            // as the `Int` at index 0 (ClassCastException at run time).
             let prefix = format!("{}#", tp.name);
-            if target_refs.iter().any(|r| r.starts_with(&prefix)) {
+            let names_scope_tparam = || {
+                let mut arg_refs = Vec::new();
+                walk(a, &mut arg_refs, 0);
+                arg_refs.iter().any(|r| {
+                    let head = r.split('#').next().unwrap_or(r);
+                    matches!(scope.get(head), Some(Type::TypeParam(_)))
+                })
+            };
+            if target_refs.iter().any(|r| r.starts_with(&prefix)) && !names_scope_tparam() {
                 if let Some(bound) = self.conv_at(st, bin, scope, a, d) {
                     alias_scope.insert(tp.name.clone(), bound);
                 }
