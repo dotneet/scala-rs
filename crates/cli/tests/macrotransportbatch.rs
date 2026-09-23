@@ -959,6 +959,9 @@ fn nested_implicit_macro_derivation_keeps_associated_types_and_stable_symbols() 
         let out = root.join(format!("nested-derivation-{nsc}"));
         compile("macroreflection_nested_derivation", nsc, &out, &cp, true);
         assert_eq!(run(&out, &cp), b"true\n");
+        let wide = root.join(format!("wide-case-derivation-{nsc}"));
+        compile("macroreflection_wide_case", nsc, &wide, &cp, true);
+        assert_eq!(run(&wide, &cp), b"true\n");
     }
     // An attributed This in a binary nested companion must retain its module
     // path even though that module is not an enclosing owner at the call site.

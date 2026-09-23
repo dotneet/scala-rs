@@ -1477,14 +1477,19 @@ impl Typer {
             self.st.enter_in_current("apply", apply);
             // also put apply on the module value for Point(1,2)
             self.st.get_mut(m).members.push(apply);
-            let unapply = self.st.alloc(
-                "unapply",
-                cls,
-                SymKind::Method,
-                Flags::SYNTHETIC.with(Flags::CASE),
-                "",
-            );
-            self.st.get_mut(m).members.push(unapply);
+            // Scala 2 has Tuple1 through Tuple22 only. For a case class with
+            // more fields, scalac omits the synthetic extractor rather than
+            // exposing an unapply whose result mentions a nonexistent tuple.
+            if fields.len() <= 22 {
+                let unapply = self.st.alloc(
+                    "unapply",
+                    cls,
+                    SymKind::Method,
+                    Flags::SYNTHETIC.with(Flags::CASE),
+                    "",
+                );
+                self.st.get_mut(m).members.push(unapply);
+            }
         }
     }
 
