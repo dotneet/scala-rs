@@ -328,7 +328,7 @@ pub(crate) fn gen_ctor_fields_pattern(
             };
             match acc {
                 Some(a) => asm.invokevirtual(&jvm, &a, &acc_desc),
-                None => emit_getfield(asm, &jvm, &fname, &fdesc),
+                None => crate::gen_desc::emit_field_read(asm, ctx, &jvm, &fname, &fdesc),
             }
             if repeated && i + 1 == fields.len() {
                 let tail = args.get(i..).unwrap_or(&[]);
@@ -742,10 +742,13 @@ fn bind_tuple_fields(
         let fname = format!("_{}", i + 1);
         load(asm, slot, JvmSort::Ref);
         if args.len() == 2 {
-            // `scala.Tuple2`'s two fields are public, and so are the
-            // private runtime's; every wider tuple keeps them private
-            // behind an accessor, which is what nsc calls.
-            asm.getfield(&tuple, &fname, "Ljava/lang/Object;");
+            // The private runtime's `Tuple2` has only its two public
+            // fields. scala-library's has them too, but a specialized
+            // pair (`Tuple2$mcII$sp`) leaves them unset, so the library
+            // ABI calls the accessor -- see `tuple_field_needs_accessor`.
+            // Every wider tuple keeps its fields private behind an
+            // accessor, which is what nsc calls.
+            crate::gen_desc::emit_field_read(asm, ctx, &tuple, &fname, "Ljava/lang/Object;");
         } else {
             asm.invokevirtual(&tuple, &fname, "()Ljava/lang/Object;");
         }

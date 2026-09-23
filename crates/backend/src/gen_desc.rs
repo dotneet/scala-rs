@@ -1642,6 +1642,37 @@ pub(crate) fn checkcast_field_receiver(asm: &mut Assembler, ctx: &EmitCtx, owner
     asm.checkcast(owner);
 }
 
+/// Whether a read of field `name` on JVM class `owner` has to go through the
+/// accessor even though the symbol table models it as a plain field.
+///
+/// The prelude declares `scala.Tuple2`'s `_1` / `_2` as fields, which is
+/// exactly what the private runtime's `Tuple2` has. scala-library's `Tuple2`
+/// has public fields of those names too, but a **specialized** pair
+/// (`Tuple2$mcII$sp`, built by every scalac-compiled `(Int, Int)`, including a
+/// case class's `unapply`) never writes them: it keeps its values in
+/// `_1$mcI$sp` and overrides the `_1()` accessor. `getfield Tuple2._1` then
+/// read `null`, which unboxed to `0` -- a silent miscompile. nsc always calls
+/// `_1()`, and so does this under the library ABI.
+pub(crate) fn tuple_field_needs_accessor(ctx: &EmitCtx, owner: &str, name: &str) -> bool {
+    !ctx.abi.is_private() && owner == "scala/Tuple2" && matches!(name, "_1" | "_2")
+}
+
+/// `getfield owner.name`, or its accessor call where
+/// [`tuple_field_needs_accessor`] says the field is not reliable.
+pub(crate) fn emit_field_read(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    owner: &str,
+    name: &str,
+    desc: &str,
+) {
+    if tuple_field_needs_accessor(ctx, owner, name) {
+        asm.invokevirtual(owner, name, "()Ljava/lang/Object;");
+    } else {
+        emit_getfield(asm, owner, name, desc);
+    }
+}
+
 /// Whether JVMS 4.10.1.9 will accept an `invoke*` whose `Methodref` names
 /// `to` on a receiver the assembler tracks as JVM class `from`.
 ///

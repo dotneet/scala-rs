@@ -62,6 +62,8 @@ mod sortedlb;
 mod sortedmap;
 #[path = "../specialized.rs"]
 mod specialized;
+#[path = "../specialized_tuple_fields.rs"]
+mod specialized_tuple_fields;
 #[path = "../sqlstoragebatch.rs"]
 mod sqlstoragebatch;
 #[path = "../stableprofile.rs"]

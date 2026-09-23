@@ -1783,7 +1783,7 @@ pub(crate) fn gen_select(
                             desc
                         };
                         crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
-                        emit_getfield(asm, &owner, &s.name, &desc);
+                        crate::gen_desc::emit_field_read(asm, ctx, &owner, &s.name, &desc);
                     } else {
                         let acc = s.jvm_name.clone();
                         asm.invokevirtual(&owner, &acc, &format!("(){}", jvm_desc(ctx.st, &s.ty)));
@@ -1989,7 +1989,7 @@ pub(crate) fn gen_select(
         let owner = class_internal(ctx.st, cid);
         let desc = jvm_desc_val(ctx.st, &tree.ty);
         crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
-        emit_getfield(asm, &owner, name, &desc);
+        crate::gen_desc::emit_field_read(asm, ctx, &owner, name, &desc);
         return;
     }
     report_ctx_error(ctx, tree.span, format!("select {name}"));
