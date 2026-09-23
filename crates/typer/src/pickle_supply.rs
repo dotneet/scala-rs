@@ -550,6 +550,15 @@ impl PickleSupply {
         // `$default$n` getter).
         self.adopted.insert(class_sym.0);
         trace(format_args!("adopting {full} (module={is_module})"));
+        if is_nested_jvm_name(&internal) {
+            if let Some((owner_name, _)) = full.rsplit_once('.') {
+                if let Some(owner) =
+                    self.ensure_class(st, bin, owner_name, sig.declaring_owner_is_module)
+                {
+                    st.binary_nested_decl_owners.insert(class_sym, owner);
+                }
+            }
+        }
         adopt_tparam_kinds(st, class_sym, &sig);
 
         // Member names in declaration order, deduplicated: `complete_named`
@@ -2199,6 +2208,11 @@ impl PickleSupply {
             // hit RHS were used, specialize that shared declaration to the
             // first concrete subclass that asked for it.
             let alias_owner = class_sym;
+            let declaring_owner = if hit.owner != full || hit.owner_module != is_module {
+                self.ensure_class(st, bin, &hit.owner, hit.owner_module)
+            } else {
+                None
+            };
             // The RHS is installed on `class_sym`, so use the substituted
             // member from `lookup`. Its alias prefix still belongs to the
             // declaring member and is needed to retain path-dependent inner
@@ -2254,6 +2268,11 @@ impl PickleSupply {
                     Some(id)
                 }
             };
+            if let (Some(id), Some(declaring_owner)) = (decl, declaring_owner) {
+                if st.get(id).owner == alias_owner && st.get(id).name == name {
+                    st.binary_alias_decl_owners.insert(id, declaring_owner);
+                }
+            }
             return Some(CompletedTypeMember { ty, decl });
         }
         // A *nested class or trait* named as a **type**, as opposed to a type

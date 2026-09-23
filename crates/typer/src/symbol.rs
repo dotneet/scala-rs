@@ -1011,6 +1011,13 @@ pub struct SymbolTable {
     /// Original RHS prefixes of binary aliases, keyed by declaring owner/name.
     /// These are declaration metadata, not a cache of call-site receivers.
     pub binary_alias_prefixes: HashMap<(SymbolId, String), scala_rs_pickle::sym::SigType>,
+    /// Declaring class of an inherited binary type alias installed on a
+    /// receiver for type-argument substitution. Its pickle reference must
+    /// name the declaration, while its prefix still names the receiver.
+    pub binary_alias_decl_owners: HashMap<SymbolId, SymbolId>,
+    /// Declaring owner of a nested binary class that is reached through its
+    /// companion object rather than through the trait that defines it.
+    pub binary_nested_decl_owners: HashMap<SymbolId, SymbolId>,
     /// Classes whose class file has been read (`classpath::apply_java_class_meta`):
     /// only for these does the absence of `Flags::STATIC` say a nested class
     /// is not static (`prefix.rs`, `is_binary_nested_class`). A stub knows
@@ -1433,6 +1440,8 @@ impl SymbolTable {
         let mut st = SymbolTable {
             parent_outer_modules: HashMap::default(),
             binary_alias_prefixes: HashMap::default(),
+            binary_alias_decl_owners: HashMap::default(),
+            binary_nested_decl_owners: HashMap::default(),
             binary_read: rustc_hash::FxHashSet::default(),
             sam_known_overrides: rustc_hash::FxHashMap::default(),
             mutation_gen: std::cell::Cell::new(0),

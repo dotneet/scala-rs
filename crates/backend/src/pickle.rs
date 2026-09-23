@@ -869,10 +869,24 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 // match at a real scalac reader).  Keep the external symbol
                 // owner unchanged; only the TypeRef prefix carries the
                 // package path.
-                let mut pb = Vec::new();
-                write_nat_to(&mut pb, owner);
-                let pref = self.add(THISTPE, pb);
-                let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(n), owner);
+                let decl_owner = self
+                    .facts
+                    .binary_nested_decl_owners
+                    .get(&class_sym)
+                    .copied();
+                let pref = if decl_owner.is_some()
+                    && self.facts.get(self.facts.get(class_sym).owner).kind == SymKind::ModuleClass
+                {
+                    self.module_singleton_prefix(self.facts.get(class_sym).owner)
+                } else {
+                    let mut pb = Vec::new();
+                    write_nat_to(&mut pb, owner);
+                    self.add(THISTPE, pb)
+                };
+                let sym_owner = decl_owner
+                    .map(|id| self.external_class_like_ref(id))
+                    .unwrap_or(owner);
+                let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(n), sym_owner);
                 let mut body = Vec::new();
                 write_nat_to(&mut body, pref);
                 write_nat_to(&mut body, sym);
@@ -951,7 +965,13 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
 
     fn external_class_ref(&mut self, class_sym: SymbolId) -> u32 {
         let name = self.external_member_name(class_sym);
-        let prefix = self.external_owner_ref(class_sym);
+        let prefix = self
+            .facts
+            .binary_nested_decl_owners
+            .get(&class_sym)
+            .copied()
+            .map(|owner| self.external_class_like_ref(owner))
+            .unwrap_or_else(|| self.external_owner_ref(class_sym));
         self.ext_ref_owned(&name, prefix)
     }
 
@@ -3537,10 +3557,16 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         }
         if let Some(pref) = self.stable_member_path_prefix(id) {
             let owner = self.facts.get(id).owner;
+            let decl_owner = self
+                .facts
+                .binary_alias_decl_owners
+                .get(&id)
+                .copied()
+                .unwrap_or(owner);
             let name = self.facts.get(id).name.clone();
             if !owner.is_none() && !self.sym_index.contains_key(&owner.0) {
                 if let Some(r) =
-                    self.external_member_type_ref_with_refs(owner, name, pref, arg_refs)
+                    self.external_member_type_ref_with_refs(decl_owner, name, pref, arg_refs)
                 {
                     return r;
                 }
@@ -3639,8 +3665,14 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             return None;
         }
         let pref = self.inherited_this_prefix(owner);
+        let decl_owner = self
+            .facts
+            .binary_alias_decl_owners
+            .get(&id)
+            .copied()
+            .unwrap_or(owner);
         self.external_member_type_ref_with_refs(
-            owner,
+            decl_owner,
             self.facts.get(id).name.clone(),
             pref,
             arg_refs,

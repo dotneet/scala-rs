@@ -78,6 +78,8 @@ mod impprio;
 mod incremental_forwarder;
 #[path = "../indy.rs"]
 mod indy;
+#[path = "../inherited_alias_owner_pickle.rs"]
+mod inherited_alias_owner_pickle;
 #[path = "../inherited_bridge_owner.rs"]
 mod inherited_bridge_owner;
 #[path = "../inherited_extension_pickle.rs"]

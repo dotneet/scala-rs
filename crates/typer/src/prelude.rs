@@ -509,6 +509,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
             crate::prelude_coll::add_collections_extra(st, tuple2, ordering, it);
         }
         crate::prelude_sgap::add_iterable_apply(st, library_abi);
+        crate::prelude_iterprim::complete_with_filter_flat_map(st, with_filter);
         if let Some(aops) = array_ops {
             // ArrayOps' conversions and aggregates (toList/toSeq/groupBy/sum/...) and
             // scala.collection.MapView. Run after the collections themselves so that

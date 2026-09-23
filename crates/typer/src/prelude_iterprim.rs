@@ -76,6 +76,46 @@ pub(crate) fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     );
     wf
 }
+
+/// Collection `WithFilter.flatMap` accepts any `IterableOnce[B]` from its
+/// callback and builds the receiver's `CC[B]`. The collection symbol is
+/// installed later in the prelude, so finish this signature after that step.
+pub(crate) fn complete_with_filter_flat_map(st: &mut SymbolTable, wf: SymbolId) {
+    let Some(iterable_once) = crate::classpath::find_by_jvm(st, "scala/collection/IterableOnce")
+    else {
+        return;
+    };
+    let Some(fm) = st
+        .get(wf)
+        .members
+        .iter()
+        .copied()
+        .find(|&id| st.get(id).name == "flatMap")
+    else {
+        return;
+    };
+    let [a, cc] = st.get(wf).tparams.as_slice() else {
+        return;
+    };
+    let (a, cc) = (*a, *cc);
+    let Some(&b) = st.get(fm).tparams.first() else {
+        return;
+    };
+    let result = Type::Applied {
+        ctor: Box::new(Type::TypeParam(cc)),
+        args: vec![Type::TypeParam(b)],
+    };
+    st.get_mut(fm).ty = Type::Method {
+        paramss: vec![vec![fn1(
+            Type::TypeParam(a),
+            Type::Class {
+                sym: iterable_once,
+                args: vec![Type::TypeParam(b)],
+            },
+        )]],
+        ret: Box::new(result),
+    };
+}
 pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
     let wf = class(
         st,

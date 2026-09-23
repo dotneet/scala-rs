@@ -346,6 +346,9 @@ pub struct ClassSig {
     /// [`ClassSig::is_module`].
     pub full_name: String,
     pub is_module: bool,
+    /// Whether a nested class's declaring owner is a module class. This is
+    /// distinct from the receiver through which an inherited member is seen.
+    pub declaring_owner_is_module: bool,
     pub flags: u64,
     pub tparams: Vec<TParam>,
     /// Parent types from the `CLASSINFOtpe`, in declaration order.
@@ -478,6 +481,11 @@ pub fn class_sigs(p: &Pickle) -> Vec<ClassSig> {
         out.push(ClassSig {
             full_name: p.sym_full_name(i as Idx).unwrap_or_default(),
             is_module: info.has(pflags::MODULE),
+            declaring_owner_is_module: match p.entry(info.owner) {
+                Some(Entry::ClassSym { info, .. }) => info.has(pflags::MODULE),
+                Some(Entry::ModuleSym { .. } | Entry::ExtModClassRef { .. }) => true,
+                _ => false,
+            },
             flags: info.flags,
             tparams,
             parents,
