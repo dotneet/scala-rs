@@ -1570,7 +1570,23 @@ impl Typer {
                                 &arg_tys,
                                 recv_ty.as_ref(),
                             );
-                            let current = param_at(&params, ai).cloned();
+                            // Not for a parameter that *is* a type variable
+                            // (`A` in `apply[A](elems: A*)`): nsc joins such a
+                            // variable's arguments after typing them all, by
+                            // weak lub, and a prototype taken from the first
+                            // one decides that join early. `List('a', 1)`
+                            // typed the `1` against `Char`, narrowed the
+                            // literal, and built a `List[Char]` where scalac
+                            // builds a `List[Int]`.
+                            let current = param_at(&params, ai).cloned().filter(|p| {
+                                !matches!(
+                                    match p {
+                                        Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                                        other => other,
+                                    },
+                                    Type::TypeParam(_)
+                                )
+                            });
                             current.and_then(|current| {
                                 let ids: Vec<_> = solved.iter().map(|(id, _)| *id).collect();
                                 // Only a parameter the earlier arguments
