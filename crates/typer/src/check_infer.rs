@@ -2106,6 +2106,14 @@ impl Typer {
                 Type::Repeated(e) => e.as_ref(),
                 other => other,
             };
+            // The value can carry a classfile alias too. Its nominal spelling
+            // cannot unify with a structural function parameter even though
+            // the alias's definition exposes all of the constraints.
+            let arg_alias = match a {
+                Type::Named { name, args } => self.st.named_alias_type(name, args),
+                _ => None,
+            };
+            let a = arg_alias.as_ref().map_or(a, |(_, ty)| ty);
             // A method value handed to a function parameter is the function
             // its eta-expansion makes, one clause per arrow. cats'
             // `lift(identity[C])` for `lift[A, B](f: A => B)` reads `A` and
@@ -5339,6 +5347,44 @@ mod qualified_alias_tests {
         let actual = Type::Function {
             params: vec![Type::Int],
             ret: Box::new(Type::String),
+        };
+        assert_eq!(
+            typer.infer_method_tparams(method, &[pattern], &[actual]),
+            vec![(result, Type::String)]
+        );
+    }
+
+    #[test]
+    fn method_type_inference_expands_an_argument_alias() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let st = &mut typer.st;
+        let pkg = st.alloc("alias", st.root, SymKind::Package, Flags::EMPTY, "alias");
+        let module = st.alloc(
+            "Types",
+            pkg,
+            SymKind::ModuleClass,
+            Flags::EMPTY,
+            "alias/Types$",
+        );
+        let alias = st.alloc("Callback", module, SymKind::TypeMember, Flags::EMPTY, "");
+        let element = st.alloc("A", alias, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(alias).tparams.push(element);
+        st.get_mut(alias).is_type_alias = true;
+        st.get_mut(alias).ty = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::TypeParam(element)),
+        };
+        let method = st.alloc("use", module, SymKind::Method, Flags::EMPTY, "");
+        let result = st.alloc("R", method, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(method).tparams.push(result);
+
+        let pattern = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::TypeParam(result)),
+        };
+        let actual = Type::Named {
+            name: "alias.Types.Callback".into(),
+            args: vec![Type::String],
         };
         assert_eq!(
             typer.infer_method_tparams(method, &[pattern], &[actual]),
