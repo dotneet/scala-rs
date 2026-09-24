@@ -4633,6 +4633,27 @@ impl SymbolTable {
     /// given: the stable path the member was selected on, when the caller
     /// has one (`o.mk` for `def mk: In` is an `o.In`, not an `Outer#In`).
     pub fn subst_as_seen_from_at(&self, recv: &Type, inner_pre: Option<&Type>, ty: &Type) -> Type {
+        use scala_rs_parser::TypeFlags as F;
+        // A closed signature without inner classes has no part that the
+        // receiver can instantiate. Avoid walking its entire base hierarchy.
+        let dependent = F::TYPE_PARAM
+            | F::TYPE_MEMBER
+            | F::NAMED
+            | F::SINGLETON
+            | F::APPLIED
+            | F::REFINED
+            | F::MODULE_REF
+            | F::WILDCARD;
+        if !ty.flags().contains(dependent)
+            && !any_type(ty, &mut |t| {
+                matches!(t, Type::Class { sym, .. } if self.is_inner_class_of_class(*sym)
+                    || (self.get(*sym).kind == SymKind::ModuleClass
+                        && !self.get(*sym).flags.contains(Flags::STATIC)
+                        && self.get(self.get(*sym).owner).kind == SymKind::Class))
+            })
+        {
+            return ty.clone();
+        }
         let ty = self.rewrite_view_this(recv, inner_pre, ty);
         let ty = self.subst_receiver_this_type(recv, recv, &ty);
         self.subst_as_seen_from_walk_at(recv, inner_pre, &ty)
@@ -9577,6 +9598,54 @@ mod api_boundary_tests {
             },
             &named
         ));
+    }
+
+    #[test]
+    fn closed_member_types_do_not_walk_receiver_bases() {
+        let mut st = SymbolTable::new();
+        let owner = st.alloc("Owner", st.root, SymKind::Class, Flags::EMPTY, "Owner");
+        let param = st.alloc("A", owner, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(owner).tparams.push(param);
+        let result = st.alloc("Result", st.root, SymKind::Class, Flags::EMPTY, "Result");
+        let recv = Type::Class {
+            sym: owner,
+            args: vec![Type::String].into(),
+        };
+        let ty = Type::Method {
+            paramss: vec![vec![Type::Int]],
+            ret: TyBox::new(Type::Class {
+                sym: result,
+                args: vec![Type::Array(TyBox::new(Type::String))].into(),
+            }),
+        };
+        assert_eq!(st.subst_as_seen_from(&recv, &ty), ty);
+        assert_eq!(st.bta_cache.borrow().len, 0);
+        assert_eq!(
+            st.subst_as_seen_from(&recv, &Type::TypeParam(param)),
+            Type::String
+        );
+        assert!(st.bta_cache.borrow().len > 0);
+    }
+
+    #[test]
+    fn closed_inner_member_types_still_receive_the_selected_prefix() {
+        let mut st = SymbolTable::new();
+        let owner = st.alloc("Owner", st.root, SymKind::Class, Flags::EMPTY, "Owner");
+        let inner = st.alloc("Inner", owner, SymKind::Class, Flags::EMPTY, "Owner$Inner");
+        let recv = Type::Class {
+            sym: owner,
+            args: vec![].into(),
+        };
+        let ty = Type::Class {
+            sym: inner,
+            args: vec![].into(),
+        };
+        let viewed = st.subst_as_seen_from_at(&recv, Some(&Type::ThisType(owner)), &ty);
+        assert_eq!(
+            crate::prefix::view_prefix(&viewed),
+            Some(&Type::ThisType(owner))
+        );
+        assert_eq!(crate::prefix::strip_view(&viewed), &ty);
     }
 
     #[test]
