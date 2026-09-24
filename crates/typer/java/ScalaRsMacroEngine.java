@@ -80,7 +80,7 @@ public final class ScalaRsMacroEngine {
      * ask scala-rs a question ({@link #query}), which is written and read on
      * the same two streams the request came in on.
      */
-    static BufferedReader in;
+    static WireReader in;
     static PrintStream out;
     /**
      * Set when scala-rs answered a question with "scala-rs cannot answer
@@ -143,7 +143,7 @@ public final class ScalaRsMacroEngine {
             throw new IllegalArgumentException("unexpected macro engine argument");
         }
         out = new PrintStream(System.out, true, "UTF-8");
-        in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        in = new WireReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         // Keep the original stream for protocol packets; macro println/Console
         // output is payload, never another expansion reply.
         System.setOut(new PrintStream(new MacroOutput("stdout"), true, "UTF-8"));
@@ -3300,31 +3300,56 @@ public final class ScalaRsMacroEngine {
     }
 
     /** Read one protocol packet without allowing an unterminated line to grow forever. */
-    static String readWireLine(BufferedReader reader) throws java.io.IOException {
+    static String readWireLine(WireReader reader) throws java.io.IOException {
         return readWireLine(reader, MAX_WIRE_CHARS);
     }
 
-    static String readWireLine(BufferedReader reader, int limit) throws java.io.IOException {
-        StringBuilder sb = new StringBuilder();
-        int seen = 0;
-        while (true) {
-            int value = reader.read();
-            if (value < 0) {
-                if (seen == 0) return null;
-                return sb.toString();
-            }
-            if (value == '\n') {
-                // Accept the platform's CRLF transport, but never trim parser
-                // input or a CR escaped inside a quoted payload.
-                if (sb.length() > 0 && sb.charAt(sb.length() - 1) == '\r') {
-                    sb.setLength(sb.length() - 1);
+    static String readWireLine(WireReader reader, int limit) throws java.io.IOException {
+        return reader.readLine(limit);
+    }
+
+    /** Only the protocol thread reads this buffer, including nested expansions.
+     * Bulk reads avoid BufferedReader's lock/unlock for every wire character. */
+    static final class WireReader {
+        final java.io.Reader source;
+        final char[] chars = new char[8192];
+        int at, end;
+
+        WireReader(java.io.Reader source) { this.source = source; }
+
+        String readLine(int limit) throws java.io.IOException {
+            StringBuilder sb = null;
+            int seen = 0;
+            for (;;) {
+                if (at == end) {
+                    // Never drain an unterminated producer past the first
+                    // character that proves this packet is oversized.
+                    int size = (int) Math.min(chars.length, (long) limit - seen + 1);
+                    end = source.read(chars, 0, size);
+                    at = 0;
+                    if (end < 0) {
+                        end = 0;
+                        return seen == 0 ? null : sb.toString();
+                    }
                 }
-                return sb.toString();
+                int start = at;
+                while (at < end && chars[at] != '\n') {
+                    at++;
+                    if (++seen > limit) throw new java.io.IOException(
+                        "macro protocol line exceeds " + limit + " characters");
+                }
+                int length = at - start;
+                if (at < end) {
+                    at++;
+                    String line;
+                    if (sb == null) line = new String(chars, start, length);
+                    else line = sb.append(chars, start, length).toString();
+                    // CRLF is transport; all other CR characters are payload.
+                    return line.endsWith("\r") ? line.substring(0, line.length() - 1) : line;
+                }
+                if (sb == null) sb = new StringBuilder();
+                sb.append(chars, start, length);
             }
-            seen++;
-            if (seen > limit) throw new java.io.IOException(
-                "macro protocol line exceeds " + limit + " characters");
-            sb.append((char) value);
         }
     }
 
@@ -3361,7 +3386,7 @@ public final class ScalaRsMacroEngine {
             throw new AssertionError("rejected valid typecheck fail answer");
         }
 
-        BufferedReader bounded = new BufferedReader(new java.io.StringReader("123456\n(ok)\r\n"));
+        WireReader bounded = new WireReader(new java.io.StringReader("123456\n(ok)\r\n"));
         rejected = false;
         try { readWireLine(bounded, 5); }
         catch (java.io.IOException expected) { rejected = true; }
@@ -3379,10 +3404,41 @@ public final class ScalaRsMacroEngine {
             public void close() {}
         };
         rejected = false;
-        try { readWireLine(new BufferedReader(producer), 5); }
+        try { readWireLine(new WireReader(producer), 5); }
         catch (java.io.IOException expected) { rejected = true; }
         if (!rejected || reads[0] > 6) {
             throw new AssertionError("bounded line reader drained an unterminated producer");
+        }
+        final int[] scalarReads = new int[] { 0 };
+        BufferedReader counted = new BufferedReader(new java.io.StringReader("(ok)\r\n\n(last)")) {
+            public int read() throws java.io.IOException {
+                scalarReads[0]++;
+                return super.read();
+            }
+        };
+        WireReader bulk = new WireReader(counted);
+        if (!"(ok)".equals(readWireLine(bulk, 32))
+                || !"".equals(readWireLine(bulk, 0))
+                || !"(last)".equals(readWireLine(bulk, 6))
+                || readWireLine(bulk, 6) != null) {
+            throw new AssertionError("bounded line reader lost a frame or CRLF boundary");
+        }
+        if (scalarReads[0] != 0) {
+            throw new AssertionError("protocol reader still locks once per character");
+        }
+        char[] longChars = new char[8191];
+        java.util.Arrays.fill(longChars, 'x');
+        String longLine = new String(longChars);
+        WireReader split = new WireReader(new java.io.StringReader(longLine + "\r\nnext\r"));
+        if (!longLine.equals(readWireLine(split, 8192))
+                || !"next\r".equals(readWireLine(split, 5))
+                || readWireLine(split, 5) != null) {
+            throw new AssertionError("bounded line reader lost a chunk boundary or EOF payload");
+        }
+        for (String value : new String[] { "", "plain", "a\nb\tc\rd", "\\\"", "\u65e5\ud83d\ude00" }) {
+            if (!value.equals(Sexp.parse(Sexp.quote(value)).text())) {
+                throw new AssertionError("protocol string did not round trip: " + value);
+            }
         }
         System.out.println("ok");
     }
@@ -3486,11 +3542,13 @@ public final class ScalaRsMacroEngine {
                 return v;
             }
             if (c == '"') {
-                p[0]++;
-                StringBuilder sb = new StringBuilder();
+                int start = ++p[0];
+                StringBuilder sb = null;
                 while (p[0] < s.length() && s.charAt(p[0]) != '"') {
-                    char ch = s.charAt(p[0]++);
+                    char ch = s.charAt(p[0]);
                     if (ch == '\\') {
+                        if (sb == null) sb = new StringBuilder();
+                        sb.append(s, start, p[0]++);
                         if (p[0] >= s.length()) {
                             throw new IllegalArgumentException("unterminated macro protocol escape");
                         }
@@ -3501,28 +3559,30 @@ public final class ScalaRsMacroEngine {
                         else if (e == '"' || e == '\\') sb.append(e);
                         else throw new IllegalArgumentException(
                             "unknown macro protocol escape: \\" + e);
+                        start = p[0];
                     } else {
-                        sb.append(ch);
+                        p[0]++;
                     }
                 }
                 if (p[0] >= s.length()) {
                     throw new IllegalArgumentException("unterminated macro protocol string");
                 }
+                v.atom = sb == null ? s.substring(start, p[0])
+                    : sb.append(s, start, p[0]).toString();
                 p[0]++;
-                v.atom = sb.toString();
                 return v;
             }
             if (c == ')') {
                 throw new IllegalArgumentException("unexpected ) in macro protocol packet");
             }
-            StringBuilder sb = new StringBuilder();
+            int start = p[0];
             while (p[0] < s.length() && " ()".indexOf(s.charAt(p[0])) < 0) {
-                sb.append(s.charAt(p[0]++));
+                p[0]++;
             }
-            if (sb.length() == 0) {
+            if (p[0] == start) {
                 throw new IllegalArgumentException("empty macro protocol atom");
             }
-            v.atom = sb.toString();
+            v.atom = s.substring(start, p[0]);
             return v;
         }
 

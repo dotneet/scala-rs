@@ -147,8 +147,8 @@ struct Entry {
 
 struct DirPackage {
     exists: bool,
-    /// Exact file names avoid a filesystem probe for every absent class in a
-    /// package that exists in many directory classpath roots.
+    /// Exact regular-file names avoid filesystem probes for both missing and
+    /// present classes. Symlinks are checked once when the package is listed.
     files: Option<HashSet<std::ffi::OsString>>,
 }
 
@@ -181,7 +181,7 @@ impl Entry {
         if let Some(found) = self.dir_packages.get(package) {
             return found.exists;
         }
-        let found = self.path.join(package).is_dir() && self.directory_case_matches(package);
+        let found = self.directory_case_matches(package) && self.path.join(package).is_dir();
         self.dir_packages.insert(
             package.to_string(),
             DirPackage {
@@ -204,13 +204,25 @@ impl Entry {
                 return dir.join(file).is_file()
                     && self.directory_case_matches(&format!("{package}/{file}"));
             };
-            package_entry.files = Some(entries.flatten().map(|entry| entry.file_name()).collect());
+            package_entry.files = Some(
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.file_type().map_or_else(
+                            |_| entry.path().is_file(),
+                            |kind| {
+                                kind.is_file() || (kind.is_symlink() && entry.path().is_file())
+                            },
+                        )
+                    })
+                    .map(|entry| entry.file_name())
+                    .collect(),
+            );
         }
         package_entry
             .files
             .as_ref()
             .is_some_and(|files| files.contains(std::ffi::OsStr::new(file)))
-            && dir.join(file).is_file()
     }
 }
 
@@ -958,12 +970,28 @@ mod tests {
         let root = std::env::temp_dir().join(format!("scala-rs-default-package-{unique}"));
         std::fs::create_dir_all(root.join("Directory.class")).unwrap();
         std::fs::write(root.join("Found.class"), b"class bytes").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("Found.class"), root.join("Alias.class")).unwrap();
+            std::os::unix::fs::symlink(root.join("absent"), root.join("Broken.class")).unwrap();
+            std::os::unix::fs::symlink(root.join("Directory.class"), root.join("DirLink.class"))
+                .unwrap();
+        }
         let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
 
         assert_eq!(index.find_class("Missing").unwrap(), None);
         assert_eq!(index.find_class("AlsoMissing").unwrap(), None);
         assert_eq!(index.find_class("found").unwrap(), None);
         assert_eq!(index.find_class("Directory").unwrap(), None);
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                index.find_class("Alias").unwrap(),
+                Some(b"class bytes".to_vec())
+            );
+            assert_eq!(index.find_class("Broken").unwrap(), None);
+            assert_eq!(index.find_class("DirLink").unwrap(), None);
+        }
         assert_eq!(
             index.find_class("Found").unwrap(),
             Some(b"class bytes".to_vec())
@@ -974,7 +1002,35 @@ mod tests {
             .get("")
             .and_then(|package| package.files.as_ref())
             .is_some_and(|files| files.contains(std::ffi::OsStr::new("Found.class"))));
+        assert!(!entry.dir_packages[""]
+            .files
+            .as_ref()
+            .unwrap()
+            .contains(std::ffi::OsStr::new("Directory.class")));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_packages_reuse_their_ancestor_listing() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-missing-packages-{unique}"));
+        std::fs::create_dir(&root).unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+        assert!(!index.has_package_prefix("absent/one/"));
+        assert!(!index.has_package_prefix("absent/two/"));
+        let entry = index.paths.iter().find(|entry| entry.path == root).unwrap();
+        assert_eq!(entry.dir_children.len(), 1);
+        assert!(entry
+            .dir_children
+            .get("")
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
