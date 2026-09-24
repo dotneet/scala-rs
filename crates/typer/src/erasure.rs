@@ -14,21 +14,40 @@ pub fn erase(tree: &mut Tree, st: &mut SymbolTable) {
     // Before `erase_symbols`, which erases the constant types away.
     inline_constant_refs(tree, st);
     erase_symbols(st);
+    box_value_class_lambda_params(st, &boxed_params);
+    erase_tree(tree, st, None);
+}
+
+fn box_value_class_lambda_params(st: &mut SymbolTable, params: &[(SymbolId, SymbolId)]) {
+    let originals = st.erasure_settled.then(|| {
+        params
+            .iter()
+            .map(|&(param, class)| (param, class, st.get(param).ty.clone()))
+            .collect::<Vec<_>>()
+    });
     // A `FunctionN.apply` takes `Object`, so a lambda parameter instantiated at
     // a value class receives the *boxed* instance: `xs.map(_.n)` over a
     // `List[Meters]` is handed a `Meters`, not an `Integer`.
-    for (p, c) in &boxed_params {
+    for (p, c) in params {
         st.get_mut(*p).ty = Type::Class {
             sym: *c,
             args: vec![].into(),
         };
     }
-    // These writes are the one thing that can make the next unit's
-    // `erase_symbols` do work again; see `SymbolTable::erasure_settled`.
-    if !boxed_params.is_empty() {
-        st.erasure_settled = false;
+    // Keep the boxed types until the next unit, exactly as the full-table
+    // pass did. If erasing them restores the settled table, that pass only
+    // needs to restore these parameters, not revisit every library symbol.
+    match originals {
+        Some(originals)
+            if originals.iter().all(|(param, _, erased)| {
+                st.get(*param).kind == crate::symbol::SymKind::Term
+                    && erase_ty(&st.get(*param).ty, st) == *erased
+            }) =>
+        {
+            st.erasure_boxed_params = originals;
+        }
+        _ => st.erasure_settled = false,
     }
-    erase_tree(tree, st, None);
 }
 
 /// nsc's typer replaces a reference to a constant-typed value by its literal
@@ -369,15 +388,19 @@ pub fn tree_mentions_symbol(tree: &Tree, sym: SymbolId) -> bool {
 /// files. It is a fixpoint loop, though, and one that usually converges after
 /// two rounds: a pass that changes nothing leaves `st` exactly as it found it,
 /// so the next pass over the same table cannot change anything either. That is
-/// what `erasure_settled` records. The only writes to a symbol's type between
-/// two passes are the boxed lambda parameters in `erase` above, which clear the
-/// flag, and `alloc`, which clears it too — `erase_tree` writes tree types
-/// only. Skipping a settled pass is therefore not an approximation: the pass
-/// that is skipped provably had no effect.
+/// what `erasure_settled` records. Boxed lambda parameters can temporarily
+/// differ from that settled state; restore their known erased types on the
+/// next pass. A new symbol or a changed erased representation still requires
+/// the full pass. `erase_tree` writes tree types only.
 fn erase_symbols(st: &mut SymbolTable) {
     if st.erasure_settled {
+        for (param, class, erased) in std::mem::take(&mut st.erasure_boxed_params) {
+            st.get_mut(param).ty = erased;
+            st.record_value_class_term(param, class);
+        }
         return;
     }
+    st.erasure_boxed_params.clear();
     let mut changed = false;
     let n = st.symbols.len();
     // Save every declaration before erasing any field: later method symbols
@@ -2552,4 +2575,85 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         byname_thunk: false,
         byname_type_marker: false,
     };
+}
+
+#[cfg(test)]
+mod settled_erasure_tests {
+    use super::*;
+    use crate::symbol::SymKind;
+
+    fn settled_value_class() -> (SymbolTable, SymbolId, SymbolId) {
+        let mut st = SymbolTable::new();
+        let class = st.alloc("Meters", st.root, SymKind::Class, Flags::FINAL, "Meters");
+        let field = st.alloc("value", class, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(field).ty = Type::Int;
+        st.get_mut(class).parents = vec![Type::AnyVal];
+        st.get_mut(class).ctor_fields = vec![field];
+        let param = st.alloc("x", st.root, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(param).ty = Type::Class {
+            sym: class,
+            args: vec![].into(),
+        };
+        erase_symbols(&mut st);
+        erase_symbols(&mut st);
+        assert!(st.erasure_settled);
+        assert_eq!(st.get(param).ty, Type::Int);
+        (st, class, param)
+    }
+
+    #[test]
+    fn lambda_boxing_restores_the_settled_table_without_another_sweep() {
+        let (mut st, class, param) = settled_value_class();
+        let before: Vec<_> = st.symbols.iter().map(|s| s.ty.clone()).collect();
+        for _ in 0..3 {
+            box_value_class_lambda_params(&mut st, &[(param, class)]);
+            assert!(
+                st.erasure_settled,
+                "temporary boxing invalidated every symbol"
+            );
+            assert_eq!(
+                st.get(param).ty,
+                Type::Class {
+                    sym: class,
+                    args: vec![].into()
+                }
+            );
+            erase_symbols(&mut st);
+            assert!(st.erasure_settled);
+            assert!(st.erasure_boxed_params.is_empty());
+            assert_eq!(
+                st.symbols.iter().map(|s| s.ty.clone()).collect::<Vec<_>>(),
+                before
+            );
+            assert_eq!(st.value_class_for_term(param), Some(class));
+        }
+    }
+
+    #[test]
+    fn new_symbols_still_require_a_full_erasure_pass_after_boxing() {
+        let (mut st, class, param) = settled_value_class();
+        box_value_class_lambda_params(&mut st, &[(param, class)]);
+        let added = st.alloc("next", st.root, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(added).ty = Type::Class {
+            sym: class,
+            args: vec![].into(),
+        };
+        assert!(!st.erasure_settled);
+        erase_symbols(&mut st);
+        assert_eq!(st.get(param).ty, Type::Int);
+        assert_eq!(st.get(added).ty, Type::Int);
+        assert_eq!(st.value_class_for_term(added), Some(class));
+        assert!(st.erasure_boxed_params.is_empty());
+    }
+
+    #[test]
+    fn changed_erased_representations_are_not_restored_from_the_cache() {
+        let (mut st, class, param) = settled_value_class();
+        st.get_mut(param).ty = Type::Long;
+        box_value_class_lambda_params(&mut st, &[(param, class)]);
+        assert!(!st.erasure_settled);
+        assert!(st.erasure_boxed_params.is_empty());
+        erase_symbols(&mut st);
+        assert_eq!(st.get(param).ty, Type::Int);
+    }
 }

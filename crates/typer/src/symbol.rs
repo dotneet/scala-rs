@@ -1291,11 +1291,12 @@ pub struct SymbolTable {
     /// which used to scan every symbol on every call. See `JvmIndex`.
     pub(crate) jvm_index: std::cell::RefCell<JvmIndex>,
     /// The last `erasure::erase_symbols` pass changed nothing, and nothing has
-    /// changed a symbol's type since. The next pass over the same table would
-    /// therefore also change nothing, so it is skipped. Cleared by `alloc` and
-    /// by the one place in `erasure` that writes a symbol type outside the
-    /// pass itself.
+    /// changed a symbol's erased type since. Temporary lambda parameter
+    /// boxing is tracked separately and restored before skipping the next
+    /// pass. Cleared by `alloc` and by boxing that changes the erased form.
     pub erasure_settled: bool,
+    /// Parameter, value class, and settled type to restore on the next pass.
+    pub(crate) erasure_boxed_params: Vec<(SymbolId, SymbolId, Type)>,
     /// How many symbols `uncurry::flatten_method_symbols` has already joined
     /// into a single parameter list. It runs once per compilation unit and
     /// only ever appends, so each pass starts here instead of at 0.
@@ -1675,6 +1676,7 @@ impl SymbolTable {
             ops_shapes: rustc_hash::FxHashMap::default(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
+            erasure_boxed_params: Vec::new(),
             flattened_upto: 0,
             method_variants: rustc_hash::FxHashMap::default(),
             qualify_tparams: std::cell::RefCell::new(Vec::new()),
