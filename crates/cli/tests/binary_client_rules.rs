@@ -115,6 +115,59 @@ object Main {
     }
 }
 
+#[test]
+fn projected_binary_alias_does_not_suppress_case_apply_overload() {
+    let lib = r#"
+package lib
+class Code(val value: Int)
+object Catalog {
+  class Row(val value: Int)
+  class Table { type Element = Row }
+}
+"#;
+    let client = r#"
+import lib.{Catalog, Code}
+case class Entry(code: Code)
+object Entry {
+  def apply(row: Catalog.Table#Element): Entry = Entry(code = new Code(row.value))
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(Entry(new Code(7)).code.value)
+    println(Entry(new Catalog.Row(9)).code.value)
+  }
+}
+"#;
+    let Some((dir, outcome)) = compile_against_lib_dir("projected-case-apply", lib, client) else {
+        return;
+    };
+    outcome.assert_success("case apply overload beside a projected binary alias");
+    if let Some(stdout) = run_main(&dir) {
+        assert_eq!(stdout.trim(), "7\n9");
+    }
+    let tools = toolchain();
+    let reference = dir.join("reference");
+    fs::create_dir_all(&reference).unwrap();
+    let status = Command::new(tools.scalac().unwrap())
+        .arg("-cp")
+        .arg(dir.join("lib"))
+        .arg("-d")
+        .arg(&reference)
+        .arg(dir.join("Use.scala"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "scalac rejected the client");
+    let cp = std::env::join_paths([
+        reference,
+        dir.join("lib"),
+        tools.scala_library().unwrap().to_path_buf(),
+    ])
+    .unwrap();
+    let run = RunCommand::new("Main").classpath(cp).run();
+    run.assert_success("reference case apply overloads");
+    assert_eq!(run.stdout_string().trim(), "7\n9");
+}
+
 /// nsc: `not enough arguments for constructor Plain: (tag: String)`. A
 /// classpath class was never judged, so `new lib.Plain` compiled to an
 /// `<init>()V` the class does not have and threw `NoSuchMethodError`. `Plain`

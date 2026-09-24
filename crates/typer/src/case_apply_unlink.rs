@@ -209,6 +209,19 @@ impl Typer {
 /// compare that mixed representation explicitly before the conservative
 /// override matcher gets a chance to treat it as unknown.
 fn builtin_and_class_same(st: &crate::symbol::SymbolTable, a: &Type, b: &Type) -> Option<bool> {
+    // A path-dependent class is represented by a view refinement. Its prefix
+    // can affect equality, but cannot make two different nominal classes the
+    // same. The override matcher treats refinements as uncertain, which is
+    // not sufficient evidence to remove a generated overload.
+    if let (Type::Class { sym: x, .. }, Type::Class { sym: y, .. }) =
+        (crate::prefix::strip_view(a), crate::prefix::strip_view(b))
+    {
+        let x = &st.get(*x).jvm_name;
+        let y = &st.get(*y).jvm_name;
+        if !x.is_empty() && !y.is_empty() && x != y {
+            return Some(false);
+        }
+    }
     fn builtin(st: &crate::symbol::SymbolTable, ty: &Type) -> Option<SymbolId> {
         Some(match ty {
             Type::Unit => st.unit_sym,
@@ -228,5 +241,37 @@ fn builtin_and_class_same(st: &crate::symbol::SymbolTable, a: &Type, b: &Type) -
         (Some(x), _, _, Type::Class { sym, args }) => Some(x == *sym && args.is_empty()),
         (_, Some(y), Type::Class { sym, args }, _) => Some(y == *sym && args.is_empty()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::symbol::SymbolTable;
+
+    #[test]
+    fn different_nominal_classes_stay_distinct_through_a_prefix_view() {
+        let mut st = SymbolTable::new();
+        let row = st.alloc(
+            "Row",
+            st.root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "lib/Catalog$Row",
+        );
+        let code = st.alloc("Code", st.root, SymKind::Class, Flags::EMPTY, "lib/Code");
+        let row = crate::prefix::with_prefix(
+            Type::Class {
+                sym: row,
+                args: Vec::new().into(),
+            },
+            Type::AnyRef,
+        );
+        let code = Type::Class {
+            sym: code,
+            args: Vec::new().into(),
+        };
+        assert_eq!(builtin_and_class_same(&st, &row, &code), Some(false));
+        assert_eq!(builtin_and_class_same(&st, &code, &row), Some(false));
     }
 }

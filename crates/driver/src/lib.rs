@@ -884,7 +884,15 @@ fn load_cp(
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    load_classpath_checked(paths).map(scala_rs_typer::adapt_classpath)
+    // BinaryIndex loads directory and archive entries on demand. Eagerly
+    // decoding every directory class duplicates that work for each consumer,
+    // including dependencies whose declarations the source never uses.
+    // Explicit class files still need this loader and its strict diagnostics.
+    let explicit: Vec<_> = paths
+        .iter()
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("class") && !p.is_dir())
+        .collect();
+    load_classpath_checked(&explicit).map(scala_rs_typer::adapt_classpath)
 }
 
 /// Run `java -cp out_dir[:extra...] main_class args...`.
@@ -1204,6 +1212,44 @@ object Main {
             diag.message.contains("cannot load classpath ABI")
                 && diag.message.contains("not a classfile (bad magic)")
         }));
+    }
+
+    #[test]
+    fn directory_classpath_is_left_to_lazy_binary_loading() {
+        let tmp = fresh_dir();
+        let src = tmp.0.join("Library.scala");
+        std::fs::write(
+            &src,
+            "package lazycp; class Library { def value: Int = 42 }",
+        )
+        .unwrap();
+        let producer = CompileOptions {
+            out_dir: tmp.0.join("library"),
+            ..CompileOptions::default()
+        };
+        let result = compile_paths(&[src], &producer);
+        assert!(result.ok(), "{}", result.render_diags());
+        assert!(load_cp(&[producer.out_dir.clone()]).unwrap().is_empty());
+        assert_eq!(
+            load_cp(&[producer.out_dir.join("lazycp/Library.class")])
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let src = tmp.0.join("Consumer.scala");
+        std::fs::write(
+            &src,
+            "object Consumer { def value: Int = new lazycp.Library().value }",
+        )
+        .unwrap();
+        let consumer = CompileOptions {
+            out_dir: tmp.0.join("consumer"),
+            class_path: vec![producer.out_dir],
+            ..CompileOptions::default()
+        };
+        let result = compile_paths(&[src], &consumer);
+        assert!(result.ok(), "{}", result.render_diags());
     }
 
     #[test]

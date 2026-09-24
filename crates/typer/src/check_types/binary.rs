@@ -1438,7 +1438,14 @@ impl Typer {
             if !inner.inner_jvm.ends_with('$') || inner.inner_jvm.contains("$anon") {
                 continue;
             }
-            if !inner.inner_jvm.starts_with(&nest_prefix) {
+            let Some(rest) = inner.inner_jvm.strip_prefix(&nest_prefix) else {
+                continue;
+            };
+            // The table also mentions descendants of nested objects. Their
+            // members belong to those objects, not directly to this owner.
+            if scala_rs_pickle::names::last_nesting_separator(rest.trim_end_matches('$'))
+                .is_some()
+            {
                 continue;
             }
             let simple = crate::classpath::java_simple_name(&inner.inner_jvm);
@@ -1451,11 +1458,13 @@ impl Typer {
             // package object's `InnerClasses` table. Cats then exposed
             // `cats.syntax.eq` only as the inherited Boolean method and the
             // syntax import brought no implicit conversions into scope.
+            // A class stub is not its companion: an earlier signature may
+            // already have named the class without loading the object.
             if self.st.get(nest_owner).members.iter().any(|&m| {
                 self.st.get(m).name == simple
                     && matches!(
                         self.st.get(m).kind,
-                        SymKind::Class | SymKind::Module | SymKind::ModuleClass
+                        SymKind::Module | SymKind::ModuleClass
                     )
             }) {
                 continue;

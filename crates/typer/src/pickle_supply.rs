@@ -677,18 +677,18 @@ impl PickleSupply {
                     let s = st.get(m);
                     s.name == name
                         && (s.kind == SymKind::Method
-                            // The eager classpath reader represents a Scala
-                            // `val` accessor as a Term because the pickle
-                            // subset marks the declaration as a value.  The
-                            // full ScalaSignature later exposes that same
-                            // accessor as a zero-argument Method.  Keep the
+                            // Classpath readers can represent a Scala `val`
+                            // accessor as a Term. The full pickle exposes it
+                            // as a zero-argument Method. Keep the
                             // prelude and source declarations intact, but
                             // remove this origin-less classpath Term when the
-                            // richer pickled Method replaces it.
+                            // richer pickled Method replaces it. Lazy binary
+                            // fields can be allocated after source_start, so
+                            // use the owning class's origin, not symbol order.
                             || (s.kind == SymKind::Term
                                 && s.pickled_origin.is_empty()
                                 && m.0 >= st.prelude_end
-                                && m.0 < st.source_start))
+                                && !st.is_source_owner(class_sym)))
                 })
                 .collect();
             let installed = self.complete_named(st, bin, class_sym, &name, false);

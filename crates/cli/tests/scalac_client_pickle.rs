@@ -4,8 +4,90 @@
 use crate::support;
 use std::{fs, process::Command};
 
-/// Compile `lib` with scala-rs and `client` against it with scalac, run
-/// `Main`, and return its stdout (`None` when the toolchain is missing).
+#[test]
+fn nested_case_companion_loads_after_its_class_was_stubbed() {
+    let Some(out) = scalac_client_output(
+        "scalac-client-stubbed-companion",
+        r#"package lib
+object Service {
+  type Call = Input => Int
+  def execute: Call = input => input.a
+  case class Input(a: Int, b: String)
+}
+"#,
+        r#"object Main {
+  def main(args: Array[String]): Unit = println(lib.Service.Input(a = 7, b = "x").a)
+}
+"#,
+    ) else {
+        return;
+    };
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn nested_companion_singleton_reference_keeps_its_owner() {
+    let Some(out) = scalac_client_output(
+        "scalac-client-nested-companion-owner",
+        r#"package lib
+trait Companion[A]
+case class Envelope(choice: Envelope.Choice) {
+  def companion: Envelope.type = Envelope
+  def wrap(value: Envelope.Payload): Envelope.Choice = Envelope.Choice.Wrapped(value)
+}
+object Envelope {
+  sealed trait Choice
+  object Choice { case class Wrapped(value: Envelope.Payload) extends Choice }
+  case class Payload(value: Seq[String]) {
+    def companion: Envelope.Payload.type = Envelope.Payload
+  }
+  object Payload extends Companion[Envelope.Payload]
+}
+"#,
+        r#"import lib.Envelope.Choice.Wrapped
+import lib.Envelope.Payload
+object Main {
+  def main(args: Array[String]): Unit = println(Wrapped(Payload(Seq("x"))).value.value.head)
+}
+"#,
+    ) else {
+        return;
+    };
+    assert_eq!(out, "x\n");
+}
+
+#[test]
+fn external_option_names_keep_their_declaring_owner() {
+    let Some(out) = scalac_client_output(
+        "scalac-client-option-name-owner",
+        r#"package lib
+object Domain {
+  class Option(val n: Int)
+  class Some(val n: Int)
+  class None(val n: Int)
+}
+object Api {
+  def option(value: Domain.Option): Int = value.n
+  def some(value: Domain.Some): Int = value.n
+  def none(value: Domain.None): Int = value.n
+}
+"#,
+        r#"object Main {
+  def main(args: Array[String]): Unit = {
+    println(lib.Api.option(new lib.Domain.Option(1)))
+    println(lib.Api.some(new lib.Domain.Some(2)))
+    println(lib.Api.none(new lib.Domain.None(3)))
+  }
+}
+"#,
+    ) else {
+        return;
+    };
+    assert_eq!(out, "1\n2\n3\n");
+}
+
+/// Compile `lib` with scala-rs and `client` with both compilers, run `Main`,
+/// and return its stdout (`None` when the toolchain is missing).
 fn scalac_client_output(label: &str, lib: &str, client: &str) -> Option<String> {
     let tools = support::toolchain();
     let (Some(scalac), Some(library), Some(java)) =
@@ -27,6 +109,13 @@ fn scalac_client_output(label: &str, lib: &str, client: &str) -> Option<String> 
         .scala_library(library)
         .run()
         .assert_success("scala-rs library");
+    let native_out = dir.join("native-use");
+    fs::create_dir_all(&native_out).unwrap();
+    support::CompileCommand::new(&use_src, &native_out)
+        .scala_library(library)
+        .classpath(&lib_out)
+        .run()
+        .assert_success("scala-rs client against scala-rs library");
     let client = support::CompileOutcome::from_output(
         Command::new(scalac)
             .arg("-cp")
@@ -54,6 +143,22 @@ fn scalac_client_output(label: &str, lib: &str, client: &str) -> Option<String> 
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
+    let native_classpath = format!(
+        "{}:{}:{}",
+        native_out.display(),
+        lib_out.display(),
+        library.display()
+    );
+    let native_run = Command::new(java)
+        .args(["-cp", &native_classpath, "Main"])
+        .output()
+        .unwrap();
+    assert!(
+        native_run.status.success(),
+        "native client failed:\n{}",
+        String::from_utf8_lossy(&native_run.stderr)
+    );
+    assert_eq!(native_run.stdout, run.stdout);
     Some(String::from_utf8_lossy(&run.stdout).into_owned())
 }
 

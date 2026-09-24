@@ -815,7 +815,12 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                     self.type_ref_in_refs(owner, "Seq", arg_refs)
                 }
             }
-            "Option" | "Some" | "None" => {
+            "Option" | "Some" | "None"
+                if matches!(
+                    self.facts.get(class_sym).jvm_name.as_str(),
+                    "scala/Option" | "scala/Some" | "scala/None$"
+                ) =>
+            {
                 let sc = self.scala_module();
                 self.type_ref_in_refs(sc, n.as_str(), arg_refs)
             }
