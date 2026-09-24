@@ -2625,6 +2625,7 @@ impl Typer {
                                     && !found.is_no_type()
                                     && !found.is_error()
                                     && !self.st.is_sub_type(&found, wanted)
+                                    && !self.directly_fits_open_result(&found, wanted, &open)
                                 {
                                     self.warm_own_scope_once(&found);
                                     self.warm_conversion_witnesses(&found, wanted);

@@ -265,7 +265,7 @@ impl BinaryIndex {
     fn find_class_uncached(&mut self, internal: &str) -> Result<Option<Vec<u8>>, String> {
         let rel = format!("{internal}.class");
         let alt = format!("classes/{rel}");
-        let package = internal.rsplit_once('/').map(|(package, _)| package);
+        let (package, _) = internal.rsplit_once('/').unwrap_or(("", internal));
         for i in 0..self.paths.len() {
             match self.paths[i].kind {
                 PathKind::Zip => {
@@ -298,16 +298,14 @@ impl BinaryIndex {
                 // archive at startup may have become a directory since.
                 PathKind::Dir | PathKind::Unknown => {
                     if matches!(self.paths[i].kind, PathKind::Dir) {
-                        if let Some(package) = package {
-                            let file = rel.rsplit('/').next().expect("class file name");
-                            if !self.paths[i].has_directory_class(package, file) {
-                                continue;
-                            }
-                            let f = self.paths[i].path.join(&rel);
-                            return std::fs::read(&f)
-                                .map(Some)
-                                .map_err(|e| format!("cannot read {}: {e}", f.display()));
+                        let file = rel.rsplit('/').next().expect("class file name");
+                        if !self.paths[i].has_directory_class(package, file) {
+                            continue;
                         }
+                        let f = self.paths[i].path.join(&rel);
+                        return std::fs::read(&f)
+                            .map(Some)
+                            .map_err(|e| format!("cannot read {}: {e}", f.display()));
                     }
                     let root = self.paths[i].path.clone();
                     let f = root.join(&rel);
@@ -947,6 +945,35 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains(std::ffi::OsStr::new("Found.class")));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_package_class_probes_reuse_directory_listing() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-default-package-{unique}"));
+        std::fs::create_dir_all(root.join("Directory.class")).unwrap();
+        std::fs::write(root.join("Found.class"), b"class bytes").unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+
+        assert_eq!(index.find_class("Missing").unwrap(), None);
+        assert_eq!(index.find_class("AlsoMissing").unwrap(), None);
+        assert_eq!(index.find_class("found").unwrap(), None);
+        assert_eq!(index.find_class("Directory").unwrap(), None);
+        assert_eq!(
+            index.find_class("Found").unwrap(),
+            Some(b"class bytes".to_vec())
+        );
+        let entry = index.paths.iter().find(|entry| entry.path == root).unwrap();
+        assert!(entry
+            .dir_packages
+            .get("")
+            .and_then(|package| package.files.as_ref())
+            .is_some_and(|files| files.contains(std::ffi::OsStr::new("Found.class"))));
 
         std::fs::remove_dir_all(root).unwrap();
     }

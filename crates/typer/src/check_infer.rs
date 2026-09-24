@@ -998,6 +998,55 @@ impl Typer {
         (!mentions_tparam(&out, open)).then_some(out)
     }
 
+    /// Prefer ordinary inference to inserting a view into a lambda result.
+    /// A successful structural unification alone is not enough: the inferred
+    /// arguments must satisfy their bounds and the substituted result must
+    /// actually accept the body, including invariant positions.
+    pub(crate) fn directly_fits_open_result(
+        &self,
+        arg: &Type,
+        result: &Type,
+        open: &[SymbolId],
+    ) -> bool {
+        let ids: Vec<SymbolId> = open
+            .iter()
+            .copied()
+            .filter(|tp| mentions_tparam(result, std::slice::from_ref(tp)))
+            .collect();
+        let Some(args) = ids
+            .iter()
+            .map(|tp| unify_one(&self.st, *tp, result, arg))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        if args
+            .iter()
+            .any(|t| t.is_no_type() || t.is_error() || mentions_tparam(t, open))
+        {
+            return false;
+        }
+        for (&tp, arg) in ids.iter().zip(&args) {
+            let symbol = self.st.get(tp);
+            for (bound, upper) in [(&symbol.bound_hi, true), (&symbol.bound_lo, false)] {
+                let Some(bound) = bound else { continue };
+                let bound = crate::symbol::subst_tparams_slice(&ids, &args, bound);
+                if mentions_tparam(&bound, open)
+                    || if upper {
+                        !self.st.is_sub_type(arg, &bound)
+                            && !self.st.hk_ctor_meets_proper_bound(arg, &bound)
+                    } else {
+                        !self.st.is_sub_type(&bound, arg)
+                    }
+                {
+                    return false;
+                }
+            }
+        }
+        let solved = crate::symbol::subst_tparams_slice(&ids, &args, result);
+        self.st.is_sub_type(arg, &solved)
+    }
+
     /// nsc's `dependentTypeMap`. `def get[P <: Phase](p: P): Option[p.State]`
     /// reads `State` off the *argument*, not off `Phase`, so
     /// `get(Phase.assignUniqueSymbols)` is an `Option[UsedFeatures]` and not an
@@ -5458,6 +5507,49 @@ fn bound_mentions_tparam(ty: &Type) -> bool {
 enum SingletonRecv<'t> {
     Tree(&'t Tree),
     This(SymbolId),
+}
+
+#[cfg(test)]
+mod direct_result_tests {
+    use super::*;
+
+    #[test]
+    fn direct_result_inference_checks_dependent_bounds_and_repeated_variables() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let pair = typer
+            .st
+            .alloc("Pair", root, SymKind::Class, Flags::EMPTY, "Pair");
+        let a = typer
+            .st
+            .alloc("A", root, SymKind::TypeParam, Flags::EMPTY, "A");
+        let b = typer
+            .st
+            .alloc("B", root, SymKind::TypeParam, Flags::EMPTY, "B");
+        let applied = |left, right| Type::Class {
+            sym: pair,
+            args: vec![left, right].into(),
+        };
+        let actual = applied(Type::String, Type::Int);
+        let result = applied(Type::TypeParam(a), Type::TypeParam(b));
+        assert!(typer.directly_fits_open_result(&actual, &result, &[a, b]));
+        assert!(!typer.directly_fits_open_result(
+            &actual,
+            &applied(Type::TypeParam(a), Type::TypeParam(a)),
+            &[a],
+        ));
+
+        typer.st.get_mut(b).bound_hi = Some(Type::TypeParam(a));
+        assert!(!typer.directly_fits_open_result(&actual, &result, &[a, b]));
+        assert!(typer.directly_fits_open_result(
+            &applied(Type::String, Type::String),
+            &result,
+            &[a, b],
+        ));
+        typer.st.get_mut(b).bound_hi = None;
+        typer.st.get_mut(b).bound_lo = Some(Type::TypeParam(a));
+        assert!(!typer.directly_fits_open_result(&actual, &result, &[a, b]));
+    }
 }
 
 #[cfg(test)]

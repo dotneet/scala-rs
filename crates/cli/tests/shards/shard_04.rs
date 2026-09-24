@@ -20,6 +20,8 @@ mod kernel;
 mod kindproj;
 #[path = "../kvar.rs"]
 mod kvar;
+#[path = "../lambda_result_inference.rs"]
+mod lambda_result_inference;
 #[path = "../lang.rs"]
 mod lang;
 #[path = "../lastone.rs"]
