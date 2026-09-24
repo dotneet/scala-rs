@@ -335,6 +335,49 @@ fn collect_abi_classpath(
 }
 
 fn collect_classes(dir: &Path, out: &mut Vec<AbiLoadedClass>, strict_scala_signature: bool) {
+    let mut paths = Vec::new();
+    collect_class_paths(dir, &mut paths);
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+    // Bound both I/O concurrency and buffered bytes. Decode in discovery order:
+    // declaration order and classpath precedence must not depend on scheduling.
+    for batch in paths.chunks(128) {
+        let readers = if batch.len() < 16 { 1 } else { workers };
+        for bytes in read_class_files(batch, readers, &|p| std::fs::read(p))
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(c) = parse_abi_class_with_policy(&bytes, strict_scala_signature) {
+                if !skip_runtime(&c.internal_name) {
+                    out.push(c);
+                }
+            }
+        }
+    }
+}
+
+fn read_class_files(
+    paths: &[PathBuf],
+    workers: usize,
+    read: &(impl Fn(&Path) -> std::io::Result<Vec<u8>> + Sync),
+) -> Vec<Option<Vec<u8>>> {
+    let workers = workers.clamp(1, 4).min(paths.len());
+    if workers <= 1 {
+        return paths.iter().map(|p| read(p).ok()).collect();
+    }
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = paths
+            .chunks(paths.len().div_ceil(workers))
+            .map(|chunk| {
+                scope.spawn(move || chunk.iter().map(|p| read(p).ok()).collect::<Vec<_>>())
+            })
+            .collect();
+        jobs.into_iter()
+            .flat_map(|job| job.join().expect("classpath reader panicked"))
+            .collect()
+    })
+}
+
+fn collect_class_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
@@ -344,15 +387,9 @@ fn collect_classes(dir: &Path, out: &mut Vec<AbiLoadedClass>, strict_scala_signa
         };
         let path = ent.path();
         if path.is_dir() {
-            collect_classes(&path, out, strict_scala_signature);
+            collect_class_paths(&path, out);
         } else if path.extension().and_then(|s| s.to_str()) == Some("class") {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(c) = parse_abi_class_with_policy(&bytes, strict_scala_signature) {
-                    if !skip_runtime(&c.internal_name) {
-                        out.push(c);
-                    }
-                }
-            }
+            out.push(path);
         }
     }
 }
@@ -392,6 +429,25 @@ mod tests {
     use super::*;
     use crate::classfile::{ClassEmit, Field, Method, Pool};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn parallel_class_reads_are_bounded_and_preserve_order_and_failures() {
+        let paths: Vec<_> = (0..128).map(|i| PathBuf::from(i.to_string())).collect();
+        let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+        let read = |path: &Path| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            if path == Path::new("5") {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                Ok(path.to_str().unwrap().as_bytes().to_vec())
+            }
+        };
+        let parallel = read_class_files(&paths, 100, &read);
+        assert_eq!(threads.lock().unwrap().len(), 4);
+        assert_eq!(parallel[5], None);
+        assert_eq!(parallel, read_class_files(&paths, 1, &read));
+        assert!(read_class_files(&[], 4, &read).is_empty());
+    }
 
     struct TestDir(PathBuf);
 
