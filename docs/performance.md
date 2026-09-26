@@ -51,6 +51,9 @@ rather than an absolute benchmark:
 * **circe/shapeless derivations, 2026-09-26** (below): 19.5 s -> 13.3 s wall,
   1.88e11 -> 1.28e11 instructions; with sealed-trait decoders, which did not
   compile before, 14.5 s against scalac's 17.1 s.
+* **44 synthetic workloads against scalac, 2026-09-27** (below): every one
+  now compiles in 0.01--0.54 of scalac's wall time; before, scalac won five
+  and two did not compile.
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -337,6 +340,88 @@ expansion (1.7 ms) parsing, building and writing trees. A derivation nested
 more than about 32 levels deep stops at `MAX_QUERY_DEPTH` (64 queries, two
 per level), where scalac has no such limit.
 
+### Across the board against scalac (2026-09-27)
+
+**Workload.** `tests/scalac_bench_gen.py` writes 44 synthetic programs, one
+per language area (collections, for-comprehensions, pattern matching and
+exhaustivity, implicits and type classes, Java interop and SAM lambdas,
+literals, case classes, value classes, futures, higher-kinded types,
+`BigDecimal` arithmetic, stackable traits, ...), 20 files each unless noted;
+`tests/scalac_bench.sh` compiles each with both compilers (`-nowarn`, scalac
+with `-Xmx2g`), runs both programs and compares their output. One fresh
+process each, JDK 17.0.20, 12 cores, 2026-09-27. Wall seconds:
+
+| kind | scalac | before | after | after / scalac |
+|---|---:|---:|---:|---:|
+| `bigenum` (300-case sealed matches) | 58.7 | 165.6 | 2.5 | 0.04 |
+| `patmat_big` (100 files) | 45.4 | 20.0 | 6.1 | 0.13 |
+| `bignum` (`Int op BigDecimal`) | 4.3 | fails | 1.7 | 0.39 |
+| `literals` (800-entry tables) | 3.9 | fails | 0.9 | 0.24 |
+| `futures` | 7.6 | 7.9 | 2.1 | 0.28 |
+| `hkt` | 4.9 | 4.8 | 1.0 | 0.20 |
+| `javainterop` | 5.1 | 3.4 | 1.3 | 0.26 |
+| `javainterop_big` (100 files) | 13.5 | 16.8 | 6.6 | 0.49 |
+| `typeclass_big` (100 files) | 5.5 | 5.1 | 2.2 | 0.40 |
+| `typeclass_n200` (200 files) | 8.1 | 10.2 | 4.4 | 0.54 |
+| `lambdas_big` (100 files) | 21.9 | 15.1 | 8.1 | 0.37 |
+| `coll_big` (100 files) | 21.9 | 11.9 | 8.3 | 0.38 |
+| `forcomp_big` (100 files) | 20.9 | 10.8 | 9.2 | 0.44 |
+| `chains_big` (100 files) | 14.0 | 8.0 | 6.5 | 0.46 |
+
+The other 30 kinds went from 0.01--0.43 to 0.01--0.31 of scalac's time, and
+every program prints what scalac's does (three print a lambda, whose class
+name differs). On the real code bases: 538 sources of the standard library
+type-check in 2.3 s instead of 11.9 s (same 18 diagnostics); slick compiles
+in 3.7 s instead of 4.0 s.
+
+**What was slow, and what nsc does instead.**
+
+* *Exhaustivity analysis was re-solved for every match.* Code written from
+  a template repeats one match shape hundreds of times. Whether a case is
+  reachable and whether a match is exhaustive are satisfiability questions,
+  so their answers are now kept per translated match, positions left out
+  (`warn_patmat::AnalysisMemo`); a hit advances the symbol-id counter as
+  solving would. Counter-examples of a non-exhaustive match can follow
+  hash-set order and are solved every time.
+* *A lub per argument, from scratch, per argument.* Each argument's
+  prototype re-inferred the callee's type parameters from all earlier
+  arguments, so `Map(k0 -> v0, ..., k799 -> v799)` was a million joins. An
+  argument repeating an earlier (formal, type) pair now reuses the last
+  solution. Within one outermost `lub`, repeated sub-lubs are memoised, as
+  nsc's `lubResults` are.
+* *Caches that never hit.* The SAM check erasure asks of every tree's type
+  cached nothing for `Integer` (an `AnyVal` parent) or any `Seq` (a
+  function-typed parent above it), and scanned constructors before the
+  cheap answer; the emitter looked classes up by internal name with a scan
+  of the whole symbol table. `member_graph_gen` (`graph_gen` plus members
+  entered by `alloc`, which `graph_gen` did not see) now keys caches that
+  read member lists: companion implicits (nsc's `implicitsCache`), SAM
+  walks, as-seen-from walks per receiver.
+* *Work that changed nothing, repeated.* Warming implicit witnesses and
+  completing a member from the pickles are additive; a request that changed
+  no symbol is remembered until the class graph moves.
+* *A class per SAM literal.* nsc implements a SAM type through
+  `LambdaMetafactory` when it compiles to a pure interface (a Java
+  interface, or traits with nothing but abstract members); scala-rs emitted
+  an anonymous class for every one, 20,000 class files where scalac wrote
+  200. The closure classes per enclosing class now match scalac's
+  (`sam_literals_use_lambda_metafactory_where_scalac_does`).
+* *Dead branches emitted.* nsc folds `0 % 2 == 0` and never keeps the branch
+  that cannot run; a table of such entries overflowed the 64 KB method
+  limit here and not in scalac.
+
+**Bugs found on the way.** `Stream.collect(Collector[T, A, R])` came back a
+`Stream[A]` (a `collect(pf)` heuristic read any class's second type
+argument); `2 / y` with `y: BigDecimal` did not find
+`BigDecimal.int2bigDecimal`, which nsc's view search takes from the
+argument's implicit scope. Both have scalac-compared tests.
+
+**Still behind.** At 100--200 files scalac's JIT has warmed up, and its
+marginal cost per file is 0.15--0.2 s against scala-rs's 0.06--0.1 s: the
+large kinds sit at 0.4--0.55 of scalac where their 20-file versions are at
+0.2--0.3. Everything runs on one core. A SAM literal of a trait read from
+the classpath still gets a class, since its initializer is not known here.
+
 ### What is left
 
 From the profiles of 2026-09-24:
@@ -347,7 +432,8 @@ From the profiles of 2026-09-24:
   derivation, the search each `c.inferImplicitValue` answers starts from
   scratch, where nsc's derivation context shares it.
 * **`mutation_gen` moves at nearly every statement**, which bounds every
-  cache keyed on it; `graph_gen` covers the class graph only.
+  cache keyed on it; `graph_gen` covers the class graph only, and
+  `member_graph_gen` adds member lists.
 * **`Method.paramss` is still `Vec<Vec<Type>>`**, and `Named.name` a
   `String`: the remaining deep copies are there and in trees.
 * The compile is single-threaded. Parsing is trivially parallel; the typer

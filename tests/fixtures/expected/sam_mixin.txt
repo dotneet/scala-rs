@@ -1,0 +1,6 @@
+List(1, 10, 10, 15, 20, 20)
+List(105, c10, c10, 3)
+x!
+List(None, g2)
+List(1, 4, 9)
+List(Base, Counter 1, label, hello init!, Base)

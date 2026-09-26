@@ -104,6 +104,22 @@ pub struct PickleSupply {
     /// Library classes stubbed into the symbol table by `ensure_class`, keyed
     /// by JVM internal name, so a second mention reuses the same symbol.
     stubs: HashMap<String, SymbolId>,
+    /// The JVM name `ensure_class` settled on for a dotted name (and module
+    /// flag). It depends on the classpath alone, and completing a member
+    /// asks for the receiver's companion at every selection.
+    class_keys: HashMap<(String, bool), String>,
+    /// [`PickleSupply::nested_pickle_readable`]'s answer per class, with the
+    /// JVM name it was computed for. It depends on the classpath alone, and
+    /// every member selected on a nested library class (`JMapWrapper`,
+    /// `Collectors`' results) asks again before anything else.
+    nested_readable: HashMap<u32, (String, bool)>,
+    /// [`PickleSupply::complete`]'s answers that changed nothing, by `(class,
+    /// name)`, while the class graph and its member lists
+    /// (`member_graph_gen`) stand still. Completion only adds, so asking
+    /// again can only repeat them; every selection of a member a library
+    /// class lacks (`x % 2` on an `Integer`, through each view in scope)
+    /// asked, and each time walked the ancestors' pickles again.
+    idle_completions: (u64, HashMap<(u32, String), Vec<SymbolId>>),
     /// Classes whose pickled parents have already been attached.
     parented: HashSet<u32>,
     /// Dotted names `conv` needed and could not turn into a symbol, since the
@@ -250,6 +266,31 @@ impl PickleSupply {
     /// the companion object lands on the companion's module class, not on
     /// `class_sym`, so the caller has to look there too.
     pub fn complete(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let gen = st.member_graph_gen();
+        let key = (class_sym.0, name.to_string());
+        if self.idle_completions.0 == gen {
+            if let Some(known) = self.idle_completions.1.get(&key) {
+                return known.clone();
+            }
+        }
+        let before = st.mutation_gen.get();
+        let out = self.complete_uncached(st, bin, class_sym, name);
+        if st.mutation_gen.get() == before {
+            if self.idle_completions.0 != gen {
+                self.idle_completions = (gen, HashMap::new());
+            }
+            self.idle_completions.1.insert(key, out.clone());
+        }
+        out
+    }
+
+    fn complete_uncached(
         &mut self,
         st: &mut SymbolTable,
         bin: &mut BinaryIndex,
@@ -5071,13 +5112,16 @@ impl PickleSupply {
         // dotted name. Take the first candidate that is really a classfile;
         // `key` decides both the symbol's `jvm_name` and its owner, and
         // getting it wrong invents a package called `Names`.
-        let key = {
+        let cache_key = (full_name.to_string(), module);
+        let key = if let Some(known) = self.class_keys.get(&cache_key) {
+            known.clone()
+        } else {
             let plain = if module {
                 format!("{internal}$")
             } else {
                 internal.clone()
             };
-            scala_rs_pickle::sym::pickle_files_for(full_name, module)
+            let key = scala_rs_pickle::sym::pickle_files_for(full_name, module)
                 .into_iter()
                 // `pickle_files_for` also offers the *enclosing top-level*
                 // class file, because that is where a nested class's pickle
@@ -5091,7 +5135,9 @@ impl PickleSupply {
                 // ends with this class's own simple name.
                 .filter(|c| names_class(c, full_name))
                 .find(|c| bin.find_class(c).ok().flatten().is_some())
-                .unwrap_or(plain)
+                .unwrap_or(plain);
+            self.class_keys.insert(cache_key, key.clone());
+            key
         };
         if let Some(id) = self.stubs.get(&key).copied() {
             self.rehome_static_nested_module(st, bin, id, &key, module);
@@ -5797,6 +5843,24 @@ impl PickleSupply {
         if class_sym.is_none() || !st.get(class_sym).is_class_like() {
             return false;
         }
+        let internal = st.get(class_sym).jvm_name.as_str();
+        if let Some((name, known)) = self.nested_readable.get(&class_sym.0) {
+            if name == internal {
+                return *known;
+            }
+        }
+        let known = self.nested_pickle_readable_uncached(st, bin, class_sym);
+        self.nested_readable
+            .insert(class_sym.0, (st.get(class_sym).jvm_name.clone(), known));
+        known
+    }
+
+    fn nested_pickle_readable_uncached(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> bool {
         let internal = st.get(class_sym).jvm_name.as_str();
         if internal.is_empty()
             || internal.starts_with("java/")

@@ -2944,8 +2944,17 @@ pub(crate) fn has_class_sym(st: &SymbolTable, ty: &Type) -> bool {
 }
 
 /// The class-like symbol whose JVM internal name is `internal`.
+///
+/// A scan of the whole table, so the answer is kept
+/// ([`SymbolTable::jvm_query_memo`]): every call site whose result may need a
+/// cast asks it, and on 100 files of collection code the scans were a third
+/// of emitting.
 pub(crate) fn class_sym_named(st: &SymbolTable, internal: &str) -> Option<SymbolId> {
-    st.symbols
+    if let Some(&known) = st.jvm_query_memo().classes.get(internal) {
+        return known;
+    }
+    let found = st
+        .symbols
         .iter()
         .find(|s| {
             s.is_class_like()
@@ -2954,7 +2963,11 @@ pub(crate) fn class_sym_named(st: &SymbolTable, internal: &str) -> Option<Symbol
                     // `jvm_name`; their internal name is built from the owners.
                     || (s.jvm_name.is_empty() && class_internal(st, s.id) == internal))
         })
-        .map(|s| s.id)
+        .map(|s| s.id);
+    st.jvm_query_memo()
+        .classes
+        .insert(internal.to_string(), found);
+    found
 }
 
 /// Is the JVM class `from` *known* to conform to `to`?
@@ -2969,6 +2982,16 @@ pub(crate) fn internal_conforms(st: &SymbolTable, from: &str, to: &str) -> bool 
     if from == to || to == "java/lang/Object" {
         return true;
     }
+    let key = (from.to_string(), to.to_string());
+    if let Some(&known) = st.jvm_query_memo().conforms.get(&key) {
+        return known;
+    }
+    let out = internal_conforms_uncached(st, from, to);
+    st.jvm_query_memo().conforms.insert(key, out);
+    out
+}
+
+fn internal_conforms_uncached(st: &SymbolTable, from: &str, to: &str) -> bool {
     let Some(start) = class_sym_named(st, from) else {
         return false;
     };

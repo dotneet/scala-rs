@@ -483,8 +483,20 @@ impl<'a> Unify<'a> {
                     return a1.is_empty() || a2.is_empty();
                 }
                 // `=:=[A0, A0]` fitted to `<:<[From, To]`: widen the candidate
-                // side to the wanted class before matching arguments.
-                if let Some(Type::Class { args, .. }) = self.typer.base_type_instance(a, *s2, 0) {
+                // side to the wanted class before matching arguments. Neither
+                // direction can find a base class the class graph says is
+                // unreachable, and asking walked the whole hierarchy for every
+                // candidate whose head differs from the wanted one.
+                let reaches = |from: SymbolId, to: SymbolId| {
+                    self.typer.st.subtype_class_reaches(from, to) != Some(false)
+                };
+                if !reaches(*s1, *s2) && !reaches(*s2, *s1) {
+                    return false;
+                }
+                if let Some(Type::Class { args, .. }) = reaches(*s1, *s2)
+                    .then(|| self.typer.base_type_instance(a, *s2, 0))
+                    .flatten()
+                {
                     if args.len() == a2.len()
                         && args
                             .iter()
@@ -501,7 +513,10 @@ impl<'a> Unify<'a> {
                 // has to answer a wanted `Shape[FlatShapeLevel, LiteralColumn[Boolean], ?, ?BP]`
                 // (`Mixed_` is `-`), and `T` is only reachable by seeing the
                 // wanted `LiteralColumn[Boolean]` as a `ConstColumn`.
-                match self.typer.base_type_instance(b, *s1, 0) {
+                match reaches(*s2, *s1)
+                    .then(|| self.typer.base_type_instance(b, *s1, 0))
+                    .flatten()
+                {
                     Some(Type::Class { args, .. }) if args.len() == a1.len() => a1
                         .iter()
                         .zip(args.iter())

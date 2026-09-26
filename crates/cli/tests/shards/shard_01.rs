@@ -36,6 +36,8 @@ mod appidentity;
 mod applied_collection_names;
 #[path = "../applied_inner_result_prefix.rs"]
 mod applied_inner_result_prefix;
+#[path = "../arg_companion_views.rs"]
+mod arg_companion_views;
 #[path = "../arraygen.rs"]
 mod arraygen;
 #[path = "../arrconv.rs"]
@@ -106,5 +108,7 @@ mod codegen_diag;
 mod codegen_nested_generic;
 #[path = "../coll.rs"]
 mod coll;
+#[path = "../collect_result_element.rs"]
+mod collect_result_element;
 #[path = "../collectionresults.rs"]
 mod collectionresults;

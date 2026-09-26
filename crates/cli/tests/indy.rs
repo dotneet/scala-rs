@@ -9,7 +9,8 @@
 //! * **shape** — the classfiles a plain `FunctionN` literal produces (none),
 //!   what the enclosing class gains instead (a `$anonfun$N` static method and
 //!   a `BootstrapMethods` attribute), and which literals still fall back to an
-//!   anonymous class (`PartialFunction`, a user-defined SAM type).
+//!   anonymous class (`PartialFunction`, a SAM type that does not compile to
+//!   a pure interface), counted against scalac's own output.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -336,11 +337,12 @@ fn indy2_matches_real_scalac() {
     let _ = fs::remove_dir_all(&ref_out);
 }
 
-/// What is *not* an `invokedynamic` yet, stated as a test so the boundary
-/// moves deliberately: a `PartialFunction` literal (two abstract methods, so
-/// not a SAM — nsc emits a class here too) and a user-defined SAM type.
+/// What is *not* an `invokedynamic`, stated as a test so the boundary moves
+/// deliberately: a `PartialFunction` literal (two abstract methods, so not a
+/// SAM — nsc emits a class here too). The `Transform` SAM is a pure
+/// interface and, as in nsc, no class.
 #[test]
-fn indy2_falls_back_to_a_class_for_partial_functions_and_sam_types() {
+fn indy2_falls_back_to_a_class_for_partial_functions() {
     let Some(jar) = scala_library_jar() else {
         eprintln!("skip indy2 shape check: jar not obtainable");
         return;
@@ -350,13 +352,74 @@ fn indy2_falls_back_to_a_class_for_partial_functions_and_sam_types() {
         .into_iter()
         .filter(|n| n.contains("anonfun"))
         .collect();
-    // `pf`, the `collect { case … }` argument, and the `Transform` SAM.
+    // `pf` and the `collect { case … }` argument.
     assert_eq!(
         closures.len(),
-        3,
-        "expected exactly the two PartialFunctions and the SAM literal, got {closures:?}"
+        2,
+        "expected exactly the two PartialFunctions, got {closures:?}"
     );
     let _ = fs::remove_dir_all(&out);
+}
+
+/// Closure classes per enclosing class: `Main$$anonfun$1` and scala-rs's
+/// `Main$$$anonfun$1` both count for `Main`.
+fn closure_classes_by_owner(out: &Path) -> Vec<(String, usize)> {
+    let mut counts = std::collections::BTreeMap::new();
+    for name in class_names(out) {
+        if let Some((owner, _)) = name.split_once("$$") {
+            if name.contains("anonfun") {
+                *counts
+                    .entry(owner.trim_end_matches('$').to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+    counts.into_iter().collect()
+}
+
+/// SAM literals go through `LambdaMetafactory` exactly where nsc sends them:
+/// Java functional interfaces and traits that compile to pure interfaces
+/// (with primitive, `long`, reference and `void` shapes, captures, and a
+/// `Serializable` trait round-tripped through `$deserializeLambda$`), while
+/// a trait with a concrete member or a `val` and an abstract class keep an
+/// anonymous class. Both the output and the closure classes per enclosing
+/// class are compared with real scalac 2.13.16's.
+#[test]
+fn sam_literals_use_lambda_metafactory_where_scalac_does() {
+    if !java_available() {
+        return;
+    }
+    let (Some(scalac), Some(jar)) = (find_scalac(), scala_library_jar()) else {
+        eprintln!("skip sam_indy: toolchain not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join("sam_indy.scala");
+    let ref_out = tmp_dir("sam_indy-scalac-ref");
+    let status = Command::new(&scalac)
+        .args([src.to_str().unwrap(), "-d", ref_out.to_str().unwrap()])
+        .status()
+        .expect("scalac");
+    assert!(status.success(), "real scalac failed to compile sam_indy");
+    let reference = run_java(&ref_out, Some(&jar));
+    assert_eq!(
+        reference,
+        expected_stdout("sam_indy"),
+        "recorded expectation for sam_indy does not match real scalac"
+    );
+
+    let out = compile_fixture_with("sam_indy", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(
+        run_java(&out, Some(&jar)),
+        reference,
+        "stdout differs from real scalac"
+    );
+    assert_eq!(
+        closure_classes_by_owner(&out),
+        closure_classes_by_owner(&ref_out),
+        "closure classes differ from real scalac's"
+    );
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&ref_out);
 }
 
 /// A two-parameter literal is not a `Function1`: the typer rejects it rather
@@ -391,4 +454,48 @@ fn indy1_bad_arity_is_an_error() {
         "expected an arity mismatch diagnostic, got {err:?}"
     );
     let _ = fs::remove_dir_all(&out);
+}
+
+/// A SAM literal of a trait with fields or an initializer is an anonymous
+/// class that mixes the trait in, as nsc's is: the trait's `val`s, `var`s,
+/// `lazy val`s and member objects are implemented there, and its `$init$`
+/// runs, base traits first, after the captures are stored. Before, the class
+/// only called `Object.<init>`: reading a trait `val` was an
+/// `AbstractMethodError` and the trait's statements never ran.
+#[test]
+fn sam_literals_of_traits_with_state_mix_them_in_like_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(scalac), Some(jar)) = (find_scalac(), scala_library_jar()) else {
+        eprintln!("skip sam_mixin: toolchain not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join("sam_mixin.scala");
+    let ref_out = tmp_dir("sam_mixin-scalac-ref");
+    let status = Command::new(&scalac)
+        .args([src.to_str().unwrap(), "-d", ref_out.to_str().unwrap()])
+        .status()
+        .expect("scalac");
+    assert!(status.success(), "real scalac failed to compile sam_mixin");
+    let reference = run_java(&ref_out, Some(&jar));
+    assert_eq!(
+        reference,
+        expected_stdout("sam_mixin"),
+        "recorded expectation for sam_mixin does not match real scalac"
+    );
+
+    let out = compile_fixture_with("sam_mixin", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(
+        run_java(&out, Some(&jar)),
+        reference,
+        "stdout differs from real scalac"
+    );
+    assert_eq!(
+        closure_classes_by_owner(&out),
+        closure_classes_by_owner(&ref_out),
+        "closure classes differ from real scalac's"
+    );
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&ref_out);
 }

@@ -486,6 +486,7 @@ pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpt
         generic_sigs: opts.generic_sigs.unwrap_or_default(),
         companion_fwd: HashMap::new(),
         parked_companions: Vec::new(),
+        sam_host: Cell::new(SymbolId::NONE),
     };
     g.walk(tree);
     g.flush_parked_companions();
@@ -556,6 +557,11 @@ pub(crate) struct Gen<'a> {
     /// been emitted yet, so its forwarders are still unknown. A `Vec` rather
     /// than a map to keep the emission order of everything else fixed.
     pub(crate) parked_companions: Vec<(String, ClassBuilder)>,
+    /// The SAM trait whose literal's anonymous class is being given its
+    /// mixin members (see [`SamMixins`]). That class has no symbol of its
+    /// own; while this is set, the trait stands for it, and
+    /// [`Gen::lin_above`] answers as for a class extending the trait.
+    pub(crate) sam_host: Cell<SymbolId>,
 }
 
 /// JVM internal name → class-like symbol, for every `Class`/`ModuleClass` in
@@ -608,6 +614,21 @@ pub(crate) struct PendingBody {
     pub(crate) local_caps: Vec<SymbolId>,
     /// Result type of the lambda, for the boxing the epilogue does.
     pub(crate) ret_ty: Type,
+    /// Set when the body implements a SAM type rather than a `FunctionN`:
+    /// its parameters then arrive at the SAM method's erased types.
+    pub(crate) sam: Option<SamIndy>,
+}
+
+/// How a SAM literal implemented through `LambdaMetafactory` meets its
+/// interface: the method's JVM name, its erased parameter and result types
+/// (which the hoisted body takes and returns as they are), and whether the
+/// interface is `Serializable`.
+#[derive(Clone)]
+pub(crate) struct SamIndy {
+    pub(crate) name: String,
+    pub(crate) params: Vec<Type>,
+    pub(crate) ret: Type,
+    pub(crate) serializable: bool,
 }
 
 #[derive(Clone)]
@@ -663,6 +684,12 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) method_sym: SymbolId,
     /// Captured `var`s lowered to `scala.runtime.*Ref`.
     pub(crate) boxed_vars: &'a HashSet<SymbolId>,
+    /// Every trait of the run with its fields and initializers: whether a
+    /// SAM trait can be implemented by `LambdaMetafactory`.
+    pub(crate) traits: &'a TraitImpls,
+    /// The class machinery, for the anonymous class a SAM literal becomes
+    /// when its trait has fields or an initializer.
+    pub(crate) mixins: &'a dyn SamMixins,
     /// Set while emitting a value class's `$extension` static: there is no
     /// `this` there, only the underlying value in slot 0, so anything that
     /// really needs the boxed instance has to build one.
@@ -684,6 +711,8 @@ pub(crate) fn emit_ctx<'a>(
     abi: AbiMode,
     boxed_vars: &'a HashSet<SymbolId>,
     emit_errors: Rc<RefCell<Vec<EmitError>>>,
+    traits: &'a TraitImpls,
+    mixins: &'a dyn SamMixins,
 ) -> EmitCtx<'a> {
     EmitCtx {
         st,
@@ -705,8 +734,24 @@ pub(crate) fn emit_ctx<'a>(
         abi,
         method_sym: SymbolId::NONE,
         boxed_vars,
+        traits,
+        mixins,
         value_ext: None,
     }
+}
+
+/// What the anonymous class a SAM literal becomes needs from [`Gen`] when the
+/// SAM type is a trait: nsc's `UnCurry` expands such a literal into an
+/// ordinary anonymous class, and mixin gives that class everything it gives a
+/// class written `new T { ... }` -- the trait's fields with their accessors
+/// and setters, its lazy vals and member objects, and the `$init$` calls.
+pub(crate) trait SamMixins {
+    /// Add the members the traits of `sam` owe to `b`, the class
+    /// implementing it.
+    fn add_sam_mixin_members(&self, b: &mut ClassBuilder, sam: SymbolId);
+    /// The `<Iface>.$init$(this)` calls the class's constructor makes, as
+    /// `(interface, descriptor)`, base traits first.
+    fn sam_mixin_inits(&self, sam: SymbolId) -> Vec<(String, String)>;
 }
 
 pub(crate) fn report_emit_error(

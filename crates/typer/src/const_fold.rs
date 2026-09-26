@@ -14,7 +14,7 @@
 use scala_rs_parser::{Lit, Tree, TreeKind, Type};
 
 /// The constant `tree` evaluates to, if it is one.
-pub(crate) fn fold(tree: &Tree) -> Option<Lit> {
+pub fn fold(tree: &Tree) -> Option<Lit> {
     match &tree.kind {
         TreeKind::Literal { lit } => {
             (!matches!(lit, Lit::Unit | Lit::Symbol(_))).then(|| lit.clone())

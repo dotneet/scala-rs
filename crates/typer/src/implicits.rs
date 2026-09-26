@@ -987,10 +987,57 @@ impl Typer {
     /// Implicit members of the companion module of `class_id` (or the module
     /// class itself when `class_id` is already a module / module class).
     fn companion_implicits_of_class(&self, class_id: SymbolId) -> Vec<SymbolId> {
-        let mut out = Vec::new();
         if class_id.is_none() {
-            return out;
+            return Vec::new();
         }
+        let gen = self.st.member_graph_gen();
+        let cached = {
+            let cache = self.companion_implicit_cache.borrow();
+            (cache.0 == gen)
+                .then(|| cache.1.get(&class_id).cloned())
+                .flatten()
+        };
+        let entry = match cached {
+            Some(entry) => entry,
+            None => {
+                let mut routes = Vec::new();
+                let out = self.companion_implicits_of_class_walk(class_id, &mut routes);
+                let entry = std::rc::Rc::new((out, routes));
+                if self.st.member_graph_gen() == gen {
+                    let mut cache = self.companion_implicit_cache.borrow_mut();
+                    if cache.0 != gen {
+                        *cache = (gen, Default::default());
+                    }
+                    cache.1.insert(class_id, entry.clone());
+                }
+                entry
+            }
+        };
+        // Replay what the walk records for a member reached through a trait
+        // the object mixes in (see `companion_implicits_of_class_walk`).
+        for &(mem, module_sym) in &entry.1 {
+            let changed = self
+                .implicit_via_module
+                .borrow_mut()
+                .insert(mem, module_sym)
+                != Some(module_sym);
+            let mut memo = self.implicit_memo.borrow_mut();
+            if changed {
+                memo.candidate_tys.clear();
+            }
+            if memo.depth > 0 {
+                memo.routes.insert(mem, module_sym);
+            }
+        }
+        entry.0.clone()
+    }
+
+    fn companion_implicits_of_class_walk(
+        &self,
+        class_id: SymbolId,
+        routes: &mut Vec<(u32, SymbolId)>,
+    ) -> Vec<SymbolId> {
+        let mut out = Vec::new();
         let (module_sym, mcls) = match self.st.get(class_id).kind {
             SymKind::Module => (class_id, self.st.module_class_of(class_id)),
             // Reached as a module *class*; there is no back-pointer to the
@@ -1030,19 +1077,8 @@ impl Typer {
                     if id != mcls && !module_sym.is_none() {
                         // Declared by a trait the object mixes in; the
                         // reference has to name the object (see
-                        // `wildcard_module_for`).
-                        let changed = self
-                            .implicit_via_module
-                            .borrow_mut()
-                            .insert(mem.0, module_sym)
-                            != Some(module_sym);
-                        let mut memo = self.implicit_memo.borrow_mut();
-                        if changed {
-                            memo.candidate_tys.clear();
-                        }
-                        if memo.depth > 0 {
-                            memo.routes.insert(mem.0, module_sym);
-                        }
+                        // `wildcard_module_for`). Recorded by the caller.
+                        routes.push((mem.0, module_sym));
                     }
                     out.push(mem);
                 }
@@ -3993,6 +4029,55 @@ impl Typer {
         name: &str,
         span: Span,
     ) -> Option<(SymbolId, SymbolId, Type)> {
+        self.search_extension_with_args(from, narrow, name, span, &[])
+    }
+
+    /// Whether no `name` member of the view result `to` can take arguments of
+    /// types `args`, as far as a plain comparison of concrete types can tell.
+    /// Anything it cannot decide -- an arity or clause shape it does not
+    /// model, a type parameter, an argument that is not a class -- counts as
+    /// possibly accepting.
+    fn view_member_rejects(&self, to: &Type, name: &str, args: &[Type]) -> bool {
+        let Some(cls) = self.st.class_sym_of(to) else {
+            return false;
+        };
+        let members = self.st.lookup_member(cls, name);
+        !members.is_empty()
+            && members.iter().all(|&m| {
+                let sym = self.st.get(m);
+                let Type::Method { paramss, .. } = &sym.ty else {
+                    return false;
+                };
+                let Some(params) = paramss.first() else {
+                    return false;
+                };
+                if params.len() != args.len() || !sym.tparams.is_empty() {
+                    return false;
+                }
+                params.iter().zip(args).any(|(p, a)| {
+                    let p = self.st.subst_as_seen_from(to, p);
+                    self.st.class_sym_of(&p).is_some()
+                        && self.st.class_sym_of(a).is_some()
+                        && !matches!(p, Type::ByName(_) | Type::Repeated(_))
+                        && !self.weak_conforms(a, &p)
+                })
+            })
+    }
+
+    /// [`Self::search_extension_in`] for a member about to be applied to
+    /// arguments of types `args`. nsc searches the view to
+    /// `?{def name(x: ? >: A): ?}`, whose implicit scope takes in the
+    /// argument types' parts too: `2 / y` with `y: BigDecimal` finds
+    /// `BigDecimal.int2bigDecimal` in `BigDecimal`'s companion, which nothing
+    /// about `Int` leads to.
+    pub(crate) fn search_extension_with_args(
+        &mut self,
+        from: &Type,
+        narrow: Option<&Type>,
+        name: &str,
+        span: Span,
+        args: &[Type],
+    ) -> Option<(SymbolId, SymbolId, Type)> {
         // A conversion is applicable only if its own implicit clauses have
         // witnesses ([`Self::drop_witnessless_conversions`], below). The
         // witness for `FlatMap[Box]` lives on `Box`'s companion, which is a
@@ -4021,6 +4106,9 @@ impl Typer {
             .into_iter()
             .chain(self.companion_implicits(&Type::Any))
             .collect::<Vec<_>>();
+        for arg in args {
+            companion_ids.extend(self.companion_implicits(arg));
+        }
         companion_ids.sort_by_key(|id| id.0);
         companion_ids.dedup();
         companion_ids = self.collapse_pickled_copies(companion_ids);
@@ -4155,8 +4243,26 @@ impl Typer {
             hits
         };
         let mut hits = collect(lexical_ids);
+        // With arguments (a failed application being retried, so rare) the
+        // implicit scope is read up front: it may have to stand in for the
+        // lexical views below.
+        let wider = (hits.is_empty() || !args.is_empty()).then(|| collect(companion_ids));
         if hits.is_empty() {
-            hits = collect(companion_ids);
+            hits = wider.unwrap_or_default();
+        } else if let Some(wider) = wider {
+            // Every lexical view's member plainly cannot take the arguments
+            // (`any2stringadd`'s `+(String)` for `1 + y` with `y:
+            // BigDecimal`): nsc's view to `?{def +(x: ? >: BigDecimal): ?}`
+            // does not match it, and goes on to the implicit scope.
+            if hits
+                .iter()
+                .all(|(_, _, to)| self.view_member_rejects(to, name, args))
+                && wider
+                    .iter()
+                    .any(|(_, _, to)| !self.view_member_rejects(to, name, args))
+            {
+                hits = wider;
+            }
         }
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
@@ -5364,6 +5470,62 @@ impl Typer {
             .collect()
     }
 
+    /// nsc's `isPlausiblyCompatible` for a view's parameter: `false` only
+    /// when no instantiation of the conversion's type parameters could make
+    /// `from` conform, decided from classes alone. An extension search asks
+    /// every conversion in scope -- the fifty of `Predef` included, which the
+    /// member prune leaves in -- and solving `genericArrayOps[T](xs: Array[T])`
+    /// against a `Map[Int, String]` before finding out was most of the cost
+    /// of a selection through an `implicit class`.
+    fn plausible_view_param(&self, from: &Type, param: &Type) -> bool {
+        let Type::Class { sym, .. } = from else {
+            return true;
+        };
+        if *sym == self.st.array_sym {
+            return true;
+        }
+        let jvm = self.st.get(*sym).jvm_name.as_str();
+        // What a value type, or `String`, may stand behind: its boxes, and
+        // the prelude's classes for the value types themselves.
+        let boxed_or_value = matches!(
+            jvm,
+            "java/lang/Integer"
+                | "java/lang/Long"
+                | "java/lang/Double"
+                | "java/lang/Float"
+                | "java/lang/Short"
+                | "java/lang/Byte"
+                | "java/lang/Character"
+                | "java/lang/Boolean"
+                | "java/lang/Void"
+                | "java/lang/String"
+                | "scala/Int"
+                | "scala/Long"
+                | "scala/Double"
+                | "scala/Float"
+                | "scala/Short"
+                | "scala/Byte"
+                | "scala/Char"
+                | "scala/Boolean"
+                | "scala/Unit"
+        );
+        match param {
+            Type::Class { .. } => !self.st.classes_unrelated(from, param),
+            Type::Array(_) => false,
+            Type::Int
+            | Type::Long
+            | Type::Double
+            | Type::Float
+            | Type::Short
+            | Type::Byte
+            | Type::Char
+            | Type::Boolean
+            | Type::Unit
+            | Type::String => boxed_or_value,
+            _ => true,
+        }
+    }
+
     fn conv_param_matches(&self, id: SymbolId, from: &Type, param: &Type) -> bool {
         let param = &unwrap_byname(param);
         // A conversion imported through a value has two sides that must be
@@ -5388,6 +5550,9 @@ impl Typer {
             .unwrap_or_else(|| param.clone());
         let from = &from_seen;
         let param = &param_seen;
+        if !self.plausible_view_param(from, param) {
+            return false;
+        }
         // Match a polymorphic conversion against the receiver after solving
         // its own parameters structurally. Erasing them to wildcards first
         // loses the variance of nested function types such as

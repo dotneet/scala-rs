@@ -306,6 +306,22 @@ impl Default for TypecheckOptions {
     }
 }
 
+/// A cache valid for one generation of a symbol-table counter, and the
+/// answers kept for it.
+pub(crate) type GenMap<K, V> = (u64, rustc_hash::FxHashMap<K, V>);
+
+/// A selection's receiver class and its alternatives
+/// ([`Typer::overridden_cache`]).
+pub(crate) type Alternatives = (SymbolId, Vec<SymbolId>);
+
+/// See [`Typer::idle_candidate_warms`]: the wanted types and the lexical
+/// candidates in scope.
+pub(crate) type IdleWarm = (Vec<Type>, Vec<SymbolId>);
+
+/// See [`Typer::companion_implicit_cache`]: the implicit members, and the
+/// module each one inherited from a mixed-in trait is named through.
+pub(crate) type CompanionImplicits = (Vec<SymbolId>, Vec<(u32, SymbolId)>);
+
 pub struct Typer {
     pub st: SymbolTable,
     pub diags: Vec<Diagnostic>,
@@ -667,6 +683,32 @@ pub struct Typer {
     /// declarations, by internal name (`None`: absent or unreadable). The
     /// classpath does not change during a run, so each file is inflated and
     /// parsed once, as nsc's `ClassfileParser` runs once per class.
+    /// [`Typer::drop_overridden_at`]'s answers for alternatives that all come
+    /// from the classpath, by receiver and alternatives, while the class
+    /// graph (`graph_gen`) stands still. A library declaration does not change
+    /// during a run, and every `sb.append(…)` on a Java builder sorted its
+    /// thirty alternatives pairwise again.
+    pub(crate) overridden_cache: std::cell::RefCell<GenMap<Alternatives, Vec<SymbolId>>>,
+    /// The requests [`Typer::warm_implicit_derivation_scopes`] has completed:
+    /// the wanted type with its candidates, while the class graph
+    /// (`graph_gen`) stands still. Warming is idempotent, so the same request
+    /// has nothing left to do, and it was re-fitting every candidate in scope
+    /// for each implicit argument -- every `ExecutionContext` of a `Future`
+    /// chain.
+    pub(crate) derivation_scopes_warmed: (u64, rustc_hash::FxHashSet<u64>),
+    /// [`Typer::warm_implicit_candidates`] requests that found nothing to
+    /// do: the wanted types and the lexical candidates they were warmed
+    /// against, while the class graph and its member lists
+    /// (`member_graph_gen`) stand still.
+    pub(crate) idle_candidate_warms: (u64, Vec<IdleWarm>),
+    /// [`Typer::companion_implicits_of_class`]'s answers while the class
+    /// graph and its member lists (`member_graph_gen`) stand still: the
+    /// implicit members, and the module each one inherited from a mixed-in
+    /// trait has to be named through. nsc keeps a type's implicit infos the
+    /// same way (`implicitsCache`); walking every member of `Map`'s and
+    /// `List`'s companions again was a fifth of a type-class search.
+    pub(crate) companion_implicit_cache:
+        std::cell::RefCell<GenMap<SymbolId, std::rc::Rc<CompanionImplicits>>>,
     pub(crate) parsed_classfiles:
         rustc_hash::FxHashMap<String, Option<std::rc::Rc<crate::javaclass::JavaClass>>>,
     /// Overload sets whose alternatives do not all belong to one class's
@@ -1304,6 +1346,10 @@ impl Typer {
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
             parsed_classfiles: rustc_hash::FxHashMap::default(),
+            companion_implicit_cache: Default::default(),
+            derivation_scopes_warmed: Default::default(),
+            idle_candidate_warms: Default::default(),
+            overridden_cache: Default::default(),
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
             undet_tvars: Vec::new(),
@@ -4193,29 +4239,9 @@ fn unify_applied_via_parents(
     pas: &[Type],
     actual: &Type,
 ) -> Option<Type> {
-    let mut seen: Vec<SymbolId> = Vec::new();
-    let mut level: Vec<Type> = vec![actual.clone()];
-    while !level.is_empty() {
-        let mut next: Vec<Type> = Vec::new();
-        for t in &level {
-            let Type::Class { sym, .. } = t else {
-                continue;
-            };
-            if seen.contains(sym) {
-                continue;
-            }
-            seen.push(*sym);
-            for q in st.get(*sym).parents.clone() {
-                let p = st.subst_as_seen_from(t, &q);
-                if let Some(r) = unify_applied_class(st, tp, ctor, pas, &p) {
-                    return Some(r);
-                }
-                next.push(p);
-            }
-        }
-        level = next;
-    }
-    None
+    st.parents_as_seen_from(actual)
+        .iter()
+        .find_map(|p| unify_applied_class(st, tp, ctor, pas, p))
 }
 
 /// The partial-unification step of [`unify_one_precise`]: pattern `ctor[pas]`

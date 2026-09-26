@@ -1,0 +1,5 @@
+List(a!, 6, 18, cba, true, false)
+List(xu, false, 3000000000, 2, 42)
+List(2, 8, 101, 8)
+102
+[a, bb, ccc]

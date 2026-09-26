@@ -32,6 +32,7 @@ use scala_rs_span::{Diagnostic, Phase};
 pub(crate) fn run(t: &mut Typer, units: &mut [(&mut Tree, usize)]) {
     let mut sym_ids: usize = 0;
     let mut fresh_ids: u32 = 0;
+    let mut memo = AnalysisMemo::default();
     let mut out = Vec::new();
     for (tree, file) in units.iter() {
         let Some(src) = t.sources.get(*file).cloned() else {
@@ -44,6 +45,7 @@ pub(crate) fn run(t: &mut Typer, units: &mut [(&mut Tree, usize)]) {
             out: Vec::new(),
             sym_ids: &mut sym_ids,
             fresh_ids: &mut fresh_ids,
+            memo: &mut memo,
             owners: Vec::new(),
             pf_unchecked: false,
         };
@@ -51,6 +53,113 @@ pub(crate) fn run(t: &mut Typer, units: &mut [(&mut Tree, usize)]) {
         out.extend(pass.out);
     }
     t.diags.extend(out);
+}
+
+/// The analyses' answers for matches already seen in this run, keyed by the
+/// translated match with its positions and display texts left out
+/// ([`memo_key`]). Code written from a template repeats one match shape
+/// hundreds of times, and each analysis builds and solves the same formula
+/// again (12,000 identical matches were three quarters of a build).
+///
+/// Only answers that cannot depend on the order the solver meets its
+/// symbols in are kept: whether a case is reachable is a satisfiability
+/// question, and so is a match with no counter-example at all. Which
+/// counter-examples a non-exhaustive match names can follow hash-set
+/// iteration order (see `warn_patmat_order.scala`) and the symbol ids that
+/// break ties between equal names, so those are solved every time. A hit
+/// advances the id counter by what the analysis took, so every later match
+/// sees the ids it would have.
+#[derive(Default)]
+struct AnalysisMemo {
+    /// `unreachableCase`'s answer (`Err` for an unsupported match), and the
+    /// symbol ids it used.
+    reach: std::collections::HashMap<String, (Result<Option<usize>, ()>, usize)>,
+    /// Exhaustive matches (`Ok`) and unsupported ones (`Err`), and the ids.
+    exhaustive: std::collections::HashMap<String, (Result<(), ()>, usize)>,
+}
+
+/// [`AnalysisMemo`]'s key: everything the analyses read off the translated
+/// match except source positions, pattern texts and switch constants, which
+/// only shape the messages.
+fn memo_key(binders: &[Binder], root: B, makers: &[Vec<Maker>]) -> String {
+    use std::fmt::Write;
+    fn maker(s: &mut String, m: &Maker) {
+        match &m.tm {
+            TM::TypeTest {
+                prev,
+                tested,
+                expected,
+                next,
+                extractor_arg,
+            } => {
+                let _ = write!(s, "T{prev},{tested},{expected:?},{next},{extractor_arg}");
+            }
+            TM::EqTest { prev, pat, next } => {
+                let _ = write!(s, "E{prev},{:?},{:?},{next}", pat.key, pat.tp);
+            }
+            TM::Alts { alts, .. } => {
+                s.push('A');
+                for alt in alts {
+                    s.push('(');
+                    for m in alt {
+                        maker(s, m);
+                    }
+                    s.push(')');
+                }
+            }
+            TM::Product {
+                prev,
+                has_extra,
+                subs,
+                refs,
+            } => {
+                let _ = write!(s, "P{prev},{has_extra},{subs:?},{refs:?}");
+            }
+            TM::Extractor {
+                ext,
+                has_extra,
+                next,
+                subs,
+                refs,
+                prev,
+                checked_length,
+            } => {
+                let _ = write!(
+                    s,
+                    "X{:?},{},{},{has_extra},{next},{subs:?},{refs:?},{prev},{checked_length:?}",
+                    ext.unapply, ext.irrefutable, ext.seq_wrapper
+                );
+            }
+            TM::NonNull { prev } => {
+                let _ = write!(s, "N{prev}");
+            }
+            TM::Guard { constant } => {
+                let _ = write!(s, "G{constant:?}");
+            }
+            TM::Body { .. } => s.push('B'),
+            TM::SubstOnly { prev, next } => {
+                let _ = write!(s, "S{prev},{next}");
+            }
+            TM::Dummy => s.push('D'),
+        }
+        if let Some(sub) = &m.sub {
+            let _ = write!(s, "/{:?}{:?}", sub.from, sub.to);
+        }
+        s.push(';');
+    }
+    let mut s = String::new();
+    let _ = write!(s, "{root}|");
+    for b in binders {
+        let _ = write!(s, "{:?};", b.tp);
+    }
+    for case in makers {
+        s.push('[');
+        for m in case {
+            maker(&mut s, m);
+        }
+        s.push(']');
+    }
+    s
 }
 
 /// One enclosing definition, for `matchingSymbolInScope`.
@@ -70,6 +179,7 @@ struct Patmat<'a> {
     /// nsc `Sym.nextSymId`: one counter for the whole run.
     sym_ids: &'a mut usize,
     fresh_ids: &'a mut u32,
+    memo: &'a mut AnalysisMemo,
     owners: Vec<Owner>,
     /// Inside a `{ case ... }` literal typed as a `PartialFunction`, whose
     /// match nsc synthesizes `@unchecked`.
@@ -751,11 +861,30 @@ impl<'a> Patmat<'a> {
         suppress_exhaustive: bool,
         suppress_unreachable: bool,
     ) {
+        let key = if suppress_unreachable && suppress_exhaustive {
+            String::new()
+        } else {
+            memo_key(binders, root, makers)
+        };
         if !suppress_unreachable {
-            let r = {
-                let mut a =
-                    crate::warn_patmat_analysis::Approx::new(self.t, binders, root, self.sym_ids);
-                a.unreachable_case(makers)
+            let r = if let Some((answer, used)) = self.memo.reach.get(&key) {
+                *self.sym_ids += used;
+                *answer
+            } else {
+                let before = *self.sym_ids;
+                let r = {
+                    let mut a = crate::warn_patmat_analysis::Approx::new(
+                        self.t,
+                        binders,
+                        root,
+                        self.sym_ids,
+                    );
+                    a.unreachable_case(makers).map_err(|_| ())
+                };
+                self.memo
+                    .reach
+                    .insert(key.clone(), (r, *self.sym_ids - before));
+                r
             };
             if let Ok(Some(i)) = r {
                 if let Some(Maker {
@@ -768,10 +897,31 @@ impl<'a> Patmat<'a> {
             }
         }
         if !suppress_exhaustive {
-            let r = {
-                let mut a =
-                    crate::warn_patmat_analysis::Approx::new(self.t, binders, root, self.sym_ids);
-                a.exhaustive(makers)
+            let r = if let Some((answer, used)) = self.memo.exhaustive.get(&key) {
+                *self.sym_ids += used;
+                answer.map(|()| (Vec::new(), false))
+            } else {
+                let before = *self.sym_ids;
+                let r = {
+                    let mut a = crate::warn_patmat_analysis::Approx::new(
+                        self.t,
+                        binders,
+                        root,
+                        self.sym_ids,
+                    );
+                    a.exhaustive(makers).map_err(|_| ())
+                };
+                let used = *self.sym_ids - before;
+                match &r {
+                    Ok((examples, false)) if examples.is_empty() => {
+                        self.memo.exhaustive.insert(key, (Ok(()), used));
+                    }
+                    Err(()) => {
+                        self.memo.exhaustive.insert(key, (Err(()), used));
+                    }
+                    Ok(_) => {}
+                }
+                r
             };
             if let Ok((examples, depth_reached)) = r {
                 if depth_reached {

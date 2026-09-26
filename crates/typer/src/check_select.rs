@@ -1520,9 +1520,57 @@ impl Typer {
         if found.len() <= 1 {
             return found;
         }
+        let cacheable = found.len() > 2
+            && !self.st.has_ambient_type_context()
+            && found
+                .iter()
+                .all(|&m| !self.st.is_source_owner(self.st.get(m).owner));
+        if !cacheable {
+            return self.drop_overridden_uncached(recv, found);
+        }
+        let gen = self.st.graph_gen.get();
+        let key = (recv, found);
+        {
+            let cache = self.overridden_cache.borrow();
+            if cache.0 == gen {
+                if let Some(hit) = cache.1.get(&key) {
+                    return hit.clone();
+                }
+            }
+        }
+        let kept = self.drop_overridden_uncached(recv, key.1.clone());
+        if self.st.graph_gen.get() == gen {
+            let mut cache = self.overridden_cache.borrow_mut();
+            if cache.0 != gen {
+                cache.0 = gen;
+                cache.1.clear();
+            }
+            cache.1.insert(key, kept.clone());
+        }
+        kept
+    }
+
+    fn drop_overridden_uncached(&self, recv: SymbolId, found: Vec<SymbolId>) -> Vec<SymbolId> {
         let found = self.collapse_pickled_copies(found);
         let found = self.drop_classfile_forwarders(found);
         let found = self.drop_field_behind_accessor(found);
+        // Whether one owner's class is below another's, asked once per pair
+        // of owners rather than once per pair of alternatives: a Java
+        // builder's `append` has some thirty alternatives from three owners.
+        let below: std::cell::RefCell<rustc_hash::FxHashMap<(SymbolId, SymbolId), bool>> =
+            Default::default();
+        let owner_below = |child: SymbolId, parent: SymbolId| -> bool {
+            if let Some(&known) = below.borrow().get(&(child, parent)) {
+                return known;
+            }
+            let child_ty = Type::Class {
+                sym: child,
+                args: vec![].into(),
+            };
+            let answer = self.st.is_sub_type(&child_ty, &self.owner_as_type(parent));
+            below.borrow_mut().insert((child, parent), answer);
+            answer
+        };
         let kept: Vec<SymbolId> = found
             .iter()
             .copied()
@@ -1570,12 +1618,7 @@ impl Typer {
                     if self.definition_outranks_declaration(s, other) {
                         return true;
                     }
-                    let child = Type::Class {
-                        sym: oo,
-                        args: vec![].into(),
-                    };
-                    let parent = self.owner_as_type(owner);
-                    self.st.is_sub_type(&child, &parent)
+                    owner_below(oo, owner)
                         // Inheriting is not overriding: nsc keeps `f(Int)`
                         // declared on the parent as an alternative of `f`
                         // alongside a `f(String)` the subclass adds. Only a
@@ -2271,8 +2314,16 @@ impl Typer {
         {
             return false;
         }
-        let sub_ps = flat_param_types(&self.st.get(sub).ty);
-        let base_ps = flat_param_types(&self.st.get(base).ty);
+        // Read in place: this runs for every pair of alternatives of an
+        // overloaded selection.
+        fn params(ty: &Type) -> Vec<&Type> {
+            match ty {
+                Type::Method { paramss, .. } => paramss.iter().flatten().collect(),
+                _ => Vec::new(),
+            }
+        }
+        let sub_ps = params(&self.st.get(sub).ty);
+        let base_ps = params(&self.st.get(base).ty);
         if sub_ps.len() != base_ps.len() {
             return false;
         }
@@ -3109,11 +3160,13 @@ impl Typer {
     /// When a member exists on the receiver (e.g. `Int.+`) but the argument
     /// types do not match, try an implicit conversion that *does* have the
     /// method (`any2stringadd` for `1 + "x"`).
-    pub(crate) fn rewrite_apply_extension(&mut self, fun: &mut Tree) -> bool {
+    pub(crate) fn rewrite_apply_extension(&mut self, fun: &mut Tree, arg_tys: &[Type]) -> bool {
         let TreeKind::Select { qual, name } = &mut fun.kind else {
             return false;
         };
-        let Some((conv, member, to)) = self.search_extension(&qual.ty, name, fun.span) else {
+        let Some((conv, member, to)) =
+            self.search_extension_with_args(&qual.ty, None, name, fun.span, arg_tys)
+        else {
             return false;
         };
         let span = qual.span;

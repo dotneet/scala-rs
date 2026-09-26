@@ -1,6 +1,6 @@
 // The rest of the lambda shapes, against the real scala-library: higher
 // arities, a `PartialFunction` (still an anonymous class, as in nsc), a
-// user-defined SAM type (also still an anonymous class), a by-name argument,
+// user-defined SAM type (an `invokedynamic`, as in nsc), a by-name argument,
 // a lambda that returns non-locally, and a lambda over an `Array`.
 trait Transform {
   def run(s: String): String

@@ -10,6 +10,8 @@ mod companionkind;
 mod conform;
 #[path = "../conspat.rs"]
 mod conspat;
+#[path = "../constant_condition_branches.rs"]
+mod constant_condition_branches;
 #[path = "../contextualfollowup.rs"]
 mod contextualfollowup;
 #[path = "../contextualinference.rs"]

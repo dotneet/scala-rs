@@ -547,6 +547,8 @@ pub(crate) fn emit_partial_function_methods<'a>(
     ret_ty: &Type,
     boxed_vars: &HashSet<SymbolId>,
     emit_errors: Rc<RefCell<Vec<EmitError>>>,
+    traits: &TraitImpls,
+    mixins: &dyn SamMixins,
 ) {
     let cases: Vec<scala_rs_parser::CaseDef> = pf_match_cases(body).unwrap_or(&[]).to_vec();
     let sel_ty = match &body.kind {
@@ -608,6 +610,8 @@ pub(crate) fn emit_partial_function_methods<'a>(
                         abi,
                         method_sym: SymbolId::NONE,
                         boxed_vars,
+                        traits,
+                        mixins,
                         value_ext: None,
                     };
                     gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
@@ -682,6 +686,8 @@ pub(crate) fn emit_partial_function_methods<'a>(
                             abi,
                             method_sym: SymbolId::NONE,
                             boxed_vars,
+                            traits,
+                            mixins,
                             value_ext: None,
                         };
                         gen_pattern(a, &mut fr, &inner_ctx, &c.pat, tmp, sel_sort, fail);
@@ -809,6 +815,7 @@ pub(crate) fn gen_function_indy(
     vparams: &[Tree],
     body: &Tree,
     fn_ty: &Type,
+    sam: Option<SamIndy>,
 ) {
     // Before invokespecial <init>, slot zero is uninitializedThis and
     // cannot be passed to LambdaMetafactory. The available receiver is the
@@ -845,7 +852,12 @@ pub(crate) fn gen_function_indy(
     }
     call_desc.push_str(&format!(")L{iface};"));
 
-    let sam_desc = erased_apply_desc(arity);
+    // The body takes and returns exactly what the interface method does, so
+    // the SAM's erased descriptor is also the instantiated one.
+    let sam_desc = match &sam {
+        Some(s) => jvm_method_desc(ctx.st, &s.params, &s.ret),
+        None => erased_apply_desc(arity),
+    };
     let mut impl_desc = String::from("(");
     if need_outer {
         impl_desc.push_str(&outer_desc);
@@ -853,10 +865,7 @@ pub(crate) fn gen_function_indy(
     for _ in local_caps {
         impl_desc.push_str("Ljava/lang/Object;");
     }
-    for _ in 0..arity {
-        impl_desc.push_str("Ljava/lang/Object;");
-    }
-    impl_desc.push_str(")Ljava/lang/Object;");
+    impl_desc.push_str(&sam_desc[1..]);
     let impl_name = format!("$anonfun${n}");
     // A lambda in a trait's `default` method (or in its `$init$`) hoists onto
     // the interface, and the method handle then has to be an
@@ -864,15 +873,19 @@ pub(crate) fn gen_function_indy(
     let owner_is_iface = owner == ctx.class_name && is_interface_sym(ctx.st, ctx.class_sym);
     // `$deserializeLambda$` needs `scala.runtime.LambdaDeserialize`, which only
     // the real library has.
+    let (sam_name, serializable) = match &sam {
+        Some(s) => (s.name.as_str(), s.serializable),
+        None => ("apply", ctx.abi.is_library()),
+    };
     asm.invokedynamic_lambda(
-        "apply",
+        sam_name,
         &sam_desc,
         &call_desc,
         owner,
         &impl_name,
         &impl_desc,
         owner_is_iface,
-        ctx.abi.is_library(),
+        serializable,
     );
 
     ctx.lambda_bodies.borrow_mut().push(PendingBody {
@@ -884,11 +897,116 @@ pub(crate) fn gen_function_indy(
         vparams: vparams.to_vec(),
         body: body.clone(),
         local_caps: local_caps.to_vec(),
-        ret_ty: match fn_ty {
-            Type::Function { ret, .. } => (**ret).clone(),
-            t => t.clone(),
+        ret_ty: match (&sam, fn_ty) {
+            (Some(s), _) => s.ret.clone(),
+            (None, Type::Function { ret, .. }) => (**ret).clone(),
+            (None, t) => t.clone(),
         },
+        sam,
     });
+}
+
+/// The shape of `s` when a literal of it can be an `invokedynamic` against
+/// `LambdaMetafactory`, as nsc makes it: `UnCurry.mustExpandFunction` expands
+/// a SAM literal into a class unless the type compiles to a pure interface
+/// (`erasure.compilesToPureInterface`). That is a Java interface, or a trait
+/// whose every ancestor trait the parser marked `INTERFACE`: nothing in its
+/// body but abstract members, types and imports. A concrete method, a
+/// `val`, a nested class or object, or a statement anywhere above the SAM
+/// makes it a class (checked against scalac 2.13.16).
+///
+/// A few pure interfaces keep the class too, where the anonymous class does
+/// something the metafactory cannot: a SAM method some ancestor also
+/// declares (the class emits the bridge between the two erasures, which nsc
+/// leaves out and then fails to link), a diamond of parents (default-method
+/// conflicts the class resolves), value-class parameters (the class unboxes
+/// them in a bridge), and a trait read from the classpath, whose initializer
+/// is not known here.
+fn sam_indy_shape(ctx: &EmitCtx, s: &scala_rs_typer::SamSig, vparams: &[Tree]) -> Option<SamIndy> {
+    let st = ctx.st;
+    if s.raw_param_tys.len() != vparams.len() {
+        return None;
+    }
+    let mut serializable = false;
+    let mut work = vec![s.class];
+    let mut seen = HashSet::new();
+    while let Some(c) = work.pop() {
+        if !seen.insert(c) || is_top_class(st, c) {
+            continue;
+        }
+        let sym = st.get(c);
+        if sym.jvm_name == "java/io/Serializable" {
+            serializable = true;
+            continue;
+        }
+        let pure = if sym.flags.contains(Flags::JAVA) {
+            sym.flags.contains(Flags::INTERFACE)
+        } else {
+            sym.flags.contains(Flags::TRAIT)
+                && st.is_source_class(c)
+                && !ctx.traits.inits.contains_key(&c)
+                && sym.members.iter().all(|&m| match st.get(m).kind {
+                    SymKind::Method => st.method_is_deferred(m) || st.get(m).name == "<init>",
+                    SymKind::TypeMember | SymKind::TypeParam => true,
+                    _ => false,
+                })
+        };
+        if !pure {
+            return None;
+        }
+        if c != st.get(s.method).owner
+            && sym
+                .members
+                .iter()
+                .any(|&m| st.get(m).kind == SymKind::Method && st.get(m).name == s.name)
+        {
+            return None;
+        }
+        let mut parents = 0;
+        for p in &sym.parents {
+            let pc = st.class_sym_of(p)?;
+            if !is_top_class(st, pc) && st.get(pc).jvm_name != "java/io/Serializable" {
+                parents += 1;
+            }
+            work.push(pc);
+        }
+        if parents > 1 {
+            return None;
+        }
+    }
+    // `$deserializeLambda$` needs `scala.runtime.LambdaDeserialize`.
+    if serializable && !ctx.abi.is_library() {
+        return None;
+    }
+    for (p, raw) in vparams.iter().zip(&s.raw_param_tys) {
+        let typed = if p.sym.is_none() {
+            &p.ty
+        } else {
+            if st.value_class_for_term(p.sym).is_some() {
+                return None;
+            }
+            &st.get(p.sym).ty
+        };
+        if value_class_symbol(st, typed).is_some() || value_class_symbol(st, raw).is_some() {
+            return None;
+        }
+        // A primitive arrives as itself; anything else arrives at the erased
+        // reference type and is cast in the body, as a `FunctionN`'s is.
+        if is_jvm_primitive(raw) && jvm_desc(st, raw) != jvm_desc(st, typed) {
+            return None;
+        }
+    }
+    if value_class_symbol(st, &s.raw_ret_ty).is_some()
+        || value_class_symbol(st, &s.ret_ty).is_some()
+    {
+        return None;
+    }
+    Some(SamIndy {
+        name: encode_method_name(&s.name),
+        params: s.raw_param_tys.clone(),
+        ret: s.raw_ret_ty.clone(),
+        serializable,
+    })
 }
 
 /// Write one queued lambda body as a static method of `b`.
@@ -903,6 +1021,8 @@ pub(crate) fn emit_lambda_body(
     abi: AbiMode,
     boxed: &HashSet<SymbolId>,
     emit_errors: Rc<RefCell<Vec<EmitError>>>,
+    traits: &TraitImpls,
+    mixins: &dyn SamMixins,
     pb: PendingBody,
 ) {
     // nsc's own `$anonfun$` methods are `public static final synthetic`;
@@ -918,14 +1038,34 @@ pub(crate) fn emit_lambda_body(
     let owner = b.this_name.clone();
     let base = u16::from(pb.has_outer);
     let n_caps = pb.local_caps.len() as u16;
-    let n_params = base + n_caps + pb.vparams.len() as u16;
+    // Where each parameter arrives: one `Object` slot each for a `FunctionN`,
+    // the SAM method's own erased types (a `long` taking two) for a SAM.
+    let mut arg_slots = Vec::with_capacity(pb.vparams.len());
+    let mut n_params = base + n_caps;
+    for i in 0..pb.vparams.len() {
+        arg_slots.push(n_params);
+        n_params += pb
+            .sam
+            .as_ref()
+            .and_then(|s| s.params.get(i))
+            .map_or(1, param_slots);
+    }
     let name = pb.name.clone();
     let desc = pb.desc.clone();
     b.add_code(access, &name, &desc, n_params + 8, move |a| {
         let mut fr = Frame::instance();
         fr.next_slot = n_params;
         for (i, p) in pb.vparams.iter().enumerate() {
-            let obj_slot = base + n_caps + i as u16;
+            let obj_slot = arg_slots[i];
+            if let Some(raw) = pb.sam.as_ref().and_then(|s| s.params.get(i)) {
+                if is_jvm_primitive(raw) && !is_unit_like(raw) {
+                    let sort = jvm_sort(raw);
+                    load(a, obj_slot, sort);
+                    let slot = fr.alloc(p.sym, sort);
+                    store(a, slot, sort);
+                    continue;
+                }
+            }
             let value_class = (!p.sym.is_none())
                 .then(|| st.value_class_for_term(p.sym))
                 .flatten()
@@ -990,12 +1130,25 @@ pub(crate) fn emit_lambda_body(
             abi,
             method_sym: SymbolId::NONE,
             boxed_vars: boxed,
+            traits,
+            mixins,
             value_ext: None,
         };
         gen_expr(a, &mut fr, &inner_ctx, &pb.body);
         if matches!(pb.body.ty, Type::Nothing) {
             // `throw` already emitted athrow; an areturn here would be an
             // unreachable StackMapTable target.
+        } else if pb.sam.is_some() {
+            // The SAM method's own result, as the anonymous class's method
+            // returns it.
+            if is_unit_like(&pb.ret_ty) {
+                pop_if_value(a, &pb.body.ty);
+                a.vreturn();
+            } else if is_jvm_primitive(&pb.ret_ty) {
+                emit_return(a, &pb.ret_ty);
+            } else {
+                a.areturn();
+            }
         } else if is_unit_like(&pb.ret_ty) {
             pop_if_value(a, &pb.body.ty);
             emit_box(a, &Type::Unit);
@@ -1446,10 +1599,16 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
 
     // nsc 2.13 lowers a plain `FunctionN` literal to an `invokedynamic`
     // against `LambdaMetafactory` instead of a closure class; the body
-    // becomes a static method of the enclosing classfile. Everything else
-    // (a `PartialFunction`, a user-defined SAM type) still needs a real
-    // class, so those fall through to the anonymous-class path below.
-    if !is_pf && sam.is_none() && arity <= MAX_FUNCTION_ARITY {
+    // becomes a static method of the enclosing classfile. A SAM type goes
+    // the same way when it compiles to a pure interface (see
+    // [`sam_indy_shape`]). Everything else (a `PartialFunction`, a SAM
+    // class, a trait with fields) still needs a real class, so those fall
+    // through to the anonymous-class path below.
+    let sam_indy = match (&sam, is_pf) {
+        (Some(s), false) => sam_indy_shape(ctx, s, vparams),
+        _ => None,
+    };
+    if !is_pf && (sam.is_none() && arity <= MAX_FUNCTION_ARITY || sam_indy.is_some()) {
         if let Some(owner) = ctx.hoist_owner {
             gen_function_indy(
                 asm,
@@ -1464,6 +1623,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 vparams,
                 body,
                 &tree.ty,
+                sam_indy,
             );
             return;
         }
@@ -1564,6 +1724,14 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     let cap_n = local_caps.len();
     let class_name_owned = ctx.class_name.to_string();
     let need_outer_c = need_outer;
+    // A SAM trait with fields or an initializer is mixed into this class as
+    // into any other (nsc expands such a literal into an ordinary anonymous
+    // class): its `$init$` runs once the captures are stored, since what it
+    // runs may call the SAM method that reads them.
+    let mixin_inits = sam
+        .as_ref()
+        .map(|s| ctx.mixins.sam_mixin_inits(s.class))
+        .unwrap_or_default();
     b.add_code(
         ACC_PUBLIC,
         "<init>",
@@ -1584,6 +1752,10 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 a.aload(slot);
                 a.putfield(&lam_name, &format!("$captured${i}"), "Ljava/lang/Object;");
                 slot += 1;
+            }
+            for (iface, init_desc) in &mixin_inits {
+                a.aload(0);
+                a.invokestatic_interface(iface, "$init$", init_desc);
             }
             a.vreturn();
         },
@@ -1841,6 +2013,8 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 abi,
                 method_sym: SymbolId::NONE,
                 boxed_vars: boxed,
+                traits: ctx.traits,
+                mixins: ctx.mixins,
                 value_ext: None,
             };
             gen_expr(a, &mut fr, &inner_ctx, &body);
@@ -1887,6 +2061,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 abi,
             );
             emit_sam_default_conflict_bridges(&mut b, st, s.class, name);
+            ctx.mixins.add_sam_mixin_members(&mut b, s.class);
         }
     }
     if is_pf {
@@ -1910,6 +2085,8 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
             &ret_ty_pf,
             ctx.boxed_vars,
             std::rc::Rc::clone(&ctx.emit_errors),
+            ctx.traits,
+            ctx.mixins,
         );
     }
     ctx.extras.borrow_mut().push(b.finish());

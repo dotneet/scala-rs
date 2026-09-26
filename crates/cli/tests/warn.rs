@@ -119,6 +119,26 @@ fn patmat_expected_is_scalacs() {
 }
 
 #[test]
+fn patmat_counter_examples_follow_scalas_hash_set_order() {
+    check_ours("warn_patmat_order", &[], "warn_patmat_order");
+}
+
+#[test]
+fn patmat_counter_examples_expected_is_scalacs() {
+    check_scalac("warn_patmat_order", &[], "warn_patmat_order");
+}
+
+#[test]
+fn patmat_repeated_matches_warn_like_scalac() {
+    check_ours("warn_patmat_memo", &[], "warn_patmat_memo");
+}
+
+#[test]
+fn patmat_memoized_analyses_expected_is_scalacs() {
+    check_scalac("warn_patmat_memo", &[], "warn_patmat_memo");
+}
+
+#[test]
 fn refchecks_warnings_match_scalac() {
     check_ours("warn_pure", &[], "warn_pure");
 }

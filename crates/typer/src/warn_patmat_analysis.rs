@@ -17,8 +17,12 @@ struct VarInfo {
     path: PTree,
     static_tp: NTy,
     checkable: NTy,
-    /// `symForEqualsTo`
+    /// `symForEqualsTo`, in the order the equalities were registered.
     sym_for: Vec<(ConstId, SymId)>,
+    /// `sym_for` by constant: nsc's is a map. A sealed trait with a few
+    /// hundred children has as many constants per variable, and the linear
+    /// scans made each match's analysis cubic in them.
+    sym_index: rustc_hash::FxHashMap<ConstId, SymId>,
     may_be_null: bool,
     domain: Option<Option<Vec<ConstId>>>,
     domain_syms: Option<Option<Vec<SymId>>>,
@@ -234,6 +238,7 @@ impl<'x> Approx<'x> {
             static_tp,
             checkable,
             sym_for: Vec::new(),
+            sym_index: Default::default(),
             may_be_null: false,
             domain: None,
             domain_syms: None,
@@ -328,8 +333,8 @@ impl<'x> Approx<'x> {
     }
 
     fn register_equality(&mut self, v: VarId, c: ConstId) -> SymId {
-        if let Some((_, s)) = self.vars[v].sym_for.iter().find(|(k, _)| *k == c) {
-            return *s;
+        if let Some(&s) = self.vars[v].sym_index.get(&c) {
+            return s;
         }
         *self.sym_ids += 1;
         self.syms.push(SymInfo {
@@ -339,12 +344,13 @@ impl<'x> Approx<'x> {
         });
         let s = self.syms.len() - 1;
         self.vars[v].sym_for.push((c, s));
+        self.vars[v].sym_index.insert(c, s);
         s
     }
 
     fn prop_for_equals_to(&self, v: VarId, c: ConstId) -> Prop {
-        match self.vars[v].sym_for.iter().find(|(k, _)| *k == c) {
-            Some((_, s)) => Prop::Sym(*s),
+        match self.vars[v].sym_index.get(&c) {
+            Some(&s) => Prop::Sym(s),
             None => Prop::False,
         }
     }
@@ -561,6 +567,7 @@ impl<'x> Approx<'x> {
             Some(tps) => {
                 let mut seen: Vec<NTy> = Vec::new();
                 let mut consts = Vec::new();
+                let mut known: HashSet<ConstId> = HashSet::new();
                 for tp in tps {
                     if seen.contains(&tp) {
                         continue;
@@ -568,7 +575,7 @@ impl<'x> Approx<'x> {
                     seen.push(tp.clone());
                     let c = self.type_const(&tp);
                     self.register_equality(v, c);
-                    if !consts.contains(&c) {
+                    if known.insert(c) {
                         consts.push(c);
                     }
                 }
@@ -595,10 +602,11 @@ impl<'x> Approx<'x> {
         }
         let d = self.domain(v)?.map(|cs| {
             let mut out = Vec::new();
+            let mut known: HashSet<SymId> = HashSet::new();
             for c in cs {
-                if let Some((_, s)) = self.vars[v].sym_for.iter().find(|(k, _)| *k == c) {
-                    if !out.contains(s) {
-                        out.push(*s);
+                if let Some(&s) = self.vars[v].sym_index.get(&c) {
+                    if known.insert(s) {
+                        out.push(s);
                     }
                 }
             }
@@ -614,11 +622,7 @@ impl<'x> Approx<'x> {
         }
         let checkable = self.vars[v].checkable.clone();
         let c = self.type_const(&checkable);
-        let s = self.vars[v]
-            .sym_for
-            .iter()
-            .find(|(k, _)| *k == c)
-            .map(|(_, s)| *s);
+        let s = self.vars[v].sym_index.get(&c).copied();
         self.vars[v].sym_static = Some(s);
         s
     }
@@ -639,8 +643,8 @@ impl<'x> Approx<'x> {
             .ok_or_else(|| bail!())
     }
 
-    /// `excludes(a, b)`
-    fn excludes(&self, domain: &Option<Vec<ConstId>>, a: ConstId, b: ConstId) -> bool {
+    /// `excludes(a, b)`, with the variable's domain as a set.
+    fn excludes(&self, domain: &Option<HashSet<ConstId>>, a: ConstId, b: ConstId) -> bool {
         let both = domain
             .as_ref()
             .is_some_and(|d| d.contains(&a) && d.contains(&b));
@@ -656,10 +660,11 @@ impl<'x> Approx<'x> {
         if let Some(i) = &self.vars[v].implications {
             return Ok(i.clone());
         }
-        let domain = self.domain(v)?;
+        let domain: Option<HashSet<ConstId>> = self.domain(v)?.map(|d| d.into_iter().collect());
         let mut eq_syms: Vec<SymId> = self.vars[v].sym_for.iter().map(|(_, s)| *s).collect();
         eq_syms.sort_by_key(|s| self.sym_string(*s));
-        let mut excluded_pairs: Vec<(ConstId, ConstId)> = Vec::new();
+        // Unordered pairs, as nsc's `excludedPair` set holds them.
+        let mut excluded_pairs: HashSet<(ConstId, ConstId)> = HashSet::new();
         let mut out = Vec::new();
         for &sym in &eq_syms {
             let sc = self.syms[sym].konst;
@@ -668,10 +673,7 @@ impl<'x> Approx<'x> {
                 .copied()
                 .filter(|b| {
                     let bc = self.syms[*b].konst;
-                    !(bc == sc
-                        || excluded_pairs
-                            .iter()
-                            .any(|(x, y)| (*x == bc && *y == sc) || (*x == sc && *y == bc)))
+                    !(bc == sc || excluded_pairs.contains(&(bc.min(sc), bc.max(sc))))
                 })
                 .collect();
             let (excluded, not_excluded): (Vec<SymId>, Vec<SymId>) = todo
@@ -684,7 +686,8 @@ impl<'x> Approx<'x> {
                 }
             }
             for e in &excluded {
-                excluded_pairs.push((sc, self.syms[*e].konst));
+                let ec = self.syms[*e].konst;
+                excluded_pairs.insert((sc.min(ec), sc.max(ec)));
             }
             out.push((sym, implied, excluded));
         }
@@ -701,19 +704,20 @@ impl<'x> Approx<'x> {
         let mut out = Vec::new();
         for sub in subtypes {
             let mut syms = Vec::new();
+            let mut known: HashSet<SymId> = HashSet::new();
             for tpe in sub {
                 let c = self.type_const(&tpe);
-                if let Some((_, s)) = self.vars[v].sym_for.iter().find(|(k, _)| *k == c) {
-                    if !syms.contains(s) {
-                        syms.push(*s);
+                if let Some(&s) = self.vars[v].sym_index.get(&c) {
+                    if known.insert(s) {
+                        syms.push(s);
                     }
                 }
             }
             if self.vars[v].may_be_null {
                 let n = self.null_const;
-                if let Some((_, s)) = self.vars[v].sym_for.iter().find(|(k, _)| *k == n) {
-                    if !syms.contains(s) {
-                        syms.push(*s);
+                if let Some(&s) = self.vars[v].sym_index.get(&n) {
+                    if known.insert(s) {
+                        syms.push(s);
                     }
                 }
             }
@@ -759,6 +763,14 @@ impl<'x> Approx<'x> {
             }
             let imps = self.implications(v)?;
             let groups = self.grouped_domains(v)?;
+            // The groups each symbol is in, to test "in one group together"
+            // without scanning every group per excluded pair.
+            let mut group_of: HashMap<SymId, Vec<usize>> = HashMap::new();
+            for (index, group) in groups.iter().enumerate() {
+                for &s in group {
+                    group_of.entry(s).or_default().push(index);
+                }
+            }
             for (sym, implied, excluded) in imps {
                 for i in implied {
                     axioms.push(or_create([
@@ -766,8 +778,13 @@ impl<'x> Approx<'x> {
                         Prop::Sym(i),
                     ]));
                 }
+                let sym_groups = group_of.get(&sym);
                 for e in excluded {
-                    let exclusive = groups.iter().any(|d| d.contains(&sym) && d.contains(&e));
+                    let exclusive = sym_groups.is_some_and(|mine| {
+                        group_of
+                            .get(&e)
+                            .is_some_and(|theirs| mine.iter().any(|g| theirs.contains(g)))
+                    });
                     if !exclusive {
                         axioms.push(or_create([
                             Prop::Not(Box::new(Prop::Sym(sym))),

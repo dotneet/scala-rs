@@ -1298,6 +1298,17 @@ impl Typer {
             }),
             _ => false,
         };
+        // The sequential prototype below solves the callee's type parameters
+        // from every argument before the current one, which is quadratic in
+        // a long argument list: `Map(k0 -> v0, …, k799 -> v799)` was a
+        // million joins. An argument whose (formal, type) pair repeats an
+        // earlier one adds no constraint, so the last solution stands until a
+        // new pair arrives. `seq_pairs` holds the distinct pairs of the first
+        // `seq_upto` arguments; `seq_new` is one past the last new one.
+        let mut seq_pairs: rustc_hash::FxHashMap<u64, Vec<(Type, Type)>> = Default::default();
+        let mut seq_upto = 0usize;
+        let mut seq_new = 0usize;
+        let mut seq_solved: Option<(usize, Vec<(SymbolId, Type)>)> = None;
         for (ai, a) in args.iter_mut().enumerate() {
             if let Some(alts) = &argument_overloads {
                 self.overload_member_types.insert(fun.sym.0, alts.clone());
@@ -1564,12 +1575,35 @@ impl Typer {
                         if prior.len() != arg_tys.len() {
                             None
                         } else {
-                            let solved = self.infer_method_tparams_in(
-                                fun.sym,
-                                &prior,
-                                &arg_tys,
-                                recv_ty.as_ref(),
-                            );
+                            while seq_upto < ai {
+                                let (formal, actual) = (&prior[seq_upto], &arg_tys[seq_upto]);
+                                let key = {
+                                    use std::hash::Hasher;
+                                    let mut h = rustc_hash::FxHasher::default();
+                                    crate::implicits::hash_type(formal, &mut h);
+                                    crate::implicits::hash_type(actual, &mut h);
+                                    h.finish()
+                                };
+                                let bucket = seq_pairs.entry(key).or_default();
+                                if !bucket.iter().any(|(f, a)| f == formal && a == actual) {
+                                    bucket.push((formal.clone(), actual.clone()));
+                                    seq_new = seq_upto + 1;
+                                }
+                                seq_upto += 1;
+                            }
+                            let solved = match &seq_solved {
+                                Some((upto, solved)) if *upto >= seq_new => solved.clone(),
+                                _ => {
+                                    let solved = self.infer_method_tparams_in(
+                                        fun.sym,
+                                        &prior,
+                                        &arg_tys,
+                                        recv_ty.as_ref(),
+                                    );
+                                    seq_solved = Some((ai, solved.clone()));
+                                    solved
+                                }
+                            };
                             // Not for a parameter that *is* a type variable
                             // (`A` in `apply[A](elems: A*)`): nsc joins such a
                             // variable's arguments after typing them all, by
@@ -3447,12 +3481,29 @@ impl Typer {
                         }
                     } else if method_name == "collect" {
                         if let Some(a0) = args.first() {
+                            // The element of `collect(pf)`'s `CC[B]` is the
+                            // partial function's result -- read off its
+                            // `PartialFunction` base type, not off whatever
+                            // class the argument is: `java.util.stream.Stream`'s
+                            // `collect(Collector[T, A, R]): R` came back a
+                            // `Stream[A]`, and the `R` it returns was cast to
+                            // `Stream` (ClassCastException).
                             let to = match &a0.ty {
-                                Type::Class { args, .. } if args.len() >= 2 => {
-                                    Some(args[1].clone())
-                                }
                                 Type::Function { ret, .. } => Some((**ret).clone()),
-                                _ => None,
+                                t => crate::check::partial_function_type(&self.st, t)
+                                    .map(|(_, to)| to)
+                                    .or_else(|| {
+                                        let pf = crate::classpath::find_by_jvm(
+                                            &self.st,
+                                            "scala/PartialFunction",
+                                        )?;
+                                        match self.base_type_instance(t, pf, 0)? {
+                                            Type::Class { args, .. } if args.len() == 2 => {
+                                                Some(args[1].clone())
+                                            }
+                                            _ => None,
+                                        }
+                                    }),
                             };
                             if let Some(to) = to {
                                 if self.is_array_ops_ty(recv_ty.as_ref()) {
@@ -4026,7 +4077,7 @@ impl Typer {
                     // then accepted the two arguments tupled, and the program
                     // printed a `MapBuilderImpl`.
                     let before_view = fun.clone();
-                    if self.rewrite_apply_extension(fun) {
+                    if self.rewrite_apply_extension(fun, &arg_tys) {
                         recv_ty = match &fun.kind {
                             TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
                             _ => None,

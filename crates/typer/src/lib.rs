@@ -24,6 +24,7 @@ mod class_rules;
 mod classpath;
 mod compile_time_only;
 mod const_fold;
+pub use const_fold::fold as fold_constant;
 mod ctor_defaults;
 mod cyclic;
 mod default_recv;

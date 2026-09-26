@@ -424,6 +424,8 @@ impl<'a> Gen<'a> {
                 abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
             );
             ctx.in_constructor = true;
             if own_outer.is_some() {
@@ -457,6 +459,8 @@ impl<'a> Gen<'a> {
                 abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
             );
             ctx_early.in_constructor = true;
             ctx_early.presuper = true;

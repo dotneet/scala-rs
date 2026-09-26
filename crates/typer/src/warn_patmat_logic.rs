@@ -38,7 +38,16 @@ impl PartialEq for Prop {
         match (self, other) {
             (Prop::Eq(a, b), Prop::Eq(c, d)) => a == c && b == d,
             (Prop::And(a), Prop::And(b)) | (Prop::Or(a), Prop::Or(b)) => {
-                a.len() == b.len() && a.iter().all(|x| b.contains(x))
+                if a.len() != b.len() {
+                    return false;
+                }
+                // Operands are sets; past a handful, compare them as sets.
+                if a.len() <= 8 {
+                    a.iter().all(|x| b.contains(x))
+                } else {
+                    let others: rustc_hash::FxHashSet<&Prop> = b.iter().collect();
+                    a.iter().all(|x| others.contains(x))
+                }
             }
             (Prop::Not(a), Prop::Not(b)) => a == b,
             (Prop::AtMostOne(a), Prop::AtMostOne(b)) => a == b,
@@ -68,7 +77,7 @@ impl Hash for Prop {
                 // Order-independent, like a set's hash.
                 let mut acc: u64 = 0;
                 for o in ops {
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    let mut h = rustc_hash::FxHasher::default();
                     o.hash(&mut h);
                     acc = acc.wrapping_add(h.finish());
                 }
@@ -92,35 +101,56 @@ impl Hash for Prop {
     }
 }
 
-/// Insert into an insertion-ordered set.
-fn add_unique(v: &mut Vec<Prop>, p: Prop) {
-    if !v.contains(&p) {
-        v.push(p);
+/// An insertion-ordered set of operands under construction, as nsc's
+/// `LogicLinkedHashSet`: membership by hash rather than by comparing with
+/// every operand so far, which was quadratic in the hundreds of equality
+/// axioms a large sealed hierarchy gives a match.
+#[derive(Default)]
+struct PropSet {
+    items: Vec<Prop>,
+    index: rustc_hash::FxHashMap<u64, Vec<usize>>,
+}
+
+impl PropSet {
+    fn insert(&mut self, p: Prop) {
+        let mut h = rustc_hash::FxHasher::default();
+        p.hash(&mut h);
+        let bucket = self.index.entry(h.finish()).or_default();
+        if bucket.iter().any(|&i| self.items[i] == p) {
+            return;
+        }
+        bucket.push(self.items.len());
+        self.items.push(p);
     }
+
+    fn contains(&self, p: &Prop) -> bool {
+        let mut h = rustc_hash::FxHasher::default();
+        p.hash(&mut h);
+        self.index
+            .get(&h.finish())
+            .is_some_and(|bucket| bucket.iter().any(|&i| self.items[i] == *p))
+    }
+}
+
+fn unique(ps: impl IntoIterator<Item = Prop>) -> Vec<Prop> {
+    let mut set = PropSet::default();
+    for p in ps {
+        set.insert(p);
+    }
+    set.items
 }
 
 pub(crate) fn and_create(ps: impl IntoIterator<Item = Prop>) -> Prop {
-    let mut v = Vec::new();
-    for p in ps {
-        add_unique(&mut v, p);
-    }
-    Prop::And(v)
+    Prop::And(unique(ps))
 }
 
 pub(crate) fn or_create(ps: impl IntoIterator<Item = Prop>) -> Prop {
-    let mut v = Vec::new();
-    for p in ps {
-        add_unique(&mut v, p);
-    }
-    Prop::Or(v)
+    Prop::Or(unique(ps))
 }
 
 /// nsc `/\`: `True` for none, the operand itself for one.
 pub(crate) fn big_and(ps: Vec<Prop>) -> Prop {
-    let mut v = Vec::new();
-    for p in ps {
-        add_unique(&mut v, p);
-    }
+    let mut v = unique(ps);
     match v.len() {
         0 => Prop::True,
         1 => v.pop().unwrap(),
@@ -130,10 +160,7 @@ pub(crate) fn big_and(ps: Vec<Prop>) -> Prop {
 
 /// nsc `\/`.
 pub(crate) fn big_or(ps: Vec<Prop>) -> Prop {
-    let mut v = Vec::new();
-    for p in ps {
-        add_unique(&mut v, p);
-    }
+    let mut v = unique(ps);
     match v.len() {
         0 => Prop::False,
         1 => v.pop().unwrap(),
@@ -170,11 +197,7 @@ fn nnf(p: &Prop) -> Prop {
 
 /// `mapConserve` into a fresh `LinkedHashSet`: equal results collapse.
 fn dedup(it: impl Iterator<Item = Prop>) -> Vec<Prop> {
-    let mut v = Vec::new();
-    for p in it {
-        add_unique(&mut v, p);
-    }
-    v
+    unique(it)
 }
 
 fn has_impure_atom(ops: &[Prop]) -> bool {
@@ -199,42 +222,42 @@ fn has_impure_atom(ops: &[Prop]) -> bool {
 }
 
 fn simplify_and(ps: &[Prop]) -> Prop {
-    let mut props = Vec::new();
+    let mut props = PropSet::default();
     for p in ps {
         match simplify_prop(p) {
             Prop::True => {}
             Prop::And(fv) => {
                 for f in fv {
-                    add_unique(&mut props, f);
+                    props.insert(f);
                 }
             }
-            f => add_unique(&mut props, f),
+            f => props.insert(f),
         }
     }
-    if props.contains(&Prop::False) || has_impure_atom(&props) {
+    if props.contains(&Prop::False) || has_impure_atom(&props.items) {
         Prop::False
     } else {
-        big_and(props)
+        big_and(props.items)
     }
 }
 
 fn simplify_or(ps: &[Prop]) -> Prop {
-    let mut props = Vec::new();
+    let mut props = PropSet::default();
     for p in ps {
         match simplify_prop(p) {
             Prop::False => {}
             Prop::Or(fv) => {
                 for f in fv {
-                    add_unique(&mut props, f);
+                    props.insert(f);
                 }
             }
-            f => add_unique(&mut props, f),
+            f => props.insert(f),
         }
     }
-    if props.contains(&Prop::True) || has_impure_atom(&props) {
+    if props.contains(&Prop::True) || has_impure_atom(&props.items) {
         Prop::True
     } else {
-        big_or(props)
+        big_or(props.items)
     }
 }
 
@@ -252,21 +275,26 @@ fn simplify_prop(p: &Prop) -> Prop {
 
 /// Every symbol of `p`, in traversal order (`gatherSymbols`).
 pub(crate) fn gather_symbols(p: &Prop, out: &mut Vec<SymId>) {
+    let mut seen = rustc_hash::FxHashSet::default();
+    gather_symbols_into(p, out, &mut seen);
+}
+
+fn gather_symbols_into(p: &Prop, out: &mut Vec<SymId>, seen: &mut rustc_hash::FxHashSet<SymId>) {
     match p {
         Prop::And(ops) | Prop::Or(ops) => {
             for o in ops {
-                gather_symbols(o, out);
+                gather_symbols_into(o, out, seen);
             }
         }
-        Prop::Not(a) => gather_symbols(a, out),
+        Prop::Not(a) => gather_symbols_into(a, out, seen),
         Prop::Sym(s) => {
-            if !out.contains(s) {
+            if seen.insert(*s) {
                 out.push(*s);
             }
         }
         Prop::AtMostOne(ops) => {
             for s in ops {
-                if !out.contains(s) {
+                if seen.insert(*s) {
                     out.push(*s);
                 }
             }
@@ -597,8 +625,14 @@ pub(crate) struct Solution {
 }
 
 /// `dropUnit`.
-fn drop_unit(clauses: &mut Vec<Option<Clause>>, unit: Lit) {
+/// Also returns what the solver's next step would find by scanning the
+/// clauses again: whether one is empty, and else the first unit clause.
+fn drop_unit(clauses: &mut [Option<Clause>], unit: Lit) -> Scan {
     let negated = unit.neg();
+    let mut scan = Scan {
+        empty: false,
+        unit: None,
+    };
     let mut j = 0;
     let n = clauses.len();
     let mut i = 0;
@@ -607,58 +641,83 @@ fn drop_unit(clauses: &mut Vec<Option<Clause>>, unit: Lit) {
             break;
         };
         if !c.contains(&unit) {
-            clauses[j] = Some(c.excl(&negated));
+            let kept = c.excl(&negated);
+            match kept.len() {
+                0 => scan.empty = true,
+                1 if scan.unit.is_none() => scan.unit = Some(j),
+                _ => {}
+            }
+            clauses[j] = Some(kept);
             j += 1;
         }
         i += 1;
     }
+    scan
+}
+
+/// The empty and unit clauses of a clause list, as `findTseitinModel0` looks
+/// for them.
+#[derive(Clone, Copy)]
+struct Scan {
+    empty: bool,
+    unit: Option<usize>,
+}
+
+fn scan_clauses(clauses: &[Option<Clause>]) -> Scan {
+    let mut unit = None;
+    for (i, c) in clauses.iter().enumerate() {
+        if let Some(c) = c {
+            match c.len() {
+                0 => {
+                    return Scan { empty: true, unit };
+                }
+                1 if unit.is_none() => unit = Some(i),
+                _ => {}
+            }
+        }
+    }
+    Scan { empty: false, unit }
 }
 
 /// `findTseitinModel0`: DPLL with an explicit stack. `None` is UNSAT; the
 /// model lists the literals most recent first.
 fn find_tseitin_model(clauses: &[Clause]) -> Option<Vec<Lit>> {
-    type State = (Vec<Option<Clause>>, Vec<Lit>);
-    let mut stack: Vec<State> = vec![(clauses.iter().cloned().map(Some).collect(), Vec::new())];
-    while let Some((mut clauses, assignments)) = stack.pop() {
+    // The scan a unit propagation already made, if the state came from one:
+    // each step used to walk every clause once to drop the unit and again to
+    // find the next.
+    type State = (Vec<Option<Clause>>, Vec<Lit>, Option<Scan>);
+    let mut stack: Vec<State> = vec![(
+        clauses.iter().cloned().map(Some).collect(),
+        Vec::new(),
+        None,
+    )];
+    while let Some((mut clauses, assignments, scanned)) = stack.pop() {
         if clauses.is_empty() || clauses[0].is_none() {
             return Some(assignments);
         }
-        let mut empty_index = None;
-        let mut unit_index = None;
-        for (i, c) in clauses.iter().enumerate() {
-            if let Some(c) = c {
-                match c.len() {
-                    0 => {
-                        empty_index = Some(i);
-                        break;
-                    }
-                    1 if unit_index.is_none() => unit_index = Some(i),
-                    _ => {}
-                }
-            }
-        }
-        if empty_index.is_some() {
+        let scan = scanned.unwrap_or_else(|| scan_clauses(&clauses));
+        if scan.empty {
             continue;
         }
-        if let Some(ui) = unit_index {
+        if let Some(ui) = scan.unit {
             let unit = *clauses[ui].as_ref().unwrap().head().unwrap();
-            drop_unit(&mut clauses, unit);
+            let next = drop_unit(&mut clauses, unit);
             let mut a = assignments;
             a.insert(0, unit);
-            stack.push((clauses, a));
+            stack.push((clauses, a, Some(next)));
             continue;
         }
         // Pure literals.
         let mut pos = std::collections::BTreeSet::new();
         let mut neg = std::collections::BTreeSet::new();
         for c in clauses.iter().flatten() {
-            for l in c.elems() {
+            c.for_each_unordered(|l| {
                 if l.positive() {
                     pos.insert(l.variable());
                 } else {
                     neg.insert(l.variable());
                 }
-            }
+            });
         }
         let pures: Vec<i32> = pos.symmetric_difference(&neg).copied().collect();
         if let Some(&pure_var) = pures.iter().min() {
@@ -673,7 +732,7 @@ fn find_tseitin_model(clauses: &[Clause]) -> Option<Vec<Lit>> {
                 .collect();
             let mut a = assignments;
             a.insert(0, pure_lit);
-            stack.push((simplified, a));
+            stack.push((simplified, a, None));
             continue;
         }
         let split = *clauses
@@ -691,8 +750,8 @@ fn find_tseitin_model(clauses: &[Clause]) -> Option<Vec<Lit>> {
         pos_clauses.push(Some(clause1(split)));
         neg_clauses.push(Some(clause1(split.neg())));
         // `loop(pos :: neg :: rest)`: `pos` is tried first.
-        stack.push((neg_clauses, assignments.clone()));
-        stack.push((pos_clauses, assignments));
+        stack.push((neg_clauses, assignments.clone(), None));
+        stack.push((pos_clauses, assignments, None));
     }
     None
 }

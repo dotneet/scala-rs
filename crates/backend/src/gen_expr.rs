@@ -2212,6 +2212,22 @@ pub(crate) fn gen_if(
     elsep: &Tree,
     result_ty: &Type,
 ) {
+    // A constant condition: nsc folds `0 % 2 == 0` to `true` while typing,
+    // and its backend never keeps the branch that cannot run. Emitting both
+    // (and the test) made a table of 800 `if (i % 2 == 0) Some(i) else None`
+    // entries too large for one method where scalac's code fits.
+    if let Some(Lit::Boolean(live)) = scala_rs_typer::fold_constant(cond) {
+        let branch = if live { thenp } else { elsep };
+        if is_unit_like(result_ty) {
+            gen_stat(asm, frame, ctx, branch);
+        } else {
+            gen_expr(asm, frame, ctx, branch);
+            pad_unit_branch(asm, branch, result_ty);
+            let join = join_class_of(ctx.st, result_ty);
+            cast_branch_to_join(asm, ctx.st, join.as_deref());
+        }
+        return;
+    }
     gen_expr(asm, frame, ctx, cond);
     let else_l = asm.fresh_label();
     let end_l = asm.fresh_label();

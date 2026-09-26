@@ -1396,16 +1396,32 @@ pub struct SymbolTable {
     /// so `mutation_gen` moves at nearly every statement; this moves when a
     /// class, module, package or type member is handed out.
     pub(crate) graph_gen: std::cell::Cell<u64>,
+    /// Members `alloc` has entered into a class-like owner. That writes the
+    /// owner's member list without handing the owner out, so `graph_gen`
+    /// does not see it; see [`Self::member_graph_gen`].
+    member_gen: std::cell::Cell<u64>,
     /// [`crate::lin::linearize`]'s answers for the current `mutation_gen`.
     pub(crate) lin_cache: std::cell::RefCell<LinCache>,
     /// [`SymbolTable::base_type_args`]'s answers for the current
     /// `mutation_gen`.
     pub(crate) bta_cache: std::cell::RefCell<BtaCache>,
+    /// [`SymbolTable::parents_as_seen_from`]'s answers, under the same
+    /// validity as `bta_cache`.
+    parents_seen_cache: std::cell::RefCell<ByType<Vec<Type>>>,
     /// [`SymbolTable::class_reaches`]'s answers for the current
     /// `mutation_gen`.
     pub(crate) reach_cache: std::cell::RefCell<ReachCache>,
-    /// Nominal SAM member walks, invalidated by symbol edits or additions.
+    /// Nominal SAM member walks (every method name's first declaration),
+    /// invalidated by class graph edits or member additions.
     sam_methods_cache: std::cell::RefCell<SamMethodsCache>,
+    /// [`SymbolTable::lub_at`]'s answers during one outermost [`SymbolTable::lub`].
+    lub_memo: std::cell::RefCell<LubMemo>,
+    /// See [`SymbolTable::jvm_query_memo`].
+    jvm_query_memo: std::cell::RefCell<JvmQueryMemo>,
+    /// [`SymbolTable::subst_as_seen_from_walk_at`]'s walk for a receiver:
+    /// the (class, arguments) pairs and the classes it passed, by
+    /// `graph_gen`.
+    seen_from_walk_cache: std::cell::RefCell<ByType<SeenFromWalk>>,
     /// [`SymbolTable::companion_module`]'s answers: class -> (the owner's
     /// member count when it was read, the module).
     pub(crate) companion_cache:
@@ -1415,9 +1431,37 @@ pub struct SymbolTable {
     pub(crate) empty_base_type_args: std::rc::Rc<BaseTypeArgs>,
 }
 
+/// Answers to questions about classes named by their JVM internal names,
+/// which the backend asks for every call it emits. Kept for the table as it
+/// stands: its `mutation_gen` and symbol count.
+#[derive(Default)]
+pub struct JvmQueryMemo {
+    epoch: (u64, usize),
+    /// The class-like symbol an internal name denotes.
+    pub classes: rustc_hash::FxHashMap<String, Option<SymbolId>>,
+    /// Whether the first class is known to conform to the second.
+    pub conforms: rustc_hash::FxHashMap<(String, String), bool>,
+}
+
+/// Answers keyed by a type, for one generation: the type's hash, then the
+/// types sharing it with their answers.
+type ByType<V> = crate::check::GenMap<u64, Vec<(Type, std::rc::Rc<V>)>>;
+
+/// The pairs and the visited classes of one walk; see
+/// [`SymbolTable::subst_as_seen_from_walk_at`].
+type SeenFromWalk = (Vec<(SymbolId, Vec<Type>)>, rustc_hash::FxHashSet<u32>);
+
+/// See [`SymbolTable::lub_at`].
+#[derive(Default)]
+struct LubMemo {
+    /// Nesting of [`SymbolTable::lub`]; the answers live while it is non-zero.
+    active: u32,
+    answers: rustc_hash::FxHashMap<u64, Vec<(Type, Type, u32, Type)>>,
+}
+
 #[derive(Default)]
 struct SamMethodsCache {
-    epoch: (u64, usize, u32, u32),
+    epoch: (u64, u32, u32),
     methods: HashMap<SymbolId, Vec<SymbolId>>,
 }
 
@@ -1577,10 +1621,15 @@ impl SymbolTable {
             sam_known_overrides: rustc_hash::FxHashMap::default(),
             mutation_gen: std::cell::Cell::new(0),
             graph_gen: std::cell::Cell::new(0),
+            member_gen: std::cell::Cell::new(0),
             lin_cache: std::cell::RefCell::new(LinCache::default()),
             bta_cache: std::cell::RefCell::new(BtaCache::default()),
+            parents_seen_cache: Default::default(),
             reach_cache: std::cell::RefCell::new(ReachCache::default()),
+            seen_from_walk_cache: Default::default(),
+            jvm_query_memo: Default::default(),
             sam_methods_cache: std::cell::RefCell::new(SamMethodsCache::default()),
+            lub_memo: std::cell::RefCell::new(LubMemo::default()),
             companion_cache: std::cell::RefCell::new(Default::default()),
             empty_base_type_args: std::rc::Rc::new(BaseTypeArgs::default()),
             symbols: vec![Symbol {
@@ -1779,9 +1828,22 @@ impl SymbolTable {
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
                 ow.members.push(id);
+                if !matches!(
+                    ow.kind,
+                    SymKind::Method | SymKind::Term | SymKind::TypeParam
+                ) {
+                    self.member_gen.set(self.member_gen.get().wrapping_add(1));
+                }
             }
         }
         id
+    }
+
+    /// A generation that moves with [`Self::graph_gen`] and also whenever a
+    /// class-like symbol gains a member: the key for caches that read member
+    /// lists. Both counters only grow, so their sum moves when either does.
+    pub(crate) fn member_graph_gen(&self) -> u64 {
+        self.graph_gen.get().wrapping_add(self.member_gen.get())
     }
 
     pub fn get(&self, id: SymbolId) -> &Symbol {
@@ -2051,6 +2113,74 @@ impl SymbolTable {
 
     /// [`Self::base_type_args`]'s answer for this exact pair, if it was
     /// computed since the last change to any symbol.
+    /// Every parent clause of `actual`'s class and of its ancestors, each
+    /// seen from `actual`, breadth first and a class's clauses in order --
+    /// the order `unify_one_precise` tries them in when `actual` does not
+    /// match a type constructor directly. It asks once per type parameter of
+    /// every candidate an implicit search fits, about the same few receivers,
+    /// and each walk substitutes the whole hierarchy.
+    pub(crate) fn parents_as_seen_from(&self, actual: &Type) -> std::rc::Rc<Vec<Type>> {
+        let Type::Class { sym, .. } = actual else {
+            return std::rc::Rc::new(Vec::new());
+        };
+        let cacheable =
+            !self.has_ambient_type_context() && crate::lin::linearize_settled(self, *sym).1;
+        let key = {
+            use std::hash::Hasher;
+            let mut h = rustc_hash::FxHasher::default();
+            crate::implicits::hash_type(actual, &mut h);
+            h.finish()
+        };
+        let gen = self.mutation_gen.get();
+        if cacheable {
+            let cache = self.parents_seen_cache.borrow();
+            if cache.0 == gen {
+                if let Some((_, hit)) = cache
+                    .1
+                    .get(&key)
+                    .and_then(|bucket| bucket.iter().find(|(t, _)| t == actual))
+                {
+                    return hit.clone();
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut seen: Vec<SymbolId> = Vec::new();
+        let mut level: Vec<Type> = vec![actual.clone()];
+        while !level.is_empty() {
+            let mut next: Vec<Type> = Vec::new();
+            for t in &level {
+                let Type::Class { sym, .. } = t else {
+                    continue;
+                };
+                if seen.contains(sym) {
+                    continue;
+                }
+                seen.push(*sym);
+                for q in self.get(*sym).parents.clone() {
+                    let p = self.subst_as_seen_from(t, &q);
+                    out.push(p.clone());
+                    next.push(p);
+                }
+            }
+            level = next;
+        }
+        let out = std::rc::Rc::new(out);
+        if cacheable && self.mutation_gen.get() == gen {
+            let mut cache = self.parents_seen_cache.borrow_mut();
+            if cache.0 != gen || cache.1.len() >= 4096 {
+                cache.0 = gen;
+                cache.1.clear();
+            }
+            cache
+                .1
+                .entry(key)
+                .or_default()
+                .push((actual.clone(), out.clone()));
+        }
+        out
+    }
+
     fn cached_base_type_args(
         &self,
         sym: SymbolId,
@@ -4708,6 +4838,7 @@ impl SymbolTable {
             subs: &mut Vec<(SymbolId, Vec<Type>)>,
             seen: &mut rustc_hash::FxHashSet<u32>,
             base: &BaseTypeArgs,
+            nominal: &mut bool,
         ) {
             match recv {
                 Type::Class { sym, args } => {
@@ -4725,6 +4856,18 @@ impl SymbolTable {
                     if !args.is_empty() {
                         subs.push((*sym, args.clone()));
                     }
+                    *nominal &= st.get(*sym).parents.iter().all(|p| {
+                        matches!(
+                            p,
+                            Type::Class { .. }
+                                | Type::ModuleRef(_)
+                                | Type::Any
+                                | Type::AnyRef
+                                | Type::AnyVal
+                                | Type::JavaObject
+                                | Type::Function { .. }
+                        )
+                    });
                     for i in 0..st.get(*sym).parents.len() {
                         // The parent is declared in terms of *this* class's
                         // type parameters, so it has to be instantiated before
@@ -4734,7 +4877,7 @@ impl SymbolTable {
                         // resolving `BR` to `Boolean` through
                         // `OptionMapper[BR, R]`.
                         let p = st.subst_tparams_cow(*sym, args, &st.get(*sym).parents[i]);
-                        walk(st, &p, subs, seen, base);
+                        walk(st, &p, subs, seen, base, nominal);
                     }
                     // A self type is a second place `this` inherits members
                     // from, and they are declared in *its* vocabulary:
@@ -4744,7 +4887,7 @@ impl SymbolTable {
                     // unequal -- "type mismatch; found: A required: A".
                     if let Some(sf) = &st.get(*sym).self_type {
                         let sf = st.subst_tparams_cow(*sym, args, sf);
-                        walk(st, &sf, subs, seen, base);
+                        walk(st, &sf, subs, seen, base, nominal);
                     }
                 }
                 Type::ModuleRef(sym) => {
@@ -4752,11 +4895,12 @@ impl SymbolTable {
                         return;
                     }
                     for p in st.get(*sym).parents.clone() {
-                        walk(st, &p, subs, seen, base);
+                        walk(st, &p, subs, seen, base, nominal);
                     }
                 }
                 Type::Annotated { tpe, .. } | Type::Existential { body: tpe, .. } => {
-                    walk(st, tpe, subs, seen, base)
+                    *nominal = false;
+                    walk(st, tpe, subs, seen, base, nominal)
                 }
                 // `p.type` has the members of `p`'s type, at its arguments:
                 // `def f(b: Buf[Int]): b.type` and then `f(x).add(1)` reads
@@ -4767,12 +4911,13 @@ impl SymbolTable {
                 // The prefix is where the term is *declared*, not what it is,
                 // so a term with no type yet gives nothing to walk.
                 Type::SingleType { sym, .. } => {
+                    *nominal = false;
                     if !seen.insert(sym.0) {
                         return;
                     }
                     let under = st.singleton_underlying(*sym);
                     if !under.is_no_type() && !matches!(under, Type::Method { .. }) {
-                        walk(st, &under, subs, seen, base);
+                        walk(st, &under, subs, seen, base, nominal);
                     }
                 }
                 // `trait C[-T] extends (T => R)` inherits `Function1.apply`,
@@ -4781,7 +4926,7 @@ impl SymbolTable {
                 // it has to be read back as one first.
                 Type::Function { .. } => {
                     if let Some(c) = st.function_class_form(recv) {
-                        walk(st, &c, subs, seen, base);
+                        walk(st, &c, subs, seen, base, nominal);
                     }
                 }
                 // `trait GetResult[+T] extends (PositionedResult => T) { self => }`
@@ -4805,6 +4950,7 @@ impl SymbolTable {
                         subs,
                         seen,
                         base,
+                        nominal,
                     );
                 }
                 // Only heads that `apply_type_ctor` folds may be re-walked: an
@@ -4817,6 +4963,7 @@ impl SymbolTable {
                         Type::Class { .. } | Type::Named { .. } | Type::Applied { .. }
                     ) =>
                 {
+                    *nominal = false;
                     let t = apply_type_ctor((**ctor).clone(), args.clone().into_vec());
                     if matches!(t, Type::Applied { .. }) {
                         // Still applied: the constructor is abstract (a type
@@ -4824,7 +4971,7 @@ impl SymbolTable {
                         // into. Recursing here would not terminate.
                         return;
                     }
-                    walk(st, &t, subs, seen, base);
+                    walk(st, &t, subs, seen, base, nominal);
                 }
                 // A member reached through `Ops[F, A] { type TypeClassType =
                 // FlatMap[F] }` is declared by one of the parents and has to be
@@ -4832,8 +4979,9 @@ impl SymbolTable {
                 // syntax layer -- every result type simulacrum writes is a
                 // refinement -- handed back `flatMap`'s raw `A`.
                 Type::Refined { parents, .. } => {
+                    *nominal = false;
                     for p in parents {
-                        walk(st, p, subs, seen, base);
+                        walk(st, p, subs, seen, base, nominal);
                     }
                     // An inner class seen through a prefix, reached as the
                     // type of a path (`m.In` with `val m = o.mid`): the
@@ -4844,7 +4992,7 @@ impl SymbolTable {
                     // `attach_inner_prefixes`).
                     if let Some(pre) = crate::prefix::view_prefix(recv) {
                         let mut pseen = rustc_hash::FxHashSet::default();
-                        walk(st, pre, subs, &mut pseen, base);
+                        walk(st, pre, subs, &mut pseen, base, nominal);
                     }
                 }
                 // A member reached through an abstract type member (or a type
@@ -4857,13 +5005,17 @@ impl SymbolTable {
                 // unbound, so the element type slick's `mapToImpl` enumerates
                 // case-class fields with was never `Symbol`.
                 Type::TypeMember(id) | Type::TypeParam(id) => {
+                    *nominal = false;
                     if !seen.insert(id.0) {
                         return;
                     }
                     if let Some(hi) = st.get(*id).bound_hi.clone() {
-                        walk(st, &hi, subs, seen, base);
+                        walk(st, &hi, subs, seen, base, nominal);
                     }
                 }
+                // Ignored by the walk, except that a name resolved through
+                // the scopes may mean another class elsewhere.
+                Type::Named { .. } => *nominal = false,
                 _ => {}
             }
         }
@@ -4895,6 +5047,42 @@ impl SymbolTable {
         } else {
             recv
         };
+        // The pairs and the classes the walk passes depend on the receiver
+        // alone, and `type_select` asks for them once per member it reads off
+        // the same `List[Int]`: rebuilding them was a fifth of typing
+        // collection code. Kept for a receiver that names its class outright,
+        // with no prefix, while the class graph stands still -- and only when
+        // the walk met nothing but classes, since an abstract type's bound, a
+        // singleton's type or a parent resolved through the scopes is not a
+        // function of the graph alone.
+        let memo_key = match (inner_pre, recv) {
+            (None, Type::Class { sym, .. })
+                if !sym.is_none()
+                    && crate::prefix::view_prefix(recv).is_none()
+                    && !self.has_ambient_type_context() =>
+            {
+                use std::hash::Hasher;
+                let mut h = rustc_hash::FxHasher::default();
+                crate::implicits::hash_type(recv, &mut h);
+                Some((h.finish(), *sym))
+            }
+            _ => None,
+        };
+        let gen = self.graph_gen.get();
+        if let Some((key, _)) = memo_key {
+            let hit = {
+                let cache = self.seen_from_walk_cache.borrow();
+                (cache.0 == gen)
+                    .then(|| cache.1.get(&key))
+                    .flatten()
+                    .and_then(|bucket| bucket.iter().find(|(t, _)| t == recv))
+                    .map(|(_, walked)| walked.clone())
+            };
+            if let Some(walked) = hit {
+                let t = self.apply_collected_subs(&walked.0, ty);
+                return self.attach_inner_prefixes(&walked.1, &self.canonical_prefix(recv), t);
+            }
+        }
         // Only a receiver that names a class outright is given a base map:
         // `class_sym_of` chases bounds and aliases, and the walk's own
         // recursion re-enters here for those shapes anyway.
@@ -4917,7 +5105,8 @@ impl SymbolTable {
         };
         let mut seen = rustc_hash::FxHashSet::default();
         let mut subs: Vec<(SymbolId, Vec<Type>)> = Vec::new();
-        walk(self, core, &mut subs, &mut seen, &base);
+        let mut nominal = true;
+        walk(self, core, &mut subs, &mut seen, &base, &mut nominal);
         // A nested class inherits the type vocabulary of its lexical outer
         // class even when that outer class is not an ancestor in the class
         // hierarchy. `StringGenerator.StringDef` therefore still reads
@@ -4940,6 +5129,7 @@ impl SymbolTable {
                                 &mut subs,
                                 &mut outer_seen,
                                 &base,
+                                &mut nominal,
                             );
                         }
                     }
@@ -4947,6 +5137,22 @@ impl SymbolTable {
             }
         }
         let t = self.apply_collected_subs(&subs, ty);
+        // A linearization that is still settling is not kept; one found here
+        // was settled when it was stored, and the graph has not moved since.
+        if let Some((key, sym)) = memo_key.filter(|_| nominal && outer.is_none()) {
+            if self.graph_gen.get() == gen && crate::lin::linearize_settled(self, sym).1 {
+                let mut cache = self.seen_from_walk_cache.borrow_mut();
+                if cache.0 != gen || cache.1.len() >= 4096 {
+                    cache.0 = gen;
+                    cache.1.clear();
+                }
+                cache
+                    .1
+                    .entry(key)
+                    .or_default()
+                    .push((recv.clone(), std::rc::Rc::new((subs, seen.clone()))));
+            }
+        }
         // nsc's as-seen-from for the enclosing instance: a bare inner class
         // of any class the walk went through means `C.this.In`, and read
         // through this receiver it is the receiver's `In`. The receiver is
@@ -5649,6 +5855,21 @@ impl SymbolTable {
     /// Index entries can be stale (a symbol renamed away from `jvm`), so the
     /// name is re-checked here; entries are never *missing*, which is what
     /// `set_jvm_name` buys.
+    /// [`JvmQueryMemo`], emptied first if a symbol has changed or been added
+    /// since it was filled. The emitter only reads the table, so everything
+    /// it asks twice is answered from here.
+    pub fn jvm_query_memo(&self) -> std::cell::RefMut<'_, JvmQueryMemo> {
+        let epoch = (self.mutation_gen.get(), self.symbols.len());
+        let mut memo = self.jvm_query_memo.borrow_mut();
+        if memo.epoch != epoch {
+            *memo = JvmQueryMemo {
+                epoch,
+                ..Default::default()
+            };
+        }
+        memo
+    }
+
     pub fn find_class_by_jvm(&self, jvm: &str) -> Option<SymbolId> {
         let mut idx = self.jvm_index.borrow_mut();
         if idx.upto < self.symbols.len() {
@@ -5912,6 +6133,22 @@ impl SymbolTable {
     /// varargs element types. Walks the parent chain, so
     /// `lub(Circle, Rect) = Shape` for a sealed `Shape` hierarchy.
     pub fn lub(&self, a: &Type, b: &Type) -> Type {
+        self.lub_memo.borrow_mut().active += 1;
+        let out =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.lub_uncached(a, b)));
+        let mut memo = self.lub_memo.borrow_mut();
+        memo.active -= 1;
+        if memo.active == 0 {
+            memo.answers.clear();
+        }
+        drop(memo);
+        match out {
+            Ok(out) => out,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn lub_uncached(&self, a: &Type, b: &Type) -> Type {
         let plain = self.lub_at(a, b, 0);
         if self.is_sub_type(a, b) || self.is_sub_type(b, a) {
             return plain;
@@ -5968,7 +6205,48 @@ impl SymbolTable {
     /// crashed the compiler with a stack overflow on it (`JGitUtil.scala`),
     /// with no diagnostic at all. nsc bounds the same recursion with
     /// `Depth`/`maxDepth` and answers `Any` when it runs out; so does this.
+    ///
+    /// Joining two classes joins every pair of generic bases they share at
+    /// the next depth, and each of those joins walks its own operands' bases
+    /// again, so over a collection hierarchy the same pairs recur at every
+    /// level: one `lub(Nil.type, ::[B])` took 0.4 s, and the 538 sources of
+    /// the standard library spent 10 of their 12 s here. nsc keeps each
+    /// answer for the rest of the outermost lub (`lubResults`); so does this.
     fn lub_at(&self, a: &Type, b: &Type, depth: u32) -> Type {
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            crate::implicits::hash_type(a, &mut h);
+            crate::implicits::hash_type(b, &mut h);
+            depth.hash(&mut h);
+            h.finish()
+        };
+        {
+            let memo = self.lub_memo.borrow();
+            if memo.active > 0 {
+                if let Some((.., answer)) = memo.answers.get(&key).and_then(|bucket| {
+                    bucket
+                        .iter()
+                        .find(|(x, y, d, _)| *d == depth && x == a && y == b)
+                }) {
+                    return answer.clone();
+                }
+            }
+        }
+        let answer = self.lub_at_uncached(a, b, depth);
+        let mut memo = self.lub_memo.borrow_mut();
+        if memo.active > 0 {
+            memo.answers.entry(key).or_default().push((
+                a.clone(),
+                b.clone(),
+                depth,
+                answer.clone(),
+            ));
+        }
+        answer
+    }
+
+    fn lub_at_uncached(&self, a: &Type, b: &Type, depth: u32) -> Type {
         /// nsc's `LubGlbMargin` is 0 and its starting depth comes from the
         /// operands; a fixed cap is enough here, since a lub that needs more
         /// than this many nested joins is the pathological case, not a real
@@ -6440,7 +6718,7 @@ impl SymbolTable {
     /// comparison needs an unapplied constructor. Answering first spares those
     /// whole-type traversals on the question implicit search asks most.
     /// `Array` is left out because it is re-spelled as `Type::Array` first.
-    fn classes_unrelated(&self, a: &Type, b: &Type) -> bool {
+    pub(crate) fn classes_unrelated(&self, a: &Type, b: &Type) -> bool {
         let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, .. }) = (a, b) else {
             return false;
         };
@@ -8515,11 +8793,27 @@ impl SymbolTable {
         if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
             return None;
         }
+        let mut abstracts = self.abstract_sam_methods(cls);
+        let known = self.sam_known_overrides.get(&cls.0);
+        if !overridden.is_empty() || known.is_some() {
+            abstracts.retain(|m| {
+                let s = self.get(*m);
+                s.owner == cls
+                    || !(overridden.contains(&s.name)
+                        || known.is_some_and(|ns| ns.contains(&s.name)))
+            });
+        }
+        if abstracts.len() != 1 {
+            return None;
+        }
         // nsc `samOf`: a SAM *class* must be instantiable by the literal's
         // anonymous subclass with no arguments -- its constructor takes an
         // empty parameter list. `abstract class H(x: Int) { def h(s: String):
         // String }` is not a SAM type; converting to it built a subclass
-        // calling a `<init>()V` that does not exist.
+        // calling a `<init>()V` that does not exist. Checked after the count
+        // above: a concrete class (`Integer`, `StringBuilder`) has no abstract
+        // method, erasure asks this of every tree's type, and scanning the
+        // members for constructors first was most of the question's cost.
         let f = self.get(cls).flags;
         if !f.contains(Flags::TRAIT) && !f.contains(Flags::INTERFACE) {
             let ctors: Vec<SymbolId> = self
@@ -8536,19 +8830,6 @@ impl SymbolTable {
             if !ctors.is_empty() && !ctors.iter().any(nullary) {
                 return None;
             }
-        }
-        let mut abstracts = self.abstract_sam_methods(cls);
-        let known = self.sam_known_overrides.get(&cls.0);
-        if !overridden.is_empty() || known.is_some() {
-            abstracts.retain(|m| {
-                let s = self.get(*m);
-                s.owner == cls
-                    || !(overridden.contains(&s.name)
-                        || known.is_some_and(|ns| ns.contains(&s.name)))
-            });
-        }
-        if abstracts.len() != 1 {
-            return None;
         }
         let method = abstracts[0];
         // nsc `definitions.samOf`: `!sam.isOverloaded`. `abstract_sam_methods`
@@ -8595,17 +8876,20 @@ impl SymbolTable {
     }
 
     fn abstract_sam_methods(&self, cls: SymbolId) -> Vec<SymbolId> {
-        let epoch = (
-            self.mutation_gen.get(),
-            self.symbols.len(),
-            self.any_sym.0,
-            self.anyref_sym.0,
-        );
+        // The walk reads member lists and parents, which the class graph
+        // generation covers; whether a method is deferred is a method's own
+        // flag, which `mutation_gen` would track at the price of missing at
+        // nearly every statement, so it is re-read on every call instead.
+        let epoch = (self.member_graph_gen(), self.any_sym.0, self.anyref_sym.0);
         {
             let cache = self.sam_methods_cache.borrow();
             if cache.epoch == epoch {
                 if let Some(methods) = cache.methods.get(&cls) {
-                    return methods.clone();
+                    return methods
+                        .iter()
+                        .copied()
+                        .filter(|m| self.method_is_deferred(*m))
+                        .collect();
                 }
             }
         }
@@ -8630,14 +8914,22 @@ impl SymbolTable {
             }
             for p in &self.get(id).parents {
                 // Other parent forms can resolve through scopes or ambient
-                // type-expansion guards without changing a symbol.
+                // type-expansion guards without changing a symbol. A function
+                // type always names its `FunctionN` (a class entered later
+                // moves `member_graph_gen`), and `AnyVal` is as fixed as
+                // `Any`. Leaving them out kept `java.lang.Integer` (whose
+                // parent is `AnyVal` here) and every `Seq` (`PartialFunction[
+                // Int, A]` extends `Int => A`) out of the cache, and erasure
+                // asks for each tree's type: 600,000 walks for 100 files.
                 nominal &= matches!(
                     p,
                     Type::Class { .. }
                         | Type::ModuleRef(_)
                         | Type::Any
                         | Type::AnyRef
+                        | Type::AnyVal
                         | Type::JavaObject
+                        | Type::Function { .. }
                 );
                 // A parent written as a function type (`trait C[-T] extends
                 // (T => R)`) declares `apply`, which is what makes `C` a SAM.
@@ -8648,19 +8940,19 @@ impl SymbolTable {
                 }
             }
         }
-        let methods: Vec<_> = by_name
-            .into_values()
-            .filter(|m| self.method_is_deferred(*m))
-            .collect();
+        let named: Vec<_> = by_name.into_values().collect();
         if nominal {
             let mut cache = self.sam_methods_cache.borrow_mut();
             if cache.epoch != epoch || cache.methods.len() >= 1024 {
                 cache.epoch = epoch;
                 cache.methods.clear();
             }
-            cache.methods.insert(cls, methods.clone());
+            cache.methods.insert(cls, named.clone());
         }
-        methods
+        named
+            .into_iter()
+            .filter(|m| self.method_is_deferred(*m))
+            .collect()
     }
 
     /// Names of deferred methods `cls` inherits from a parent and does not
@@ -9540,7 +9832,7 @@ mod api_boundary_tests {
     use super::*;
 
     #[test]
-    fn sam_method_walk_is_reused_until_a_symbol_changes() {
+    fn sam_method_walk_is_reused_until_a_member_is_added() {
         let mut st = SymbolTable::new();
         let base = st.alloc("Base", st.root, SymKind::Class, Flags::TRAIT, "Base");
         let method = st.alloc("run", base, SymKind::Method, Flags::ABSTRACT, "");
@@ -9553,13 +9845,14 @@ mod api_boundary_tests {
         assert_eq!(st.abstract_sam_methods(child), vec![method]);
         assert_eq!(st.abstract_sam_methods(child), vec![method]);
         assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 1);
+        // A method's own flags are re-read, not walked for again.
         st.get_mut(method).flags = Flags::EMPTY;
         assert!(st.abstract_sam_methods(child).is_empty());
         assert!(st.abstract_sam_methods(child).is_empty());
-        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 2);
+        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 1);
         let second = st.alloc("next", base, SymKind::Method, Flags::ABSTRACT, "");
         assert_eq!(st.abstract_sam_methods(child), vec![second]);
-        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 3);
+        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 2);
     }
 
     #[test]

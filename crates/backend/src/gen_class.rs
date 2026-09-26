@@ -366,6 +366,8 @@ impl<'a> Gen<'a> {
                 self.abi,
                 &self.boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
                 pb,
             );
         }
@@ -1125,6 +1127,8 @@ impl<'a> Gen<'a> {
                 abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
             );
             for stt in &stats {
                 if let TreeKind::ValDef {
@@ -1342,6 +1346,8 @@ impl<'a> Gen<'a> {
                 abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
             );
             // nsc stores `$outer` *before* the super constructor call, so a
             // method the parent's `<init>` dispatches back to this class
@@ -1523,6 +1529,8 @@ impl<'a> Gen<'a> {
                 abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
             );
             // An eager initializer may still read the lexical outer even when
             // no method or lazy field needs it after construction. scalac
@@ -1723,6 +1731,8 @@ impl<'a> Gen<'a> {
                 abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
             );
             ctx.method_sym = meth;
             tailrec_error = crate::gen_tailrec::begin_tail_loop(asm, &mut frame, &ctx, rhs);
@@ -1962,6 +1972,8 @@ impl<'a> Gen<'a> {
                     abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
+                    &self.traits,
+                    self,
                 );
                 ctx.method_sym = method;
                 ctx.value_ext = Some((

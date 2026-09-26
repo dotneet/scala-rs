@@ -1,0 +1,33 @@
+warn_patmat_order.scala:52: warning: Exhaustivity analysis reached max recursion depth, not all missing cases are reported.
+(Please try with scalac -Ypatmat-exhaust-depth 40 or -Ypatmat-exhaust-depth off.)
+  def m2(o: Op, t: T): Int = (o, t) match {
+                             ^
+warn_patmat_order.scala:52: warning: match may not be exhaustive.
+It would fail on the following inputs: (O25, A(Some(3))), (O25, A(Some(_)))
+  def m2(o: Op, t: T): Int = (o, t) match {
+                             ^
+warn_patmat_order.scala:92: warning: Exhaustivity analysis reached max recursion depth, not all missing cases are reported.
+(Please try with scalac -Ypatmat-exhaust-depth 40 or -Ypatmat-exhaust-depth off.)
+  def m7(o: Op, t: T): Int = (o, t) match {
+                             ^
+warn_patmat_order.scala:92: warning: match may not be exhaustive.
+It would fail on the following inputs: (O9, B(_)), (O9, C)
+  def m7(o: Op, t: T): Int = (o, t) match {
+                             ^
+warn_patmat_order.scala:122: warning: Exhaustivity analysis reached max recursion depth, not all missing cases are reported.
+(Please try with scalac -Ypatmat-exhaust-depth 40 or -Ypatmat-exhaust-depth off.)
+  def m13(o: Op, t: T): Int = (o, t) match {
+                              ^
+warn_patmat_order.scala:122: warning: match may not be exhaustive.
+It would fail on the following input: (O4, A(Some(_)))
+  def m13(o: Op, t: T): Int = (o, t) match {
+                              ^
+warn_patmat_order.scala:162: warning: Exhaustivity analysis reached max recursion depth, not all missing cases are reported.
+(Please try with scalac -Ypatmat-exhaust-depth 40 or -Ypatmat-exhaust-depth off.)
+  def m34(o: Op, t: T): Int = (o, t) match {
+                              ^
+warn_patmat_order.scala:162: warning: match may not be exhaustive.
+It would fail on the following input: (O9, A(_))
+  def m34(o: Op, t: T): Int = (o, t) match {
+                              ^
+8 warnings

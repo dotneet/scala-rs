@@ -102,19 +102,59 @@ pub(crate) fn java_string_hash(s: &str) -> i32 {
 /// insertion order; a fifth element turns it into a `HashSet`, which keeps
 /// the trie order from then on (removing elements does not turn it back).
 /// `ListSet` keeps insertion order at any size.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum ScalaSet<T> {
     Small(Vec<T>),
-    Hash(Vec<T>),
+    Hash(Box<HashElems<T>>),
     List(Vec<T>),
 }
+
+/// A `HashSet`'s elements. The trie's order is a function of the elements
+/// alone (keys with the same full hash aside, which keep insertion order), so
+/// it is computed when first read rather than at every insertion: building a
+/// clause of a few hundred literals used to re-sort the whole trie per
+/// literal, which made the exhaustivity check of a match over a large sealed
+/// hierarchy slower than the rest of the compile.
+///
+/// Removal only updates the membership set; the insertion-ordered list keeps
+/// removed elements until an order is next computed. The solver removes the
+/// literals of a clause of a few hundred one at a time, and filtering the list
+/// at each removal was quadratic in them.
+#[derive(Clone, Debug)]
+pub(crate) struct HashElems<T> {
+    /// In insertion order, possibly with elements removed since.
+    inserted: Vec<T>,
+    members: rustc_hash::FxHashSet<T>,
+    /// Removed elements still in `inserted`.
+    stale: rustc_hash::FxHashSet<T>,
+    ordered: std::cell::OnceCell<Vec<T>>,
+}
+
+impl<T: Clone + Eq + std::hash::Hash + ScalaHash> PartialEq for ScalaSet<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+            && self.elems() == other.elems()
+    }
+}
+
+impl<T: Clone + Eq + std::hash::Hash + ScalaHash> Eq for ScalaSet<T> {}
 
 pub(crate) trait ScalaHash {
     /// The element's `##`.
     fn scala_hash(&self) -> i32;
 }
 
-impl<T: Clone + PartialEq + ScalaHash> ScalaSet<T> {
+impl<T: Clone + Eq + std::hash::Hash + ScalaHash> ScalaSet<T> {
+    fn hash_set(inserted: Vec<T>) -> Self {
+        let members = inserted.iter().cloned().collect();
+        ScalaSet::Hash(Box::new(HashElems {
+            inserted,
+            members,
+            stale: Default::default(),
+            ordered: std::cell::OnceCell::new(),
+        }))
+    }
+
     pub(crate) fn empty() -> Self {
         ScalaSet::Small(Vec::new())
     }
@@ -143,20 +183,44 @@ impl<T: Clone + PartialEq + ScalaHash> ScalaSet<T> {
 
     pub(crate) fn elems(&self) -> &[T] {
         match self {
-            ScalaSet::Small(v) | ScalaSet::Hash(v) | ScalaSet::List(v) => v,
+            ScalaSet::Small(v) | ScalaSet::List(v) => v,
+            ScalaSet::Hash(h) => h.ordered.get_or_init(|| {
+                Self::rehash(
+                    h.inserted
+                        .iter()
+                        .filter(|e| h.members.contains(*e))
+                        .cloned()
+                        .collect(),
+                )
+            }),
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.elems().len()
+    /// The elements in no particular order, for a caller that does not
+    /// depend on it.
+    pub(crate) fn for_each_unordered(&self, f: impl FnMut(&T)) {
+        match self {
+            ScalaSet::Small(v) | ScalaSet::List(v) => v.iter().for_each(f),
+            ScalaSet::Hash(h) => h.members.iter().for_each(f),
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.elems().is_empty()
+        self.len() == 0
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ScalaSet::Small(v) | ScalaSet::List(v) => v.len(),
+            ScalaSet::Hash(h) => h.members.len(),
+        }
     }
 
     pub(crate) fn contains(&self, x: &T) -> bool {
-        self.elems().contains(x)
+        match self {
+            ScalaSet::Small(v) | ScalaSet::List(v) => v.contains(x),
+            ScalaSet::Hash(h) => h.members.contains(x),
+        }
     }
 
     pub(crate) fn head(&self) -> Option<&T> {
@@ -180,17 +244,22 @@ impl<T: Clone + PartialEq + ScalaHash> ScalaSet<T> {
         }
         match self {
             ScalaSet::Small(mut v) => {
-                if v.len() < 4 {
-                    v.push(x);
+                v.push(x);
+                if v.len() <= 4 {
                     ScalaSet::Small(v)
                 } else {
-                    v.push(x);
-                    ScalaSet::Hash(Self::rehash(v))
+                    Self::hash_set(v)
                 }
             }
-            ScalaSet::Hash(mut v) => {
-                v.push(x);
-                ScalaSet::Hash(Self::rehash(v))
+            ScalaSet::Hash(mut h) => {
+                if h.stale.remove(&x) {
+                    // Back after a removal: it is inserted anew, last.
+                    h.inserted.retain(|e| *e != x);
+                }
+                h.members.insert(x.clone());
+                h.inserted.push(x);
+                h.ordered = std::cell::OnceCell::new();
+                ScalaSet::Hash(h)
             }
             ScalaSet::List(mut v) => {
                 v.push(x);
@@ -205,9 +274,12 @@ impl<T: Clone + PartialEq + ScalaHash> ScalaSet<T> {
                 v.retain(|e| e != x);
                 ScalaSet::Small(v)
             }
-            ScalaSet::Hash(mut v) => {
-                v.retain(|e| e != x);
-                ScalaSet::Hash(v)
+            ScalaSet::Hash(mut h) => {
+                if h.members.remove(x) {
+                    h.stale.insert(x.clone());
+                    h.ordered = std::cell::OnceCell::new();
+                }
+                ScalaSet::Hash(h)
             }
             ScalaSet::List(mut v) => {
                 v.retain(|e| e != x);

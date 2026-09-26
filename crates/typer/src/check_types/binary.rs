@@ -687,6 +687,39 @@ impl Typer {
         candidates.extend(self.companion_implicits(wanted));
         candidates.sort_unstable_by_key(|id| id.0);
         candidates.dedup();
+        // Only derivation rules whose declared result could be the wanted
+        // type take part (the class-level test `implicit_fit_at` begins with):
+        // an unrelated implicit in scope -- each method's own
+        // `ExecutionContext` -- neither contributes nor makes the request look
+        // new.
+        candidates.retain(|&id| {
+            if !self.only_implicit_clauses(id) {
+                return false;
+            }
+            match &self.st.get(id).ty {
+                Type::Method { ret, .. } => match &**ret {
+                    Type::Class { sym, .. } if !self.st.is_inner_class_of_class(*sym) => {
+                        self.plausibly_inhabits(ret, wanted)
+                    }
+                    _ => true,
+                },
+                _ => false,
+            }
+        });
+        let request = {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            crate::implicits::hash_type(wanted, &mut h);
+            candidates.hash(&mut h);
+            h.finish()
+        };
+        let gen = self.st.graph_gen.get();
+        if self.derivation_scopes_warmed.0 != gen {
+            self.derivation_scopes_warmed = (gen, Default::default());
+        }
+        if self.derivation_scopes_warmed.1.contains(&request) {
+            return;
+        }
         let mut scopes = Vec::new();
         for id in candidates {
             if !self.only_implicit_clauses(id) {
@@ -716,10 +749,43 @@ impl Typer {
         for scope in scopes {
             self.warm_implicit_scope_once(&scope);
         }
+        // Only a graph the warming left as it was is one the next identical
+        // request could skip.
+        if self.st.graph_gen.get() == gen {
+            self.derivation_scopes_warmed.1.insert(request);
+        }
     }
 
     pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
-        self.warm_implicit_candidates_at(wanted, 0, &mut crate::implicits::TypeSet::default())
+        // Warming only fills in what is missing -- a signature, a parent
+        // list, a companion's members -- so a request that changed no
+        // symbol at all can only do nothing again, from the same lexical
+        // candidates, until a class or a member list changes. Every
+        // `2 * x` with `x: BigInt` asks for the same witnesses through the
+        // same scope, and warming them again was two thirds of typing such
+        // code. Not while a signature is being completed: its candidate was
+        // skipped, not warmed.
+        let gen = self.st.member_graph_gen();
+        let scope = self.implicits_in_scope();
+        if self.idle_candidate_warms.0 == gen
+            && self
+                .idle_candidate_warms
+                .1
+                .iter()
+                .any(|(w, s)| w.as_slice() == wanted && *s == scope)
+        {
+            return false;
+        }
+        let before = self.st.mutation_gen.get();
+        let out =
+            self.warm_implicit_candidates_at(wanted, 0, &mut crate::implicits::TypeSet::default());
+        if self.st.mutation_gen.get() == before && self.lazy_completing.is_empty() {
+            if self.idle_candidate_warms.0 != gen || self.idle_candidate_warms.1.len() >= 256 {
+                self.idle_candidate_warms = (gen, Vec::new());
+            }
+            self.idle_candidate_warms.1.push((wanted.to_vec(), scope));
+        }
+        out
     }
 
     fn warm_implicit_candidates_at(

@@ -114,6 +114,8 @@ impl<'a> Gen<'a> {
                     abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
+                    &self.traits,
+                    self,
                 );
                 // Trait `$init$` is the constructor-time body for each
                 // implementing instance. Anonymous classes created by an
@@ -236,6 +238,8 @@ impl<'a> Gen<'a> {
                 abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
+                &self.traits,
+                self,
             );
             ctx.method_sym = meth;
             tailrec_error = crate::gen_tailrec::begin_tail_loop(asm, &mut frame, &ctx, rhs);
@@ -442,7 +446,7 @@ impl<'a> Gen<'a> {
     /// trait's `var` is not given a second field that shadows it.
     pub(crate) fn superclass_member_names(&self, class_id: SymbolId) -> HashSet<String> {
         let mut out = HashSet::new();
-        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+        for parent in self.lin_above(class_id) {
             if is_interface_sym(self.st, parent) {
                 continue;
             }
@@ -497,11 +501,23 @@ impl<'a> Gen<'a> {
         if class_id.is_none() {
             return Vec::new();
         }
-        linearize(self.st, class_id)
+        self.lin_above(class_id)
             .into_iter()
-            .skip(1)
             .take_while(|p| is_interface_sym(self.st, *p))
             .collect()
+    }
+
+    /// `class_id`'s linearization without the class itself -- or, for the
+    /// trait standing in for a SAM literal's anonymous class
+    /// ([`Gen::sam_host`]), the trait's whole linearization: that class
+    /// extends the trait.
+    pub(crate) fn lin_above(&self, class_id: SymbolId) -> Vec<SymbolId> {
+        let lin = linearize(self.st, class_id);
+        if class_id == self.sam_host.get() {
+            lin
+        } else {
+            lin.into_iter().skip(1).collect()
+        }
     }
 
     pub(crate) fn mixin_val_fields(
@@ -3767,6 +3783,8 @@ impl<'a> Gen<'a> {
                     abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
+                    &self.traits,
+                    self,
                 );
                 gen_expr(asm, &mut frame, &ctx, &rhs);
                 if is_unit_like(&ret_for_body) {
@@ -3832,6 +3850,8 @@ impl<'a> Gen<'a> {
                         abi,
                         boxed_vars,
                         std::rc::Rc::clone(&self.emit_errors),
+                        &self.traits,
+                        self,
                     );
                     ctx.value_ext = Some((
                         class_name.clone(),
@@ -4028,7 +4048,7 @@ impl<'a> Gen<'a> {
         if class_id.is_none() || self.binary_parents.is_none() {
             return;
         }
-        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+        for parent in self.lin_above(class_id) {
             if !is_interface_sym(self.st, parent) || self.traits.modules.contains_key(&parent) {
                 continue;
             }
@@ -4180,6 +4200,8 @@ impl<'a> Gen<'a> {
                     abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
+                    &self.traits,
+                    self,
                 );
                 if let Some(prefix) = prefix {
                     let mut frame = Frame::instance();
@@ -4322,6 +4344,8 @@ impl<'a> Gen<'a> {
                             abi,
                             boxed_vars,
                             std::rc::Rc::clone(&self.emit_errors),
+                            &self.traits,
+                            self,
                         );
                         gen_expr(asm, &mut frame, &ctx, rhs);
                     }
@@ -4459,7 +4483,7 @@ impl<'a> Gen<'a> {
                 }
                 // The parent may declare the member with an erased signature
                 // (`def value: T` becomes `value()Object`); bridge to it.
-                for parent in linearize(self.st, class_id).into_iter().skip(1) {
+                for parent in self.lin_above(class_id) {
                     let Some(pm) = self.st.get(parent).members.iter().copied().find(|&m| {
                         self.st.get(m).kind == SymKind::Method && self.st.get(m).name == *name
                     }) else {
@@ -4800,4 +4824,86 @@ fn emit_case_hash_code(
         asm.invokestatic("scala/runtime/Statics", "finalizeHash", "(II)I");
         asm.ireturn();
     });
+}
+
+/// A SAM literal's anonymous class gets what [`Gen::emit_class`] gives a
+/// class mixing in the same traits, by the same functions, with the SAM
+/// trait standing in for the class ([`Gen::sam_host`]). A SAM *class*
+/// already carries its traits' fields and runs their `$init$` itself, so
+/// only a trait needs any of it.
+impl SamMixins for Gen<'_> {
+    fn add_sam_mixin_members(&self, b: &mut ClassBuilder, sam: SymbolId) {
+        if !is_interface_sym(self.st, sam) {
+            return;
+        }
+        let _host = SamHost::set(self, sam);
+        let binary_lazies = self.binary_mixin_lazy_vals(sam, &[]);
+        for (name, ty, extra) in self.mixin_val_fields(sam, &[], &[]) {
+            if b.fields.iter().any(|f| f.name == name)
+                || binary_lazies.iter().any(|v| v.name == name)
+            {
+                continue;
+            }
+            b.fields.push(Field {
+                access: ACC_PUBLIC | extra,
+                name,
+                desc: jvm_desc_val(self.st, &ty),
+            });
+        }
+        let lazies = self.mixin_lazy_vals(sam, &[]);
+        for v in &lazies {
+            b.fields.push(Field {
+                access: Self::mixin_lazy_field_access(v),
+                name: v.name().unwrap_or("").to_string(),
+                desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
+            });
+        }
+        for v in &binary_lazies {
+            b.fields.push(Field {
+                access: ACC_PRIVATE,
+                name: v.name.clone(),
+                desc: jvm_desc_val(self.st, &v.ty),
+            });
+        }
+        if !lazies.is_empty() || !binary_lazies.is_empty() {
+            b.fields
+                .extend(self.lazy_bitmap_fields(&lazies, binary_lazies.len()));
+        }
+        let modules = self.mixin_member_modules(sam, &[]);
+        self.emit_member_module_accessors(b, &modules);
+        let mut have_modules: HashSet<String> = modules
+            .iter()
+            .map(|&m| module_accessor_name(self.st, m))
+            .collect();
+        self.emit_binary_member_module_accessors(b, sam, &mut have_modules);
+        self.emit_lazy_accessors(b, sam, &lazies, &binary_lazies);
+        self.emit_trait_val_accessors(b, sam, &[]);
+    }
+
+    fn sam_mixin_inits(&self, sam: SymbolId) -> Vec<(String, String)> {
+        if !is_interface_sym(self.st, sam) {
+            return Vec::new();
+        }
+        let _host = SamHost::set(self, sam);
+        self.mixin_init_calls(sam)
+    }
+}
+
+/// [`Gen::sam_host`] for the extent of one [`SamMixins`] call.
+struct SamHost<'g, 'a> {
+    gen: &'g Gen<'a>,
+    before: SymbolId,
+}
+
+impl<'g, 'a> SamHost<'g, 'a> {
+    fn set(gen: &'g Gen<'a>, sam: SymbolId) -> Self {
+        let before = gen.sam_host.replace(sam);
+        SamHost { gen, before }
+    }
+}
+
+impl Drop for SamHost<'_, '_> {
+    fn drop(&mut self) {
+        self.gen.sam_host.set(self.before);
+    }
 }
