@@ -149,7 +149,7 @@ fn widen_option(st: &mut SymbolTable) {
         let b = add_lower_bounded_tparam(st, m, "B", ta.clone());
         let tb = Type::TypeParam(b);
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::ByName(TyBox::new(tb.clone()))]],
+            paramss: vec![vec![Type::ByName(TyBox::new(tb.clone()))]].into(),
             ret: TyBox::new(tb),
         };
     }
@@ -160,7 +160,7 @@ fn widen_option(st: &mut SymbolTable) {
             args: vec![Type::TypeParam(b)].into(),
         };
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::ByName(TyBox::new(opt_b.clone()))]],
+            paramss: vec![vec![Type::ByName(TyBox::new(opt_b.clone()))]].into(),
             ret: TyBox::new(opt_b),
         };
     }
@@ -193,7 +193,7 @@ fn widen_map_get_or_else(st: &mut SymbolTable) {
             let v1 = add_lower_bounded_tparam(st, m, "V1", tv.clone());
             let tv1 = Type::TypeParam(v1);
             st.get_mut(m).ty = Type::Method {
-                paramss: vec![vec![key, Type::ByName(TyBox::new(tv1.clone()))]],
+                paramss: vec![vec![key, Type::ByName(TyBox::new(tv1.clone()))]].into(),
                 ret: TyBox::new(tv1),
             };
         }

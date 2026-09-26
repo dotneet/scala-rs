@@ -1113,7 +1113,7 @@ impl Typer {
         }
 
         let dummy_method = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::NoType),
         };
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)

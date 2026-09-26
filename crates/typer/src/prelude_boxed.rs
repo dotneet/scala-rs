@@ -149,7 +149,7 @@ fn add_conversion(
     st.get_mut(id).params = vec![p];
     st.get_mut(id).paramss = vec![vec![p]];
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![vec![from]],
+        paramss: vec![vec![from]].into(),
         ret: TyBox::new(to),
     };
     st.get_mut(id).intrinsic = intrinsic;

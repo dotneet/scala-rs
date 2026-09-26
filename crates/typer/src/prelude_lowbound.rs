@@ -28,7 +28,7 @@ pub(crate) fn install(st: &mut SymbolTable) {
     for m in members_named(st, list, "::") {
         let b = add_lower_bounded_tparam(st, m, "B", Type::TypeParam(elem));
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(b)]],
+            paramss: vec![vec![Type::TypeParam(b)]].into(),
             ret: TyBox::new(list_of(b)),
         };
     }
@@ -152,7 +152,7 @@ fn install_membership(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
         }
         let b = add_lower_bounded_tparam(st, m, "A1", ta.clone());
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(b)]],
+            paramss: vec![vec![Type::TypeParam(b)]].into(),
             ret: TyBox::new(Type::Boolean),
         };
     }
@@ -163,7 +163,7 @@ fn install_membership(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
         }
         let b = add_lower_bounded_tparam(st, m, "B", ta.clone());
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(b)]],
+            paramss: vec![vec![Type::TypeParam(b)]].into(),
             ret: TyBox::new(Type::Int),
         };
         widened_index_of = true;
@@ -180,7 +180,7 @@ fn install_membership(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
         let m = st.alloc("indexOf", list, SymKind::Method, Flags::FINAL, "");
         let b = add_lower_bounded_tparam(st, m, "B", ta.clone());
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(b), Type::Int]],
+            paramss: vec![vec![Type::TypeParam(b), Type::Int]].into(),
             ret: TyBox::new(Type::Int),
         };
     }
@@ -249,7 +249,8 @@ fn install_reductions(st: &mut SymbolTable, list: SymbolId, elem: SymbolId) {
                 paramss: vec![vec![Type::Function {
                     params: vec![left, right].into(),
                     ret: TyBox::new(tb.clone()),
-                }]],
+                }]]
+                .into(),
                 ret: TyBox::new(tb),
             };
         }
@@ -314,7 +315,8 @@ fn install_map_add(st: &mut SymbolTable) {
             paramss: vec![vec![Type::Class {
                 sym: tuple2,
                 args: vec![tk.clone(), tv1.clone()].into(),
-            }]],
+            }]]
+            .into(),
             ret: TyBox::new(map_of(&tv1)),
         };
     }
@@ -329,7 +331,7 @@ fn install_map_add(st: &mut SymbolTable) {
         let v1 = add_lower_bounded_tparam(st, m, "V1", tv.clone());
         let tv1 = Type::TypeParam(v1);
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![key, tv1.clone()]],
+            paramss: vec![vec![key, tv1.clone()]].into(),
             ret: TyBox::new(map_of(&tv1)),
         };
     }
@@ -383,7 +385,7 @@ fn set_single_implicit_param(st: &mut SymbolTable, method: SymbolId, ev: Type, r
     st.get_mut(method).params = vec![p];
     st.get_mut(method).paramss = vec![vec![p]];
     st.get_mut(method).ty = Type::Method {
-        paramss: vec![vec![ev]],
+        paramss: vec![vec![ev]].into(),
         ret: TyBox::new(ret),
     };
 }

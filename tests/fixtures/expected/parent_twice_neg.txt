@@ -1,0 +1,58 @@
+parent_twice_neg.scala:5: error: trait T0 is inherited twice
+class C extends T0 with T1 with T0
+                ^
+parent_twice_neg.scala:5: error: trait T0 is inherited twice
+class C extends T0 with T1 with T0
+                                ^
+parent_twice_neg.scala:6: error: trait T1 is inherited twice
+class D extends T1 with T0 with T1 with T1
+                ^
+parent_twice_neg.scala:6: error: trait T1 is inherited twice
+class D extends T1 with T0 with T1 with T1
+                                ^
+parent_twice_neg.scala:6: error: trait T1 is inherited twice
+class D extends T1 with T0 with T1 with T1
+                                        ^
+parent_twice_neg.scala:7: error: trait T0 is inherited twice
+trait E extends T0 with T0
+                ^
+parent_twice_neg.scala:7: error: trait T0 is inherited twice
+trait E extends T0 with T0
+                        ^
+parent_twice_neg.scala:8: error: trait T1 is inherited twice
+object O extends T1 with T1
+                 ^
+parent_twice_neg.scala:8: error: trait T1 is inherited twice
+object O extends T1 with T1
+                         ^
+parent_twice_neg.scala:9: error: trait T0 is inherited twice
+class F { val x = new T0 with T0 }
+                      ^
+parent_twice_neg.scala:9: error: trait T0 is inherited twice
+class F { val x = new T0 with T0 }
+                              ^
+parent_twice_neg.scala:10: error: class Object is inherited twice
+class G extends AnyRef with T0 with AnyRef
+                ^
+parent_twice_neg.scala:10: error: class Object is inherited twice
+class G extends AnyRef with T0 with AnyRef
+                                    ^
+parent_twice_neg.scala:11: error: trait Runnable is inherited twice
+abstract class R extends Runnable with Runnable
+                         ^
+parent_twice_neg.scala:11: error: trait Runnable is inherited twice
+abstract class R extends Runnable with Runnable
+                                       ^
+parent_twice_neg.scala:12: error: trait Seq is inherited twice
+class H extends Seq[Int] with Seq[String]
+                ^
+parent_twice_neg.scala:12: error: trait Seq is inherited twice
+class H extends Seq[Int] with Seq[String]
+                              ^
+parent_twice_neg.scala:14: error: trait T0 is inherited twice
+class L extends T0 with Al.A0
+                ^
+parent_twice_neg.scala:14: error: trait T0 is inherited twice
+class L extends T0 with Al.A0
+                           ^
+19 errors

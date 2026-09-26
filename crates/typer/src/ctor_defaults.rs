@@ -164,9 +164,9 @@ impl Typer {
                 // getters`, which says the same for `copy$default$n`.
                 self.st.get_mut(gid).ty = Type::Method {
                     paramss: if preceding_tys.is_empty() {
-                        Vec::new()
+                        Vec::new().into()
                     } else {
-                        vec![preceding_tys.clone()]
+                        vec![preceding_tys.clone()].into()
                     },
                     ret: TyBox::new(ret.clone()),
                 };

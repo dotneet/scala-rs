@@ -93,6 +93,10 @@ pub struct EmitOpts {
     /// emits no `Signature` attribute at all, which is what a caller that
     /// never ran [`crate::sig::record_generic_signatures`] must get.
     pub generic_sigs: Option<Rc<crate::sig::GenericSignatures>>,
+    /// nsc's names for the unit's partial-function classes
+    /// ([`scala_rs_typer::anonfun_class_names`], taken before lowering).
+    /// `None` names them after scala-rs's own lambda counter.
+    pub anonfun_names: Option<Rc<scala_rs_typer::AnonfunClassNames>>,
 }
 
 impl EmitOpts {
@@ -487,6 +491,12 @@ pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpt
         companion_fwd: HashMap::new(),
         parked_companions: Vec::new(),
         sam_host: Cell::new(SymbolId::NONE),
+        anonfun_name_set: opts
+            .anonfun_names
+            .as_deref()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default(),
+        anonfun_names: opts.anonfun_names.unwrap_or_default(),
     };
     g.walk(tree);
     g.flush_parked_companions();
@@ -562,6 +572,10 @@ pub(crate) struct Gen<'a> {
     /// own; while this is set, the trait stands for it, and
     /// [`Gen::lin_above`] answers as for a class extending the trait.
     pub(crate) sam_host: Cell<SymbolId>,
+    /// See [`EmitOpts::anonfun_names`].
+    pub(crate) anonfun_names: Rc<scala_rs_typer::AnonfunClassNames>,
+    /// The same names, as a set.
+    pub(crate) anonfun_name_set: HashSet<String>,
 }
 
 /// JVM internal name → class-like symbol, for every `Class`/`ModuleClass` in
@@ -752,6 +766,12 @@ pub(crate) trait SamMixins {
     /// The `<Iface>.$init$(this)` calls the class's constructor makes, as
     /// `(interface, descriptor)`, base traits first.
     fn sam_mixin_inits(&self, sam: SymbolId) -> Vec<(String, String)>;
+    /// nsc's name, relative to the class it is emitted in, for the class of
+    /// the partial-function literal at `span`.
+    fn anonfun_class_name(&self, span: Span) -> Option<&str>;
+    /// Whether `rel` is one of those names, which a literal class named any
+    /// other way must stay clear of.
+    fn is_anonfun_class_name(&self, rel: &str) -> bool;
 }
 
 pub(crate) fn report_emit_error(

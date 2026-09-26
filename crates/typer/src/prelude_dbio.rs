@@ -68,7 +68,7 @@ fn widen_get_or_else(st: &mut SymbolTable, class_name: &str, tparam_index: usize
         let b1 = add_lower_bounded_tparam(st, m, "B1", elem.clone());
         let tb1 = Type::TypeParam(b1);
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![Type::ByName(TyBox::new(tb1.clone()))]],
+            paramss: vec![vec![Type::ByName(TyBox::new(tb1.clone()))]].into(),
             ret: TyBox::new(tb1),
         };
     }

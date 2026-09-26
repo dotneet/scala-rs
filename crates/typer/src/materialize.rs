@@ -345,7 +345,8 @@ pub(crate) fn ensure_tag_module(
                 sym: creator,
                 args: vec![].into(),
             },
-        ]],
+        ]]
+        .into(),
         ret: TyBox::new(Type::Class {
             sym: tag_cls,
             args: vec![Type::TypeParam(t)].into(),
@@ -385,7 +386,7 @@ pub(crate) fn ensure_tag_module(
             format!("()L{module_jvm};"),
         );
         st.get_mut(acc).ty = Type::Method {
-            paramss: Vec::new(),
+            paramss: Vec::new().into(),
             ret: TyBox::new(Type::ModuleRef(mcls)),
         };
     }
@@ -497,7 +498,7 @@ pub(crate) fn ensure_core_tags(st: &mut SymbolTable, tag: Tag, mcls: SymbolId, t
             format!("()L{tag_jvm};"),
         );
         st.get_mut(acc).ty = Type::Method {
-            paramss: Vec::new(),
+            paramss: Vec::new().into(),
             ret: TyBox::new(Type::Class {
                 sym: tag_cls,
                 args: vec![core_tag_type(name)].into(),

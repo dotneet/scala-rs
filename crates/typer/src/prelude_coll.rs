@@ -347,7 +347,8 @@ fn add_indexed_buffer_extra(
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(tb.clone(), ta.clone(), tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
 
@@ -366,7 +367,7 @@ fn add_indexed_buffer_extra(
         st.get_mut(m).params = vec![f, ev];
         st.get_mut(m).paramss = vec![vec![f], vec![ev]];
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![fn1(ta.clone(), tb)], vec![ord_ty]],
+            paramss: vec![vec![fn1(ta.clone(), tb)], vec![ord_ty]].into(),
             ret: TyBox::new(buf_t.clone()),
         };
 
@@ -380,7 +381,7 @@ fn add_indexed_buffer_extra(
         st.get_mut(m).params = vec![ev];
         st.get_mut(m).paramss = vec![vec![ev]];
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![ord_ty]],
+            paramss: vec![vec![ord_ty]].into(),
             ret: TyBox::new(buf_t),
         };
     }
@@ -620,7 +621,7 @@ fn add_mutable_map(
         args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
     };
     st.get_mut(map_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(map_pair))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(map_pair))]].into(),
         ret: TyBox::new(Type::Class {
             sym: map,
             args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
@@ -780,7 +781,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
     let saa = type_param(st, set_apply, "A");
     st.get_mut(set_apply).tparams = vec![saa];
     st.get_mut(set_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: set,
             args: vec![Type::TypeParam(saa)].into(),
@@ -968,7 +969,8 @@ fn add_immutable_map_extra(
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(tb.clone(), pair.clone(), tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
     method(
@@ -1021,7 +1023,7 @@ fn add_immutable_map_extra(
         st.get_mut(mm).params = vec![f];
         st.get_mut(mm).paramss = vec![vec![f]];
         st.get_mut(mm).ty = Type::Method {
-            paramss: vec![vec![fn1(Type::TypeParam(vv), tw.clone())]],
+            paramss: vec![vec![fn1(Type::TypeParam(vv), tw.clone())]].into(),
             ret: TyBox::new(Type::Class {
                 sym: map_view,
                 args: vec![Type::TypeParam(vk), tw].into(),
@@ -1328,7 +1330,8 @@ fn add_vector_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_sym: Sym
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(tb.clone(), Type::TypeParam(va), tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
 }

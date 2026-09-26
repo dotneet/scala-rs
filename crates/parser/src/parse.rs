@@ -12,6 +12,9 @@ mod kindproj;
 pub struct ParseResult {
     pub tree: Tree,
     pub diags: Vec<Diagnostic>,
+    /// One past the largest [`NodeId`] the tree holds: the parser numbers a
+    /// file's nodes from 1.
+    pub next_node_id: u32,
 }
 
 /// Source-level switches that change what the parser accepts.
@@ -63,7 +66,11 @@ pub fn parse_snippet(source: &SourceFile, file_index: usize) -> ParseResult {
         block_from_stats(&mut p, span, stats)
     };
     diags.extend(p.diags);
-    ParseResult { tree, diags }
+    ParseResult {
+        tree,
+        diags,
+        next_node_id: p.next_id,
+    }
 }
 
 pub fn parse_source_opts(
@@ -78,6 +85,7 @@ pub fn parse_source_opts(
     ParseResult {
         tree,
         diags: p.diags,
+        next_node_id: p.next_id,
     }
 }
 

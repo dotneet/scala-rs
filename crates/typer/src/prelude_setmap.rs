@@ -133,7 +133,7 @@ fn add_set_widening_concat(st: &mut SymbolTable) {
     st.get_mut(m).params = vec![p];
     st.get_mut(m).paramss = vec![vec![p]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![param_ty]],
+        paramss: vec![vec![param_ty]].into(),
         ret: TyBox::new(Type::Class {
             sym: set,
             args: vec![tb].into(),
@@ -216,7 +216,7 @@ fn add_wrap(st: &mut SymbolTable, owner: SymbolId, name: &str, cls: SymbolId) {
     st.get_mut(m).params = vec![param];
     st.get_mut(m).paramss = vec![vec![param]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![Type::Array(TyBox::new(tt.clone()))]],
+        paramss: vec![vec![Type::Array(TyBox::new(tt.clone()))]].into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: vec![tt].into(),

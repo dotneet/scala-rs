@@ -93,7 +93,7 @@ impl Typer {
         let Type::Method { paramss, .. } = &s.ty else {
             return none;
         };
-        let shape: Vec<Vec<Type>> = paramss.clone();
+        let shape: Vec<Vec<Type>> = paramss.clone().into_vec();
         let arity: usize = shape.iter().map(|c| c.len()).sum();
         let name = s.name.clone();
         let owner = s.owner;

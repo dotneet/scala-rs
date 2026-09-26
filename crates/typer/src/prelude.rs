@@ -369,7 +369,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     let some_a = type_param(st, some_apply, "A");
     st.get_mut(some_apply).tparams = vec![some_a];
     st.get_mut(some_apply).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(some_a)]],
+        paramss: vec![vec![Type::TypeParam(some_a)]].into(),
         ret: TyBox::new(Type::Class {
             sym: st.some_sym,
             args: vec![Type::TypeParam(some_a)].into(),
@@ -557,7 +557,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         let bt = type_param(st, pair, "B");
         st.get_mut(pair).tparams = vec![bt];
         st.get_mut(pair).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(bt)]],
+            paramss: vec![vec![Type::TypeParam(bt)]].into(),
             ret: TyBox::new(Type::Class {
                 sym: tuple2,
                 args: vec![Type::TypeParam(at), Type::TypeParam(bt)].into(),
@@ -581,7 +581,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
         let bt = type_param(st, pair, "B");
         st.get_mut(pair).tparams = vec![bt];
         st.get_mut(pair).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(bt)]],
+            paramss: vec![vec![Type::TypeParam(bt)]].into(),
             ret: TyBox::new(Type::Class {
                 sym: tuple2,
                 args: vec![Type::TypeParam(at), Type::TypeParam(bt)].into(),
@@ -797,7 +797,7 @@ fn add_java_sam(st: &mut SymbolTable, java: SymbolId, java_lang: SymbolId) {
     mark_java(st, runnable);
     let run = st.alloc("run", runnable, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(run).ty = Type::Method {
-        paramss: Vec::new(),
+        paramss: Vec::new().into(),
         ret: TyBox::new(Type::Unit),
     };
 
@@ -808,7 +808,7 @@ fn add_java_sam(st: &mut SymbolTable, java: SymbolId, java_lang: SymbolId) {
     st.get_mut(comparator).tparams = vec![ct];
     let cmp = st.alloc("compare", comparator, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(cmp).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(ct), Type::TypeParam(ct)]],
+        paramss: vec![vec![Type::TypeParam(ct), Type::TypeParam(ct)]].into(),
         ret: TyBox::new(Type::Int),
     };
 
@@ -826,7 +826,7 @@ fn add_java_sam(st: &mut SymbolTable, java: SymbolId, java_lang: SymbolId) {
     st.get_mut(jfun).tparams = vec![ft, fr];
     let apply = st.alloc("apply", jfun, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(apply).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(ft)]],
+        paramss: vec![vec![Type::TypeParam(ft)]].into(),
         ret: TyBox::new(Type::TypeParam(fr)),
     };
 }
@@ -1008,7 +1008,7 @@ pub(crate) fn method(
         vec![params]
     };
     st.get_mut(id).ty = Type::Method {
-        paramss,
+        paramss: paramss.into(),
         ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = intrinsic;

@@ -10,10 +10,11 @@ use scala_rs_span::{
     finish_diagnostics, render_all, Diagnostic, Level, SourceFile, Span, WarnSettings,
 };
 use scala_rs_typer::{
-    add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
-    expand_private_names, expand_trait_private_vals, find_mains, hoist_default_receivers,
-    lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes,
-    restore_named_arg_order, restore_rassoc_order, typecheck_units_src, uncurry, TypecheckOptions,
+    add_value_class_companions, check_local_case_class_captures, check_local_objects,
+    defines_local_classes, erase, expand_private_names, expand_trait_private_vals, find_mains,
+    hoist_default_receivers, lambda_lift, lazy_locals, mark_anon_captures,
+    note_source_value_classes, restore_named_arg_order, restore_rassoc_order, typecheck_units_src,
+    uncurry, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -172,7 +173,12 @@ impl CompileResult {
 struct Unit {
     file_index: usize,
     tree: Tree,
+    /// [`scala_rs_parser::ParseResult::next_node_id`].
+    next_node_id: u32,
     pickles: std::rc::Rc<std::collections::HashMap<u32, Vec<u8>>>,
+    /// nsc's names for the unit's partial-function classes, read off the
+    /// typed tree before lowering reshapes what they are named after.
+    anonfun_names: std::rc::Rc<scala_rs_typer::AnonfunClassNames>,
 }
 
 fn has_errors(diags: &[Diagnostic]) -> bool {
@@ -264,7 +270,9 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                 units.push(Unit {
                     file_index,
                     tree: parsed.tree,
+                    next_node_id: parsed.next_node_id,
                     pickles: std::rc::Rc::new(std::collections::HashMap::new()),
+                    anonfun_names: Default::default(),
                 });
                 sources.push(sf);
             }
@@ -319,6 +327,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
         phase!("classpath");
         // One symbol table for the whole run: every unit is named before any
         // is typed, so files can reference each other.
+        let node_id_bound = units.iter().map(|u| u.next_node_id).max();
         let mut refs: Vec<(&mut Tree, usize)> = units
             .iter_mut()
             .map(|u| {
@@ -330,6 +339,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
         let (mut st, tdiags) = typecheck_units_src(
             &mut refs,
             &TypecheckOptions {
+                node_id_bound,
                 // `-Werror` is applied by the reporting layer after the run
                 // (`finish_diagnostics`), as nsc does: the typer's own
                 // promotion of each warning to an error is for API callers.
@@ -365,13 +375,16 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
         // A local `object` reading the enclosing instance or a captured local
         // is not compiled yet; say so rather than emitting a singleton that
         // crashes at run time.
-        if !has_errors(&diags) {
+        let local_classes = defines_local_classes(&st);
+        if !has_errors(&diags) && local_classes {
             for u in units.iter() {
                 diags.extend(check_local_objects(u.file_index, &u.tree, &st));
             }
         }
         if !has_errors(&diags) {
             for u in units.iter_mut() {
+                u.anonfun_names =
+                    std::rc::Rc::new(scala_rs_typer::anonfun_class_names(&u.tree, &st));
                 // nsc's `NamesDefaults`: a call that omitted defaults binds its
                 // qualifier to a local first, so the receiver is evaluated
                 // once rather than once per `name$default$n` getter.
@@ -403,8 +416,10 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             // written body; `Symbol::captures` is only filled in by
             // `mark_anon_captures` just above, so this check has to run
             // here rather than alongside `check_local_objects`.
-            for u in units.iter() {
-                diags.extend(check_local_case_class_captures(u.file_index, &u.tree, &st));
+            if local_classes {
+                for u in units.iter() {
+                    diags.extend(check_local_case_class_captures(u.file_index, &u.tree, &st));
+                }
             }
             // nsc's `extmethods` runs before `pickler`, so a value class's
             // `$extension` methods are part of the signature every later
@@ -517,15 +532,16 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
     });
     phase!("backend setup");
 
-    // Keep every emitted class in memory until every unit has passed the
-    // backend gate. A backend fallback is a compile error, so publishing the
-    // runtime or an earlier unit before a later unit fails would leave a
-    // partial class tree on disk.
-    let mut emitted_classes = if library_abi {
-        Vec::new()
-    } else {
-        emit_runtime()
-    };
+    // Each unit's classes go to the writer as soon as they exist, so the file
+    // system works while later units are generated. A backend fallback is a
+    // compile error, though, and publishing the runtime or an earlier unit
+    // before a later unit fails would leave a partial class tree on disk: the
+    // writer takes back what it wrote when any unit fails the backend gate.
+    let mut writer = ClassWriter::start(&opts.out_dir);
+    if !library_abi {
+        writer.push(emit_runtime());
+    }
+    let mut emit_failed = false;
     for u in &units {
         let src_name = source_file_name(&sources[u.file_index]);
         let result = emit_opts(
@@ -541,6 +557,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                 class_by_name: Some(std::rc::Rc::clone(&class_by_name)),
                 binary_parents: binary_parents.clone(),
                 generic_sigs: generic_sigs.clone(),
+                anonfun_names: Some(std::rc::Rc::clone(&u.anonfun_names)),
             },
         );
         let mut classes = match result {
@@ -549,6 +566,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                 for e in errors {
                     diags.push(Diagnostic::error(u.file_index, e.span, e.message));
                 }
+                emit_failed = true;
                 continue;
             }
         };
@@ -571,12 +589,16 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                     .note(m.clone()),
                 );
             }
+            emit_failed = true;
             false
         });
-        emitted_classes.extend(classes);
+        if !emit_failed {
+            writer.push(classes);
+        }
     }
     phase!("emit");
-    if has_errors(&diags) {
+    if emit_failed {
+        writer.discard();
         return CompileResult {
             diags,
             sources,
@@ -584,11 +606,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             mains,
         };
     }
-    let (emitted, write_result) = {
-        let mut writer = ClassWriter::start(&opts.out_dir);
-        writer.push(emitted_classes);
-        writer.finish()
-    };
+    let (emitted, write_result) = writer.finish();
     phase!("write");
     let _ = phase_start;
     if let Err(e) = write_result {
@@ -674,7 +692,13 @@ struct WritePool {
 ///
 /// Writing every class after the last unit made the file system latency
 /// (almost all of it in `open`) wall time nobody was doing anything else
-/// during. Overlapping it with code generation hides it instead.
+/// during. Overlapping it with code generation hides it instead: 0.55 s of
+/// lambdas_big's 12202 classes.
+///
+/// A compile that fails in a later unit leaves no class file of the run
+/// behind: [`ClassWriter::discard`] deletes the ones already written. Staging
+/// them in a directory of their own and renaming them into place cost as much
+/// as the writes when a run's classes share one directory.
 struct ClassWriter {
     out_dir: PathBuf,
     /// Chunks held back until the run is known to be worth a thread pool.
@@ -772,6 +796,31 @@ impl ClassWriter {
         }
     }
 
+    /// Delete every class file written so far, and the directories that
+    /// leaves empty.
+    fn discard(self) {
+        // Chunks still pending never started the pool and were not written.
+        let Some(pool) = self.pool else { return };
+        let out_dir = self.out_dir;
+        let (written, _) = pool.join();
+        let mut dirs = std::collections::BTreeSet::new();
+        for class in &written {
+            let path = class_path(&out_dir, &class.internal_name);
+            if std::fs::remove_file(&path).is_ok() {
+                let mut dir = path.parent();
+                while let Some(d) = dir.filter(|d| *d != out_dir) {
+                    dirs.insert(d.to_path_buf());
+                    dir = d.parent();
+                }
+            }
+        }
+        // Deepest first; one that still holds files of an earlier build
+        // stays.
+        for d in dirs.iter().rev() {
+            let _ = std::fs::remove_dir(d);
+        }
+    }
+
     /// Wait for every class to be on disk and return them all in push order.
     fn finish(self) -> (Vec<EmittedClass>, std::io::Result<()>) {
         let ClassWriter {
@@ -795,19 +844,26 @@ impl ClassWriter {
             }
             return (out, result);
         };
+        pool.join()
+    }
+}
+
+impl WritePool {
+    /// Wait for every chunk to be written and return them in push order.
+    fn join(self) -> (Vec<EmittedClass>, std::io::Result<()>) {
         // Closing the queue is what tells the writers to stop.
-        drop(pool.jobs);
-        for t in pool.threads {
+        drop(self.jobs);
+        for t in self.threads {
             let _ = t.join();
         }
         // Every sender is gone now, so this drains and ends.
-        let mut chunks: Vec<Chunk> = pool.done.into_iter().collect();
+        let mut chunks: Vec<Chunk> = self.done.into_iter().collect();
         chunks.sort_by_key(|(seq, _)| *seq);
         let mut out = Vec::with_capacity(chunks.iter().map(|(_, c)| c.len()).sum());
         for (_, classes) in chunks {
             out.extend(classes);
         }
-        let failed = pool.failed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let failed = self.failed.lock().unwrap_or_else(|e| e.into_inner()).take();
         match failed {
             Some(e) => (out, Err(e)),
             None => (out, Ok(())),

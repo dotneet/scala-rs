@@ -279,5 +279,14 @@ conform!(
     // Run-time shapes from slick (agent/ifacebridge): `this` in a template's
     // own constructor invocation, a `def this()` in front of defaulted
     // parameters, and overloaded concrete trait methods.
-    ifacebridge_ctor
+    ifacebridge_ctor,
+    // `toSet[B >: A]` / `toArray[B >: A]` widened to the expected element
+    // type (gitbucket's `Event.values.flatMap { ... }.toSet`).
+    lower_bound_widening,
+    // A generic call discarded to `Unit`: the expected `Unit` does not
+    // decide its type parameters (gitbucket's `setAttribute(key, authType)`).
+    unit_discard_generic,
+    // cats' newtypes: a factory's abstract-type result keeps the owning
+    // object's path, and with it the implicit ops conversion.
+    newtype_alias_prefix
 );

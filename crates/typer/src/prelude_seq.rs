@@ -59,7 +59,7 @@ fn simple(
         vec![params]
     };
     st.get_mut(id).ty = Type::Method {
-        paramss,
+        paramss: paramss.into(),
         ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = Intrinsic::None;
@@ -125,7 +125,7 @@ fn poly_in(
     st.get_mut(m).params = all;
     st.get_mut(m).paramss = pss;
     st.get_mut(m).ty = Type::Method {
-        paramss,
+        paramss: paramss.into(),
         ret: TyBox::new(ret),
     };
     st.get_mut(m).intrinsic = Intrinsic::None;
@@ -969,21 +969,41 @@ fn add_conversions(st: &mut SymbolTable, env: &Env) {
     let l = env.list;
     let ta = env.ta();
     let ct = env.classtag;
-    {
-        let ta2 = ta.clone();
-        poly_implicit(st, l, "toArray", &[], 0, move |_| {
-            (
-                vec![vec![Type::Class {
-                    sym: ct,
-                    args: vec![ta2.clone()].into(),
-                }]],
-                Type::Array(TyBox::new(ta2)),
-            )
-        });
-    }
-    simple(st, l, "toSet", vec![], env.one(env.set, ta.clone()));
+    // `toArray[B >: A: ClassTag]: Array[B]` and `toSet[B >: A]: Set[B]`, as
+    // declared in `IterableOnceOps`. Both collections are invariant, so the
+    // lower-bounded parameter is what lets the expected type widen the
+    // element: `List(A, B).toSet` is a `Set[Event]` where one is expected,
+    // not the `Set[Event with Product with Serializable]` of the elements.
+    let m = poly_implicit(st, l, "toArray", &["B"], 0, move |t| {
+        (
+            vec![vec![Type::Class {
+                sym: ct,
+                args: vec![t[0].clone()].into(),
+            }]],
+            Type::Array(TyBox::new(t[0].clone())),
+        )
+    });
+    lower_bound_first_tparam(st, m, ta.clone());
+    let set = env.set;
+    let m = poly(st, l, "toSet", &["B"], move |t| {
+        (
+            Vec::new(),
+            Type::Class {
+                sym: set,
+                args: vec![t[0].clone()].into(),
+            },
+        )
+    });
+    lower_bound_first_tparam(st, m, ta.clone());
     simple(st, l, "toVector", vec![], env.one(env.vector, ta.clone()));
     simple(st, l, "toSeq", vec![], env.one(env.seq, ta.clone()));
+}
+
+/// Give `m`'s first type parameter the lower bound `lo` (`[B >: A]`).
+fn lower_bound_first_tparam(st: &mut SymbolTable, m: SymbolId, lo: Type) {
+    if let Some(&b) = st.get(m).tparams.first() {
+        st.get_mut(b).bound_lo = Some(lo);
+    }
 }
 
 /// `groupBy` / `grouped` / `sliding`.

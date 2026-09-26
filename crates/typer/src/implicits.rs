@@ -172,6 +172,15 @@ pub(crate) struct ImplicitMemo {
 /// entered into its owner without handing the owner out for mutation). Under
 /// an ambient expansion guard the walk can see a truncated alias and is not
 /// kept.
+/// See [`Typer::outer_implicits`].
+#[derive(PartialEq)]
+pub(crate) struct OuterImplicitsKey {
+    stamps: Vec<u64>,
+    this_class: SymbolId,
+    parent_ctor_scope: bool,
+    gen: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct InScopeCache {
     epoch: (u64, usize),
@@ -664,7 +673,106 @@ impl Typer {
     }
 
     fn implicits_in_scope_uncached(&self) -> Vec<SymbolId> {
+        // The scopes of the innermost template and everything outside it do
+        // not change while a body inside it is typed, but every parameter,
+        // local and lambda does move the stack's version: walking every name
+        // of every enclosing scope again for each search was a quarter of
+        // the implicit work in a file of future combinators. Their part of
+        // the answer is kept ([`Typer::outer_implicits`]); only the scopes
+        // inside the template are walked here, and what they bind hides the
+        // kept candidates exactly as the full walk would.
+        let scopes = &self.st.scopes;
+        let split = scopes
+            .iter()
+            .rposition(|sc| sc.template_owner.is_some())
+            .map_or(0, |i| i + 1);
+        let outer = self.outer_implicits(split);
         let mut out = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut inner_names: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+        for sc in scopes[split..].iter().rev() {
+            self.scope_implicits(sc, &mut inner_names, &mut seen, &mut |id, _| out.push(id));
+        }
+        for (id, name) in outer.iter() {
+            if !inner_names.contains(name.as_str()) && seen.insert(id.0) {
+                out.push(*id);
+            }
+        }
+        self.shadow_inherited_implicits(out)
+    }
+
+    /// The implicits one scope offers, innermost-first rules: a name a
+    /// nearer scope bound as a term hides every binding of it here.
+    fn scope_implicits<'s>(
+        &self,
+        sc: &'s crate::symbol::Scope,
+        shadowed_names: &mut rustc_hash::FxHashSet<&'s str>,
+        seen: &mut rustc_hash::FxHashSet<u32>,
+        found: &mut dyn FnMut(SymbolId, &'s str),
+    ) {
+        for (name, ids) in sc.entries() {
+            // Types and terms are separate namespaces (SLS 2): a *type*
+            // named `F` hides no term `F`. cats' `new Parallel[IorT[F0, E,
+            // *]] { type F[x] = IorT[F0, E, x]; … }` sits inside a method
+            // whose `implicit F: Monad[F0]` is the `Applicative[F0]` the
+            // body's `IorT.pure(a)` needs, and the anonymous class's type
+            // member took it out of the search.
+            let binds_term = ids.iter().any(|b| {
+                !matches!(
+                    self.st.get(b.sym).kind,
+                    crate::symbol::SymKind::Class
+                        | crate::symbol::SymKind::TypeParam
+                        | crate::symbol::SymKind::TypeMember
+                )
+            });
+            let hidden = if binds_term {
+                !shadowed_names.insert(name.as_str())
+            } else {
+                shadowed_names.contains(name.as_str())
+            };
+            if hidden {
+                continue;
+            }
+            // Every binding of the name, whatever its SLS 2 precedence:
+            // an implicit is found by searching the scope, not by being
+            // written down, so a shadowed *name* still offers its
+            // implicit. nsc's `ImplicitComputation` shadows by name only
+            // across levels, which the `shadowed_names` set is.
+            for b in ids {
+                if self.st.get(b.sym).flags.contains(Flags::IMPLICIT) && seen.insert(b.sym.0) {
+                    found(b.sym, name.as_str());
+                }
+            }
+        }
+    }
+
+    /// The implicits of the scopes below `split` -- the innermost template's
+    /// and everything outside it -- then this class's own and inherited
+    /// implicit members and the package object's, each with the name an
+    /// inner scope has to bind to hide it, in the order the full walk meets
+    /// them. Kept while the scopes' stamps, `this`, the super-constructor
+    /// flag and the class graph with its member lists stand still.
+    fn outer_implicits(&self, split: usize) -> std::rc::Rc<Vec<(SymbolId, String)>> {
+        let key = OuterImplicitsKey {
+            stamps: self.st.scopes[..split].iter().map(|sc| sc.stamp()).collect(),
+            this_class: self.st.this_class,
+            parent_ctor_scope: self.parent_ctor_scope,
+            gen: self.st.member_graph_gen(),
+        };
+        // Under an ambient expansion guard a parent can read as a truncated
+        // alias; such an answer is neither taken from nor kept in the cache.
+        let keep = !self.st.has_ambient_type_context();
+        if keep {
+            if let Some((_, hit)) = self
+                .outer_implicits_cache
+                .borrow()
+                .iter()
+                .find(|(k, _)| *k == key)
+            {
+                return hit.clone();
+            }
+        }
+        let mut out: Vec<(SymbolId, String)> = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
         // SLS 7.2: a candidate is an identifier "that can be accessed ...
         // without a prefix", i.e. ordinary unqualified name resolution, which
@@ -676,51 +784,15 @@ impl Typer {
         // so an outer scope's same-named symbol is never even considered --
         // matching, rather than merely deduplicating, what a bare reference
         // to that name would resolve to at each point in the walk.
-        // Borrowed keys: this runs on every implicit search and copying every
-        // name in every enclosing scope was its largest single cost.
-        // Sized up front: every name of every enclosing scope goes in, and
-        // growing the table from empty on each implicit search cost more than
-        // the inserts themselves.
         let mut shadowed_names: rustc_hash::FxHashSet<&str> =
             rustc_hash::FxHashSet::with_capacity_and_hasher(
-                self.st.scopes.iter().map(|sc| sc.len()).sum(),
+                self.st.scopes[..split].iter().map(|sc| sc.len()).sum(),
                 rustc_hash::FxBuildHasher,
             );
-        for sc in self.st.scopes.iter().rev() {
-            for (name, ids) in sc.entries() {
-                // Types and terms are separate namespaces (SLS 2): a *type*
-                // named `F` hides no term `F`. cats' `new Parallel[IorT[F0, E,
-                // *]] { type F[x] = IorT[F0, E, x]; … }` sits inside a method
-                // whose `implicit F: Monad[F0]` is the `Applicative[F0]` the
-                // body's `IorT.pure(a)` needs, and the anonymous class's type
-                // member took it out of the search.
-                let binds_term = ids.iter().any(|b| {
-                    !matches!(
-                        self.st.get(b.sym).kind,
-                        crate::symbol::SymKind::Class
-                            | crate::symbol::SymKind::TypeParam
-                            | crate::symbol::SymKind::TypeMember
-                    )
-                });
-                let hidden = if binds_term {
-                    !shadowed_names.insert(name.as_str())
-                } else {
-                    shadowed_names.contains(name.as_str())
-                };
-                if hidden {
-                    continue;
-                }
-                // Every binding of the name, whatever its SLS 2 precedence:
-                // an implicit is found by searching the scope, not by being
-                // written down, so a shadowed *name* still offers its
-                // implicit. nsc's `ImplicitComputation` shadows by name only
-                // across levels, which the `shadowed_names` set above is.
-                for b in ids {
-                    if self.st.get(b.sym).flags.contains(Flags::IMPLICIT) && seen.insert(b.sym.0) {
-                        out.push(b.sym);
-                    }
-                }
-            }
+        for sc in self.st.scopes[..split].iter().rev() {
+            self.scope_implicits(sc, &mut shadowed_names, &mut seen, &mut |id, name| {
+                out.push((id, name.to_string()))
+            });
         }
         if !self.st.this_class.is_none() && !self.parent_ctor_scope {
             // Instance implicits on this class/module, walking parents (nsc
@@ -749,7 +821,7 @@ impl Typer {
                         && !shadowed_names.contains(self.st.get(m).name.as_str())
                         && seen.insert(m.0)
                     {
-                        out.push(m);
+                        out.push((m, self.st.get(m).name.clone()));
                     }
                 }
                 for p in &self.st.get(id).parents {
@@ -769,7 +841,7 @@ impl Typer {
                             && !shadowed_names.contains(self.st.get(m).name.as_str())
                             && seen.insert(m.0)
                         {
-                            out.push(m);
+                            out.push((m, self.st.get(m).name.clone()));
                         }
                         if self.st.get(m).name == "package" {
                             let mcls = self.st.module_class_of(m);
@@ -778,7 +850,7 @@ impl Typer {
                                     && !shadowed_names.contains(self.st.get(mem).name.as_str())
                                     && seen.insert(mem.0)
                                 {
-                                    out.push(mem);
+                                    out.push((mem, self.st.get(mem).name.clone()));
                                 }
                             }
                         }
@@ -788,7 +860,15 @@ impl Typer {
                 owner = o.owner;
             }
         }
-        self.shadow_inherited_implicits(out)
+        let out = std::rc::Rc::new(out);
+        if keep && self.st.member_graph_gen() == key.gen {
+            let mut cache = self.outer_implicits_cache.borrow_mut();
+            if cache.len() >= 16 {
+                cache.remove(0);
+            }
+            cache.push((key, out.clone()));
+        }
+        out
     }
 
     /// nsc's `findMember`, applied to the implicit members `this` inherits.
@@ -6227,7 +6307,7 @@ mod memo_tests {
             .alloc("A", candidate, SymKind::TypeParam, Flags::EMPTY, "A");
         typer.st.get_mut(candidate).tparams = vec![tp];
         typer.st.get_mut(candidate).ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::Class {
                 sym: have,
                 args: vec![Type::TypeParam(tp)].into(),
@@ -6473,7 +6553,7 @@ mod memo_tests {
             .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "A");
         typer.st.get_mut(method).tparams = vec![tp];
         typer.st.get_mut(method).ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::TypeParam(tp)),
         };
         let members = typer.st.get(owner).members.clone();
@@ -6506,7 +6586,7 @@ mod memo_tests {
             .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "A");
         typer.st.get_mut(method).tparams = vec![tp];
         typer.st.get_mut(method).ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: (Box::new(Type::Class {
                 sym: result,
                 args: vec![Type::TypeParam(tp)].into(),
@@ -6548,7 +6628,7 @@ mod memo_tests {
             args: vec![Type::TypeParam(tp)].into(),
         };
         typer.st.get_mut(method).ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(ret.clone()),
         };
         typer.st.this_class = owner;
@@ -6572,7 +6652,7 @@ mod memo_tests {
         typer.st.get_mut(evidence).ty = Type::TypeParam(tp);
         typer.st.get_mut(method).paramss = vec![vec![evidence]];
         typer.st.get_mut(method).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(tp)]],
+            paramss: vec![vec![Type::TypeParam(tp)]].into(),
             ret: TyBox::new(ret),
         };
         typer.warm_implicit_candidates(std::slice::from_ref(&wanted));
@@ -6604,7 +6684,7 @@ mod memo_tests {
             .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "A");
         typer.st.get_mut(method).tparams = vec![tp];
         typer.st.get_mut(method).ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::Class {
                 sym: result,
                 args: vec![Type::TypeParam(tp)].into(),
@@ -6629,7 +6709,7 @@ mod memo_tests {
         typer.st.get_mut(evidence).ty = Type::Int;
         typer.st.get_mut(method).paramss = vec![vec![evidence]];
         if let Type::Method { paramss, .. } = &mut typer.st.get_mut(method).ty {
-            *paramss = vec![vec![Type::Int]];
+            *paramss = vec![vec![Type::Int]].into();
         }
         assert!(typer.implicits_in_scope().contains(&method));
         unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
@@ -6697,7 +6777,7 @@ mod memo_tests {
             .alloc("A", witness, SymKind::TypeParam, Flags::EMPTY, "A");
         typer.st.get_mut(witness).tparams = vec![tp];
         typer.st.get_mut(witness).ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::Class {
                 sym: evidence,
                 args: vec![Type::TypeParam(tp)].into(),
@@ -6711,7 +6791,7 @@ mod memo_tests {
             "conversion",
         );
         let method_ty = |result| Type::Method {
-            paramss: vec![vec![input_ty.clone()], vec![evidence_ty.clone()]],
+            paramss: vec![vec![input_ty.clone()], vec![evidence_ty.clone()]].into(),
             ret: TyBox::new(result),
         };
         typer.st.get_mut(conversion).ty = method_ty(class_ty(unrelated));

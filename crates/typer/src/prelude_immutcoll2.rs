@@ -292,7 +292,7 @@ pub(crate) fn add_list_members(
         let la = type_param(st, list_apply, "A");
         st.get_mut(list_apply).tparams = vec![la];
         st.get_mut(list_apply).ty = Type::Method {
-            paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(la)))]],
+            paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(la)))]].into(),
             ret: TyBox::new(Type::Class {
                 sym: l,
                 args: vec![Type::TypeParam(la)].into(),
@@ -494,7 +494,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
     };
     st.get_mut(map_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(map_pair))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(map_pair))]].into(),
         ret: TyBox::new(Type::Class {
             sym: map,
             args: vec![Type::TypeParam(mak), Type::TypeParam(mav)].into(),
@@ -579,7 +579,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
     let vaa = type_param(st, vec_apply, "A");
     st.get_mut(vec_apply).tparams = vec![vaa];
     st.get_mut(vec_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(vaa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(vaa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: vec,
             args: vec![Type::TypeParam(vaa)].into(),
@@ -657,7 +657,7 @@ pub(crate) fn add_set(st: &mut SymbolTable) {
     let saa = type_param(st, set_apply, "A");
     st.get_mut(set_apply).tparams = vec![saa];
     st.get_mut(set_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: set,
             args: vec![Type::TypeParam(saa)].into(),
@@ -716,7 +716,7 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
     let saa = type_param(st, seq_apply, "A");
     st.get_mut(seq_apply).tparams = vec![saa];
     st.get_mut(seq_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(saa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: seq,
             args: vec![Type::TypeParam(saa)].into(),
@@ -777,7 +777,7 @@ pub(crate) fn add_seq_and_lazylist(st: &mut SymbolTable) {
     let lla = type_param(st, ll_apply, "A");
     st.get_mut(ll_apply).tparams = vec![lla];
     st.get_mut(ll_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(lla)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(lla)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: ll,
             args: vec![Type::TypeParam(lla)].into(),
@@ -835,7 +835,7 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
     st.get_mut(vmap).params = vec![vf];
     st.get_mut(vmap).paramss = vec![vec![vf]];
     st.get_mut(vmap).ty = Type::Method {
-        paramss: vec![vec![fn1(vta.clone(), Type::TypeParam(vb))]],
+        paramss: vec![vec![fn1(vta.clone(), Type::TypeParam(vb))]].into(),
         ret: TyBox::new(view_t(Type::TypeParam(vb))),
     };
 
@@ -866,7 +866,7 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
     st.get_mut(smap).params = vec![sf];
     st.get_mut(smap).paramss = vec![vec![sf]];
     st.get_mut(smap).ty = Type::Method {
-        paramss: vec![vec![fn1(sta.clone(), Type::TypeParam(sb))]],
+        paramss: vec![vec![fn1(sta.clone(), Type::TypeParam(sb))]].into(),
         ret: TyBox::new(Type::Class {
             sym: seq_view,
             args: vec![Type::TypeParam(sb)].into(),
@@ -903,7 +903,8 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
         paramss: vec![
             vec![Type::Int],
             vec![Type::ByName(TyBox::new(Type::TypeParam(fa)))],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(view_t(Type::TypeParam(fa))),
     };
     st.set_jvm_name(fill, "(ILscala/Function0;)Ljava/lang/Object;");
@@ -935,7 +936,8 @@ pub(crate) fn add_view(st: &mut SymbolTable) {
         paramss: vec![
             vec![Type::TypeParam(ia), Type::Int],
             vec![fn1(Type::TypeParam(ia), Type::TypeParam(ia))],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(view_t(Type::TypeParam(ia))),
     };
     st.get_mut(iterate).jvm_name =
@@ -995,7 +997,7 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
     let iaa = type_param(st, idx_apply, "A");
     st.get_mut(idx_apply).tparams = vec![iaa];
     st.get_mut(idx_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(iaa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(iaa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: idx,
             args: vec![Type::TypeParam(iaa)].into(),
@@ -1077,7 +1079,7 @@ pub(crate) fn add_indexedseq_and_queue(st: &mut SymbolTable) {
     let qaa = type_param(st, q_apply, "A");
     st.get_mut(q_apply).tparams = vec![qaa];
     st.get_mut(q_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(qaa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(qaa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: queue,
             args: vec![Type::TypeParam(qaa)].into(),

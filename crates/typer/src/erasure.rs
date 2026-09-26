@@ -78,9 +78,7 @@ fn inline_constant_refs(tree: &mut Tree, st: &SymbolTable) {
         TreeKind::TypeDef { .. } | TreeKind::Import { .. } | TreeKind::New { .. } => return,
         _ => {}
     }
-    for c in crate::lazy_local::children_mut(tree) {
-        inline_constant_refs(c, st);
-    }
+    crate::lazy_local::for_each_child_mut(tree, &mut |c| inline_constant_refs(c, st));
 }
 
 /// The literal a reference to a constant-typed member stands for.
@@ -1909,7 +1907,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                             .then_some(Type::Any)
                         });
                     fun_ty = Type::Method {
-                        paramss: vec![param_tys.clone()],
+                        paramss: vec![param_tys.clone()].into(),
                         ret: TyBox::new(descriptor_result.unwrap_or_else(|| (**ret).clone())),
                     };
                 }
@@ -2468,7 +2466,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         span,
         kind: TreeKind::Ident { name: name.into() },
         ty: Type::Method {
-            paramss: vec![vec![param]],
+            paramss: vec![vec![param]].into(),
             ret: TyBox::new(result.clone()),
         },
         sym,
@@ -2526,7 +2524,7 @@ fn wrap_box(tree: &mut Tree) {
             name: "$box".into(),
         },
         ty: Type::Method {
-            paramss: vec![vec![orig_ty.clone()]],
+            paramss: vec![vec![orig_ty.clone()]].into(),
             ret: TyBox::new(Type::Any),
         },
         sym: SymbolId::NONE,
@@ -2563,7 +2561,7 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
             name: "$unbox".into(),
         },
         ty: Type::Method {
-            paramss: vec![vec![Type::Any]],
+            paramss: vec![vec![Type::Any]].into(),
             ret: TyBox::new(to.clone()),
         },
         sym: SymbolId::NONE,
@@ -2601,7 +2599,7 @@ mod settled_erasure_tests {
         let parent = st.alloc("Parent", st.root, SymKind::Class, Flags::TRAIT, "Parent");
         let member = st.alloc("value", parent, SymKind::Method, Flags::ABSTRACT, "");
         st.get_mut(member).ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::Any),
         };
         let child = st.alloc("Child", st.root, SymKind::Class, Flags::EMPTY, "Child");
@@ -2611,7 +2609,7 @@ mod settled_erasure_tests {
         }];
         let implementation = st.alloc("value", child, SymKind::Method, Flags::EMPTY, "()I");
         let ty = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::Int),
         };
         st.get_mut(implementation).ty = ty.clone();

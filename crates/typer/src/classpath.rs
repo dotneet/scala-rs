@@ -676,7 +676,7 @@ fn ensure_interface_ctor(st: &mut SymbolTable, id: SymbolId) {
     }
     let ctor = st.alloc("<init>", id, SymKind::Method, Flags::CONSTRUCTOR, "");
     st.get_mut(ctor).ty = Type::Method {
-        paramss: vec![],
+        paramss: vec![].into(),
         ret: TyBox::new(Type::Unit),
     };
 }
@@ -1313,9 +1313,9 @@ fn add_method_types(
     st.get_mut(id).paramss = if pids.is_empty() { vec![] } else { vec![pids] };
     st.get_mut(id).ty = Type::Method {
         paramss: if params.is_empty() {
-            vec![]
+            vec![].into()
         } else {
-            vec![params]
+            vec![params].into()
         },
         ret: TyBox::new(ret),
     };

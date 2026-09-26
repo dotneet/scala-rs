@@ -106,7 +106,7 @@ fn add_companion(st: &mut SymbolTable, cls: SymbolId, n: usize) {
     st.get_mut(apply).tparams = tps.clone();
     let params: Vec<Type> = tps.iter().map(|t| Type::TypeParam(*t)).collect();
     st.get_mut(apply).ty = Type::Method {
-        paramss: vec![params],
+        paramss: vec![params].into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),

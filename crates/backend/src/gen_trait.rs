@@ -4832,6 +4832,19 @@ fn emit_case_hash_code(
 /// already carries its traits' fields and runs their `$init$` itself, so
 /// only a trait needs any of it.
 impl SamMixins for Gen<'_> {
+    fn anonfun_class_name(&self, span: scala_rs_span::Span) -> Option<&str> {
+        if span.is_dummy() {
+            return None;
+        }
+        self.anonfun_names
+            .get(&(span.lo.0, span.hi.0))
+            .map(String::as_str)
+    }
+
+    fn is_anonfun_class_name(&self, rel: &str) -> bool {
+        self.anonfun_name_set.contains(rel)
+    }
+
     fn add_sam_mixin_members(&self, b: &mut ClassBuilder, sam: SymbolId) {
         if !is_interface_sym(self.st, sam) {
             return;

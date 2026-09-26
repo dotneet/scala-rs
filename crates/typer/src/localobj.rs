@@ -40,6 +40,19 @@ pub fn check_local_objects(file_index: usize, tree: &Tree, st: &SymbolTable) -> 
     out
 }
 
+/// Whether the run defines any local `object` or local class at all: the
+/// only definitions [`check_local_objects`] and
+/// [`check_local_case_class_captures`] report. One pass over the symbol
+/// table instead of two over every tree when there is none, which was 1% of
+/// a large compile.
+pub fn defines_local_classes(st: &SymbolTable) -> bool {
+    st.symbols.iter().any(|s| {
+        matches!(s.kind, SymKind::Class | SymKind::ModuleClass)
+            && !s.owner.is_none()
+            && matches!(st.get(s.owner).kind, SymKind::Method | SymKind::Term)
+    })
+}
+
 /// A local `case class` whose synthetic companion would need to capture an
 /// enclosing-method local.
 ///

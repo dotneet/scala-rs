@@ -132,7 +132,7 @@ fn add_collect(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, pf: SymbolId) 
     st.get_mut(m).params = vec![p];
     st.get_mut(m).paramss = vec![vec![p]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![pf_cc]],
+        paramss: vec![vec![pf_cc]].into(),
         ret: TyBox::new(Type::String),
     };
 
@@ -151,7 +151,7 @@ fn add_collect(st: &mut SymbolTable, so: SymbolId, idx: SymbolId, pf: SymbolId) 
     st.get_mut(g).params = vec![gp];
     st.get_mut(g).paramss = vec![vec![gp]];
     st.get_mut(g).ty = Type::Method {
-        paramss: vec![vec![pf_cb]],
+        paramss: vec![vec![pf_cb]].into(),
         ret: TyBox::new(Type::Class {
             sym: idx,
             args: vec![tb].into(),
@@ -170,7 +170,7 @@ fn add_apply(st: &mut SymbolTable, so: SymbolId) {
     st.get_mut(m).params = vec![p];
     st.get_mut(m).paramss = vec![vec![p]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![Type::Int]],
+        paramss: vec![vec![Type::Int]].into(),
         ret: TyBox::new(Type::Char),
     };
 }
@@ -209,7 +209,7 @@ fn add_add_string(st: &mut SymbolTable, so: SymbolId) {
         st.get_mut(m).params = ps.clone();
         st.get_mut(m).paramss = vec![ps];
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![tys],
+            paramss: vec![tys].into(),
             ret: TyBox::new(sbt.clone()),
         };
     }
@@ -285,7 +285,7 @@ fn set_fn1_method(st: &mut SymbolTable, id: SymbolId, pname: &str, p: Type, r: T
     st.get_mut(id).params = vec![a];
     st.get_mut(id).paramss = vec![vec![a]];
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![vec![fty]],
+        paramss: vec![vec![fty]].into(),
         ret: TyBox::new(ret),
     };
 }

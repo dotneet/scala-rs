@@ -1550,6 +1550,53 @@ fn method_return_is_covariant(st: &SymbolTable, child: &str, parent: &str) -> bo
     jvm_assignable(st, child_name, parent_name)
 }
 
+const ABSTRACT_PARTIAL_FUNCTION: &str = "scala/runtime/AbstractPartialFunction";
+
+/// The binary name of the class a function literal compiles to when it does
+/// not go through `LambdaMetafactory`.
+///
+/// A partial function takes nsc's name where the driver computed one
+/// (`scala_rs_typer::anonfun_names`): `pk/M$$anonfun$m0$1`. Joined to a
+/// module class's name as flatten joins it, with no second `$`. Any other
+/// literal class keeps scala-rs's own counter, `<class>$$anonfun$<n>`, stepping
+/// past a name already written in this unit or one nsc's scheme reserved.
+/// Both stay in the enclosing class's package: `pk$M$$$anonfun$0`, as the
+/// name used to be, sat in the default package.
+fn literal_class_name(ctx: &EmitCtx, tree: &Tree, is_pf: bool, n: u32) -> String {
+    let module = ctx.class_name.ends_with('$');
+    let join = |rel: &str| {
+        if module {
+            format!("{}{rel}", ctx.class_name)
+        } else {
+            format!("{}${rel}", ctx.class_name)
+        }
+    };
+    let written = |name: &str| ctx.extras.borrow().iter().any(|c| c.internal_name == name);
+    if is_pf {
+        if let Some(rel) = ctx.mixins.anonfun_class_name(tree.span) {
+            let name = join(rel);
+            // A tree emitted twice (a `finally` block, a guard copied into
+            // `isDefinedAt`) must not write the class twice.
+            if !written(&name) {
+                return name;
+            }
+        }
+    }
+    let mut k = n;
+    loop {
+        let rel = if module {
+            format!("$$anonfun${k}")
+        } else {
+            format!("$anonfun${k}")
+        };
+        let name = join(&rel);
+        if !written(&name) && !ctx.mixins.is_anonfun_class_name(&rel) {
+            return name;
+        }
+        k += 1;
+    }
+}
+
 pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     let (vparams, body) = match &tree.kind {
         TreeKind::Function { vparams, body } => (vparams, body),
@@ -1557,7 +1604,6 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     };
     let n = ctx.lambda_n.get();
     ctx.lambda_n.set(n + 1);
-    let lam_name = format!("{}$$anonfun${}", ctx.class_name.replace('/', "$"), n);
     let arity = vparams.len();
     let is_pf = is_partial_function_ty(ctx.st, &tree.ty);
     let sam = ctx.st.sam_sig(&tree.ty);
@@ -1648,6 +1694,14 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
         );
     }
 
+    let lam_name = literal_class_name(ctx, tree, is_pf, n);
+    // A partial function's class has nsc's shape on the library: it extends
+    // `AbstractPartialFunction`, which supplies `apply` (as
+    // `applyOrElse(x, PartialFunction.empty)`) and the rest of the
+    // `PartialFunction` surface, and it is `Serializable`. The private runtime
+    // has only the `PartialFunction` interface.
+    let pf_class = is_pf && ctx.abi.is_library();
+
     // Create instance: new, dup, load captures, invokespecial
     asm.new_obj(&lam_name);
     asm.dup();
@@ -1675,7 +1729,11 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
 
     // Emit the lambda class
     let mut b = ClassBuilder::new(lam_name.clone(), ctx.source);
-    b.access = ACC_PUBLIC | ACC_SUPER | ACC_SYNTHETIC | ACC_FINAL;
+    b.access = if pf_class {
+        ACC_PUBLIC | ACC_SUPER | ACC_FINAL
+    } else {
+        ACC_PUBLIC | ACC_SUPER | ACC_SYNTHETIC | ACC_FINAL
+    };
     // A SAM type may be an abstract *class* (`abstract class F { def
     // apply(a: Any): Any }`): the lambda then extends it. Listing it as an
     // interface was an `IncompatibleClassChangeError` when the class loaded
@@ -1684,21 +1742,30 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
         .as_ref()
         .filter(|s| !is_interface_sym(ctx.st, s.class))
         .map(|_| iface.clone());
-    let super_ctor_owner = sam_superclass
-        .clone()
-        .unwrap_or_else(|| "java/lang/Object".to_string());
+    let super_ctor_owner = if pf_class {
+        ABSTRACT_PARTIAL_FUNCTION.to_string()
+    } else {
+        sam_superclass
+            .clone()
+            .unwrap_or_else(|| "java/lang/Object".to_string())
+    };
     match &sam_superclass {
+        _ if pf_class => {
+            b.super_name = ABSTRACT_PARTIAL_FUNCTION.into();
+            b.interfaces.push("java/io/Serializable".into());
+        }
         Some(sc) => b.super_name = sc.clone(),
         None => b.interfaces.push(iface),
     }
     // nsc pins a serializable lambda class's `serialVersionUID` at 0, as if it
     // had been written `@SerialVersionUID(0)`; without the field the JVM
     // derives one from the class's shape.
-    let serializable = sam.as_ref().is_some_and(|s| {
-        ctx.st
-            .find_class_by_jvm("java/io/Serializable")
-            .is_some_and(|ser| self_reaches_owner(ctx.st, s.class, ser))
-    });
+    let serializable = pf_class
+        || sam.as_ref().is_some_and(|s| {
+            ctx.st
+                .find_class_by_jvm("java/io/Serializable")
+                .is_some_and(|ser| self_reaches_owner(ctx.st, s.class, ser))
+        });
     if serializable {
         b.fields.push(Field {
             access: ACC_PRIVATE | ACC_STATIC | ACC_FINAL,
@@ -1862,7 +1929,9 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     let meth_name_owned = meth_name.to_string();
     let meth_desc_owned = meth_desc.to_string();
 
-    if is_pf {
+    if pf_class {
+        // `apply` is `AbstractPartialFunction`'s.
+    } else if is_pf {
         // nsc puts the case bodies in `applyOrElse` alone; `apply` is inherited
         // from `AbstractPartialFunction` and reads
         // `applyOrElse(x, PartialFunction.empty)`. Generating the whole `match`

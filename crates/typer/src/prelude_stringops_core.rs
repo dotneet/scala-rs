@@ -437,7 +437,8 @@ pub(crate) fn add_string_ops_fold_left(st: &mut SymbolTable, so: SymbolId) {
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(tb.clone(), Type::Char, tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
 }
@@ -460,7 +461,8 @@ pub(crate) fn add_string_ops_fold_right_and_grouped(st: &mut SymbolTable, so: Sy
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(Type::Char, tb.clone(), tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
     let it = st
@@ -714,7 +716,8 @@ pub(crate) fn add_string_ops_to_array(st: &mut SymbolTable, so: SymbolId, ct: Sy
         paramss: vec![vec![Type::Class {
             sym: ct,
             args: vec![Type::Char].into(),
-        }]],
+        }]]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(Type::Char).into())),
     };
 }
@@ -738,7 +741,8 @@ pub(crate) fn add_string_ops_sorted(st: &mut SymbolTable, so: SymbolId, ordering
         paramss: vec![vec![Type::Class {
             sym: ordering,
             args: vec![Type::Char].into(),
-        }]],
+        }]]
+        .into(),
         ret: TyBox::new(Type::String),
     };
 }

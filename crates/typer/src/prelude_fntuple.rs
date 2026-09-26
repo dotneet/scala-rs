@@ -153,7 +153,7 @@ fn add_compose(st: &mut SymbolTable, fun: SymbolId, n: usize) {
             )
         };
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![param]],
+            paramss: vec![vec![param]].into(),
             ret: TyBox::new(result),
         };
         st.get_mut(m).flags = Flags::EMPTY;
@@ -192,7 +192,7 @@ fn add_function_module(st: &mut SymbolTable) {
         // `scala/FunctionN` -- which is the only thing that tells this
         // overload's JVM signature from its siblings'.
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![param]],
+            paramss: vec![vec![param]].into(),
             ret: TyBox::new(Type::Function {
                 params: args.into(),
                 ret: Box::new(ret).into(),

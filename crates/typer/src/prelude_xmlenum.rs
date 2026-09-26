@@ -169,7 +169,7 @@ pub(crate) fn add_delayed_init_app(st: &mut SymbolTable) {
     let di = iface(st, st.scala_pkg, "DelayedInit", "scala/DelayedInit");
     let d = st.alloc("delayedInit", di, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(d).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(TyBox::new(Type::Unit))]],
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::Unit))]].into(),
         ret: TyBox::new(Type::Unit),
     };
     let p = st.alloc("x", d, SymKind::Term, Flags::PARAM.with(Flags::BYNAME), "");
@@ -187,7 +187,7 @@ pub(crate) fn add_delayed_init_app(st: &mut SymbolTable) {
     ];
     let d2 = st.alloc("delayedInit", app, SymKind::Method, Flags::EMPTY, "");
     st.get_mut(d2).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(TyBox::new(Type::Unit))]],
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::Unit))]].into(),
         ret: TyBox::new(Type::Unit),
     };
     let p2 = st.alloc("x", d2, SymKind::Term, Flags::PARAM.with(Flags::BYNAME), "");
@@ -198,7 +198,7 @@ pub(crate) fn add_delayed_init_app(st: &mut SymbolTable) {
     let main = st.alloc("main", app, SymKind::Method, Flags::EMPTY, "");
     let args_ty = Type::Array(TyBox::new(Type::String));
     st.get_mut(main).ty = Type::Method {
-        paramss: vec![vec![args_ty.clone()]],
+        paramss: vec![vec![args_ty.clone()]].into(),
         ret: TyBox::new(Type::Unit),
     };
     let ap = st.alloc("args", main, SymKind::Term, Flags::PARAM, "");

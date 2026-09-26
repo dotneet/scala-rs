@@ -70,7 +70,7 @@ pub fn fix_option_flat_map(st: &mut SymbolTable) {
     st.get_mut(flat_map).params = vec![f];
     st.get_mut(flat_map).paramss = vec![vec![f]];
     st.get_mut(flat_map).ty = Type::Method {
-        paramss: vec![vec![fn1(ta, opt_b.clone())]],
+        paramss: vec![vec![fn1(ta, opt_b.clone())]].into(),
         ret: TyBox::new(opt_b),
     };
 }
@@ -131,7 +131,7 @@ pub fn add_iterable_apply(st: &mut SymbolTable, library_abi: bool) {
     let a = type_param(st, apply, "A");
     st.get_mut(apply).tparams = vec![a];
     st.get_mut(apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(a)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(a)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: iterable,
             args: vec![Type::TypeParam(a)].into(),

@@ -3,7 +3,7 @@
 use crate::async_lower::GenericAsyncCall;
 use crate::check::Typer;
 use crate::expand::{at, Sexp};
-use crate::lazy_local::children_mut;
+use crate::lazy_local::for_each_child_mut;
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
@@ -232,9 +232,9 @@ class AsyncProtocol {
             t.id = NodeId(typer.macro_next_node);
             typer.macro_next_node += 1;
             t.span = span;
-            for child in children_mut(t) {
-                prepare(child, typer, span, param, awaitable, call);
-            }
+            for_each_child_mut(t, &mut |child| {
+                prepare(child, typer, span, param, awaitable, call)
+            });
         }
         for member in &mut impl_.body {
             prepare(member, self, span, param_type, &awaitable, &call);
@@ -254,9 +254,7 @@ class AsyncProtocol {
                             }
                             _ => {}
                         }
-                        for child in children_mut(t) {
-                            rename_param(child, name);
-                        }
+                        for_each_child_mut(t, &mut |child| rename_param(child, name));
                     }
                     rename_param(member, param_name);
                 }

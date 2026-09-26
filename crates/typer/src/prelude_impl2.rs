@@ -84,7 +84,7 @@ fn add_to_map(st: &mut SymbolTable, owner: SymbolId, less: SymbolId, map: Symbol
     st.get_mut(m).params = vec![ev];
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![ev_ty]],
+        paramss: vec![vec![ev_ty]].into(),
         ret: TyBox::new(Type::Class {
             sym: map,
             args: vec![Type::TypeParam(k), Type::TypeParam(v)].into(),
@@ -124,7 +124,7 @@ fn add_option_flatten(st: &mut SymbolTable, less: SymbolId) {
     st.get_mut(m).params = vec![ev];
     st.get_mut(m).paramss = vec![vec![ev]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![evidence]],
+        paramss: vec![vec![evidence]].into(),
         ret: TyBox::new(result),
     };
 }

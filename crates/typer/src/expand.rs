@@ -1921,7 +1921,7 @@ impl Typer {
         let mut splices: Vec<Tree> = Vec::new();
         let paramss = match &self.st.get(sym).ty {
             Type::Method { paramss, .. } => paramss.clone(),
-            _ => Vec::new(),
+            _ => Vec::new().into(),
         };
         // Typing normally keeps one Apply node per source argument clause.
         // `fill_defaults_and_implicits`, however, appends an automatically

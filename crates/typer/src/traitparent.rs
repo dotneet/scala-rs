@@ -42,7 +42,7 @@ fn show_decl(st: &SymbolTable, m: SymbolId) -> String {
     };
     let paramss = match &s.ty {
         Type::Method { paramss, .. } => paramss.clone(),
-        _ => Vec::new(),
+        _ => Vec::new().into(),
     };
     let mut out = format!("def {}", s.name);
     for ps in &paramss {

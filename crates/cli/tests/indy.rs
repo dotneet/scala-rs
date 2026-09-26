@@ -499,3 +499,174 @@ fn sam_literals_of_traits_with_state_mix_them_in_like_scalac() {
     let _ = fs::remove_dir_all(&out);
     let _ = fs::remove_dir_all(&ref_out);
 }
+
+/// The same traits, read from the class path: `val`, `var`, `lazy val` and an
+/// initializer statement, from a directory and from a jar. Their interfaces
+/// declare the `val`'s mixin setter and the `var`'s setter abstract, and the
+/// SAM check counted both, so every literal was `missing parameter type` /
+/// `type mismatch`; nsc's `samOf` reads the pickle, where neither is a
+/// deferred member.
+#[test]
+fn sam_literals_of_class_path_traits_with_state_run_like_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(scalac), Some(jar)) = (find_scalac(), scala_library_jar()) else {
+        eprintln!("skip sam_mixin_cp: toolchain not obtainable");
+        return;
+    };
+    let lib_src = fixtures_dir().join("sam_mixin_cp_lib.scala");
+    let main_src = fixtures_dir().join("sam_mixin_cp_main.scala");
+    let lib_out = tmp_dir("sam_mixin_cp-lib");
+    let status = Command::new(&scalac)
+        .args([lib_src.to_str().unwrap(), "-d", lib_out.to_str().unwrap()])
+        .status()
+        .expect("scalac");
+    assert!(
+        status.success(),
+        "real scalac failed to compile the library"
+    );
+    let lib_jar_dir = tmp_dir("sam_mixin_cp-jar");
+    let lib_jar = lib_jar_dir.join("lib.jar");
+    let status = Command::new("jar")
+        .args([
+            "cf",
+            lib_jar.to_str().unwrap(),
+            "-C",
+            lib_out.to_str().unwrap(),
+            ".",
+        ])
+        .status()
+        .expect("jar");
+    assert!(status.success(), "jar failed");
+
+    let ref_out = tmp_dir("sam_mixin_cp-scalac-ref");
+    let status = Command::new(&scalac)
+        .args([
+            "-cp",
+            lib_out.to_str().unwrap(),
+            main_src.to_str().unwrap(),
+            "-d",
+            ref_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scalac");
+    assert!(status.success(), "real scalac failed to compile the client");
+    let run_cp = format!("{}:{}", lib_out.display(), jar.display());
+    let reference = run_java(&ref_out, Some(Path::new(&run_cp)));
+    assert_eq!(
+        reference,
+        expected_stdout("sam_mixin_cp"),
+        "recorded expectation for sam_mixin_cp does not match real scalac"
+    );
+
+    for lib in [&lib_out, &lib_jar] {
+        let out = tmp_dir("sam_mixin_cp");
+        let output = Command::new(bin())
+            .args([
+                "compile",
+                main_src.to_str().unwrap(),
+                "-d",
+                out.to_str().unwrap(),
+                "-cp",
+                lib.to_str().unwrap(),
+                "--scala-library",
+                jar.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run scala-rs compile");
+        assert!(
+            output.status.success(),
+            "scala-rs rejected the client against {}: {}{}",
+            lib.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let run_cp = format!("{}:{}", lib.display(), jar.display());
+        assert_eq!(
+            run_java(&out, Some(Path::new(&run_cp))),
+            reference,
+            "stdout differs from real scalac with the library at {}",
+            lib.display()
+        );
+        let _ = fs::remove_dir_all(&out);
+    }
+    for d in [&lib_out, &lib_jar_dir, &ref_out] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
+/// Every `*.class` under `out` whose name holds `anonfun`, as a path relative
+/// to `out` (so the package a class landed in is part of it).
+fn anonfun_class_paths(out: &Path) -> Vec<String> {
+    let mut v = Vec::new();
+    let mut stack = vec![out.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).expect("read output dir") {
+            let p = e.expect("dir entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "class")
+                && p.file_name().unwrap().to_string_lossy().contains("anonfun")
+            {
+                v.push(p.strip_prefix(out).unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    v.sort();
+    v
+}
+
+/// Partial-function literals compile to the classes nsc makes of them: named
+/// after their owner (`pk/M$$anonfun$m0$3`, `$nestedInanonfun$nest$1$1`,
+/// `$anonfun$dflt$default$2$1`, `$anonfun$1` for a value, ...) with the
+/// counters it shares with function literals' methods, in the enclosing
+/// class's package, and extending `AbstractPartialFunction` with
+/// `Serializable`. They were `pk$M$$$anonfun$<n>` in the default package,
+/// implementing `PartialFunction` directly.
+#[test]
+fn partial_function_classes_are_named_and_shaped_like_scalac() {
+    if !java_available() {
+        return;
+    }
+    let (Some(scalac), Some(jar)) = (find_scalac(), scala_library_jar()) else {
+        eprintln!("skip pf_class_names: toolchain not obtainable");
+        return;
+    };
+    let src = fixtures_dir().join("pf_class_names.scala");
+    let ref_out = tmp_dir("pf_class_names-scalac-ref");
+    let status = Command::new(&scalac)
+        .args([src.to_str().unwrap(), "-d", ref_out.to_str().unwrap()])
+        .status()
+        .expect("scalac");
+    assert!(
+        status.success(),
+        "real scalac failed to compile pf_class_names"
+    );
+    let out = compile_fixture_with(
+        "pf_class_names",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    assert_eq!(
+        anonfun_class_paths(&out),
+        anonfun_class_paths(&ref_out),
+        "partial-function classes differ from real scalac's"
+    );
+    let run = |dir: &Path| {
+        let cp = format!("{}:{}", dir.display(), jar.display());
+        let o = Command::new("java")
+            .args(["-Xverify:all", "-cp", &cp, "pk.Main"])
+            .output()
+            .expect("java");
+        assert!(
+            o.status.success(),
+            "pk.Main failed from {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    assert_eq!(run(&out), run(&ref_out), "stdout differs from real scalac");
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&ref_out);
+}

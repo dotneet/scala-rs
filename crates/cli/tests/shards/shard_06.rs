@@ -16,6 +16,8 @@ mod ovl_exptype;
 mod parameterless_result_inference;
 #[path = "../parent_lambda.rs"]
 mod parent_lambda;
+#[path = "../parent_twice.rs"]
+mod parent_twice;
 #[path = "../parentcheck.rs"]
 mod parentcheck;
 #[path = "../parentimpl.rs"]

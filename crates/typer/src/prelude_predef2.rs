@@ -24,7 +24,7 @@ pub(crate) fn add_predef_members(
         let t = type_param(st, co, "T");
         st.get_mut(co).tparams = vec![t];
         st.get_mut(co).ty = Type::Method {
-            paramss: Vec::new(),
+            paramss: Vec::new().into(),
             ret: TyBox::new(Type::Class {
                 sym: jclass,
                 args: vec![Type::TypeParam(t)].into(),
@@ -146,7 +146,7 @@ pub(crate) fn add_predef_members(
     let ia = type_param(st, ident, "A");
     st.get_mut(ident).tparams = vec![ia];
     st.get_mut(ident).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(ia)]],
+        paramss: vec![vec![Type::TypeParam(ia)]].into(),
         ret: TyBox::new(Type::TypeParam(ia)),
     };
     let loc = method(
@@ -160,7 +160,7 @@ pub(crate) fn add_predef_members(
     let lt = type_param(st, loc, "A");
     st.get_mut(loc).tparams = vec![lt];
     st.get_mut(loc).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(lt)]],
+        paramss: vec![vec![Type::TypeParam(lt)]].into(),
         ret: TyBox::new(Type::TypeParam(lt)),
     };
     let implm = method(
@@ -184,7 +184,7 @@ pub(crate) fn add_predef_members(
     st.get_mut(implm).params = vec![ip];
     st.get_mut(implm).paramss = vec![vec![ip]];
     st.get_mut(implm).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(it)]],
+        paramss: vec![vec![Type::TypeParam(it)]].into(),
         ret: TyBox::new(Type::TypeParam(it)),
     };
     let sadd = if library_abi {
@@ -252,7 +252,7 @@ pub(crate) fn add_predef_members(
     let arrow_a = type_param(st, conv, "A");
     st.get_mut(conv).tparams = vec![arrow_a];
     st.get_mut(conv).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(arrow_a)]],
+        paramss: vec![vec![Type::TypeParam(arrow_a)]].into(),
         ret: TyBox::new(Type::Class {
             sym: arrow,
             args: vec![Type::TypeParam(arrow_a)].into(),
@@ -425,7 +425,7 @@ pub(crate) fn add_predef_members(
         let rt = type_param(st, wrap_ref, "T");
         st.get_mut(wrap_ref).tparams = vec![rt];
         st.get_mut(wrap_ref).ty = Type::Method {
-            paramss: vec![vec![Type::Array(TyBox::new(Type::TypeParam(rt)))]],
+            paramss: vec![vec![Type::Array(TyBox::new(Type::TypeParam(rt)))]].into(),
             ret: TyBox::new(Type::Class {
                 sym: aops,
                 args: vec![Type::TypeParam(rt)].into(),
@@ -449,7 +449,7 @@ pub(crate) fn add_predef_members(
         let gt = type_param(st, wrap_g, "T");
         st.get_mut(wrap_g).tparams = vec![gt];
         st.get_mut(wrap_g).ty = Type::Method {
-            paramss: vec![vec![Type::Array(TyBox::new(Type::TypeParam(gt)))]],
+            paramss: vec![vec![Type::Array(TyBox::new(Type::TypeParam(gt)))]].into(),
             ret: TyBox::new(Type::Class {
                 sym: aops,
                 args: vec![Type::TypeParam(gt)].into(),

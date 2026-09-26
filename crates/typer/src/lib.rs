@@ -2,6 +2,7 @@
 mod allocation_test;
 mod annot_resolve;
 mod anon_capture;
+pub mod anonfun_names;
 mod async_generic;
 mod async_lower;
 mod async_returns;
@@ -185,7 +186,8 @@ pub use expand_private::{expand_private_names, expand_trait_private_vals};
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};
-pub use localobj::{check_local_case_class_captures, check_local_objects};
+pub use anonfun_names::{anonfun_class_names, AnonfunClassNames};
+pub use localobj::{check_local_case_class_captures, check_local_objects, defines_local_classes};
 pub use named_eval_order::restore_named_arg_order;
 pub use rassoc::restore_rassoc_order;
 pub use source_features::{ParsedFeatures, SourceFeature, SourceFeatures};

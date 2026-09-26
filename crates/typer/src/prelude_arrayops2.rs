@@ -149,7 +149,8 @@ pub(crate) fn add_array_ops_map(st: &mut SymbolTable, aops: SymbolId, ct: Symbol
                 sym: ct,
                 args: vec![Type::TypeParam(b)].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
@@ -184,7 +185,8 @@ pub(crate) fn add_array_ops_flat_map(st: &mut SymbolTable, aops: SymbolId, ct: S
                 sym: ct,
                 args: vec![Type::TypeParam(b)].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
@@ -263,7 +265,8 @@ pub(crate) fn add_array_ops_flat_map_from_array(
                     args: vec![Type::TypeParam(b)].into(),
                 },
             ],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
@@ -310,7 +313,8 @@ pub(crate) fn add_array_ops_collect(st: &mut SymbolTable, aops: SymbolId, ct: Sy
                 sym: ct,
                 args: vec![Type::TypeParam(b)].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(b)).into())),
     };
 }
@@ -353,7 +357,8 @@ pub(crate) fn add_array_ops_zip(st: &mut SymbolTable, aops: SymbolId, tuple2: Sy
         paramss: vec![vec![Type::Class {
             sym: ioc,
             args: vec![Type::TypeParam(b)].into(),
-        }]],
+        }]]
+        .into(),
         ret: TyBox::new(Type::Array(
             Box::new(Type::Class {
                 sym: tuple2,
@@ -385,7 +390,8 @@ pub(crate) fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(tb.clone(), ta.clone(), tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
 
@@ -403,7 +409,8 @@ pub(crate) fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
         paramss: vec![
             vec![ta1.clone()],
             vec![fn2(ta1.clone(), ta1.clone(), ta1.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(ta1),
     };
 
@@ -418,7 +425,7 @@ pub(crate) fn add_array_ops_folds(st: &mut SymbolTable, aops: SymbolId) {
     st.get_mut(m).params = vec![z, op];
     st.get_mut(m).paramss = vec![vec![z], vec![op]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![tb.clone()], vec![fn2(ta, tb.clone(), tb.clone())]],
+        paramss: vec![vec![tb.clone()], vec![fn2(ta, tb.clone(), tb.clone())]].into(),
         ret: TyBox::new(tb),
     };
 }
@@ -463,7 +470,8 @@ pub(crate) fn add_array_ops_scan_left(st: &mut SymbolTable, aops: SymbolId) {
                 sym: ct,
                 args: vec![tb.clone()].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(tb).into())),
     };
 }
@@ -747,7 +755,8 @@ pub(crate) fn add_array_companion(st: &mut SymbolTable, ct: SymbolId) {
                 sym: ct,
                 args: vec![Type::TypeParam(t)].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(Type::TypeParam(t)).into())),
     };
     let mems = st.get(mc).members.clone();

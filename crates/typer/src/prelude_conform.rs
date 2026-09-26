@@ -86,7 +86,7 @@ fn method(
         vec![params]
     };
     st.get_mut(id).ty = Type::Method {
-        paramss,
+        paramss: paramss.into(),
         ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = intrinsic;
@@ -181,7 +181,7 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         let ra = type_param(st, refl, "A");
         st.get_mut(refl).tparams = vec![ra];
         st.get_mut(refl).ty = Type::Method {
-            paramss: vec![vec![]],
+            paramss: vec![vec![]].into(),
             ret: TyBox::new(Type::Class {
                 sym: eq,
                 args: vec![Type::TypeParam(ra), Type::TypeParam(ra)].into(),
@@ -229,7 +229,7 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         st.get_mut(or_null).params = vec![ev];
         st.get_mut(or_null).paramss = vec![vec![ev]];
         st.get_mut(or_null).ty = Type::Method {
-            paramss: vec![vec![ev_ty]],
+            paramss: vec![vec![ev_ty]].into(),
             ret: TyBox::new(result),
         };
     }
@@ -346,7 +346,7 @@ fn install_conforms_member(st: &mut SymbolTable) {
     let a = type_param(st, conforms, "A");
     st.get_mut(conforms).tparams = vec![a];
     st.get_mut(conforms).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::Function {
             params: vec![Type::TypeParam(a)].into(),
             ret: Box::new(Type::TypeParam(a)).into(),

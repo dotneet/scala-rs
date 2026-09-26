@@ -39,7 +39,7 @@ pub(crate) fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     let b = type_param(st, m, "B");
     st.get_mut(m).tparams = vec![b];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]],
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]].into(),
         ret: TyBox::new(applied(Type::TypeParam(b))),
     };
     let fm = method(
@@ -53,7 +53,7 @@ pub(crate) fn add_with_filter(st: &mut SymbolTable) -> SymbolId {
     let fb = type_param(st, fm, "B");
     st.get_mut(fm).tparams = vec![fb];
     st.get_mut(fm).ty = Type::Method {
-        paramss: vec![vec![fn1(ta.clone(), applied(Type::TypeParam(fb)))]],
+        paramss: vec![vec![fn1(ta.clone(), applied(Type::TypeParam(fb)))]].into(),
         ret: TyBox::new(applied(Type::TypeParam(fb))),
     };
     method(
@@ -113,7 +113,8 @@ pub(crate) fn complete_with_filter_flat_map(st: &mut SymbolTable, wf: SymbolId) 
                 sym: iterable_once,
                 args: vec![Type::TypeParam(b)].into(),
             },
-        )]],
+        )]]
+        .into(),
         ret: TyBox::new(result),
     };
 }
@@ -145,7 +146,7 @@ pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
     let mb = type_param(st, m, "B");
     st.get_mut(m).tparams = vec![mb];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(mb))]],
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(mb))]].into(),
         ret: TyBox::new(Type::Class {
             sym: st.option_sym,
             args: vec![Type::TypeParam(mb)].into(),
@@ -166,7 +167,7 @@ pub(crate) fn add_option_with_filter(st: &mut SymbolTable) -> SymbolId {
         args: vec![Type::TypeParam(fb)].into(),
     };
     st.get_mut(fm).ty = Type::Method {
-        paramss: vec![vec![fn1(ta.clone(), opt_b.clone())]],
+        paramss: vec![vec![fn1(ta.clone(), opt_b.clone())]].into(),
         ret: TyBox::new(opt_b),
     };
     let _ = opt;

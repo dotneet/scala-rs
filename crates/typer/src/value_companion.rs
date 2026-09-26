@@ -92,7 +92,7 @@ pub fn add_value_class_companions(tree: &Tree, st: &mut SymbolTable) {
             symbol.paramss = vec![param_ids];
             symbol.pickle_clauses = vec![params.len()];
             symbol.ty = Type::Method {
-                paramss: vec![params],
+                paramss: vec![params].into(),
                 ret: TyBox::new(ret),
             };
             methods.push(method);
@@ -244,7 +244,7 @@ fn declare_extension(st: &mut SymbolTable, comp: SymbolId, cls: SymbolId, meth: 
     st.get_mut(ext).tparams = tparams;
     st.get_mut(ext).pickle_clauses = ext_clauses;
     st.get_mut(ext).ty = Type::Method {
-        paramss: vec![all_tys],
+        paramss: vec![all_tys].into(),
         ret: TyBox::new(ret),
     };
 }

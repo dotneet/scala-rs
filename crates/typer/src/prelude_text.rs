@@ -469,7 +469,7 @@ fn add_range_ops(st: &mut SymbolTable) {
     st.get_mut(flat_map).paramss = vec![vec![p]];
     st.get_mut(flat_map).tparams = vec![b];
     st.get_mut(flat_map).ty = Type::Method {
-        paramss: vec![vec![f]],
+        paramss: vec![vec![f]].into(),
         ret: TyBox::new(Type::Class {
             sym: idx,
             args: vec![tb].into(),
@@ -514,7 +514,8 @@ fn add_range_ops(st: &mut SymbolTable) {
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(tb.clone(), Type::Int, tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
     let m = method(st, range, "foldRight", vec![], Type::Unit, Intrinsic::None);
@@ -531,7 +532,8 @@ fn add_range_ops(st: &mut SymbolTable) {
         paramss: vec![
             vec![tb.clone()],
             vec![fn2(Type::Int, tb.clone(), tb.clone())],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(tb),
     };
     method(st, range, "sum", vec![], Type::Int, Intrinsic::None);

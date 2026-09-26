@@ -31,7 +31,7 @@ pub(crate) fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(pipe).params = vec![f];
     st.get_mut(pipe).paramss = vec![vec![f]];
     st.get_mut(pipe).ty = Type::Method {
-        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]],
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(b))]].into(),
         ret: TyBox::new(Type::TypeParam(b)),
     };
 
@@ -43,7 +43,7 @@ pub(crate) fn add_chaining(st: &mut SymbolTable) {
     st.get_mut(tap).params = vec![g];
     st.get_mut(tap).paramss = vec![vec![g]];
     st.get_mut(tap).ty = Type::Method {
-        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(u))]],
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(u))]].into(),
         ret: TyBox::new(ta.clone()),
     };
 
@@ -64,7 +64,7 @@ pub(crate) fn add_chaining(st: &mut SymbolTable) {
     let cta = Type::TypeParam(ca);
     st.get_mut(conv).tparams = vec![ca];
     st.get_mut(conv).ty = Type::Method {
-        paramss: vec![vec![cta.clone()]],
+        paramss: vec![vec![cta.clone()]].into(),
         ret: TyBox::new(Type::Class {
             sym: ops,
             args: vec![cta].into(),
@@ -102,7 +102,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
                 "",
             );
             st.get_mut(close).ty = Type::Method {
-                paramss: Vec::new(),
+                paramss: Vec::new().into(),
                 ret: TyBox::new(Type::Unit),
             };
             ac
@@ -122,7 +122,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
         "",
     );
     st.get_mut(release).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(r)]],
+        paramss: vec![vec![Type::TypeParam(r)]].into(),
         ret: TyBox::new(Type::Unit),
     };
 
@@ -186,7 +186,8 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
                 sym: releasable,
                 args: vec![r_t].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(a_t),
     };
 
@@ -235,7 +236,8 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
                 sym: releasable,
                 args: vec![ar_t].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Class {
             sym: try_c,
             args: vec![aa2_t].into(),
@@ -306,7 +308,8 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
                 sym: releasable,
                 args: vec![mr_t.clone()].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(mr_t),
     };
     st.get_mut(mgr_app).jvm_name =
@@ -351,7 +354,8 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
                 sym: releasable,
                 args: vec![acr_t].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Unit),
     };
     st.set_jvm_name(
@@ -389,7 +393,8 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
                 args: vec![].into(),
             },
             ma_t.clone(),
-        )]],
+        )]]
+        .into(),
         ret: TyBox::new(Type::Class {
             sym: try_c,
             args: vec![ma_t].into(),
@@ -483,7 +488,7 @@ fn add_using_resources(st: &mut SymbolTable, using_cls: SymbolId, releasable: Sy
     st.get_mut(m).params = all_params;
     st.get_mut(m).paramss = vec![p_ids, vec![f], ev_ids];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![p_tys, vec![fn_ty], ev_tys],
+        paramss: vec![p_tys, vec![fn_ty], ev_tys].into(),
         ret: TyBox::new(Type::TypeParam(a)),
     };
     let mut desc = String::from("(Ljava/lang/Object;");

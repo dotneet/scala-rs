@@ -41,7 +41,7 @@
 
 use scala_rs_parser::{Flags, Modifiers, SymbolId, Tree, TreeKind};
 
-use crate::lazy_local::children_mut;
+use crate::lazy_local::for_each_child_mut;
 use crate::symbol::{SymKind, SymbolTable};
 
 /// Rewrite every call in `tree` that omitted defaults on a computed receiver.
@@ -93,9 +93,7 @@ impl Pass<'_> {
                 }
             }
             _ => {
-                for c in children_mut(t) {
-                    self.walk_at(c, true);
-                }
+                for_each_child_mut(t, &mut |c| self.walk_at(c, true));
             }
         }
         self.owner = saved;

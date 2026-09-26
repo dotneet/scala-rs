@@ -211,7 +211,7 @@ impl Typer {
 
     pub(crate) fn type_eta(&mut self, tree: &mut Tree, pt: &Type) {
         let dummy_method = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::NoType),
         };
         if let TreeKind::Typed { expr, .. } = &mut tree.kind {
@@ -228,7 +228,7 @@ impl Typer {
             let mut clauses: Vec<Vec<Type>> = if paramss.is_empty() {
                 vec![Vec::new()]
             } else {
-                paramss
+                paramss.into_vec()
             };
             let mut ret = ret.clone();
             // `xs.map(identity _)` names a polymorphic method: its own type
@@ -432,7 +432,7 @@ impl Typer {
                     self.st.get_mut(mem).params = all_ctor_params.clone();
                     self.st.get_mut(mem).paramss = paramss_ids.clone();
                     self.st.get_mut(mem).ty = Type::Method {
-                        paramss: paramss_ty.clone(),
+                        paramss: paramss_ty.clone().into(),
                         ret: TyBox::new(Type::Unit),
                     };
                     // Unlike an ordinary method's `name$default$N` getters, a
@@ -515,7 +515,7 @@ impl Typer {
                     }
                     self.st.get_mut(copy_id).paramss = copy_paramss.clone();
                     self.st.get_mut(copy_id).ty = Type::Method {
-                        paramss: paramss_ty.clone(),
+                        paramss: paramss_ty.clone().into(),
                         ret: TyBox::new(Type::Class {
                             sym: id,
                             args: vec![].into(),
@@ -557,7 +557,7 @@ impl Typer {
                         }
                         self.st.get_mut(copy_id).tparams = own;
                         self.st.get_mut(copy_id).ty = Type::Method {
-                            paramss: renamed,
+                            paramss: renamed.into(),
                             ret: TyBox::new(Type::Class {
                                 sym: id,
                                 args: own_tys.into(),
@@ -580,12 +580,17 @@ impl Typer {
             }
         }
         let mut pts = Vec::new();
+        let mut repeated = Vec::new();
         let mut visible_in_args: Vec<SymbolId> = self.st.get(id).tparams.clone();
         visible_in_args.extend(all_ctor_params.iter().copied());
         self.with_parent_context(Some((id, saved_this)), |this| {
             this.with_parent_arg_scope(Some((id, visible_in_args)), |this| {
-                for p in parents.iter_mut() {
+                for (i, p) in parents.iter_mut().enumerate() {
                     let retry = this.type_template_parent_deferrable(p);
+                    if retry.is_none() && this.repeats_synthetic_parent(&pts, &p.ty) {
+                        repeated.push(i);
+                        continue;
+                    }
                     // A parent is stored as the class it names: every reader of
                     // `parents` matches `Type::Class`. The prefix an inner-class
                     // parent was written with is kept beside it (`prefix.rs`).
@@ -601,6 +606,7 @@ impl Typer {
                 }
             });
         });
+        drop_parents(parents, &repeated);
         if !self.sigs_only && !self.language_dynamics {
             for parent in parents.iter() {
                 if self
@@ -611,6 +617,9 @@ impl Typer {
                     self.error(parent.span, "extension of scala.Dynamic needs to be enabled by making scala.language.dynamics visible");
                 }
             }
+        }
+        if !self.sigs_only {
+            self.check_parents_inherited_twice(parents);
         }
         if !pts.is_empty() {
             self.st.get_mut(id).parents = pts;
@@ -752,8 +761,8 @@ impl Typer {
             }
         }
         if !self.sigs_only {
-            let body_snapshot: Vec<Tree> = body.to_vec();
-            self.check_abstract_override_placement(id, &body_snapshot);
+            let body: &[Tree] = body;
+            self.check_abstract_override_placement(id, body);
             // `new C with T` reaches here as the `$anon` class the parser
             // built; scalac reports that one as `object creation impossible.`
             let anon = self.st.get(id).name.starts_with("$anon");
@@ -763,9 +772,9 @@ impl Typer {
                 format!("class {} needs to be a mixin.", self.st.get(id).name)
             };
             self.check_abstract_override_grounded(id, tree_span, &headline);
-            self.complete_overridden_library_members(id, &body_snapshot);
-            self.check_overrides(id, &body_snapshot, tree_span);
-            self.check_double_defs(id, &body_snapshot);
+            self.complete_overridden_library_members(id, body);
+            self.check_overrides(id, body, tree_span);
+            self.check_double_defs(id, body);
             self.check_default_overloads(id, tree_span);
             let missing_headline = if anon {
                 "object creation impossible.".to_string()
@@ -875,7 +884,7 @@ impl Typer {
                     let ret = crate::symbol::subst_tparams_slice(&tps, &to, &class_ty);
                     self.st.get_mut(mem).tparams = own;
                     self.st.get_mut(mem).ty = Type::Method {
-                        paramss,
+                        paramss: paramss.into(),
                         ret: TyBox::new(ret),
                     };
                     self.st.get_mut(mem).paramss = paramss_ids.to_vec();
@@ -883,7 +892,7 @@ impl Typer {
                 } else if n == "unapply" {
                     self.st.get_mut(mem).tparams = tps.clone();
                     self.st.get_mut(mem).ty = Type::Method {
-                        paramss: vec![vec![class_ty.clone()]],
+                        paramss: vec![vec![class_ty.clone()]].into(),
                         ret: TyBox::new(unapply_ret.clone()),
                     };
                 }
@@ -895,7 +904,7 @@ impl Typer {
         for mem in self.st.get(class_id).members.clone() {
             if self.st.get(mem).name == "<init>" && self.st.get(mem).ty.is_no_type() {
                 self.st.get_mut(mem).ty = Type::Method {
-                    paramss: paramss_ty.to_vec(),
+                    paramss: paramss_ty.to_vec().into(),
                     ret: TyBox::new(Type::Unit),
                 };
             }
@@ -987,12 +996,17 @@ impl Typer {
             _ => return,
         };
         let mut pts = Vec::new();
+        let mut repeated = Vec::new();
         self.with_parent_context(Some((cls, saved_this)), |this| {
             this.with_parent_arg_scope(Some((cls, Vec::new())), |this| {
-                for p in parents.iter_mut() {
+                for (i, p) in parents.iter_mut().enumerate() {
                     // Parents are types: `object B extends B` extends the *trait* B,
                     // not itself. Typing them as expressions picks the module.
                     let retry = this.type_template_parent_deferrable(p);
+                    if retry.is_none() && this.repeats_synthetic_parent(&pts, &p.ty) {
+                        repeated.push(i);
+                        continue;
+                    }
                     if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
                         this.st
                             .parent_prefixes
@@ -1005,7 +1019,11 @@ impl Typer {
                 }
             });
         });
+        drop_parents(parents, &repeated);
         pts.retain(|t| !matches!(t, Type::ModuleRef(m) if *m == cls));
+        if !self.sigs_only {
+            self.check_parents_inherited_twice(parents);
+        }
         if !pts.is_empty() {
             self.st.get_mut(cls).parents = pts;
         }
@@ -1049,14 +1067,14 @@ impl Typer {
         self.check_mixin_parents(cls, tree.span);
         self.check_type_member_kind_override(cls, tree.span);
         if !self.sigs_only {
-            let body_snapshot: Vec<Tree> = body.to_vec();
-            self.check_abstract_override_placement(cls, &body_snapshot);
+            let body: &[Tree] = body;
+            self.check_abstract_override_placement(cls, body);
             // scalac 2.13.16 reports an `object` the same way it reports a
             // `new`: the instance is what cannot be built.
             let headline = "object creation impossible.".to_string();
             self.check_abstract_override_grounded(cls, mod_span, &headline);
-            self.check_overrides(cls, &body_snapshot, mod_span);
-            self.check_double_defs(cls, &body_snapshot);
+            self.check_overrides(cls, body, mod_span);
+            self.check_double_defs(cls, body);
             self.check_default_overloads(cls, mod_span);
             self.check_missing_implementations(cls, mod_span, &headline);
         }
@@ -1763,6 +1781,85 @@ impl Typer {
         self.st.get_mut(class_id).parents = cut;
     }
 
+    /// nsc `validateParentClasses`: a class that names the same class or trait
+    /// among its written parents more than once is rejected, at *every*
+    /// parent that has a twin (`ParentInheritedTwiceError`), whatever the
+    /// type arguments (`Seq[Int] with Seq[String]`) and whether or not the
+    /// name went through an alias. `AnyRef` is `Object` there.
+    /// The repetitions [`Typer::repeats_synthetic_parent`] dropped are gone by
+    /// now, as in nsc.
+    fn check_parents_inherited_twice(&mut self, parents: &[Tree]) {
+        let syms: Vec<Option<SymbolId>> = parents
+            .iter()
+            .map(|p| {
+                let s = self.st.class_sym_of(&p.ty)?;
+                Some(if self.is_object_class(s) {
+                    self.st.object_sym
+                } else {
+                    s
+                })
+            })
+            .collect();
+        for (i, p) in parents.iter().enumerate() {
+            let Some(s) = syms[i] else {
+                continue;
+            };
+            if !syms
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && *other == Some(s))
+            {
+                continue;
+            }
+            let sym = self.st.get(s);
+            let kind = if sym.flags.contains(Flags::TRAIT) || sym.flags.contains(Flags::INTERFACE) {
+                "trait"
+            } else {
+                "class"
+            };
+            let name = if s == self.st.object_sym {
+                "Object".to_string()
+            } else {
+                sym.name.clone()
+            };
+            // At nsc's point: `Al.A0` is reported at `A0`.
+            let at = match self.sources.get(self.file_index) {
+                Some(src) if !p.span.is_dummy() => {
+                    let point = crate::warn_util::point_of(p, src).clamp(p.span.lo.0, p.span.hi.0);
+                    Span::new(point, p.span.hi.0)
+                }
+                _ => p.span,
+            };
+            self.error(at, format!("{kind} {name} is inherited twice"));
+        }
+    }
+
+    /// nsc `fixDuplicateSyntheticParents`: `Product`, `ProductN` and
+    /// `Serializable` are the parents a case class may already have been
+    /// given, so writing one of them again is not an error; the repetition is
+    /// dropped. Kept, a class file listed `java/io/Serializable` twice among
+    /// its interfaces, which the JVM refuses to load.
+    fn repeats_synthetic_parent(&self, earlier: &[Type], parent: &Type) -> bool {
+        let Some(s) = self.st.class_sym_of(parent) else {
+            return false;
+        };
+        let jvm = self.st.get(s).jvm_name.as_str();
+        let synthetic = jvm == "scala/Product"
+            || jvm == "java/io/Serializable"
+            || jvm
+                .strip_prefix("scala/Product")
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| (1..=22).contains(&n));
+        synthetic && earlier.iter().any(|t| self.st.class_sym_of(t) == Some(s))
+    }
+
+    /// `AnyRef` and `java.lang.Object`, which the symbol table keeps apart.
+    fn is_object_class(&self, s: SymbolId) -> bool {
+        s == self.st.anyref_sym
+            || s == self.st.object_sym
+            || self.st.get(s).jvm_name == "java/lang/Object"
+    }
+
     /// SLS 5.3.3: `T` may only be mixed into a subclass of `T`'s own
     /// superclass. `parents` supplies the span so the caret lands on the
     /// offending mixin, as scalac's does.
@@ -2115,12 +2212,22 @@ impl Typer {
                 );
             }
         }
-        for p in self.st.get(class_id).parents.clone().iter().skip(1) {
+        // The superclass written again as a mixin is only inherited twice
+        // (`extends AnyRef with T with AnyRef`): nsc's check skips a parent
+        // that is the superclass itself.
+        let parents = self.st.get(class_id).parents.clone();
+        let superclass = parents.first().and_then(|p| self.st.class_sym_of(p));
+        for p in parents.iter().skip(1) {
             let Some(ps) = self.st.class_sym_of(p) else {
                 continue;
             };
             let f = self.st.get(ps).flags;
             if f.contains(Flags::TRAIT) || f.contains(Flags::INTERFACE) {
+                continue;
+            }
+            if superclass
+                .is_some_and(|sc| sc == ps || self.is_object_class(sc) && self.is_object_class(ps))
+            {
                 continue;
             }
             let name = self.st.get(ps).name.clone();
@@ -3333,5 +3440,13 @@ impl Typer {
             return Some(msg);
         }
         None
+    }
+}
+
+/// Remove the parent trees at `indices` (ascending), keeping the rest in
+/// order.
+fn drop_parents(parents: &mut Vec<Tree>, indices: &[usize]) {
+    for &i in indices.iter().rev() {
+        parents.remove(i);
     }
 }

@@ -300,7 +300,8 @@ fn value_class_sam_edge_adaptation_and_bridge_flags() {
     assert_eq!(got, "3\nmapped\nsource\n");
 
     let mut saw_bridge = false;
-    for entry in fs::read_dir(&out).expect("read output directory") {
+    // The literal classes sit in the enclosing class's package, `vcedge`.
+    for entry in fs::read_dir(out.join("vcedge")).expect("read output package") {
         let path = entry.expect("output entry").path();
         let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -308,11 +309,11 @@ fn value_class_sam_edge_adaptation_and_bridge_flags() {
         if !file.contains("anonfun") || !file.ends_with(".class") {
             continue;
         }
-        let class = file.trim_end_matches(".class");
+        let class = format!("vcedge.{}", file.trim_end_matches(".class"));
         let text = Command::new(&javap)
             .args(["-v", "-p", "-cp"])
             .arg(&out)
-            .arg(class)
+            .arg(&class)
             .output()
             .expect("javap SAM lambda");
         assert!(

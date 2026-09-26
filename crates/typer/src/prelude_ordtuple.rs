@@ -41,7 +41,7 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
             })
             .collect();
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![implicits],
+            paramss: vec![implicits].into(),
             ret: TyBox::new(Type::Class {
                 sym: ordering,
                 args: vec![Type::Tuple(elems.into())].into(),

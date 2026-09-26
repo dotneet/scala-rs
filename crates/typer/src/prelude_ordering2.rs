@@ -16,7 +16,7 @@ pub(crate) fn add_ordered(st: &mut SymbolTable) -> SymbolId {
     st.get_mut(ordered).tparams = vec![a];
     let cmp = st.alloc("compare", ordered, SymKind::Method, Flags::ABSTRACT, "");
     st.get_mut(cmp).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(a)]],
+        paramss: vec![vec![Type::TypeParam(a)]].into(),
         ret: TyBox::new(Type::Int),
     };
     method(
@@ -30,7 +30,7 @@ pub(crate) fn add_ordered(st: &mut SymbolTable) -> SymbolId {
     for op in ["<", ">", "<=", ">="] {
         let id = st.alloc(op, ordered, SymKind::Method, Flags::EMPTY, "");
         st.get_mut(id).ty = Type::Method {
-            paramss: vec![vec![Type::TypeParam(a)]],
+            paramss: vec![vec![Type::TypeParam(a)]].into(),
             ret: TyBox::new(Type::Boolean),
         };
     }
@@ -139,7 +139,8 @@ fn add_sorted_factory(st: &mut SymbolTable, owner: SymbolId, cls: SymbolId, orde
                 sym: ordering,
                 args: vec![Type::TypeParam(aa)].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: vec![Type::TypeParam(aa)].into(),
@@ -276,7 +277,8 @@ fn add_sorted_map_factory(
                 sym: ordering,
                 args: vec![Type::TypeParam(k)].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: vec![Type::TypeParam(k), Type::TypeParam(v)].into(),

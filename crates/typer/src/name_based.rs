@@ -306,7 +306,7 @@ impl Typer {
             return false;
         }
         let (paramss, ret) = match &s.ty {
-            Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
+            Type::Method { paramss, ret } => (paramss.clone().into_vec(), (**ret).clone()),
             other => (Vec::new(), other.clone()),
         };
         let method = s.name.clone();

@@ -137,7 +137,7 @@ fn add_ordering_option(st: &mut SymbolTable, ordering: SymbolId) {
         args: vec![Type::TypeParam(t)].into(),
     };
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![param_ty.clone()]],
+        paramss: vec![vec![param_ty.clone()]].into(),
         ret: TyBox::new(Type::Class {
             sym: ordering,
             args: vec![Type::Class {

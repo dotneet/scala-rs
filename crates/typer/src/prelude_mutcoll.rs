@@ -176,7 +176,7 @@ fn add_constructors(st: &mut SymbolTable, ordering: Option<SymbolId>) {
             _ => Type::Unit,
         };
         st.get_mut(ctor).ty = Type::Method {
-            paramss: tys,
+            paramss: tys.into(),
             ret: TyBox::new(ret),
         };
     }
@@ -236,7 +236,7 @@ fn add_factory(
     st.get_mut(empty).params = eps.concat();
     st.get_mut(empty).paramss = eps;
     st.get_mut(empty).ty = Type::Method {
-        paramss: epss,
+        paramss: epss.into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: vec![Type::TypeParam(ea)].into(),
@@ -265,7 +265,7 @@ fn add_factory(
     st.get_mut(apply).params = aps.concat();
     st.get_mut(apply).paramss = aps;
     st.get_mut(apply).ty = Type::Method {
-        paramss: apss,
+        paramss: apss.into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: vec![Type::TypeParam(aa)].into(),
@@ -311,7 +311,7 @@ fn add_map_factory(
     st.get_mut(empty).params = eps.concat();
     st.get_mut(empty).paramss = eps;
     st.get_mut(empty).ty = Type::Method {
-        paramss: epss,
+        paramss: epss.into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: vec![Type::TypeParam(ek), Type::TypeParam(ev)].into(),
@@ -348,7 +348,7 @@ fn add_map_factory(
     st.get_mut(apply).params = aps.concat();
     st.get_mut(apply).paramss = aps;
     st.get_mut(apply).ty = Type::Method {
-        paramss: apss,
+        paramss: apss.into(),
         ret: TyBox::new(Type::Class {
             sym: cls,
             args: vec![Type::TypeParam(ak), Type::TypeParam(av)].into(),

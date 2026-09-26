@@ -2102,8 +2102,14 @@ pub(crate) fn is_presuper_val(tree: &Tree) -> bool {
     )
 }
 
-pub(crate) fn flatten_apply_owned<'a>(fun: &'a Tree, args: &'a [Tree]) -> (&'a Tree, Vec<Tree>) {
-    let mut all = args.to_vec();
+/// The callee of a (possibly curried) application and all its arguments in
+/// one list. Borrowed unless clauses had to be joined: copying the arguments
+/// of every call, lambdas and nested calls included, was a tenth of emitting.
+pub(crate) fn flatten_apply_owned<'a>(
+    fun: &'a Tree,
+    args: &'a [Tree],
+) -> (&'a Tree, std::borrow::Cow<'a, [Tree]>) {
+    let mut all = std::borrow::Cow::Borrowed(args);
     let mut f = fun;
     loop {
         let p = peel_fun(f);
@@ -2121,8 +2127,8 @@ pub(crate) fn flatten_apply_owned<'a>(fun: &'a Tree, args: &'a [Tree]) -> (&'a T
                 && !matches!(p.ty, Type::Function { .. }) =>
             {
                 let mut combined = ia.clone();
-                combined.append(&mut all);
-                all = combined;
+                combined.extend_from_slice(&all);
+                all = std::borrow::Cow::Owned(combined);
                 f = inner;
             }
             _ => return (p, all),

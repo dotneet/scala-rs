@@ -72,7 +72,7 @@ pub(crate) fn add_array_buffer(st: &mut SymbolTable) {
     let baa = type_param(st, buf_apply, "A");
     st.get_mut(buf_apply).tparams = vec![baa];
     st.get_mut(buf_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(baa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(baa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: buf,
             args: vec![Type::TypeParam(baa)].into(),
@@ -142,7 +142,7 @@ pub(crate) fn add_list_buffer(st: &mut SymbolTable) {
     let baa = type_param(st, buf_apply, "A");
     st.get_mut(buf_apply).tparams = vec![baa];
     st.get_mut(buf_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(baa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(baa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: buf,
             args: vec![Type::TypeParam(baa)].into(),
@@ -212,7 +212,7 @@ pub(crate) fn add_array_deque(st: &mut SymbolTable) {
     let ea = type_param(st, deq_empty, "A");
     st.get_mut(deq_empty).tparams = vec![ea];
     st.get_mut(deq_empty).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::Class {
             sym: deq,
             args: vec![Type::TypeParam(ea)].into(),
@@ -229,7 +229,7 @@ pub(crate) fn add_array_deque(st: &mut SymbolTable) {
     let daa = type_param(st, deq_apply, "A");
     st.get_mut(deq_apply).tparams = vec![daa];
     st.get_mut(deq_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(daa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(daa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: deq,
             args: vec![Type::TypeParam(daa)].into(),
@@ -312,7 +312,7 @@ pub(crate) fn add_hash_map(st: &mut SymbolTable) {
     let ev = type_param(st, hm_empty, "V");
     st.get_mut(hm_empty).tparams = vec![ek, ev];
     st.get_mut(hm_empty).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::Class {
             sym: hm,
             args: vec![Type::TypeParam(ek), Type::TypeParam(ev)].into(),
@@ -334,7 +334,7 @@ pub(crate) fn add_hash_map(st: &mut SymbolTable) {
         args: vec![Type::TypeParam(hak), Type::TypeParam(hav)].into(),
     };
     st.get_mut(hm_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(hm_pair))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(hm_pair))]].into(),
         ret: TyBox::new(Type::Class {
             sym: hm,
             args: vec![Type::TypeParam(hak), Type::TypeParam(hav)].into(),
@@ -384,7 +384,7 @@ pub(crate) fn add_hash_set(st: &mut SymbolTable) {
     let ea = type_param(st, hs_empty, "A");
     st.get_mut(hs_empty).tparams = vec![ea];
     st.get_mut(hs_empty).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::Class {
             sym: hs,
             args: vec![Type::TypeParam(ea)].into(),
@@ -401,7 +401,7 @@ pub(crate) fn add_hash_set(st: &mut SymbolTable) {
     let haa = type_param(st, hs_apply, "A");
     st.get_mut(hs_apply).tparams = vec![haa];
     st.get_mut(hs_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(haa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(haa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: hs,
             args: vec![Type::TypeParam(haa)].into(),
@@ -493,7 +493,7 @@ pub(crate) fn add_linked_hash_map(st: &mut SymbolTable) {
     let ev = type_param(st, lhm_empty, "V");
     st.get_mut(lhm_empty).tparams = vec![ek, ev];
     st.get_mut(lhm_empty).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::Class {
             sym: lhm,
             args: vec![Type::TypeParam(ek), Type::TypeParam(ev)].into(),
@@ -515,7 +515,7 @@ pub(crate) fn add_linked_hash_map(st: &mut SymbolTable) {
         args: vec![Type::TypeParam(lak), Type::TypeParam(lav)].into(),
     };
     st.get_mut(lhm_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(lhm_pair))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(lhm_pair))]].into(),
         ret: TyBox::new(Type::Class {
             sym: lhm,
             args: vec![Type::TypeParam(lak), Type::TypeParam(lav)].into(),
@@ -585,7 +585,7 @@ pub(crate) fn add_linked_hash_set(st: &mut SymbolTable) {
     let ea = type_param(st, lhs_empty, "A");
     st.get_mut(lhs_empty).tparams = vec![ea];
     st.get_mut(lhs_empty).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::Class {
             sym: lhs,
             args: vec![Type::TypeParam(ea)].into(),
@@ -602,7 +602,7 @@ pub(crate) fn add_linked_hash_set(st: &mut SymbolTable) {
     let haa = type_param(st, lhs_apply, "A");
     st.get_mut(lhs_apply).tparams = vec![haa];
     st.get_mut(lhs_apply).ty = Type::Method {
-        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(haa)))]],
+        paramss: vec![vec![Type::Repeated(TyBox::new(Type::TypeParam(haa)))]].into(),
         ret: TyBox::new(Type::Class {
             sym: lhs,
             args: vec![Type::TypeParam(haa)].into(),

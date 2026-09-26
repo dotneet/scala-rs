@@ -1270,7 +1270,7 @@ impl Typer {
         self.st.get_mut(id).params = vec![p];
         self.st.get_mut(id).paramss = vec![vec![p]];
         self.st.get_mut(id).ty = Type::Method {
-            paramss: vec![vec![Type::Any]],
+            paramss: vec![vec![Type::Any]].into(),
             ret: TyBox::new(Type::Boolean),
         };
     }
@@ -1300,7 +1300,7 @@ impl Typer {
                 .st
                 .alloc(name, class_id, SymKind::Method, Flags::SYNTHETIC, "");
             self.st.get_mut(id).ty = Type::Method {
-                paramss: vec![],
+                paramss: vec![].into(),
                 ret: TyBox::new(ret),
             };
         }
@@ -1325,7 +1325,7 @@ impl Typer {
             self.st.get_mut(id).params = vec![p];
             self.st.get_mut(id).paramss = vec![vec![p]];
             self.st.get_mut(id).ty = Type::Method {
-                paramss: vec![vec![Type::Int]],
+                paramss: vec![vec![Type::Int]].into(),
                 ret: TyBox::new(ret),
             };
         }
@@ -1438,7 +1438,7 @@ impl Typer {
             self.st.get_mut(copy).params = copy_params.clone();
             self.st.get_mut(copy).paramss = vec![copy_params.clone()];
             self.st.get_mut(copy).ty = Type::Method {
-                paramss: vec![ptys],
+                paramss: vec![ptys].into(),
                 ret: TyBox::new(class_ty.clone()),
             };
             // Field types are not resolved yet at this point in the namer pass;
@@ -1471,7 +1471,7 @@ impl Typer {
             }
             self.st.get_mut(apply).params = fields.clone();
             self.st.get_mut(apply).ty = Type::Method {
-                paramss: vec![fields.iter().map(|_| Type::NoType).collect()],
+                paramss: vec![fields.iter().map(|_| Type::NoType).collect()].into(),
                 ret: TyBox::new(class_ty),
             };
             self.st.enter_in_current("apply", apply);
@@ -1904,7 +1904,7 @@ impl Typer {
                 self.st.get_mut(mem).params = all_ctor_params.clone();
                 self.st.get_mut(mem).paramss = paramss_ids.clone();
                 self.st.get_mut(mem).ty = Type::Method {
-                    paramss: paramss_ty.clone(),
+                    paramss: paramss_ty.clone().into(),
                     ret: TyBox::new(Type::Unit),
                 };
             }

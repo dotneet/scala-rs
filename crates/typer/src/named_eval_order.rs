@@ -52,7 +52,7 @@
 
 use scala_rs_parser::{Flags, Modifiers, SymbolId, Tree, TreeKind, Type};
 
-use crate::lazy_local::children_mut;
+use crate::lazy_local::for_each_child_mut;
 use crate::symbol::{SymKind, SymbolTable};
 
 /// Rewrite every application in `tree` whose named arguments were reordered.
@@ -98,9 +98,7 @@ impl Pass<'_> {
                 }
             }
             _ => {
-                for c in children_mut(t) {
-                    self.walk(c, true);
-                }
+                for_each_child_mut(t, &mut |c| self.walk(c, true));
             }
         }
         if outermost {
@@ -194,9 +192,7 @@ impl Pass<'_> {
                         if t.id == id {
                             *t = value.clone();
                         } else {
-                            for child in children_mut(t) {
-                                replace_copy(child, id, value);
-                            }
+                            for_each_child_mut(t, &mut |child| replace_copy(child, id, value));
                         }
                     }
                     for (i, argument) in args.iter_mut().enumerate() {

@@ -66,7 +66,7 @@ fn retype_try_apply(st: &mut SymbolTable, try_c: SymbolId) {
     st.get_mut(m).params = vec![r];
     st.get_mut(m).paramss = vec![vec![r]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![r_ty]],
+        paramss: vec![vec![r_ty]].into(),
         ret: TyBox::new(Type::Class {
             sym: try_c,
             args: vec![Type::TypeParam(t)].into(),
@@ -115,7 +115,7 @@ fn retype_map(st: &mut SymbolTable, cls: SymbolId, elem: usize, tparam: &str) {
     st.get_mut(m).params = vec![f];
     st.get_mut(m).paramss = vec![vec![f]];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![f_ty]],
+        paramss: vec![vec![f_ty]].into(),
         ret: TyBox::new(ret),
     };
 }

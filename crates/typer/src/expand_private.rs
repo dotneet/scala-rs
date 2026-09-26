@@ -38,7 +38,7 @@ use crate::symbol::{SymKind, SymbolTable};
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind};
 use std::collections::{HashMap, HashSet};
 
-use crate::lazy_local::children_mut;
+use crate::lazy_local::for_each_child_mut;
 
 /// Rename every `private` member of this unit that is reached from another
 /// class, and mark it for the backend to emit without `ACC_PRIVATE`.
@@ -154,9 +154,7 @@ fn collect_private_case_members(t: &mut Tree, st: &SymbolTable, out: &mut HashSe
             }
         }
     }
-    for c in children_mut(t) {
-        collect_private_case_members(c, st, out);
-    }
+    for_each_child_mut(t, &mut |c| collect_private_case_members(c, st, out));
 }
 
 fn collect_private_ctors(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<SymbolId>) {
@@ -170,9 +168,7 @@ fn collect_private_ctors(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<Symbo
             out.insert(t.sym);
         }
     }
-    for c in children_mut(t) {
-        collect_private_ctors(c, st, out);
-    }
+    for_each_child_mut(t, &mut |c| collect_private_ctors(c, st, out));
 }
 
 /// `<owner full name, '$'-separated>$$<name>`, nsc's `nme.expandedName`.
@@ -242,9 +238,7 @@ fn collect_trait_private_vals(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<
     {
         out.insert(t.sym);
     }
-    for c in children_mut(t) {
-        collect_trait_private_vals(c, st, out);
-    }
+    for_each_child_mut(t, &mut |c| collect_trait_private_vals(c, st, out));
 }
 
 /// A `val` / `var` / `lazy val` member of a trait written unqualified
@@ -288,9 +282,7 @@ fn collect_private_members(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<Sym
             out.insert(t.sym);
         }
     }
-    for c in children_mut(t) {
-        collect_private_members(c, st, out);
-    }
+    for_each_child_mut(t, &mut |c| collect_private_members(c, st, out));
 }
 
 /// Walk with the class the emitted code will *live in*. A `Function` becomes
@@ -311,9 +303,7 @@ fn scan(
         TreeKind::Function { .. } => SymbolId::NONE,
         _ => cls,
     };
-    for c in children_mut(t) {
-        scan(c, st, inner, candidates, need);
-    }
+    for_each_child_mut(t, &mut |c| scan(c, st, inner, candidates, need));
 }
 
 fn code_class_of(st: &SymbolTable, sym: SymbolId, fallback: SymbolId) -> SymbolId {
@@ -354,7 +344,5 @@ fn rewrite(t: &mut Tree, renames: &HashMap<SymbolId, (String, String)>) {
             }
         }
     }
-    for c in children_mut(t) {
-        rewrite(c, renames);
-    }
+    for_each_child_mut(t, &mut |c| rewrite(c, renames));
 }

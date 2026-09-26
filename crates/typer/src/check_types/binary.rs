@@ -1788,6 +1788,7 @@ impl Typer {
             return member_ty.clone();
         };
         let recorded = self.pickle.result_type_member_app(member).cloned();
+        let from_pickle = recorded.is_some();
         // A source receiver has no pickle of its own, so nothing warms the
         // alias its binary ancestors fix: `class Mine extends Flow2[Boolean,
         // String]` selecting the inherited `Mixed#twice: Repr[Out]` kept
@@ -1806,6 +1807,19 @@ impl Typer {
         let Some(ctor) = self.complete_type_member_through_bases(cls, &name) else {
             return member_ty.clone();
         };
+        // ...but only an alias some class *defines* is an answer. A member
+        // that stays abstract all the way down -- cats' newtypes, `type
+        // Type[A, +B] <: Base & Tag` in `Newtype2`, which `NonEmptyMapImpl`
+        // never fixes -- is already the right type in the member's result,
+        // read at the receiver's path (`NonEmptyMapImpl.Type[K, A]`).
+        // Rebuilding it from the declaration gave the bare `Newtype2#Type`,
+        // whose implicit scope no longer holds `catsNonEmptyMapOps`, and
+        // `acc.lookup(key)` on a `NonEmptyMap` was not a member.
+        if !from_pickle
+            && matches!(&ctor, Type::TypeMember(id) if self.st.is_deferred_type_member(*id))
+        {
+            return member_ty.clone();
+        }
         let result = self
             .st
             .expand_applied_hk_alias(crate::symbol::apply_type_ctor(ctor, args));

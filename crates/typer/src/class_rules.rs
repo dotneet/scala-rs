@@ -203,7 +203,7 @@ impl Typer {
         };
         let sizes: Vec<usize> = cs.paramss.iter().map(Vec::len).collect();
         if paramss.iter().map(Vec::len).eq(sizes.iter().copied()) {
-            return Some(paramss.clone());
+            return Some(paramss.clone().into_vec());
         }
         let flat: Vec<Type> = paramss.iter().flatten().cloned().collect();
         if flat.len() != sizes.iter().sum::<usize>() {

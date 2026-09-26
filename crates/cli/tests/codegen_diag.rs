@@ -119,6 +119,50 @@ fn backend_span_keeps_the_failing_unit_with_multiple_sources() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Classes are written while later units are still being generated, so the
+/// ones an earlier unit already put on disk have to be taken back when a later
+/// unit fails. The earlier unit here is large enough for the background
+/// writers to have started; the class files of an earlier build stay.
+#[test]
+fn backend_error_takes_back_classes_already_written() {
+    let dir = tmp_dir("rollback");
+    let good = dir.join("good.scala");
+    let bad = dir.join("bad.scala");
+    let mut src = String::from("package p.q\n");
+    for i in 0..200 {
+        src.push_str(&format!("class G{i} {{ def v: Int = {i} }}\n"));
+    }
+    fs::write(&good, src).expect("write good source");
+    fs::write(
+        &bad,
+        "object Bad {\n  def dup[T](a: Array[T]): Array[T] = a.clone()\n}\n",
+    )
+    .expect("write bad source");
+    let out = dir.join("classes");
+    let kept = out.join("p/Earlier.class");
+    fs::create_dir_all(kept.parent().unwrap()).expect("create earlier build");
+    fs::write(&kept, b"earlier").expect("write earlier class");
+    let output = compile(&[&good, &bad], &out);
+    assert!(
+        !output.status.success(),
+        "unsupported clone unexpectedly compiled"
+    );
+    assert_eq!(
+        fs::read(&kept).expect("earlier class survives"),
+        b"earlier".to_vec()
+    );
+    fs::remove_file(&kept).expect("remove earlier class");
+    assert!(
+        !has_class_files(&out),
+        "backend error left classes of an earlier unit"
+    );
+    assert!(
+        !out.join("p/q").exists(),
+        "backend error left the directory it created"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn super_accessor_uses_the_selected_target_across_source_units() {
     let base = fixtures_dir().join("codegen_diag_super_base.scala");

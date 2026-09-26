@@ -3115,7 +3115,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         // or nsc reads the trait as declaring a different member than the class
         // implementing it.
         let acc_paramss: Vec<Vec<Type>> = match &self.facts.get(method_id).ty {
-            Type::Method { paramss, .. } => paramss.clone(),
+            Type::Method { paramss, .. } => paramss.clone().into_vec(),
             _ => Vec::new(),
         };
         let sizes = self.clause_sizes(method_id, &acc_paramss, param_refs.len(), acc_name);
@@ -3309,7 +3309,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             }
             _ => match &s.ty {
                 Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
-                _ => (vec![], Type::Unit),
+                _ => (Default::default(), Type::Unit),
             },
         };
         // The parameter symbols, aligned with `params`: a result type may name

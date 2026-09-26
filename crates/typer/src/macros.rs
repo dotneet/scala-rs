@@ -678,7 +678,7 @@ impl Typer {
         // callee: a nullary implementation must not be auto-applied, and an
         // implementation with parameters must not be eta-expanded.
         let dummy = Type::Method {
-            paramss: Vec::new(),
+            paramss: Vec::new().into(),
             ret: TyBox::new(Type::NoType),
         };
         let mark = self.diags.len();
@@ -896,9 +896,7 @@ impl Typer {
         // Anonymous classes live below New/ValDef/Apply rather than directly
         // in a template's statement list. Their macro declarations also have
         // no runtime method body and must not reach bytecode generation.
-        for child in crate::lazy_local::children_mut(tree) {
-            self.strip_macro_defs(child);
-        }
+        crate::lazy_local::for_each_child_mut(tree, &mut |child| self.strip_macro_defs(child));
     }
 
     /// The macro symbol this tree applies, if it is a macro application.

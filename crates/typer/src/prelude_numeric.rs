@@ -34,7 +34,7 @@ fn module(st: &mut SymbolTable, owner: SymbolId, name: &str, jvm: &str) -> Symbo
 fn getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ret: Type) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::Method, Flags::FINAL, "");
     st.get_mut(id).ty = Type::Method {
-        paramss: Vec::new(),
+        paramss: Vec::new().into(),
         ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = Intrinsic::None;

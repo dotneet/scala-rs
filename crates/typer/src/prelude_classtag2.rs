@@ -7,7 +7,7 @@ use scala_rs_parser::{Flags, SymbolId, Type};
 fn plain_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) {
     let id = st.alloc(name, owner, SymKind::Method, Flags::EMPTY, "");
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![],
+        paramss: vec![].into(),
         ret: TyBox::new(ty),
     };
 }
@@ -91,7 +91,7 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     let at = type_param(st, apply, "T");
     st.get_mut(apply).tparams = vec![at];
     st.get_mut(apply).ty = Type::Method {
-        paramss: vec![vec![class_ty]],
+        paramss: vec![vec![class_ty]].into(),
         ret: TyBox::new(tag(Type::TypeParam(at))),
     };
     let mems = st.get(mc).members.clone();

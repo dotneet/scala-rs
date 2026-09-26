@@ -1,0 +1,5 @@
+List(6, t)
+List(4, 2)
+List(0, 5, 5)
+List(10, 10, 13, 16, c10, c10)
+List(lazy, init 0, label)

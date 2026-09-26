@@ -1292,7 +1292,7 @@ impl Typer {
                 .unwrap_or(Type::NoType);
             let ret = self.subst_dependent_paths(&first, args, ret);
             return Some(Type::Method {
-                paramss: rest_tys,
+                paramss: rest_tys.into(),
                 ret: TyBox::new(ret),
             });
         }
@@ -1724,7 +1724,7 @@ impl Typer {
             return Some(gfun);
         }
         let getter_pt = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::NoType),
         };
         self.type_expr(&mut gfun, &getter_pt);

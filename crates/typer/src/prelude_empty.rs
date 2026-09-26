@@ -58,7 +58,7 @@ pub(crate) fn install(st: &mut SymbolTable) {
         let targs: Vec<Type> = tps.iter().map(|t| Type::TypeParam(*t)).collect();
         st.get_mut(id).tparams = tps;
         st.get_mut(id).ty = Type::Method {
-            paramss: vec![vec![]],
+            paramss: vec![vec![]].into(),
             ret: TyBox::new(Type::Class {
                 sym: coll,
                 args: targs.into(),

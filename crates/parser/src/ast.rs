@@ -372,6 +372,125 @@ impl IntoIterator for TyList {
     }
 }
 
+/// A method's parameter clauses, shared the way [`TyList`] is. A method type
+/// is what every member selection copies, and copying its clauses allocated
+/// a vector per clause every time.
+///
+/// It reads as a `Vec<Vec<Type>>` and is built from one (`.into()`) or by
+/// `collect()`, with the [`TypeFlags`] of its types computed once. Mutating
+/// it in place copies the clauses if they are shared, and gives up on the
+/// flags (every bit set), which stays correct.
+#[derive(Clone)]
+pub struct ParamClauses {
+    items: std::rc::Rc<Vec<Vec<Type>>>,
+    flags: TypeFlags,
+}
+
+impl ParamClauses {
+    pub fn new(items: Vec<Vec<Type>>) -> ParamClauses {
+        let flags = items
+            .iter()
+            .flatten()
+            .fold(TypeFlags::NONE, |f, t| f | t.flags());
+        ParamClauses {
+            items: std::rc::Rc::new(items),
+            flags,
+        }
+    }
+
+    #[inline]
+    pub fn flags(&self) -> TypeFlags {
+        self.flags
+    }
+
+    /// The clauses as a vector of their own.
+    pub fn into_vec(self) -> Vec<Vec<Type>> {
+        std::rc::Rc::try_unwrap(self.items).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
+impl std::ops::Deref for ParamClauses {
+    type Target = Vec<Vec<Type>>;
+    #[inline]
+    fn deref(&self) -> &Vec<Vec<Type>> {
+        &self.items
+    }
+}
+
+impl std::ops::DerefMut for ParamClauses {
+    fn deref_mut(&mut self) -> &mut Vec<Vec<Type>> {
+        self.flags = TypeFlags::ALL;
+        std::rc::Rc::make_mut(&mut self.items)
+    }
+}
+
+impl Default for ParamClauses {
+    fn default() -> ParamClauses {
+        ParamClauses::new(Vec::new())
+    }
+}
+
+impl PartialEq for ParamClauses {
+    fn eq(&self, other: &ParamClauses) -> bool {
+        std::rc::Rc::ptr_eq(&self.items, &other.items) || *self.items == *other.items
+    }
+}
+
+impl PartialEq<Vec<Vec<Type>>> for ParamClauses {
+    fn eq(&self, other: &Vec<Vec<Type>>) -> bool {
+        *self.items == *other
+    }
+}
+
+impl fmt::Debug for ParamClauses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.items, f)
+    }
+}
+
+impl From<Vec<Vec<Type>>> for ParamClauses {
+    fn from(items: Vec<Vec<Type>>) -> ParamClauses {
+        ParamClauses::new(items)
+    }
+}
+
+impl From<ParamClauses> for Vec<Vec<Type>> {
+    fn from(p: ParamClauses) -> Vec<Vec<Type>> {
+        p.into_vec()
+    }
+}
+
+impl FromIterator<Vec<Type>> for ParamClauses {
+    fn from_iter<I: IntoIterator<Item = Vec<Type>>>(iter: I) -> ParamClauses {
+        ParamClauses::new(iter.into_iter().collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a ParamClauses {
+    type Item = &'a Vec<Type>;
+    type IntoIter = std::slice::Iter<'a, Vec<Type>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut ParamClauses {
+    type Item = &'a mut Vec<Type>;
+    type IntoIter = std::slice::IterMut<'a, Vec<Type>>;
+    fn into_iter(self) -> Self::IntoIter {
+        use std::ops::DerefMut;
+        self.deref_mut().iter_mut()
+    }
+}
+
+impl IntoIterator for ParamClauses {
+    type Item = Vec<Type>;
+    type IntoIter = std::vec::IntoIter<Vec<Type>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
 /// A single [`Type`] held by another, shared the way [`TyList`] is: the
 /// result of a function or method, an array's element, a prefix, a bound.
 #[derive(Clone)]
@@ -507,7 +626,7 @@ pub enum Type {
         args: TyList,
     },
     Method {
-        paramss: Vec<Vec<Type>>,
+        paramss: ParamClauses,
         ret: TyBox,
     },
     ByName(TyBox),
@@ -574,9 +693,7 @@ impl Type {
             Type::Class { args, .. } => args.flags(),
             Type::Overload(ts) => ts.flags(),
             Type::Function { params, ret } => TypeFlags::FUNCTION | params.flags() | bx(ret),
-            Type::Method { paramss, ret } => {
-                paramss.iter().flatten().fold(bx(ret), |f, p| f | p.flags())
-            }
+            Type::Method { paramss, ret } => paramss.flags() | bx(ret),
             Type::Applied { ctor, args } => TypeFlags::APPLIED | bx(ctor) | args.flags(),
             Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => bx(t),
             Type::Annotated { tpe, .. } => bx(tpe),

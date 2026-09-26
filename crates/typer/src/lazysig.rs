@@ -731,7 +731,7 @@ impl Typer {
                     if p.ret.is_no_type() {
                         let paramss = match &self.st.get(p.getter).ty {
                             Type::Method { paramss, .. } => paramss.clone(),
-                            _ => Vec::new(),
+                            _ => Vec::new().into(),
                         };
                         self.st.get_mut(p.getter).ty = Type::Method {
                             paramss,

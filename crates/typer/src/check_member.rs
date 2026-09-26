@@ -1221,7 +1221,7 @@ impl Typer {
         }
         self.st.pop_scope();
         let mty = Type::Method {
-            paramss: paramss_ty,
+            paramss: paramss_ty.into(),
             ret: TyBox::new(ret.clone()),
         };
         tree.ty = mty.clone();
@@ -1229,7 +1229,7 @@ impl Typer {
             self.st.get_mut(tree.sym).ty = mty;
             self.st.get_mut(tree.sym).pickle_ty = if has_pickle_alias {
                 Some(Type::Method {
-                    paramss: pickle_paramss,
+                    paramss: pickle_paramss.into(),
                     ret: TyBox::new(pickle_ret.unwrap_or_else(|| ret.clone())),
                 })
             } else {
@@ -1400,9 +1400,9 @@ impl Typer {
             };
             self.st.get_mut(gid).ty = Type::Method {
                 paramss: if preceding_tys.is_empty() {
-                    Vec::new()
+                    Vec::new().into()
                 } else {
-                    vec![preceding_tys]
+                    vec![preceding_tys].into()
                 },
                 ret: TyBox::new(ret.clone()),
             };
@@ -2105,7 +2105,7 @@ impl Typer {
         let mut shapes: Vec<(usize, usize)> = Vec::new();
         for id in alts {
             let clauses: Vec<Vec<Type>> = match &self.st.get(id).ty {
-                Type::Method { paramss, .. } => paramss.clone(),
+                Type::Method { paramss, .. } => paramss.clone().into_vec(),
                 _ => vec![self
                     .st
                     .get(id)
@@ -2149,7 +2149,7 @@ impl Typer {
     /// meaningless.
     fn ctor_first_clause_len(&self, id: SymbolId) -> Option<usize> {
         let clauses: Vec<Vec<Type>> = match &self.st.get(id).ty {
-            Type::Method { paramss, .. } => paramss.clone(),
+            Type::Method { paramss, .. } => paramss.clone().into_vec(),
             _ => vec![self
                 .st
                 .get(id)
@@ -2987,7 +2987,7 @@ impl Typer {
             };
             match ty {
                 Type::Method { paramss, ret } if paramss.len() > 1 => Type::Method {
-                    paramss: vec![paramss.into_iter().flatten().collect()],
+                    paramss: vec![paramss.into_iter().flatten().collect()].into(),
                     ret,
                 },
                 other => other,
@@ -3005,7 +3005,8 @@ impl Typer {
                         .params
                         .iter()
                         .map(|p| self.st.get(*p).ty.clone())
-                        .collect()],
+                        .collect()]
+                    .into(),
                     ret: TyBox::new(Type::Unit),
                 }
             } else {

@@ -50,6 +50,10 @@ pub(crate) struct PendingTypeBounds {
 }
 
 pub struct TypecheckOptions {
+    /// One past the largest node id in the units, when the caller knows it
+    /// ([`scala_rs_parser::ParseResult::next_node_id`]). Otherwise every
+    /// tree is walked to find it, which was 2% of a large compile.
+    pub node_id_bound: Option<u32>,
     pub fatal_warnings: bool,
     /// Type Option/List `withFilter` as the scala-library 2.13 shape, StringOps
     /// via `augmentString`, and Iterator. The backend still needs `library_abi`.
@@ -293,6 +297,7 @@ pub struct ClasspathClass {
 impl Default for TypecheckOptions {
     fn default() -> Self {
         TypecheckOptions {
+            node_id_bound: None,
             fatal_warnings: false,
             library_abi: false,
             classpath: Vec::new(),
@@ -321,6 +326,13 @@ pub(crate) type IdleWarm = (Vec<Type>, Vec<SymbolId>);
 /// See [`Typer::companion_implicit_cache`]: the implicit members, and the
 /// module each one inherited from a mixed-in trait is named through.
 pub(crate) type CompanionImplicits = (Vec<SymbolId>, Vec<(u32, SymbolId)>);
+
+/// See [`Typer::outer_implicits_cache`]: the scopes an answer was computed
+/// for, and the candidates with their names.
+pub(crate) type OuterImplicits = (
+    crate::implicits::OuterImplicitsKey,
+    std::rc::Rc<Vec<(SymbolId, String)>>,
+);
 
 pub struct Typer {
     pub st: SymbolTable,
@@ -701,6 +713,8 @@ pub struct Typer {
     /// against, while the class graph and its member lists
     /// (`member_graph_gen`) stand still.
     pub(crate) idle_candidate_warms: (u64, Vec<IdleWarm>),
+    /// [`Typer::outer_implicits`]' last answers, most recent last.
+    pub(crate) outer_implicits_cache: std::cell::RefCell<Vec<OuterImplicits>>,
     /// [`Typer::companion_implicits_of_class`]'s answers while the class
     /// graph and its member lists (`member_graph_gen`) stand still: the
     /// implicit members, and the module each one inherited from a mixed-in
@@ -1057,10 +1071,14 @@ pub fn typecheck_units_src(
         .collect();
     // Reconstructed macro trees must not share NodeId(0): block-local and
     // declaration caches use node identity across all expansions in a unit.
-    let mut pending: Vec<&Tree> = units.iter().map(|(tree, _)| &**tree).collect();
-    while let Some(tree) = pending.pop() {
-        t.macro_next_node = t.macro_next_node.max(tree.id.0.saturating_add(1));
-        crate::macros::push_children(tree, &mut pending);
+    if let Some(bound) = opts.node_id_bound {
+        t.macro_next_node = t.macro_next_node.max(bound);
+    } else {
+        let mut pending: Vec<&Tree> = units.iter().map(|(tree, _)| &**tree).collect();
+        while let Some(tree) = pending.pop() {
+            t.macro_next_node = t.macro_next_node.max(tree.id.0.saturating_add(1));
+            crate::macros::push_children(tree, &mut pending);
+        }
     }
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
@@ -1349,6 +1367,7 @@ impl Typer {
             companion_implicit_cache: Default::default(),
             derivation_scopes_warmed: Default::default(),
             idle_candidate_warms: Default::default(),
+            outer_implicits_cache: Default::default(),
             overridden_cache: Default::default(),
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),

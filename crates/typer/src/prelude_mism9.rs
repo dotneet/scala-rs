@@ -84,7 +84,7 @@ fn generalize(st: &mut SymbolTable, id: SymbolId) {
     }
     st.get_mut(id).tparams = vec![u];
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![vec![fn_ty]],
+        paramss: vec![vec![fn_ty]].into(),
         ret: TyBox::new(Type::Unit),
     };
 }

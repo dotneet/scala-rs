@@ -47,7 +47,7 @@ fn method(
         vec![params]
     };
     st.get_mut(id).ty = Type::Method {
-        paramss,
+        paramss: paramss.into(),
         ret: TyBox::new(ret),
     };
     st.get_mut(id).intrinsic = intrinsic;
@@ -189,7 +189,7 @@ pub fn install_option_core(st: &mut SymbolTable) {
     st.get_mut(fold).params = vec![p0, p1];
     st.get_mut(fold).paramss = vec![vec![p0], vec![p1]];
     st.get_mut(fold).ty = Type::Method {
-        paramss: vec![vec![by_name(tb.clone())], vec![fn1(ta, tb.clone())]],
+        paramss: vec![vec![by_name(tb.clone())], vec![fn1(ta, tb.clone())]].into(),
         ret: TyBox::new(tb),
     };
 }
@@ -238,7 +238,7 @@ fn install_option_library(st: &mut SymbolTable) {
         st.get_mut(m).params = vec![that];
         st.get_mut(m).paramss = vec![vec![that]];
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![arg]],
+            paramss: vec![vec![arg]].into(),
             ret: TyBox::new(ty_of(
                 o,
                 vec![ty_of(tuple2, vec![Type::TypeParam(a1), Type::TypeParam(b)])],
@@ -259,7 +259,7 @@ fn install_option_library(st: &mut SymbolTable) {
     st.get_mut(to_right).params = vec![lp];
     st.get_mut(to_right).paramss = vec![vec![lp]];
     st.get_mut(to_right).ty = Type::Method {
-        paramss: vec![vec![by_name(tx.clone())]],
+        paramss: vec![vec![by_name(tx.clone())]].into(),
         ret: TyBox::new(ty_of(either, vec![tx, ta.clone()])),
     };
     // nsc: `def toLeft[X](right: => X): Either[A, X]`
@@ -272,7 +272,7 @@ fn install_option_library(st: &mut SymbolTable) {
     st.get_mut(to_left).params = vec![rp];
     st.get_mut(to_left).paramss = vec![vec![rp]];
     st.get_mut(to_left).ty = Type::Method {
-        paramss: vec![vec![by_name(tyy.clone())]],
+        paramss: vec![vec![by_name(tyy.clone())]].into(),
         ret: TyBox::new(ty_of(either, vec![ta, tyy])),
     };
 }
@@ -389,7 +389,7 @@ fn install_either(st: &mut SymbolTable) {
     st.get_mut(fm).tparams = vec![fa1, fb1];
     let fm_res = ty_of(either, vec![Type::TypeParam(fa1), Type::TypeParam(fb1)]);
     st.get_mut(fm).ty = Type::Method {
-        paramss: vec![vec![fn1(tb.clone(), fm_res.clone())]],
+        paramss: vec![vec![fn1(tb.clone(), fm_res.clone())]].into(),
         ret: TyBox::new(fm_res),
     };
     method(
@@ -415,7 +415,8 @@ fn install_either(st: &mut SymbolTable) {
         paramss: vec![vec![
             fn1(ta.clone(), tc.clone()),
             fn1(tb.clone(), tc.clone()),
-        ]],
+        ]]
+        .into(),
         ret: TyBox::new(tc),
     };
     // nsc: `def filterOrElse[A1 >: A](p: B => Boolean, zero: => A1): Either[A1, B]`
@@ -681,7 +682,8 @@ fn install_try(st: &mut SymbolTable) {
         paramss: vec![vec![
             fn1(throwable_t, tu.clone()),
             fn1(t_ty.clone(), tu.clone()),
-        ]],
+        ]]
+        .into(),
         ret: TyBox::new(tu),
     };
 
@@ -711,7 +713,7 @@ fn install_try(st: &mut SymbolTable) {
     let mb = type_param(st, m, "B");
     st.get_mut(m).tparams = vec![mb];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![vec![fn1(twa.clone(), Type::TypeParam(mb))]],
+        paramss: vec![vec![fn1(twa.clone(), Type::TypeParam(mb))]].into(),
         ret: TyBox::new(ty_of(try_c, vec![Type::TypeParam(mb)])),
     };
     let fm = method(
@@ -726,7 +728,7 @@ fn install_try(st: &mut SymbolTable) {
     st.get_mut(fm).tparams = vec![fb];
     let try_b = ty_of(try_c, vec![Type::TypeParam(fb)]);
     st.get_mut(fm).ty = Type::Method {
-        paramss: vec![vec![fn1(twa.clone(), try_b.clone())]],
+        paramss: vec![vec![fn1(twa.clone(), try_b.clone())]].into(),
         ret: TyBox::new(try_b),
     };
     let _ = wf_try;
@@ -919,7 +921,7 @@ fn poly_method(
     st.get_mut(m).params = ids.clone();
     st.get_mut(m).paramss = vec![ids];
     st.get_mut(m).ty = Type::Method {
-        paramss: vec![params],
+        paramss: vec![params].into(),
         ret: TyBox::new(ret),
     };
 }

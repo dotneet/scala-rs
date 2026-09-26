@@ -1175,7 +1175,7 @@ impl<'a> Reifier<'a> {
             SymKind::Term if s.flags.contains(Flags::LAZY) => (
                 free_flags::LAZY_VAL,
                 Type::Method {
-                    paramss: vec![],
+                    paramss: vec![].into(),
                     ret: TyBox::new(s.ty.clone()),
                 },
             ),
@@ -1184,7 +1184,7 @@ impl<'a> Reifier<'a> {
                 Type::Method { paramss, ret } if paramss.is_empty() => (
                     free_flags::DEF,
                     Type::Method {
-                        paramss: vec![],
+                        paramss: vec![].into(),
                         ret: ret.clone(),
                     },
                 ),
@@ -1196,7 +1196,7 @@ impl<'a> Reifier<'a> {
                 other => (
                     free_flags::DEF,
                     Type::Method {
-                        paramss: vec![],
+                        paramss: vec![].into(),
                         ret: TyBox::new(other.clone()),
                     },
                 ),

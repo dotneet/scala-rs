@@ -435,7 +435,7 @@ fn flatten_defdef(tree: &mut Tree, st: &mut SymbolTable) {
         if paramss.len() > 1 {
             let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
             tree.ty = Type::Method {
-                paramss: vec![params],
+                paramss: vec![params].into(),
                 ret: ret.clone(),
             };
         }
@@ -487,7 +487,7 @@ fn flatten_one_method(st: &mut SymbolTable, id: SymbolId) {
         };
         let params: Vec<Type> = paramss.into_iter().flatten().collect();
         st.get_mut(id).ty = Type::Method {
-            paramss: vec![params],
+            paramss: vec![params].into(),
             ret,
         };
     }

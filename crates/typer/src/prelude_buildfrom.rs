@@ -288,7 +288,7 @@ fn widen_set_concat(st: &mut SymbolTable) {
         args: vec![Type::TypeParam(a)].into(),
     };
     let wanted = Type::Method {
-        paramss: vec![vec![set_a.clone()]],
+        paramss: vec![vec![set_a.clone()]].into(),
         ret: TyBox::new(set_a.clone()),
     };
     let targets: Vec<SymbolId> = st
@@ -300,7 +300,7 @@ fn widen_set_concat(st: &mut SymbolTable) {
         .collect();
     for m in targets {
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![ioc_a.clone()]],
+            paramss: vec![vec![ioc_a.clone()]].into(),
             ret: TyBox::new(set_a.clone()),
         };
         if let Some(&p) = st.get(m).params.first() {
@@ -444,7 +444,7 @@ fn add_to_factory(st: &mut SymbolTable) {
         st.get_mut(m).params = vec![p];
         st.get_mut(m).paramss = vec![vec![p]];
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![param]],
+            paramss: vec![vec![param]].into(),
             ret: TyBox::new(Type::Class {
                 sym: factory,
                 args: vec![elem, built].into(),
@@ -559,7 +559,7 @@ fn add_factory_evidence(st: &mut SymbolTable, module_cls: SymbolId, cls: SymbolI
         elem_tys[0].clone()
     };
     st.get_mut(m).ty = Type::Method {
-        paramss: Vec::new(),
+        paramss: Vec::new().into(),
         ret: TyBox::new(Type::Class {
             sym: factory,
             args: vec![

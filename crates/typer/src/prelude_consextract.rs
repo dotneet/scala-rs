@@ -178,7 +178,7 @@ fn add_deferrer(st: &mut SymbolTable, coll_jvm: &str, lazy_elem: bool) {
             Type::TypeParam(b)
         };
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![vec![param]],
+            paramss: vec![vec![param]].into(),
             ret: TyBox::new(coll_of(Type::TypeParam(b))),
         };
     }
@@ -192,7 +192,7 @@ fn add_deferrer(st: &mut SymbolTable, coll_jvm: &str, lazy_elem: bool) {
     let ta = type_param(st, td, "A");
     st.get_mut(td).tparams = vec![ta];
     st.get_mut(td).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(TyBox::new(coll_of(Type::TypeParam(ta))))]],
+        paramss: vec![vec![Type::ByName(TyBox::new(coll_of(Type::TypeParam(ta))))]].into(),
         ret: TyBox::new(Type::Class {
             sym: d,
             args: vec![Type::TypeParam(ta)].into(),
@@ -252,7 +252,7 @@ fn add_seq_unapply(st: &mut SymbolTable, mcls: SymbolId, seq: SymbolId, head_fir
         vec![Type::TypeParam(c), Type::TypeParam(a)]
     };
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![vec![Type::TypeParam(c)]],
+        paramss: vec![vec![Type::TypeParam(c)]].into(),
         ret: TyBox::new(Type::Class {
             sym: st.option_sym,
             args: vec![Type::Tuple(payload.into())].into(),
@@ -271,7 +271,7 @@ fn add_cons_unapply(st: &mut SymbolTable, mcls: SymbolId, cls: SymbolId) {
         args: vec![Type::TypeParam(a)].into(),
     };
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![vec![coll.clone()]],
+        paramss: vec![vec![coll.clone()]].into(),
         ret: TyBox::new(Type::Class {
             sym: st.option_sym,
             args: vec![Type::Tuple(vec![Type::TypeParam(a), coll].into())].into(),

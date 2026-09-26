@@ -123,7 +123,7 @@ fn add_c_member(
         (p, tb)
     };
     st.get_mut(id).ty = Type::Method {
-        paramss: vec![vec![param]],
+        paramss: vec![vec![param]].into(),
         ret: TyBox::new(Type::Class {
             sym: view,
             args: vec![elem].into(),

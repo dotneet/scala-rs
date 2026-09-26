@@ -2003,7 +2003,7 @@ impl PickleSupply {
             st.get_mut(existing).params = source_params.clone();
             st.get_mut(existing).paramss = source_paramss.clone();
             st.get_mut(existing).ty = Type::Method {
-                paramss: vec![source_param_types.clone()],
+                paramss: vec![source_param_types.clone()].into(),
                 ret: TyBox::new(Type::Unit),
             };
             return true;
@@ -2012,7 +2012,7 @@ impl PickleSupply {
         st.get_mut(m).params = source_params;
         st.get_mut(m).paramss = source_paramss;
         st.get_mut(m).ty = Type::Method {
-            paramss: vec![source_param_types],
+            paramss: vec![source_param_types].into(),
             ret: TyBox::new(Type::Unit),
         };
         st.get_mut(m).owner = class_sym;
@@ -3300,7 +3300,7 @@ impl PickleSupply {
         };
         let id = st.alloc(name, class_sym, SymKind::Method, Flags::FINAL, "");
         st.get_mut(id).ty = Type::Method {
-            paramss: Vec::new(),
+            paramss: Vec::new().into(),
             ret: TyBox::new(ret),
         };
         st.get_mut(id).macro_impl = Some(MacroBinding {
@@ -3460,7 +3460,7 @@ impl PickleSupply {
         st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
         st.get_mut(m).paramss = paramss_sym;
         st.get_mut(m).ty = Type::Method {
-            paramss: paramss_ty,
+            paramss: paramss_ty.into(),
             ret: TyBox::new(ret),
         };
         if shape.implicit {
@@ -3671,7 +3671,7 @@ impl PickleSupply {
             self.install_expr_apply(st, bin, mcls);
         }
         let want = Type::Method {
-            paramss: Vec::new(),
+            paramss: Vec::new().into(),
             ret: TyBox::new(Type::ModuleRef(mcls)),
         };
         // An accessor already reachable from here may be **useless**. Reading
@@ -3831,7 +3831,7 @@ impl PickleSupply {
         st.get_mut(ap).params = vec![p1, p2, p3];
         st.get_mut(ap).paramss = vec![vec![p1, p2], vec![p3]];
         st.get_mut(ap).ty = Type::Method {
-            paramss: vec![vec![mirror_ty, creator_ty], vec![tag_ty]],
+            paramss: vec![vec![mirror_ty, creator_ty], vec![tag_ty]].into(),
             ret: TyBox::new(Type::Class {
                 sym: expr,
                 args: vec![Type::TypeParam(t)].into(),
@@ -4717,7 +4717,7 @@ impl PickleSupply {
         st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
         st.get_mut(m).paramss = paramss_sym;
         st.get_mut(m).ty = Type::Method {
-            paramss: paramss_ty,
+            paramss: paramss_ty.into(),
             ret: TyBox::new(ret),
         };
         // A parameter the caller may omit is filled from the class's

@@ -688,7 +688,7 @@ impl Lower<'_> {
             "",
         );
         let method_ty = Type::Method {
-            paramss: vec![vec![]],
+            paramss: vec![vec![]].into(),
             ret: TyBox::new(result_ty.clone()),
         };
         self.typer.st.get_mut(sym).ty = method_ty.clone();

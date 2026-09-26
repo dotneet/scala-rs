@@ -1,7 +1,7 @@
 //! Preserve non-local return identity across async-generated methods/classes.
 //! A fresh key is allocated by each invocation of the lexical target method.
 use crate::check::Typer;
-use crate::lazy_local::children_mut;
+use crate::lazy_local::for_each_child_mut;
 use crate::symbol::SymKind;
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
@@ -54,9 +54,9 @@ impl Typer {
         t.id = NodeId(self.macro_next_node);
         self.macro_next_node += 1;
         t.span = span;
-        for child in children_mut(t) {
-            self.return_template(child, span, replacements);
-        }
+        for_each_child_mut(t, &mut |child| {
+            self.return_template(child, span, replacements)
+        });
     }
 
     pub(crate) fn prepare_async_returns(&mut self, t: &mut Tree) {
@@ -67,9 +67,7 @@ impl Typer {
         ) {
             return;
         }
-        for child in children_mut(t) {
-            self.prepare_async_returns(child);
-        }
+        for_each_child_mut(t, &mut |child| self.prepare_async_returns(child));
         let TreeKind::Return { expr } = &t.kind else {
             return;
         };
@@ -121,9 +119,7 @@ impl Typer {
         if self.async_return_keys.is_empty() {
             return;
         }
-        for child in children_mut(t) {
-            self.install_async_return_keys(child);
-        }
+        for_each_child_mut(t, &mut |child| self.install_async_return_keys(child));
         let TreeKind::DefDef { rhs, .. } = &mut t.kind else {
             return;
         };

@@ -178,7 +178,7 @@ pub fn install_ordered_companion(st: &mut SymbolTable) {
     st.get_mut(conv).params = vec![x, ev];
     st.get_mut(conv).paramss = vec![vec![x], vec![ev]];
     st.get_mut(conv).ty = Type::Method {
-        paramss: vec![vec![tt], vec![ord_t]],
+        paramss: vec![vec![tt], vec![ord_t]].into(),
         ret: TyBox::new(ret),
     };
     // `T` erases to `Object` and `Ordering[T]` / `Ordered[T]` to their raw

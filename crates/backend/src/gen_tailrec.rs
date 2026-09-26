@@ -4,6 +4,7 @@ use crate::code::{Assembler, Label};
 use crate::gen::*;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::SymKind;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 pub(crate) struct TailLoop {
@@ -16,10 +17,12 @@ pub(crate) struct TailLoop {
     annotated: bool,
 }
 
-fn call(tree: &Tree, method: SymbolId, nullary: bool) -> Option<(&Tree, Vec<Tree>)> {
+fn call(tree: &Tree, method: SymbolId, nullary: bool) -> Option<(&Tree, Cow<'_, [Tree]>)> {
     let (fun, args) = match &tree.kind {
         TreeKind::Apply { fun, args } => flatten_apply_owned(fun, args),
-        TreeKind::Select { .. } | TreeKind::Ident { .. } if nullary => (tree, vec![]),
+        TreeKind::Select { .. } | TreeKind::Ident { .. } if nullary => {
+            (tree, Cow::Borrowed(&[][..]))
+        }
         _ => return None,
     };
     (fun.sym == method && matches!(fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }))

@@ -54,6 +54,9 @@ rather than an absolute benchmark:
 * **44 synthetic workloads against scalac, 2026-09-27** (below): every one
   now compiles in 0.01--0.54 of scalac's wall time; before, scalac won five
   and two did not compile.
+* **2026-09-27, later** (below): the large synthetic kinds another 13--24%
+  fewer instructions; gitbucket 4.3 s against scalac's 10.9 s and cats 3.3 s
+  against 14.2 s, both with no errors.
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -422,6 +425,80 @@ large kinds sit at 0.4--0.55 of scalac where their 20-file versions are at
 0.2--0.3. Everything runs on one core. A SAM literal of a trait read from
 the classpath still gets a class, since its initializer is not known here.
 
+### Shared parameter lists, stable caches and real code bases (2026-09-27)
+
+**Where the time went.** After the pass above, type checking was still two
+thirds of every large workload, and within it copies and caches that did
+not survive a statement: `Type::Method`'s parameter lists were deep-copied
+at every as-seen-from, member lookups and outer implicit scopes were
+recomputed per selection because the counters keying them moved at every
+local definition, and the class files were written only after the last
+unit was generated.
+
+**What changed.**
+
+* `Type::Method { paramss }` is a `ParamClauses`: one reference-counted
+  `Vec<Vec<Type>>` with its type flags computed once, so cloning a method
+  type is a pointer copy and "does this mention a type parameter" is a bit
+  test. Template checks borrow the body instead of cloning it; argument
+  flattening in the backend borrows unless clauses really are joined.
+* Each `Scope` carries a stamp renewed only when a binding is entered or
+  replaced. The implicits of the scopes outside the innermost template are
+  cached per (stamps, class, `member_graph_gen`), so a statement no longer
+  invalidates what the enclosing class and package offer. `lookup_member`
+  keeps nominal answers until `member_graph_gen` moves.
+* The typer reads the node-id bound the parser already knows instead of
+  walking every tree for it; the local-object checks run only when some
+  class is owned by a method or value.
+* Class files are written by the pool while later units are generated.
+  A backend error in a later unit still leaves nothing of the run behind:
+  the writer deletes what it wrote (`backend_error_takes_back_classes_already_written`).
+  Staging into a directory and renaming cost as much as the writes when a
+  run's classes share one directory.
+
+Instructions and wall time, one fresh process each, base = `dd44c8a2`:
+
+| workload | base | now | wall base | wall now | scalac wall |
+|---|---:|---:|---:|---:|---:|
+| `coll_big` | 102.1G | 79.2G | 8.5 s | 6.7 s | 21.9 s |
+| `forcomp_big` | 110.6G | 84.4G | 9.3 s | 7.4 s | 20.9 s |
+| `chains_big` | 79.9G | 60.2G | 6.4 s | 5.1 s | 14.0 s |
+| `javainterop_big` | 85.3G | 63.6G | 6.6 s | 5.2 s | 13.5 s |
+| `typeclass_n200` | 65.3G | 58.8G | 4.4 s | 4.0 s | 8.1 s |
+| `lambdas_big` | 114.6G | 93.0G | 8.2 s | 6.2 s | 21.9 s |
+| `patmat_big` | 82.0G | 69.7G | 6.2 s | 5.1 s | 45.4 s |
+| slick, 184 sources | 28.2G | 26.9G | 2.2 s | 2.0 s | |
+
+`lambdas_big`'s write phase went from 0.55 s to 0.006 s; the classes are on
+disk by the time the last unit is generated.
+
+**Real code bases against scalac.** gitbucket (354 sources, `-Xsource:3-cross`)
+and cats kernel+core (340 sources, `-Xsource:3`, with the kind-projector and
+better-monadic-for plugins on scalac's side) had both regressed to three
+type errors each; they compile again with none:
+
+| code base | scalac | scala-rs | classes (scalac / scala-rs) |
+|---|---:|---:|---:|
+| gitbucket | 10.9 s | 4.3 s | 1314 / 1314 |
+| cats kernel+core | 14.2 s | 3.3 s | 3553 / 2948 |
+
+cats' class count differs partly by the specialised classes
+`-no-specialization` leaves out. The regressions found on the way, each with
+a scalac-compared test: a `toSet[B >: A]` stand-in without its type parameter
+(`lower_bound_widening`), an expected `Unit` deciding a generic call's type
+parameters where nsc's
+`isWeaklyCompatible` lets it decide nothing (`unit_discard_generic`), and a
+newtype's abstract `Type` read off its declaration instead of the owning
+object's path, which lost the implicit ops conversion
+(`newtype_alias_prefix`). Partial-function literals now compile to nsc's
+classes, names and package included (`pk/M$$anonfun$m0$1`, extending
+`AbstractPartialFunction`); they had been written to the default package.
+
+**Not done.** Code generation reads the symbol table through `Rc`-shared
+types, so it cannot run on threads without making `Type` `Send`; forking
+the process after typing was considered and left out, since the classpath
+and writer threads are running by then.
+
 ### What is left
 
 From the profiles of 2026-09-24:
@@ -432,12 +509,14 @@ From the profiles of 2026-09-24:
   derivation, the search each `c.inferImplicitValue` answers starts from
   scratch, where nsc's derivation context shares it.
 * **`mutation_gen` moves at nearly every statement**, which bounds every
-  cache keyed on it; `graph_gen` covers the class graph only, and
-  `member_graph_gen` adds member lists.
-* **`Method.paramss` is still `Vec<Vec<Type>>`**, and `Named.name` a
-  `String`: the remaining deep copies are there and in trees.
-* The compile is single-threaded. Parsing is trivially parallel; the typer
-  shares a mutable symbol table and is not.
+  cache keyed on it; scope stamps and `member_graph_gen` now key the
+  implicit-scope and member-lookup caches instead, but the SAM and
+  conversion caches still read it.
+* **`Named.name` is a `String`**: the remaining deep copies are there and in
+  trees.
+* The compile is single-threaded apart from class-file writing. Parsing is
+  trivially parallel; the typer shares a mutable symbol table and is not,
+  and the backend reads `Rc`-shared types.
 
 ### History
 

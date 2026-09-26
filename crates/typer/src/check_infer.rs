@@ -1472,7 +1472,7 @@ impl Typer {
         }
         match ty {
             Type::Method { paramss, ret } if paramss.is_empty() => Type::Method {
-                paramss: vec![vec![]],
+                paramss: vec![vec![]].into(),
                 ret,
             },
             other => other,
@@ -2552,6 +2552,15 @@ impl Typer {
         allow_covariant: bool,
     ) -> Vec<(SymbolId, Type)> {
         if pt.is_no_type() || pt.is_error() || ret.is_no_type() || ret.is_error() {
+            return inst;
+        }
+        // nsc `methTypeArgs` asks `isConservativelyCompatible(restpe, pt)`,
+        // which is `isWeaklyCompatible`: an expected `Unit` is met by value
+        // discarding whatever the result is, and constrains nothing.
+        // `s.setAttribute(key, a)` as a `Unit` method's body keeps `T` for
+        // its arguments to decide; taking `T := Unit` here turned the
+        // argument `a` into a discarded `{ a; () }`.
+        if matches!(pt, Type::Unit) {
             return inst;
         }
         let tps = self.st.get(method).tparams.clone();
@@ -5419,7 +5428,7 @@ impl Typer {
         self.type_select(
             fun,
             &Type::Method {
-                paramss: vec![],
+                paramss: vec![].into(),
                 ret: TyBox::new(Type::NoType),
             },
         );

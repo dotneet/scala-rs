@@ -149,6 +149,9 @@ pub struct Pool {
     /// `BootstrapMethods` (JVMS §4.7.23) entries, in attribute order:
     /// `(method handle index, static argument indices)`.
     bootstraps: Vec<(u16, Vec<u16>)>,
+    /// `bootstraps`' attribute index of each entry. A class with thousands
+    /// of lambdas looked every new one up by comparing it with all before.
+    bootstrap_index: HashMap<(u16, Vec<u16>), u16>,
     /// Method handles of the bodies of this class's *serializable* lambdas,
     /// in first-use order: the argument list of the class's
     /// `$deserializeLambda$` (see `ClassBuilder::finish_inner`).
@@ -369,15 +372,14 @@ impl Pool {
     /// *attribute* index — the number that a `CONSTANT_InvokeDynamic_info`
     /// stores in `bootstrap_method_attr_index`.
     pub fn bootstrap(&mut self, handle: u16, args: Vec<u16>) -> u16 {
-        if let Some(i) = self
-            .bootstraps
-            .iter()
-            .position(|(h, a)| *h == handle && *a == args)
-        {
-            return i as u16;
+        let key = (handle, args);
+        if let Some(&i) = self.bootstrap_index.get(&key) {
+            return i;
         }
-        self.bootstraps.push((handle, args));
-        (self.bootstraps.len() - 1) as u16
+        let i = self.bootstraps.len() as u16;
+        self.bootstrap_index.insert(key.clone(), i);
+        self.bootstraps.push(key);
+        i
     }
 
     /// `CONSTANT_InvokeDynamic_info` (JVMS §4.4.10).

@@ -1433,7 +1433,7 @@ impl Typer {
                 if matches!(fun_pt, Type::Method { .. }) && java_nullary {
                     if let Type::Method { ret, .. } = &fun.ty {
                         fun.ty = Type::Method {
-                            paramss: vec![vec![]],
+                            paramss: vec![vec![]].into(),
                             ret: ret.clone(),
                         };
                     }

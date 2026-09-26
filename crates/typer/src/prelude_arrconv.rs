@@ -224,7 +224,7 @@ fn add_array_ops_simple_extensions(
     st.get_mut(gb).params = vec![f];
     st.get_mut(gb).paramss = vec![vec![f]];
     st.get_mut(gb).ty = Type::Method {
-        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(gk))]],
+        paramss: vec![vec![fn1(ta.clone(), Type::TypeParam(gk))]].into(),
         ret: TyBox::new(Type::Class {
             sym: map_sym,
             args: vec![Type::TypeParam(gk), array_a.clone()].into(),
@@ -257,7 +257,8 @@ fn add_array_ops_simple_extensions(
                 sym: ordering,
                 args: vec![Type::TypeParam(sbk)].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(array_a.clone()),
     };
 
@@ -280,7 +281,8 @@ fn add_array_ops_simple_extensions(
         paramss: vec![vec![Type::Class {
             sym: ordering,
             args: vec![ta.clone()].into(),
-        }]],
+        }]]
+        .into(),
         ret: TyBox::new(array_a.clone()),
     };
 
@@ -322,7 +324,8 @@ fn add_array_ops_simple_extensions(
             },
             ta.clone(),
             Type::TypeParam(zb),
-        ]],
+        ]]
+        .into(),
         ret: TyBox::new(Type::Array(Box::new(pair_ab).into())),
     };
 
@@ -403,7 +406,8 @@ fn add_array_ops_simple_extensions(
                 sym: ct,
                 args: vec![ta.clone()].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(array_a.clone()),
     };
 
@@ -470,7 +474,8 @@ fn add_array_ops_simple_extensions(
                     sym: ct,
                     args: vec![ta.clone()].into(),
                 }],
-            ],
+            ]
+            .into(),
             ret: TyBox::new(array_a.clone()),
         };
     }
@@ -514,7 +519,8 @@ fn add_one_elem_ct_method(
                 sym: ct,
                 args: vec![elem.clone()].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(ret.clone()),
     };
 }
@@ -659,7 +665,8 @@ fn add_numeric_fold(
         paramss: vec![vec![Type::Class {
             sym: numeric,
             args: vec![ta.clone()].into(),
-        }]],
+        }]]
+        .into(),
         ret: TyBox::new(ta.clone()),
     };
 }
@@ -689,7 +696,8 @@ fn add_ordering_pick(
         paramss: vec![vec![Type::Class {
             sym: ordering,
             args: vec![ta.clone()].into(),
-        }]],
+        }]]
+        .into(),
         ret: TyBox::new(ta.clone()),
     };
 }
@@ -721,7 +729,8 @@ fn add_by_pick(st: &mut SymbolTable, aops: SymbolId, ta: &Type, ordering: Symbol
                 sym: ordering,
                 args: vec![tb].into(),
             }],
-        ],
+        ]
+        .into(),
         ret: TyBox::new(ta.clone()),
     };
 }
@@ -861,7 +870,7 @@ fn add_map_view(st: &mut SymbolTable, map_sym: SymbolId, tuple2: SymbolId) {
     st.get_mut(mvm).params = vec![f];
     st.get_mut(mvm).paramss = vec![vec![f]];
     st.get_mut(mvm).ty = Type::Method {
-        paramss: vec![vec![fn1(tv.clone(), tw.clone())]],
+        paramss: vec![vec![fn1(tv.clone(), tw.clone())]].into(),
         ret: TyBox::new(mapview_t(tw)),
     };
 

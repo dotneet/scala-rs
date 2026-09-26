@@ -1187,7 +1187,7 @@ impl Typer {
             if let Type::Array(elem) = &qual.ty {
                 if name == "apply" {
                     tree.ty = Type::Method {
-                        paramss: vec![vec![Type::Int]],
+                        paramss: vec![vec![Type::Int]].into(),
                         ret: TyBox::new((**elem).clone()),
                     };
                 } else if name == "update" {
@@ -1199,14 +1199,15 @@ impl Typer {
                             } else {
                                 (**elem).clone()
                             },
-                        ]],
+                        ]]
+                        .into(),
                         ret: TyBox::new(Type::Unit),
                     };
                 } else if name == "clone" && self.st.get(s).owner == self.st.array_sym {
                     // `def clone(): Array[T]` — the element type is the
                     // receiver's, exactly as for `apply`.
                     tree.ty = Type::Method {
-                        paramss: vec![vec![]],
+                        paramss: vec![vec![]].into(),
                         ret: TyBox::new(Type::Array(Box::new((**elem).clone()).into())),
                     };
                 }
@@ -1324,6 +1325,61 @@ impl Typer {
                     self.expand_macro_application(qual);
                 }
             }
+        } else if !open_receiver.is_empty()
+            && pt.is_no_type()
+            && !self.typing_callee
+            && self.callee_arity.is_none()
+            && !matches!(tree.ty, Type::Method { .. } | Type::Overload(_))
+        {
+            // No expected type, no argument list to come: the value is a
+            // statement, an untyped `val`, or another selection's receiver
+            // (`xs.toSet.toList.sorted`), and nothing is left to pin the
+            // receiver's variables. nsc solved them when it typed the
+            // receiver, each to the bound its variance picks. `toSet[B >: A]`
+            // is `toSet[A]` there, and `sorted` then finds an `Ordering[Int]`
+            // rather than looking for an `Ordering[B]`. The bound is read at
+            // the receiver's own prefix, where `A` is the list's element.
+            let prefix = match &tree.kind {
+                TreeKind::Select { qual, .. } => match &qual.kind {
+                    TreeKind::Select { qual: q, .. } => Some(q.ty.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let recv = match &tree.kind {
+                TreeKind::Select { qual, .. } => qual.ty.clone(),
+                _ => Type::NoType,
+            };
+            let solutions: Vec<(SymbolId, Type)> = open_receiver
+                .iter()
+                .filter_map(|tp| {
+                    let s = self.st.get(*tp);
+                    let bound = if self
+                        .tparam_variance_in(&recv, *tp, 1)
+                        .is_some_and(|v| v < 0)
+                    {
+                        s.bound_hi.clone().unwrap_or(Type::Any)
+                    } else {
+                        s.bound_lo.clone().unwrap_or(Type::Nothing)
+                    };
+                    let bound = match &prefix {
+                        Some(p) => self.st.subst_as_seen_from(p, &bound),
+                        None => bound,
+                    };
+                    (!mentions_tparam(&bound, &open_receiver)
+                        && !bound.is_no_type()
+                        && !bound.is_error())
+                    .then_some((*tp, bound))
+                })
+                .collect();
+            if !solutions.is_empty() {
+                let ids: Vec<_> = solutions.iter().map(|(id, _)| *id).collect();
+                let values: Vec<_> = solutions.into_iter().map(|(_, t)| t).collect();
+                tree.ty = crate::symbol::subst_tparams_slice(&ids, &values, &tree.ty);
+                if let TreeKind::Select { qual, .. } = &mut tree.kind {
+                    qual.ty = crate::symbol::subst_tparams_slice(&ids, &values, &qual.ty);
+                }
+            }
         }
         // A parameterless collection member returns the receiver's own class,
         // and only the application path put that back.
@@ -1336,7 +1392,7 @@ impl Typer {
         if name == "apply" {
             if let Type::Function { params, ret } = &recv_ty {
                 tree.ty = Type::Method {
-                    paramss: vec![params.clone().into_vec()],
+                    paramss: vec![params.clone().into_vec()].into(),
                     ret: ret.clone(),
                 };
             }
@@ -3594,7 +3650,7 @@ impl Typer {
             params_out.push(out);
         }
         Type::Method {
-            paramss: params_out,
+            paramss: params_out.into(),
             ret,
         }
     }
@@ -3811,7 +3867,7 @@ impl Typer {
                 self.type_expr(
                     &mut qual,
                     &Type::Method {
-                        paramss: vec![],
+                        paramss: vec![].into(),
                         ret: TyBox::new(Type::NoType),
                     },
                 );
@@ -4888,7 +4944,7 @@ mod pickled_copy_tests {
 
     fn method_ty(params: Vec<Type>) -> Type {
         Type::Method {
-            paramss: vec![params],
+            paramss: vec![params].into(),
             ret: TyBox::new(Type::Int),
         }
     }

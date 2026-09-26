@@ -52,7 +52,7 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
     let aio_t = type_param(st, as_instance_of, "T0");
     st.get_mut(as_instance_of).tparams = vec![aio_t];
     st.get_mut(as_instance_of).ty = Type::Method {
-        paramss: Vec::new(),
+        paramss: Vec::new().into(),
         ret: TyBox::new(Type::TypeParam(aio_t)),
     };
     let is_instance_of = method(
@@ -77,7 +77,7 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
     let t0 = type_param(st, sync, "T0");
     st.get_mut(sync).tparams = vec![t0];
     st.get_mut(sync).ty = Type::Method {
-        paramss: vec![vec![Type::ByName(TyBox::new(Type::TypeParam(t0)))]],
+        paramss: vec![vec![Type::ByName(TyBox::new(Type::TypeParam(t0)))]].into(),
         ret: TyBox::new(Type::TypeParam(t0)),
     };
     let anyref = st.anyref_sym;
@@ -128,7 +128,7 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
     // parameterless method, because `clone()` is how it is written.
     let cl = method(st, anyref, "clone", vec![], Type::AnyRef, Intrinsic::None);
     st.get_mut(cl).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::AnyRef),
     };
     st.get_mut(cl).flags.set(Flags::PROTECTED, true);
@@ -462,7 +462,7 @@ pub(crate) fn add_array_members(st: &mut SymbolTable) {
     // it is written, here as in Java.
     let cl = method(st, c, "clone", vec![], Type::Any, Intrinsic::None);
     st.get_mut(cl).ty = Type::Method {
-        paramss: vec![vec![]],
+        paramss: vec![vec![]].into(),
         ret: TyBox::new(Type::Any),
     };
 }

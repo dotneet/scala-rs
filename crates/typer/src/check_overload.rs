@@ -349,7 +349,7 @@ impl Typer {
         self.type_select(
             fun,
             &Type::Method {
-                paramss: vec![],
+                paramss: vec![].into(),
                 ret: TyBox::new(Type::NoType),
             },
         );
@@ -1397,7 +1397,7 @@ impl Typer {
                 sym,
                 &[],
                 &Type::Method {
-                    paramss: paramss[1..].to_vec(),
+                    paramss: paramss[1..].to_vec().into(),
                     ret: TyBox::new(Type::NoType),
                 },
             ),
@@ -3361,7 +3361,7 @@ impl Typer {
         let mark = self.diags.len();
         let mut probe = (**fun).clone();
         let dummy_method = Type::Method {
-            paramss: vec![],
+            paramss: vec![].into(),
             ret: TyBox::new(Type::NoType),
         };
         self.type_expr(&mut probe, &dummy_method);

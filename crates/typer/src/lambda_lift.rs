@@ -528,7 +528,7 @@ impl<'a> Lifter<'a> {
             _ => {
                 if !cap_tys.is_empty() {
                     def.ty = Type::Method {
-                        paramss: vec![cap_tys],
+                        paramss: vec![cap_tys].into(),
                         ret: TyBox::new(def.ty.clone()),
                     };
                 }

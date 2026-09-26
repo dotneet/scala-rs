@@ -76,9 +76,7 @@ impl Pass<'_> {
         if let TreeKind::Block { .. } = &tree.kind {
             self.rewrite_block(tree);
         }
-        for c in children_mut(tree) {
-            self.walk(c);
-        }
+        for_each_child_mut(tree, &mut |c| self.walk(c));
     }
 
     fn rewrite_block(&mut self, tree: &mut Tree) {
@@ -109,9 +107,7 @@ impl Pass<'_> {
         }
         // The whole block, including the right-hand sides just moved into
         // accessors: that is how one local `lazy val` reads another.
-        for c in children_mut(tree) {
-            rewrite_refs(c, &map);
-        }
+        for_each_child_mut(tree, &mut |c| rewrite_refs(c, &map));
     }
 
     /// Split `lazy val x: T = rhs` into its cell `val` and its accessor `def`.
@@ -156,7 +152,7 @@ impl Pass<'_> {
             "",
         );
         let mty = Type::Method {
-            paramss: vec![vec![cell_ty.clone()]],
+            paramss: vec![vec![cell_ty.clone()]].into(),
             ret: TyBox::new(ty.clone()),
         };
         self.st.get_mut(acc).ty = mty.clone();
@@ -239,9 +235,7 @@ fn collect_return_targets(tree: &mut Tree, out: &mut Vec<SymbolId>) {
             out.push(tree.sym);
         }
     }
-    for c in children_mut(tree) {
-        collect_return_targets(c, out);
-    }
+    for_each_child_mut(tree, &mut |c| collect_return_targets(c, out));
 }
 
 fn is_local_lazy_val(t: &Tree) -> bool {
@@ -289,47 +283,46 @@ fn rewrite_refs(tree: &mut Tree, map: &Rewrite) {
             return;
         }
     }
-    for c in children_mut(tree) {
-        rewrite_refs(c, map);
-    }
+    for_each_child_mut(tree, &mut |c| rewrite_refs(c, map));
 }
 
-/// Every subtree that can hold an expression. Deliberately exhaustive so a new
-/// `TreeKind` does not silently stop being visited.
-pub(crate) fn children_mut(t: &mut Tree) -> Vec<&mut Tree> {
-    let mut v: Vec<&mut Tree> = Vec::new();
+/// Every subtree that can hold an expression, handed to `v` in order.
+/// Deliberately exhaustive so a new `TreeKind` does not silently stop being
+/// visited. Allocates nothing, where [`children_mut`] builds a vector per
+/// node: the passes that walk every tree spent a fifth of their time there.
+pub(crate) fn for_each_child_mut<'a>(t: &'a mut Tree, v: &mut dyn FnMut(&'a mut Tree)) {
     match &mut t.kind {
         TreeKind::PackageDef { pid, stats } => {
-            v.push(pid);
-            v.extend(stats.iter_mut());
+            v(pid);
+            stats.iter_mut().for_each(&mut *v);
         }
-        TreeKind::Import { expr, .. } => v.push(expr),
+        TreeKind::Import { expr, .. } => v(expr),
         TreeKind::ClassDef {
             tparams,
             vparamss,
             impl_,
             ..
         } => {
-            v.extend(tparams.iter_mut());
+            tparams.iter_mut().for_each(&mut *v);
             for c in vparamss.iter_mut() {
-                v.extend(c.iter_mut());
+                c.iter_mut().for_each(&mut *v);
             }
-            v.extend(impl_.parents.iter_mut());
+            impl_.parents.iter_mut().for_each(&mut *v);
             if let Some(t) = impl_.self_tpt.as_mut() {
-                v.push(t);
+                v(t);
             }
-            v.extend(impl_.body.iter_mut());
+            impl_.body.iter_mut().for_each(&mut *v);
         }
         TreeKind::ModuleDef { impl_, .. } => {
-            v.extend(impl_.parents.iter_mut());
+            impl_.parents.iter_mut().for_each(&mut *v);
             if let Some(t) = impl_.self_tpt.as_mut() {
-                v.push(t);
+                v(t);
             }
-            v.extend(impl_.body.iter_mut());
+            impl_.body.iter_mut().for_each(&mut *v);
         }
         TreeKind::ValDef { tpt, rhs, .. } => {
-            v.push(tpt);
-            v.push(rhs);
+            v(tpt);
+            v(rhs);
         }
         TreeKind::DefDef {
             tparams,
@@ -338,14 +331,14 @@ pub(crate) fn children_mut(t: &mut Tree) -> Vec<&mut Tree> {
             rhs,
             ..
         } => {
-            v.extend(tparams.iter_mut());
+            tparams.iter_mut().for_each(&mut *v);
             for c in vparamss.iter_mut() {
-                v.extend(c.iter_mut());
+                c.iter_mut().for_each(&mut *v);
             }
-            v.push(tpt);
-            v.push(rhs);
+            v(tpt);
+            v(rhs);
         }
-        TreeKind::MacroRhs { impl_ref } => v.push(impl_ref),
+        TreeKind::MacroRhs { impl_ref } => v(impl_ref),
         TreeKind::TypeDef {
             tparams,
             rhs,
@@ -355,100 +348,100 @@ pub(crate) fn children_mut(t: &mut Tree) -> Vec<&mut Tree> {
             ctx_bounds,
             ..
         } => {
-            v.extend(tparams.iter_mut());
-            v.push(rhs);
+            tparams.iter_mut().for_each(&mut *v);
+            v(rhs);
             if let Some(t) = lo.as_mut() {
-                v.push(t);
+                v(t);
             }
             if let Some(t) = hi.as_mut() {
-                v.push(t);
+                v(t);
             }
-            v.extend(views.iter_mut());
-            v.extend(ctx_bounds.iter_mut());
+            views.iter_mut().for_each(&mut *v);
+            ctx_bounds.iter_mut().for_each(&mut *v);
         }
         TreeKind::LabelDef { params, rhs, .. } => {
-            v.extend(params.iter_mut());
-            v.push(rhs);
+            params.iter_mut().for_each(&mut *v);
+            v(rhs);
         }
         TreeKind::Block { stats, expr } => {
-            v.extend(stats.iter_mut());
-            v.push(expr);
+            stats.iter_mut().for_each(&mut *v);
+            v(expr);
         }
         TreeKind::If { cond, thenp, elsep } => {
-            v.push(cond);
-            v.push(thenp);
-            v.push(elsep);
+            v(cond);
+            v(thenp);
+            v(elsep);
         }
         TreeKind::Match { selector, cases } => {
-            v.push(selector);
+            v(selector);
             for c in cases.iter_mut() {
-                v.push(&mut c.pat);
-                v.push(&mut c.guard);
-                v.push(&mut c.body);
+                v(&mut c.pat);
+                v(&mut c.guard);
+                v(&mut c.body);
             }
         }
         TreeKind::Function { vparams, body } => {
-            v.extend(vparams.iter_mut());
-            v.push(body);
+            vparams.iter_mut().for_each(&mut *v);
+            v(body);
         }
         TreeKind::Assign { lhs, rhs } => {
-            v.push(lhs);
-            v.push(rhs);
+            v(lhs);
+            v(rhs);
         }
         TreeKind::While { cond, body } | TreeKind::DoWhile { body, cond } => {
-            v.push(cond);
-            v.push(body);
+            v(cond);
+            v(body);
         }
-        TreeKind::Return { expr } | TreeKind::Throw { expr } => v.push(expr),
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => v(expr),
         TreeKind::Try {
             block,
             catches,
             finalizer,
         } => {
-            v.push(block);
+            v(block);
             for c in catches.iter_mut() {
-                v.push(&mut c.pat);
-                v.push(&mut c.guard);
-                v.push(&mut c.body);
+                v(&mut c.pat);
+                v(&mut c.guard);
+                v(&mut c.body);
             }
-            v.push(finalizer);
+            v(finalizer);
         }
-        TreeKind::New { tpt } => v.push(tpt),
+        TreeKind::New { tpt } => v(tpt),
         TreeKind::Typed { expr, tpt } => {
-            v.push(expr);
-            v.push(tpt);
+            v(expr);
+            v(tpt);
         }
         TreeKind::TypeApply { fun, args }
         | TreeKind::Apply { fun, args }
         | TreeKind::UnApply { fun, args } => {
-            v.push(fun);
-            v.extend(args.iter_mut());
+            v(fun);
+            args.iter_mut().for_each(&mut *v);
         }
-        TreeKind::Select { qual, .. } | TreeKind::SelectFromTypeTree { qual, .. } => v.push(qual),
-        TreeKind::Bind { body, .. } => v.push(body),
-        TreeKind::Star { elem } => v.push(elem),
-        TreeKind::Alternative { trees } => v.extend(trees.iter_mut()),
+        TreeKind::Select { qual, .. } | TreeKind::SelectFromTypeTree { qual, .. } => v(qual),
+        TreeKind::Bind { body, .. } => v(body),
+        TreeKind::Star { elem } => v(elem),
+        TreeKind::Alternative { trees } => trees.iter_mut().for_each(&mut *v),
         TreeKind::AppliedTypeTree { tpt, args } => {
-            v.push(tpt);
-            v.extend(args.iter_mut());
+            v(tpt);
+            args.iter_mut().for_each(&mut *v);
         }
-        TreeKind::SingletonTypeTree { ref_ } => v.push(ref_),
+        TreeKind::SingletonTypeTree { ref_ } => v(ref_),
         TreeKind::AnnotatedTypeTree { tpt, annot } => {
-            v.push(tpt);
-            v.push(annot);
+            v(tpt);
+            v(annot);
         }
         TreeKind::CompoundTypeTree {
             parents,
             refinements,
         } => {
-            v.extend(parents.iter_mut());
-            v.extend(refinements.iter_mut());
+            parents.iter_mut().for_each(&mut *v);
+            refinements.iter_mut().for_each(&mut *v);
         }
         TreeKind::ExistentialTypeTree { tpt, clauses } => {
-            v.push(tpt);
-            v.extend(clauses.iter_mut());
+            v(tpt);
+            clauses.iter_mut().for_each(&mut *v);
         }
-        TreeKind::InterpolatedString { args, .. } => v.extend(args.iter_mut()),
+        TreeKind::InterpolatedString { args, .. } => args.iter_mut().for_each(&mut *v),
         TreeKind::Empty
         | TreeKind::Super { .. }
         | TreeKind::This { .. }
@@ -457,5 +450,12 @@ pub(crate) fn children_mut(t: &mut Tree) -> Vec<&mut Tree> {
         | TreeKind::Wildcard
         | TreeKind::Unimplemented { .. } => {}
     }
-    v
+}
+
+/// [`for_each_child_mut`] collected, for a caller that needs the children
+/// together.
+pub(crate) fn children_mut(t: &mut Tree) -> Vec<&mut Tree> {
+    let mut out: Vec<&mut Tree> = Vec::new();
+    for_each_child_mut(t, &mut |c| out.push(c));
+    out
 }

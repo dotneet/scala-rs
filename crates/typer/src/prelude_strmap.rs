@@ -56,7 +56,8 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
         paramss: vec![vec![Type::Function {
             params: vec![Type::Char].into(),
             ret: TyBox::new(tb.clone()),
-        }]],
+        }]]
+        .into(),
         ret: TyBox::new(Type::Class {
             sym: idx,
             args: vec![tb].into(),
