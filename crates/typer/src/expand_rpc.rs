@@ -383,6 +383,12 @@ impl Typer {
             Ok(k) => k.text(),
             Err(_) => return refusal("the macro engine asked a malformed question"),
         };
+        if matches!(
+            kind.as_str(),
+            "typecheck" | "inferImplicitValue" | "openImplicits" | "resetImplicits"
+        ) {
+            self.macro_context_queries = self.macro_context_queries.wrapping_add(1);
+        }
         match kind.as_str() {
             "typecheck" => self.answer_typecheck(items),
             "parse" => self.answer_parse(items),
@@ -589,8 +595,10 @@ impl Typer {
 
         self.warm_implicit_scope(&pt);
         self.with_implicit_macros_disabled(no_macros, |this| {
-            this.with_whitebox_fits(span, |this| {
-                this.answer_infer_implicit_search(&pt, silent, mark)
+            this.with_implicit_decisions(|this| {
+                this.with_whitebox_fits(span, |this| {
+                    this.answer_infer_implicit_search(&pt, silent, mark)
+                })
             })
         })
     }
@@ -1152,6 +1160,32 @@ impl Typer {
         Ok(wire)
     }
 
+    /// The placeholder name a refinement travels under. Equal refinements
+    /// share one, so every mention of a labelled `HList` field reads the
+    /// same on the wire and the engine builds it once.
+    fn refined_label(&mut self, ty: &Type) -> String {
+        let hash = {
+            use std::hash::Hasher;
+            let mut h = rustc_hash::FxHasher::default();
+            crate::implicits::hash_type(ty, &mut h);
+            h.finish()
+        };
+        if let Some((_, label)) = self
+            .macro_refined_labels
+            .get(&hash)
+            .and_then(|bucket| bucket.iter().find(|(known, _)| known == ty))
+        {
+            return label.clone();
+        }
+        let label = format!("<macro-type-{}>", self.macro_local_tags.len());
+        self.macro_local_tags.insert(label.clone(), ty.clone());
+        self.macro_refined_labels
+            .entry(hash)
+            .or_default()
+            .push((ty.clone(), label.clone()));
+        label
+    }
+
     fn type_to_wire_uncached(&mut self, ty: &Type) -> Result<String, String> {
         // An inner class behind a prefix (`prefix.rs`) is the class it views;
         // the engine is handed the class, as for the bare type.
@@ -1197,8 +1231,7 @@ impl Typer {
             }
         }
         if let Type::Refined { parents, decls } = ty {
-            let key = format!("<macro-type-{}>", self.macro_local_tags.len());
-            self.macro_local_tags.insert(key.clone(), ty.clone());
+            let key = self.refined_label(ty);
             let mut out = format!("(refined {} (parents", quoted(&key));
             for p in parents {
                 out.push(' ');
@@ -1460,6 +1493,10 @@ impl Typer {
 /// `Typer::tree_from_reply` refuses in the other direction. An approximation
 /// here would be a tree the implementation then *splices into its expansion*.
 fn answer_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
+    if let Some(body) = super::expand::byname_thunk_body(t) {
+        // Written as the thunk's body always was; only the wrapper goes.
+        return super::expand::tree_to_wire(cx, body, out);
+    }
     let start = out.len();
     answer_tree_to_wire_body(cx, t, out)?;
     super::expand::mirror_tree_identity(cx.st, t, start, out);
@@ -1608,6 +1645,36 @@ mod tests {
             atom(silent),
             atom(no_macros),
         ]
+    }
+
+    #[test]
+    fn equal_refinements_travel_under_one_label() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let refinement = |out: Type| Type::Refined {
+            parents: vec![Type::Int].into(),
+            decls: vec![scala_rs_parser::RefineDecl::Type {
+                name: "Out".to_string(),
+                rhs: Some(out),
+                tparams: 0,
+                lo: None,
+                hi: None,
+            }],
+        };
+        let label = |wire: &str| wire.split('"').nth(1).unwrap().to_string();
+        let first = typer.type_to_wire(&refinement(Type::Int)).unwrap();
+        let again = typer.type_to_wire(&refinement(Type::Int)).unwrap();
+        let other = typer.type_to_wire(&refinement(Type::Long)).unwrap();
+        // One label per type: the engine keeps what it built under it.
+        assert_eq!(first, again);
+        assert_ne!(label(&first), label(&other));
+        assert_eq!(
+            typer.macro_local_tags.get(&label(&first)),
+            Some(&refinement(Type::Int))
+        );
+        assert_eq!(
+            typer.macro_local_tags.get(&label(&other)),
+            Some(&refinement(Type::Long))
+        );
     }
 
     #[test]

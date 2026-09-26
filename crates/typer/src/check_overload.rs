@@ -1955,7 +1955,7 @@ impl Typer {
         }
         match crate::prefix::strip_view(p) {
             Type::Class { sym, args } => {
-                self.st.function_class_shape(*sym, args).is_some() || self.st.sam_sig(p).is_some()
+                self.st.function_class_shape(*sym, args).is_some() || self.st.is_sam_type(p)
             }
             _ => false,
         }

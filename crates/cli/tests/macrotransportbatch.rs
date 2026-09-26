@@ -1248,3 +1248,99 @@ fn method_reflection_completes_pending_inferred_signatures() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn untypechecked_macro_answers_keep_by_name_arguments() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let producer = root.join("producer");
+    compile("macrobyname_answer", true, &producer, &base, true);
+    let cp = format!("{}:{base}", producer.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        compile("macrobyname_answer_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"Int(1,2)\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn circe_coproduct_derivation_matches_scalac_and_reuses_context_free_expansions() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut jars = Vec::new();
+    for artifact in [
+        "io/circe/circe-core_2.13/0.14.7/circe-core_2.13-0.14.7.jar",
+        "io/circe/circe-generic_2.13/0.14.7/circe-generic_2.13-0.14.7.jar",
+        "io/circe/circe-numbers_2.13/0.14.7/circe-numbers_2.13-0.14.7.jar",
+        "org/typelevel/cats-core_2.13/2.11.0/cats-core_2.13-2.11.0.jar",
+        "org/typelevel/cats-kernel_2.13/2.11.0/cats-kernel_2.13-2.11.0.jar",
+        "com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar",
+    ] {
+        let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+            .into_iter()
+            .map(|cache| {
+                PathBuf::from(&home)
+                    .join(cache)
+                    .join("https/repo1.maven.org/maven2")
+                    .join(artifact)
+            })
+            .find(|jar| jar.is_file());
+        let Some(jar) = jar else {
+            eprintln!("skip: {artifact} is not cached");
+            return;
+        };
+        jars.push(jar.to_string_lossy().into_owned());
+    }
+    let compiler = "/tmp/scala-2.13.16/lib/scala-compiler.jar";
+    if !Path::new(compiler).is_file() {
+        return;
+    }
+    let root = root();
+    let cp = format!("{JAR}:{REFLECT}:{compiler}:{}", jars.join(":"));
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/macroderive_circe.scala");
+    let mut outputs = Vec::new();
+    for nsc in [true, false] {
+        let out = root.join(format!("out-{nsc}"));
+        fs::create_dir(&out).unwrap();
+        let mut cmd = Command::new(if nsc {
+            NSC
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            cmd.args(["compile", "--scala-library", JAR]);
+            cmd.env("SCALA_RS_MACRO_TIMING", "1");
+        }
+        let r = cmd
+            .arg(&source)
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        assert!(r.status.success(), "nsc={nsc}: {stderr}");
+        if !nsc {
+            // A whitebox expansion that reads nothing of the implicit search
+            // around it is fitted once per call site and reused when the
+            // derivation rule that needed it is built; it used to be expanded
+            // again for every implicit context it was reached in (32 times).
+            let labellings = stderr
+                .lines()
+                .filter(|l| l.contains("LabelledMacros.mkDefaultSymbolicLabellingImpl"))
+                .count();
+            assert!(
+                (1..=12).contains(&labellings),
+                "{labellings} expansions:\n{stderr}"
+            );
+        }
+        outputs.push(run(&out, &cp));
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&outputs[0]),
+        String::from_utf8_lossy(&outputs[1])
+    );
+    fs::remove_dir_all(root).unwrap();
+}

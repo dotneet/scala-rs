@@ -95,11 +95,7 @@ impl Typer {
                         continue;
                     }
                     let is_class = self
-                        .binary
-                        .find_class(&internal)
-                        .ok()
-                        .flatten()
-                        .and_then(|bytes| crate::javaclass::parse_java_classfile(&bytes).ok())
+                        .parsed_classfile(&internal)
                         .is_some_and(|jc| !jc.scala_module);
                     if is_class {
                         self.load_binary_into(&internal, owner, span, true);
@@ -2208,10 +2204,7 @@ impl Typer {
             return false;
         }
         let enc = scala_rs_pickle::names::encode_method_name(name);
-        let Ok(Some(bytes)) = self.binary.find_class(&internal) else {
-            return false;
-        };
-        let Ok(jc) = crate::javaclass::parse_java_classfile(&bytes) else {
+        let Some(jc) = self.parsed_classfile(&internal) else {
             return false;
         };
         jc.methods.iter().any(|m| {
@@ -2234,6 +2227,30 @@ impl Typer {
                         .all(|(w, g)| w.as_ref().is_none_or(|w| w == g))
             })
         })
+    }
+
+    /// `internal`'s class file, parsed, or `None` when the classpath has no
+    /// readable one. Read once per run: overload resolution asks the same
+    /// library classes about their declarations at every selection, and a
+    /// path through an object whose class file is only a forwarder is
+    /// checked at every mention.
+    fn parsed_classfile(
+        &mut self,
+        internal: &str,
+    ) -> Option<std::rc::Rc<crate::javaclass::JavaClass>> {
+        if let Some(known) = self.parsed_classfiles.get(internal) {
+            return known.clone();
+        }
+        let parsed = self
+            .binary
+            .find_class(internal)
+            .ok()
+            .flatten()
+            .and_then(|bytes| crate::javaclass::parse_java_classfile(&bytes).ok())
+            .map(std::rc::Rc::new);
+        self.parsed_classfiles
+            .insert(internal.to_string(), parsed.clone());
+        parsed
     }
 
     /// The number of value parameters a method takes, across all its clauses --

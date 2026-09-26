@@ -87,7 +87,7 @@ impl Typer {
                 return true;
             }
         }
-        self.st.sam_sig(&pt).is_some()
+        self.st.is_sam_type(&pt)
     }
 
     /// Apply the rule to `tree`, which is in value position with no function

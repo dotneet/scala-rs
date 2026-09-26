@@ -2292,7 +2292,13 @@ impl Typer {
                 // `tuple2Shape` instance for a nested tuple and the
                 // recursion guard mistakes the inner, smaller shape for a
                 // non-shrinking expansion.
-                match self.retry_whitebox_fits(|this| this.search_implicit_at(want, depth + 1)) {
+                let found = match self.implicit_decision(want, depth + 1) {
+                    Some(found) => found,
+                    None => {
+                        self.retry_whitebox_fits(|this| this.search_implicit_at(want, depth + 1))
+                    }
+                };
+                match found {
                     ImplicitSearch::Found(inner) => {
                         cargs.push(self.implicit_tree(inner, want, span, depth + 1))
                     }
@@ -2386,8 +2392,10 @@ impl Typer {
         fun: &Tree,
     ) {
         let filled_from = args.len();
-        self.with_whitebox_fits(span, |this| {
-            this.fill_implicit_params_in(span, args, param_tys, rest, fun)
+        self.with_implicit_decisions(|this| {
+            this.with_whitebox_fits(span, |this| {
+                this.fill_implicit_params_in(span, args, param_tys, rest, fun)
+            })
         });
         // Mark what this pass added, so a re-typing of the same application
         // (`retry_tupled_args`) starts from the arguments the user wrote.

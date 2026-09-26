@@ -48,6 +48,9 @@ rather than an absolute benchmark:
   client with two macro expansions 1.10 s -> 0.63 s wall, a hundred-table
   one 3.9 s -> 2.6 s. Diagnostics of slick, gitbucket, cats and the library
   unchanged throughout.
+* **circe/shapeless derivations, 2026-09-26** (below): 19.5 s -> 13.3 s wall,
+  1.88e11 -> 1.28e11 instructions; with sealed-trait decoders, which did not
+  compile before, 14.5 s against scalac's 17.1 s.
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -269,6 +272,70 @@ the shape. The engine is profiled with JFR through `JAVA_TOOL_OPTIONS`
 (`-Xlog:jfr+startup=error` keeps JFR's banner off the protocol's stdout); it
 is killed at the end of a run, so the recording has to be dumped before
 that.
+
+### Macro-heavy derivations against scalac (2026-09-26)
+
+**Workload.** `tests/macro_bench_gen.py` writes 30 files of ten case classes
+each, every one deriving circe's `Encoder` and `Decoder` with `semiauto`
+(shapeless `Lazy` and `LabelledGeneric` underneath, later classes holding
+earlier ones), a four-case sealed trait per file, and values derived by
+`generic.auto`; `Main` prints every round trip. The classpath is in the
+script's header. JDK 17.0.20, 12 cores, fresh processes, alternating runs.
+Give scalac a heap: its launcher's default `-Xmx256M` ends this workload in
+`OutOfMemoryError` (`JAVA_OPTS="-Xmx2g -Xss4m"`, which is also nearer what
+sbt runs it with).
+
+| sources | before | after | scalac 2.13.16 |
+|---|---:|---:|---:|
+| `--no-coproduct-decoder` | 19.5 s, 1.88e11 instr. | 13.3 s, 1.28e11 instr. | 15.5 -- 21 s |
+| full (sealed-trait decoders) | does not compile | 14.4 -- 14.5 s | 16.9 -- 17.3 s |
+
+Both compilers' programs print the same. Before and after emit the same
+classes except for the numbers in fresh macro names (`exportDecoder$macro$N`,
+`inst$macro$N`): fewer expansions draw fewer names. Comparing `javap -p -c`
+per class with those numbers normalised gives equal sets of 2,553 classes.
+scalac uses 52--55 s of CPU for its 17 s, scala-rs 19.5 s; on a loaded
+machine scalac's wall time moves far more than scala-rs's. A direct
+`Generic` + `Lazy` derivation (`Show` over 15 and 25 nested case classes, the
+shape of `shapeless_lazy_derivation_matches_scalac`) was already faster than
+scalac and still is: 0.90 s and 1.10 s against 1.76 s and 2.31 s.
+
+**Where the time went.** Before the changes the typer thread spent 36% of the
+compile waiting for the engine, 25% answering the engine's
+`c.inferImplicitValue` and 26% typing expansions; 215 MB crossed the pipe in
+92,000 round trips for 14,640 expansions. Each change adopts what makes nsc's
+side cheap:
+
+| nsc | scala-rs before | change | effect |
+|---|---|---|---|
+| expands a whitebox implicit candidate once, while typing it (`typedImplicit`) | a fitted expansion was reused only in the very open-implicit context it was fitted in, so `mkDefaultSymbolicLabelling` and `Generic.materialize` ran four times per derivation; one expansion per search pass, each pass a full search | an expansion that took no argument, read no implicit scope and asked the engine nothing context-dependent (`implicit_scope_reads`, `macro_context_queries`) is reused in any context at the call site, after the divergence check a new entry would get; every pending expansion runs before the next pass (`expand_next_whitebox_entry`) | 14,640 -> 9,421 expansions; 1.63e11 -> 1.36e11 instr., 16.3 -> 14.1 s |
+| builds an implicit argument while searching for it | fitting a candidate searched its implicit arguments, building its tree searched for each again (46% of 181,000 searches) | the fit's answers, memo entries, live until the implicit operation ends (`with_implicit_decisions`) and building takes them under the memo's own open-stack and depth rules, those found with undetermined type variables under the solved type too | 181,000 -> 140,000 searches, -5% instr. |
+| parses a class file once per class (`ClassfileParser`) | overload checks and forwarder probes re-inflated and re-parsed the same library class files: 27,500 parses in a 10-file compile | `Typer::parsed_classfile` keeps them for the run | with the two below, 1.88e11 -> 1.72e11 instr. |
+| runs macros in-process, reading fields directly | 62.9 million reflective calls from the engine, most for the universe's constants (`NoSymbol`, `EmptyTree`, `definitions`, companions) and `Iterator`/`Product`/`Tree`/`Symbol` accessors | constants kept (`stableMember`), accessors through `static final` method handles (`Fast`) | 6.8 million reflective calls left |
+| shares types | every refinement got a fresh wire label, so no type containing one -- every labelled `HList` field -- was ever found in the engine's type cache | labels by content (`refined_label`), the engine caches such types | engine+pipe -0.6 s, rebuilding replies -0.26 s |
+| -- | a timed reply read went through a reader thread and a channel, two thread wake-ups per line | `poll(2)` on the pipe before each blocking read (Unix; Windows keeps the thread) | -0.5 s |
+| -- | the engine asked for the same companion several times per expansion | companions it has found are kept | 16,000 fewer round trips |
+| -- | `expects_function_value` built the full SAM signature to answer yes or no | `SymbolTable::is_sam_type` stops before the as-seen-from substitution | -1% instr. |
+
+A round trip on the pipe costs about 12 us (measured by doubling the
+`symbol` questions), so the remaining 77,000 cost about 1 s; the engine's
+own work, not the pipe, is what the typer waits for.
+
+**A bug on the way.** A by-name argument inside an answer tree went to the
+engine as the typer's internal `() => e` thunk; shapeless's `Lazy`
+untypechecks what it collects, and the thunk came back as a function
+literal. circe's coproduct decoder passes `c.history` by name to the
+overloaded `DecodingFailure.apply`, so `deriveDecoder` of any sealed trait
+failed with `no matching overload`. Answers now carry the expression, as
+nsc's typed tree does (`byname_thunk_body`); see `docs/macros.md` §4.2.
+
+**Still behind nsc here.** 140,000 implicit searches against nsc's 41,800
+(`-Ystatistics:typer`): a labelled-generic derivation still takes five search
+passes, one per whitebox output it discovers (0.7 s), and every candidate's
+arguments are fitted again in each. The engine spends most of a `Lazy`
+expansion (1.7 ms) parsing, building and writing trees. A derivation nested
+more than about 32 levels deep stops at `MAX_QUERY_DEPTH` (64 queries, two
+per level), where scalac has no such limit.
 
 ### What is left
 

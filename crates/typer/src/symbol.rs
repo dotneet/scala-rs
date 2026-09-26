@@ -8444,88 +8444,11 @@ impl SymbolTable {
     /// (`PickleSupply::concrete_method_names`) and passes it here rather than
     /// installing it; see that function for what installing it costs.
     pub fn sam_sig_over(&self, ty: &Type, overridden: &[String]) -> Option<SamSig> {
+        let (cls, method) = self.sam_method_over(ty, overridden)?;
         // An inner class behind a prefix (`prefix.rs`) is the class it views;
         // the prefix is what its members' bare inner classes are read at.
         let view_pre = crate::prefix::view_prefix(ty).cloned();
         let ty = crate::prefix::strip_view(ty);
-        let cls = self.class_sym_of(ty)?;
-        let jvm = self.get(cls).jvm_name.clone();
-        if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
-            return None;
-        }
-        // nsc `samOf`: a SAM *class* must be instantiable by the literal's
-        // anonymous subclass with no arguments -- its constructor takes an
-        // empty parameter list. `abstract class H(x: Int) { def h(s: String):
-        // String }` is not a SAM type; converting to it built a subclass
-        // calling a `<init>()V` that does not exist.
-        let f = self.get(cls).flags;
-        if !f.contains(Flags::TRAIT) && !f.contains(Flags::INTERFACE) {
-            let ctors: Vec<SymbolId> = self
-                .get(cls)
-                .members
-                .iter()
-                .copied()
-                .filter(|m| self.get(*m).name == "<init>")
-                .collect();
-            let nullary = |c: &SymbolId| match &self.get(*c).ty {
-                Type::Method { paramss, .. } => paramss.iter().all(|l| l.is_empty()),
-                _ => self.get(*c).params.is_empty(),
-            };
-            if !ctors.is_empty() && !ctors.iter().any(nullary) {
-                return None;
-            }
-        }
-        let mut abstracts = self.abstract_sam_methods(cls);
-        let known = self.sam_known_overrides.get(&cls.0);
-        if !overridden.is_empty() || known.is_some() {
-            abstracts.retain(|m| {
-                let s = self.get(*m);
-                s.owner == cls
-                    || !(overridden.contains(&s.name)
-                        || known.is_some_and(|ns| ns.contains(&s.name)))
-            });
-        }
-        if abstracts.len() != 1 {
-            return None;
-        }
-        let method = abstracts[0];
-        // nsc `definitions.samOf`: `!sam.isOverloaded`. `abstract_sam_methods`
-        // keys by *name*, so that an override does not count twice as the
-        // declaration it replaces -- which also collapses a genuinely
-        // **overloaded** abstract method to one. `java.lang.Appendable`
-        // declares three abstract `append`s and is no SAM; read as one, an
-        // untyped function literal stayed a candidate for an `Appendable`
-        // formal and `processFully(log err _)` was an `ambiguous overload`
-        // against `processFully(processLine: String => Unit)`
-        // (`sys/process/BasicIO.scala:160,161`).
-        {
-            let name = self.get(method).name.clone();
-            let owner = self.get(method).owner;
-            let same_name = self
-                .get(owner)
-                .members
-                .iter()
-                .copied()
-                .filter(|&m| {
-                    self.get(m).kind == SymKind::Method
-                        && self.get(m).name == name
-                        && self.method_is_deferred(m)
-                })
-                .count();
-            if same_name > 1 {
-                return None;
-            }
-        }
-        // nsc `definitions.samOf`: `sam.typeParams.isEmpty`.
-        // A polymorphic abstract method has no function type to convert from,
-        // and real scalac 2.13.16 says so -- `trait Poly { def f[A](a: A): A }`
-        // with `val p: Poly = x => x` is two errors, `missing parameter type`
-        // and `found: ? => ?  required: Poly`. Without this the literal was
-        // accepted and its parameter silently pinned to whatever the body
-        // wanted.
-        if !self.get(method).tparams.is_empty() {
-            return None;
-        }
         // The abstract method may be declared in a *parent* (`trait C[-T]
         // extends (T => R)` gets its `apply` from `Function1`), so its type has
         // to be read as seen from `ty` -- substituting only `cls`'s own type
@@ -8575,6 +8498,102 @@ impl SymbolTable {
         })
     }
 
+    /// Whether `ty` is a SAM type: [`Self::sam_sig`] is `Some`, without
+    /// reading the method's signature as seen from `ty`, which is most of
+    /// what that costs. Asked for every argument whose expected type might
+    /// take a function literal.
+    pub fn is_sam_type(&self, ty: &Type) -> bool {
+        self.sam_method_over(ty, &[]).is_some()
+    }
+
+    /// The class and single abstract method that make `ty` a SAM type, by
+    /// the rules of [`Self::sam_sig_over`].
+    fn sam_method_over(&self, ty: &Type, overridden: &[String]) -> Option<(SymbolId, SymbolId)> {
+        let ty = crate::prefix::strip_view(ty);
+        let cls = self.class_sym_of(ty)?;
+        let jvm = &self.get(cls).jvm_name;
+        if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
+            return None;
+        }
+        // nsc `samOf`: a SAM *class* must be instantiable by the literal's
+        // anonymous subclass with no arguments -- its constructor takes an
+        // empty parameter list. `abstract class H(x: Int) { def h(s: String):
+        // String }` is not a SAM type; converting to it built a subclass
+        // calling a `<init>()V` that does not exist.
+        let f = self.get(cls).flags;
+        if !f.contains(Flags::TRAIT) && !f.contains(Flags::INTERFACE) {
+            let ctors: Vec<SymbolId> = self
+                .get(cls)
+                .members
+                .iter()
+                .copied()
+                .filter(|m| self.get(*m).name == "<init>")
+                .collect();
+            let nullary = |c: &SymbolId| match &self.get(*c).ty {
+                Type::Method { paramss, .. } => paramss.iter().all(|l| l.is_empty()),
+                _ => self.get(*c).params.is_empty(),
+            };
+            if !ctors.is_empty() && !ctors.iter().any(nullary) {
+                return None;
+            }
+        }
+        let mut abstracts = self.abstract_sam_methods(cls);
+        let known = self.sam_known_overrides.get(&cls.0);
+        if !overridden.is_empty() || known.is_some() {
+            abstracts.retain(|m| {
+                let s = self.get(*m);
+                s.owner == cls
+                    || !(overridden.contains(&s.name)
+                        || known.is_some_and(|ns| ns.contains(&s.name)))
+            });
+        }
+        if abstracts.len() != 1 {
+            return None;
+        }
+        let method = abstracts[0];
+        // nsc `definitions.samOf`: `!sam.isOverloaded`. `abstract_sam_methods`
+        // keys by *name*, so that an override does not count twice as the
+        // declaration it replaces -- which also collapses a genuinely
+        // **overloaded** abstract method to one. `java.lang.Appendable`
+        // declares three abstract `append`s and is no SAM; read as one, an
+        // untyped function literal stayed a candidate for an `Appendable`
+        // formal and `processFully(log err _)` was an `ambiguous overload`
+        // against `processFully(processLine: String => Unit)`
+        // (`sys/process/BasicIO.scala:160,161`).
+        {
+            let name = self.get(method).name.as_str();
+            let owner = self.get(method).owner;
+            let same_name = self
+                .get(owner)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    self.get(m).kind == SymKind::Method
+                        && self.get(m).name == name
+                        && self.method_is_deferred(m)
+                })
+                .count();
+            if same_name > 1 {
+                return None;
+            }
+        }
+        // nsc `definitions.samOf`: `sam.typeParams.isEmpty`.
+        // A polymorphic abstract method has no function type to convert from,
+        // and real scalac 2.13.16 says so -- `trait Poly { def f[A](a: A): A }`
+        // with `val p: Poly = x => x` is two errors, `missing parameter type`
+        // and `found: ? => ?  required: Poly`. Without this the literal was
+        // accepted and its parameter silently pinned to whatever the body
+        // wanted.
+        if !self.get(method).tparams.is_empty() {
+            return None;
+        }
+        if !matches!(self.get(method).ty, Type::Method { .. }) {
+            return None;
+        }
+        Some((cls, method))
+    }
+
     fn abstract_sam_methods(&self, cls: SymbolId) -> Vec<SymbolId> {
         let epoch = (
             self.mutation_gen.get(),
@@ -8592,7 +8611,9 @@ impl SymbolTable {
         }
         #[cfg(test)]
         SAM_METHOD_WALKS.with(|count| count.set(count.get() + 1));
-        let mut by_name: HashMap<String, SymbolId> = HashMap::default();
+        // Keyed by the member's own name: the walk only reads the table, and
+        // copying every inherited method name was most of its cost.
+        let mut by_name: HashMap<&str, SymbolId> = HashMap::default();
         let mut work = vec![cls];
         let mut seen = rustc_hash::FxHashSet::default();
         let mut nominal = true;
@@ -8605,7 +8626,7 @@ impl SymbolTable {
                 if s.kind != SymKind::Method || sam_excluded_name(&s.name) {
                     continue;
                 }
-                by_name.entry(s.name.clone()).or_insert(*m);
+                by_name.entry(s.name.as_str()).or_insert(*m);
             }
             for p in &self.get(id).parents {
                 // Other parent forms can resolve through scopes or ambient

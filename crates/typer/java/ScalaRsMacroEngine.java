@@ -4,6 +4,7 @@ import java.io.PrintStream;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
+import java.lang.invoke.MethodHandle;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -482,7 +483,7 @@ public final class ScalaRsMacroEngine {
     public static Object reflectionCompanion(Object symbol) throws Exception {
         Long id = sourceSymbolIds.get(symbol);
         if (id != null) {
-            long companion = Long.parseLong(query("(q companion " + id + ")").items.get(2).text());
+            long companion = companionId(id);
             return companion == 0 ? call(universe, "NoSymbol", 0) : sourceSymbol(companion);
         }
         return call(symbol, "companion", 0);
@@ -1385,10 +1386,26 @@ public final class ScalaRsMacroEngine {
             }
         }
         Object built = typeForUncached(s);
-        if (key != null && built != null && !key.contains("(refined") && !key.contains("(param")) {
+        if (key != null && built != null && !key.contains("(param")) {
             typeCache.put(key, built);
         }
         return built;
+    }
+
+    /**
+     * Every refinement built here, with the label scala-rs gave it, for the
+     * whole run. scala-rs labels a refinement by its content, so one label
+     * always names one type and a refinement -- or a type containing one,
+     * such as every field of a labelled `HList` -- can be kept in
+     * {@link #typeCache} like any other type instead of being rebuilt, scope
+     * and all, at every mention.
+     */
+    static final java.util.IdentityHashMap<Object, String> refinedLabels = new java.util.IdentityHashMap<>();
+
+    /** The label a structural type travels back under, or null. */
+    static String structuralLabel(Object tpe) {
+        String label = structuralTypes.get(tpe);
+        return label != null ? label : refinedLabels.get(tpe);
     }
 
     static Object typeForUncached(Sexp s) throws Exception {
@@ -1425,6 +1442,7 @@ public final class ScalaRsMacroEngine {
                 call(scope, "enter", 1, member);
             }
             structuralTypes.put(result, s.items.get(1).text());
+            refinedLabels.put(result, s.items.get(1).text());
             return result;
         }
         if ("cst".equals(head)) {
@@ -1722,7 +1740,7 @@ public final class ScalaRsMacroEngine {
             return;
         }
         Object attributed = call(t, "tpe", 0);
-        if (structuralTypes.containsKey(attributed)) {
+        if (structuralLabel(attributed) != null) {
             sb.append("(t \"Attributed\" (s0) ");
             serTreeShape(t, sb);
             sb.append(' ');
@@ -1872,8 +1890,9 @@ public final class ScalaRsMacroEngine {
      * bound of an abstract type.
      */
     static void serType(Object tpe, StringBuilder sb) throws Exception {
-        if (structuralTypes.containsKey(tpe)) {
-            sb.append("(ty ").append(Sexp.quote(structuralTypes.get(tpe))).append(')');
+        String structural = structuralLabel(tpe);
+        if (structural != null) {
+            sb.append("(ty ").append(Sexp.quote(structural)).append(')');
             return;
         }
         if (tpe == null || tpe == call(universe, "NoType", 0)) {
@@ -2290,6 +2309,20 @@ public final class ScalaRsMacroEngine {
         return slot == wanted.items.size();
     }
 
+    /** Found companions, by scala-rs identity. A companion never changes
+     * once it exists, so only a "none" answer is asked again: a later
+     * definition may still supply one. Every derivation asked for the same
+     * case class's companion several times per expansion, each a round trip. */
+    static final java.util.HashMap<Long, Long> companionIds = new java.util.HashMap<>();
+
+    static long companionId(long id) throws Exception {
+        Long known = companionIds.get(id);
+        if (known != null) return known;
+        long companion = Long.parseLong(query("(q companion " + id + ")").items.get(2).text());
+        if (companion != 0) companionIds.put(id, companion);
+        return companion;
+    }
+
     /** Mirror an actual source symbol. Its type is completed by reverse RPC,
      * not guessed while its enclosing definition is still being inferred.
      *
@@ -2430,7 +2463,7 @@ public final class ScalaRsMacroEngine {
         call(symbol, "setInfo", 1, lazy);
         if ("Class".equals(kind)) {
             enterInOwner(owner, symbol);
-            long companion = Long.parseLong(query("(q companion " + id + ")").items.get(2).text());
+            long companion = companionId(id);
             if (companion != 0) sourceSymbol(companion);
         }
         return symbol;
@@ -2463,7 +2496,7 @@ public final class ScalaRsMacroEngine {
         Object lazy = lazyInfoConstructor().newInstance(universe, Long.valueOf(classId));
         call(moduleClass, "setInfo", 1, lazy);
         enterInOwner(owner, module);
-        long companion = Long.parseLong(query("(q companion " + moduleId + ")").items.get(2).text());
+        long companion = companionId(moduleId);
         if (companion != 0) sourceSymbol(companion);
         return "Module".equals(kind) ? module : moduleClass;
     }
@@ -3164,6 +3197,234 @@ public final class ScalaRsMacroEngine {
      * whose parameter types actually accept these arguments.
      */
     static Object call(Object recv, String name, int arity, Object... args) throws Exception {
+        if (arity == 0) {
+            if (recv == universe || recv == universeDefinitions) return stableMember(recv, name);
+            Object fast = Fast.call0(recv, name);
+            if (fast != Fast.MISS) return fast;
+        } else if (arity == 1 && "productElement".equals(name) && Fast.PRODUCT_ELEMENT != null
+                && Fast.PRODUCT.isInstance(recv) && args[0] instanceof Integer) {
+            try {
+                return (Object) Fast.PRODUCT_ELEMENT.invokeExact(recv, ((Integer) args[0]).intValue());
+            } catch (Throwable t) {
+                throw new InvocationTargetException(t);
+            }
+        }
+        return reflectiveCall(recv, name, arity, args);
+    }
+
+    /**
+     * The universe's objects and lazy values -- `NoSymbol`, `EmptyTree`,
+     * `definitions`, the tree companions -- fetched once. Every tree built or
+     * walked here asks for several of them; a compile with a few thousand
+     * shapeless derivations made over ten million such calls, each a
+     * reflective lookup and invocation where nsc reads a field.
+     *
+     * Only members known to be stable are kept: the names below, and any
+     * member whose value is a Scala `object` (its class name ends in `$`),
+     * which is a singleton by construction.
+     */
+    static Object universeDefinitions;
+    static final java.util.HashMap<String, Object> universeMembers = new java.util.HashMap<>();
+    static final java.util.HashMap<String, Object> definitionsMembers = new java.util.HashMap<>();
+    static final java.util.Set<String> STABLE_UNIVERSE_MEMBERS = new java.util.HashSet<>(java.util.Arrays.asList(
+        "NoSymbol", "EmptyTree", "NoType", "NoPrefix", "NoPosition", "WildcardType", "definitions",
+        "internal", "Flag", "gen", "noSelfType"));
+    static final java.util.Set<String> STABLE_DEFINITIONS_MEMBERS = new java.util.HashSet<>(java.util.Arrays.asList(
+        "RepeatedParamClass", "ByNameParamClass", "JavaRepeatedParamClass", "AnyRefTpe"));
+
+    static Object stableMember(Object recv, String name) throws Exception {
+        boolean fromUniverse = recv == universe;
+        java.util.HashMap<String, Object> known = fromUniverse ? universeMembers : definitionsMembers;
+        Object value = known.get(name);
+        if (value != null) return value;
+        value = reflectiveCall(recv, name, 0);
+        boolean stable = fromUniverse
+            ? STABLE_UNIVERSE_MEMBERS.contains(name) || (value != null && value.getClass().getName().endsWith("$"))
+            : STABLE_DEFINITIONS_MEMBERS.contains(name);
+        if (stable && value != null) {
+            known.put(name, value);
+            if (fromUniverse && "definitions".equals(name)) universeDefinitions = value;
+        }
+        return value;
+    }
+
+    /**
+     * Direct handles for the members every tree and type walk here calls.
+     * `static final`, so the JIT inlines them like ordinary calls; each is
+     * taken only when the receiver has the class the handle was resolved on,
+     * and anything else goes through {@link #reflectiveCall} as before. The
+     * classes are the runtime universe's own: the engine's loader is the one
+     * the universe was created on.
+     */
+    static final class Fast {
+        static final Object MISS = new Object();
+        static final Class<?> ITERATOR = cls("scala.collection.Iterator");
+        static final Class<?> ITERABLE_ONCE = cls("scala.collection.IterableOnce");
+        static final Class<?> PRODUCT = cls("scala.Product");
+        static final Class<?> TREE = cls("scala.reflect.internal.Trees$Tree");
+        static final Class<?> SYMBOL = cls("scala.reflect.internal.Symbols$Symbol");
+        static final Class<?> TYPE = cls("scala.reflect.internal.Types$Type");
+        static final Class<?> TYPE_REF = cls("scala.reflect.internal.Types$TypeRef");
+        static final Class<?> NAME = cls("scala.reflect.internal.Names$Name");
+        static final MethodHandle HAS_NEXT = handle(ITERATOR, "hasNext", boolean.class);
+        static final MethodHandle NEXT = handle(ITERATOR, "next", Object.class);
+        static final MethodHandle ITERATOR_OF = handle(ITERABLE_ONCE, "iterator", Object.class);
+        static final MethodHandle PRODUCT_PREFIX = handle(PRODUCT, "productPrefix", Object.class);
+        static final MethodHandle PRODUCT_ARITY = handle(PRODUCT, "productArity", int.class);
+        static final MethodHandle PRODUCT_ELEMENT = handle1(PRODUCT, "productElement", int.class);
+        static final MethodHandle TREE_TPE = handle(TREE, "tpe", Object.class);
+        static final MethodHandle TREE_SYMBOL = handle(TREE, "symbol", Object.class);
+        static final MethodHandle TREE_HAS_SYMBOL_FIELD = handle(TREE, "hasSymbolField", boolean.class);
+        static final MethodHandle TREE_CHILDREN = handle(TREE, "children", Object.class);
+        static final MethodHandle TREE_ATTACHMENTS = handle(TREE, "attachments", Object.class);
+        static final MethodHandle SYM_IS_CLASS = handle(SYMBOL, "isClass", boolean.class);
+        static final MethodHandle SYM_OWNER = handle(SYMBOL, "owner", Object.class);
+        static final MethodHandle SYM_IS_ROOT = handle(SYMBOL, "isRoot", boolean.class);
+        static final MethodHandle SYM_IS_PACKAGE_CLASS = handle(SYMBOL, "isPackageClass", boolean.class);
+        static final MethodHandle SYM_IS_MODULE_CLASS = handle(SYMBOL, "isModuleClass", boolean.class);
+        static final MethodHandle SYM_IS_EMPTY_PACKAGE_CLASS = handle(SYMBOL, "isEmptyPackageClass", boolean.class);
+        static final MethodHandle SYM_IS_REFINEMENT_CLASS = handle(SYMBOL, "isRefinementClass", boolean.class);
+        static final MethodHandle SYM_FULL_NAME = handle(SYMBOL, "fullName", Object.class);
+        static final MethodHandle SYM_AS_TYPE = handle(SYMBOL, "asType", Object.class);
+        static final MethodHandle SYM_TO_TYPE_CONSTRUCTOR = handle(SYMBOL, "toTypeConstructor", Object.class);
+        static final MethodHandle TYPE_ARGS = handle(TYPE, "typeArgs", Object.class);
+        static final MethodHandle TYPE_SYMBOL_DIRECT = handle(TYPE, "typeSymbolDirect", Object.class);
+        static final MethodHandle TYPE_SYMBOL = handle(TYPE, "typeSymbol", Object.class);
+        static final MethodHandle TYPE_REF_PRE = handle(TYPE_REF, "pre", Object.class);
+        static final MethodHandle NAME_IS_TERM_NAME = handle(NAME, "isTermName", boolean.class);
+
+        static Class<?> cls(String name) {
+            try {
+                return Class.forName(name, false, ScalaRsMacroEngine.class.getClassLoader());
+            } catch (Throwable unavailable) {
+                return null;
+            }
+        }
+
+        /** `name()` on `owner` as `(Object)ret`, or null (then never taken). */
+        static MethodHandle handle(Class<?> owner, String name, Class<?> ret) {
+            if (owner == null) return null;
+            try {
+                return java.lang.invoke.MethodHandles.publicLookup()
+                    .unreflect(owner.getMethod(name))
+                    .asType(java.lang.invoke.MethodType.methodType(ret, Object.class));
+            } catch (Throwable unavailable) {
+                return null;
+            }
+        }
+
+        static MethodHandle handle1(Class<?> owner, String name, Class<?> param) {
+            if (owner == null) return null;
+            try {
+                return java.lang.invoke.MethodHandles.publicLookup()
+                    .unreflect(owner.getMethod(name, param))
+                    .asType(java.lang.invoke.MethodType.methodType(Object.class, Object.class, param));
+            } catch (Throwable unavailable) {
+                return null;
+            }
+        }
+
+        /** A zero-argument member through its handle, or {@link #MISS}. A
+         * failure in the member itself is wrapped as `Method.invoke` would. */
+        static Object call0(Object recv, String name) throws Exception {
+            try {
+                switch (name) {
+                    case "hasNext":
+                        if (HAS_NEXT != null && ITERATOR.isInstance(recv)) return (boolean) HAS_NEXT.invokeExact(recv);
+                        break;
+                    case "next":
+                        if (NEXT != null && ITERATOR.isInstance(recv)) return (Object) NEXT.invokeExact(recv);
+                        break;
+                    case "iterator":
+                        if (ITERATOR_OF != null && ITERABLE_ONCE.isInstance(recv)) return (Object) ITERATOR_OF.invokeExact(recv);
+                        break;
+                    case "productPrefix":
+                        if (PRODUCT_PREFIX != null && PRODUCT.isInstance(recv)) return (Object) PRODUCT_PREFIX.invokeExact(recv);
+                        break;
+                    case "productArity":
+                        if (PRODUCT_ARITY != null && PRODUCT.isInstance(recv)) return (int) PRODUCT_ARITY.invokeExact(recv);
+                        break;
+                    case "tpe":
+                        if (TREE_TPE != null && TREE.isInstance(recv)) return (Object) TREE_TPE.invokeExact(recv);
+                        break;
+                    case "symbol":
+                        if (TREE_SYMBOL != null && TREE.isInstance(recv)) return (Object) TREE_SYMBOL.invokeExact(recv);
+                        break;
+                    case "hasSymbolField":
+                        if (TREE_HAS_SYMBOL_FIELD != null && TREE.isInstance(recv)) return (boolean) TREE_HAS_SYMBOL_FIELD.invokeExact(recv);
+                        break;
+                    case "children":
+                        if (TREE_CHILDREN != null && TREE.isInstance(recv)) return (Object) TREE_CHILDREN.invokeExact(recv);
+                        break;
+                    case "attachments":
+                        if (TREE_ATTACHMENTS != null && TREE.isInstance(recv)) return (Object) TREE_ATTACHMENTS.invokeExact(recv);
+                        break;
+                    case "isClass":
+                        if (SYM_IS_CLASS != null && SYMBOL.isInstance(recv)) return (boolean) SYM_IS_CLASS.invokeExact(recv);
+                        break;
+                    case "owner":
+                        if (SYM_OWNER != null && SYMBOL.isInstance(recv)) return (Object) SYM_OWNER.invokeExact(recv);
+                        break;
+                    case "isRoot":
+                        if (SYM_IS_ROOT != null && SYMBOL.isInstance(recv)) return (boolean) SYM_IS_ROOT.invokeExact(recv);
+                        break;
+                    case "isPackageClass":
+                        if (SYM_IS_PACKAGE_CLASS != null && SYMBOL.isInstance(recv)) return (boolean) SYM_IS_PACKAGE_CLASS.invokeExact(recv);
+                        break;
+                    case "isModuleClass":
+                        if (SYM_IS_MODULE_CLASS != null && SYMBOL.isInstance(recv)) return (boolean) SYM_IS_MODULE_CLASS.invokeExact(recv);
+                        break;
+                    case "isEmptyPackageClass":
+                        if (SYM_IS_EMPTY_PACKAGE_CLASS != null && SYMBOL.isInstance(recv)) return (boolean) SYM_IS_EMPTY_PACKAGE_CLASS.invokeExact(recv);
+                        break;
+                    case "isRefinementClass":
+                        if (SYM_IS_REFINEMENT_CLASS != null && SYMBOL.isInstance(recv)) return (boolean) SYM_IS_REFINEMENT_CLASS.invokeExact(recv);
+                        break;
+                    case "fullName":
+                        if (SYM_FULL_NAME != null && SYMBOL.isInstance(recv)) return (Object) SYM_FULL_NAME.invokeExact(recv);
+                        break;
+                    case "asType":
+                        if (SYM_AS_TYPE != null && SYMBOL.isInstance(recv)) return (Object) SYM_AS_TYPE.invokeExact(recv);
+                        break;
+                    case "toTypeConstructor":
+                        if (SYM_TO_TYPE_CONSTRUCTOR != null && SYMBOL.isInstance(recv)) return (Object) SYM_TO_TYPE_CONSTRUCTOR.invokeExact(recv);
+                        break;
+                    case "typeArgs":
+                        if (TYPE_ARGS != null && TYPE.isInstance(recv)) return (Object) TYPE_ARGS.invokeExact(recv);
+                        break;
+                    case "typeSymbolDirect":
+                        if (TYPE_SYMBOL_DIRECT != null && TYPE.isInstance(recv)) return (Object) TYPE_SYMBOL_DIRECT.invokeExact(recv);
+                        break;
+                    case "typeSymbol":
+                        if (TYPE_SYMBOL != null && TYPE.isInstance(recv)) return (Object) TYPE_SYMBOL.invokeExact(recv);
+                        break;
+                    case "pre":
+                        if (TYPE_REF_PRE != null && TYPE_REF.isInstance(recv)) return (Object) TYPE_REF_PRE.invokeExact(recv);
+                        break;
+                    case "isTermName":
+                        if (NAME_IS_TERM_NAME != null && NAME.isInstance(recv)) return (boolean) NAME_IS_TERM_NAME.invokeExact(recv);
+                        break;
+                    default:
+                        break;
+                }
+            } catch (Throwable t) {
+                throw new InvocationTargetException(t);
+            }
+            return MISS;
+        }
+    }
+
+    static final String DBG_CALLS = System.getenv("DBG_CALLS_FILE");
+    static long dbgCalls;
+    static final java.util.HashMap<String, Integer> dbgNames = new java.util.HashMap<>();
+    static void dbgDump() {
+        try (java.io.PrintStream ps = new java.io.PrintStream(new java.io.FileOutputStream(DBG_CALLS))) {
+            ps.println("total " + dbgCalls);
+            dbgNames.entrySet().stream().sorted((a, b) -> b.getValue() - a.getValue()).limit(70).forEach(e -> ps.println(e.getValue() + " " + e.getKey()));
+        } catch (Exception e) { }
+    }
+    static Object reflectiveCall(Object recv, String name, int arity, Object... args) throws Exception {
+        if (DBG_CALLS != null) { dbgCalls++; dbgNames.merge(recv.getClass().getSimpleName() + "." + name + "/" + arity, 1, Integer::sum); if ((dbgCalls & 0x3FFFF) == 0) dbgDump(); }
         Method[] candidates = overloads(recv.getClass(), name, arity);
         Method fallback = null;
         for (Method m : candidates) {
@@ -3521,57 +3782,72 @@ public final class ScalaRsMacroEngine {
             int count;
             int position;
 
-            Packet(String text) { this.text = text; }
+            final char[] chars;
+
+            Packet(String text) { this.text = text; this.chars = text.toCharArray(); }
 
             void scan(int depth, int maxDepth) {
-                while (position < text.length() && text.charAt(position) == ' ') position++;
-                if (position >= text.length()) {
+                // Over the characters rather than `charAt`: every packet is
+                // scanned in full, and a shapeless derivation sends hundreds
+                // of megabytes of them.
+                final char[] cs = chars;
+                final int length = cs.length;
+                int at = position;
+                while (at < length && cs[at] == ' ') at++;
+                if (at >= length) {
                     throw new IllegalArgumentException("empty macro protocol packet");
                 }
                 int slot = count++ * 4;
                 if (slot == spans.length) spans = java.util.Arrays.copyOf(spans, spans.length * 2);
-                spans[slot] = position;
-                char c = text.charAt(position);
+                spans[slot] = at;
+                char c = cs[at];
                 if (c == '(') {
                     if (depth >= maxDepth) {
                         throw new IllegalArgumentException("macro protocol packet is nested too deeply");
                     }
-                    position++;
+                    at++;
                     int children = 0;
                     for (;;) {
-                        while (position < text.length() && text.charAt(position) == ' ') position++;
-                        if (position >= text.length()) {
+                        while (at < length && cs[at] == ' ') at++;
+                        if (at >= length) {
                             throw new IllegalArgumentException("unterminated macro protocol list");
                         }
-                        if (text.charAt(position) == ')') { position++; break; }
+                        if (cs[at] == ')') { at++; break; }
+                        position = at;
                         scan(depth + 1, maxDepth);
+                        at = position;
                         children++;
                     }
                     spans[slot + 3] = children;
                 } else if (c == '"') {
-                    position++;
-                    while (position < text.length() && text.charAt(position) != '"') {
-                        if (text.charAt(position++) == '\\') {
-                            if (position >= text.length()) {
+                    at++;
+                    while (at < length && cs[at] != '"') {
+                        if (cs[at++] == '\\') {
+                            if (at >= length) {
                                 throw new IllegalArgumentException("unterminated macro protocol escape");
                             }
-                            char e = text.charAt(position++);
+                            char e = cs[at++];
                             if (e != 'n' && e != 't' && e != 'r' && e != '"' && e != '\\') {
                                 throw new IllegalArgumentException("unknown macro protocol escape: \\" + e);
                             }
                         }
                     }
-                    if (position >= text.length()) {
+                    if (at >= length) {
                         throw new IllegalArgumentException("unterminated macro protocol string");
                     }
-                    position++;
+                    at++;
                     spans[slot + 3] = -1;
                 } else {
                     if (c == ')') throw new IllegalArgumentException("unexpected ) in macro protocol packet");
-                    while (position < text.length() && " ()".indexOf(text.charAt(position)) < 0) position++;
+                    while (at < length) {
+                        char d = cs[at];
+                        if (d == ' ' || d == '(' || d == ')') break;
+                        at++;
+                    }
                     spans[slot + 3] = -2;
                 }
-                spans[slot + 1] = position;
+                position = at;
+                spans[slot + 1] = at;
                 spans[slot + 2] = count;
             }
 

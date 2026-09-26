@@ -260,9 +260,33 @@ impl MacroEngine {
             };
         };
 
-        // `read_line` cannot be interrupted, so it runs where it can be
-        // abandoned: on a thread that owns the pipe from the first timed read
-        // on. On a timeout it is left blocked, and killing the child ends it.
+        // On Unix the wait itself is bounded: `poll(2)` on the pipe before
+        // each read, on this thread. A shapeless derivation makes tens of
+        // thousands of round trips, and handing every line through a reader
+        // thread cost two extra thread wake-ups per line.
+        #[cfg(unix)]
+        if let Some(stdout) = self.stdout.as_mut() {
+            let started = Instant::now();
+            let outcome = read_wire_line_before(stdout, wire_limit, started + limit);
+            *budget = Some(limit.saturating_sub(started.elapsed()));
+            let result = match outcome {
+                Ok((0, _)) => Err("the macro engine exited without a reply".to_string()),
+                Ok((_, line)) => Sexp::parse(wire_line_payload(&line)),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(self.expansion_timed_out(limit));
+                }
+                Err(e) => Err(format!("the macro engine protocol failed ({e})")),
+            };
+            return match result {
+                Ok(reply) => Ok(reply),
+                Err(reason) => self.protocol_failure(reason),
+            };
+        }
+
+        // `read_line` cannot be interrupted, so elsewhere it runs where it can
+        // be abandoned: on a thread that owns the pipe from the first timed
+        // read on. On a timeout it is left blocked, and killing the child
+        // ends it.
         if self.reader.is_none() {
             let Some(stdout) = self.stdout.take() else {
                 return self.protocol_failure(
@@ -290,21 +314,25 @@ impl MacroEngine {
                     Err(reason) => self.protocol_failure(reason),
                 }
             }
-            Err(_) => {
-                let mut reason = format!(
-                    "the macro implementation did not return within {}s -- it \
-                     is looping, deadlocked, or waiting on something that \
-                     never arrives (set SCALA_RS_MACRO_TIMEOUT_SECS to change \
-                     or 0 to disable)",
-                    limit.as_secs()
-                );
-                if let Some(stop_error) = self.poison_and_terminate() {
-                    reason.push_str("; ");
-                    reason.push_str(&stop_error);
-                }
-                Err(reason)
-            }
+            Err(_) => Err(self.expansion_timed_out(limit)),
         }
+    }
+
+    /// Poison and stop the engine after a read ran out of `limit`, and say
+    /// why.
+    fn expansion_timed_out(&mut self, limit: Duration) -> String {
+        let mut reason = format!(
+            "the macro implementation did not return within {}s -- it \
+             is looping, deadlocked, or waiting on something that \
+             never arrives (set SCALA_RS_MACRO_TIMEOUT_SECS to change \
+             or 0 to disable)",
+            limit.as_secs()
+        );
+        if let Some(stop_error) = self.poison_and_terminate() {
+            reason.push_str("; ");
+            reason.push_str(&stop_error);
+        }
+        reason
     }
 }
 
@@ -315,7 +343,8 @@ impl MacroEngine {
 /// abandoned). A shapeless derivation makes tens of thousands of round trips,
 /// and the spawns were a twentieth of the compile. The thread is asked for
 /// each line with the limit that read allows, so a line is never read ahead
-/// of a request.
+/// of a request. On Unix a timed read polls the pipe instead
+/// ([`read_wire_line_before`]), and this thread is not started.
 struct ReplyReader {
     ask: std::sync::mpsc::Sender<usize>,
     lines: std::sync::mpsc::Receiver<std::io::Result<(usize, String)>>,
@@ -343,6 +372,109 @@ impl ReplyReader {
 /// the process group, so there is deliberately no next packet to align with.
 fn read_wire_line<R: BufRead>(reader: &mut R) -> std::io::Result<(usize, String)> {
     read_wire_line_with_limit(reader, MAX_WIRE_BYTES)
+}
+
+/// [`read_wire_line_with_limit`], failing with `TimedOut` when no complete
+/// line has arrived by `deadline`. Each read that would block waits in
+/// `poll(2)` first, so a partial line cannot hold the caller past it.
+#[cfg(unix)]
+fn read_wire_line_before(
+    reader: &mut BufReader<ChildStdout>,
+    limit: usize,
+    deadline: Instant,
+) -> std::io::Result<(usize, String)> {
+    use std::os::unix::io::AsRawFd;
+    let fd = reader.get_ref().as_raw_fd();
+    let mut bytes = Vec::new();
+    let mut total = 0usize;
+    loop {
+        if reader.buffer().is_empty() && !wait_readable(fd, deadline)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the macro engine did not reply in time",
+            ));
+        }
+        let (take, ended) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return wire_line(total, bytes);
+            }
+            let ended = available.iter().position(|b| *b == b'\n');
+            let take = ended.map_or(available.len(), |at| at + 1);
+            if total.saturating_add(take) > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("macro protocol line exceeds {limit} bytes"),
+                ));
+            }
+            total += take;
+            bytes.extend_from_slice(&available[..take]);
+            (take, ended.is_some())
+        };
+        reader.consume(take);
+        if ended {
+            return wire_line(total, bytes);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wire_line(total: usize, bytes: Vec<u8>) -> std::io::Result<(usize, String)> {
+    let line = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macro protocol line is not UTF-8",
+        )
+    })?;
+    Ok((total, line))
+}
+
+/// Wait until `fd` is readable (or at end of file, or failed -- the read
+/// that follows reports those), `false` once `deadline` has passed.
+#[cfg(unix)]
+fn wait_readable(fd: std::os::raw::c_int, deadline: Instant) -> std::io::Result<bool> {
+    use std::os::raw::{c_int, c_short};
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    type NfdsT = std::os::raw::c_ulong;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    type NfdsT = std::os::raw::c_uint;
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: c_int) -> c_int;
+    }
+    const POLLIN: c_short = 0x1;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        // Rounded up, so a wait never ends just short of the deadline and
+        // spins on a zero timeout.
+        let left = deadline - now;
+        let ms = left.as_millis().saturating_add(1).min(c_int::MAX as u128) as c_int;
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a live, properly laid out `struct pollfd` for the
+        // duration of the call, and the count passed is one.
+        let ready = unsafe { poll(&mut pfd, 1, ms) };
+        if ready > 0 {
+            return Ok(true);
+        }
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
 }
 
 fn read_wire_line_with_limit<R: BufRead>(
@@ -4246,6 +4378,10 @@ pub(crate) fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<Strin
 /// type-checked again at the call site -- where an unqualified name still
 /// means what the source meant, and a `This` we did not resolve would not.
 fn typed_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
+    if let Some(body) = byname_thunk_body(t) {
+        // Written as the thunk's body always was; only the wrapper goes.
+        return tree_to_wire(cx, body, out);
+    }
     let start = out.len();
     typed_tree_to_wire_body(cx, t, out)?;
     mirror_tree_identity(cx.st, t, start, out);
@@ -4298,6 +4434,21 @@ fn typed_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<()
     }
 }
 
+/// The argument under the thunk the typer wraps a by-name argument in.
+///
+/// nsc's typed tree holds a by-name argument as the bare expression; the
+/// thunk only appears at `uncurry`. Handed to a macro as a `() => e`
+/// function, it came back from `c.untypecheck` as a literal that no longer
+/// conforms to the `=> T` parameter: circe's coproduct decoder, which passes
+/// `c.history` to `DecodingFailure.apply(String, => List[CursorOp])`, failed
+/// to compile inside every `Lazy` derivation of a sealed trait.
+pub(crate) fn byname_thunk_body(t: &Tree) -> Option<&Tree> {
+    match &t.kind {
+        TreeKind::Function { vparams, body } if t.byname_thunk && vparams.is_empty() => Some(body),
+        _ => None,
+    }
+}
+
 /// Write an argument tree in the shape the engine can rebuild.
 ///
 /// Only the forms whose *source* meaning survives being rebuilt at the call
@@ -4307,6 +4458,9 @@ fn typed_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<()
 /// refusing those by name is the honest answer until the bridge carries typed
 /// trees (`docs/macros.md` §4.3).
 pub(crate) fn tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
+    if let Some(body) = byname_thunk_body(t) {
+        return tree_to_wire(cx, body, out);
+    }
     let start = out.len();
     tree_to_wire_body(cx, t, out)?;
     mirror_tree_identity(cx.st, t, start, out);

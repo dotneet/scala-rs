@@ -470,6 +470,20 @@ name when it is static; a class the current run is compiling travels as its scal
 an unknown node kind is always a diagnostic that names it. The same channel carries the engine's
 questions back to the typer (`(q …)` / `(a …)`, §7.20).
 
+Two conventions matter for what the engine keeps:
+
+- **A refinement travels under a placeholder label chosen by content**
+  (`(refined "<macro-type-N>" (parents …) (members …))`): equal refinements get the same label for
+  the whole run, and the label always names the same scala-rs type (`Typer::refined_label`). The
+  engine can therefore keep what it built for a type that contains one -- every field of a labelled
+  `HList` does -- in its per-text type cache, and remembers each refinement's label for the run to
+  write it back (`refinedLabels`).
+- **A by-name argument goes as the expression itself**, as it stands in nsc's typed tree. The typer
+  wraps it in a thunk (`Tree::byname_thunk`) that only exists for lowering; sent as a `() => e`
+  function, it came back from `c.untypecheck` as a literal that no longer fits the `=> T`
+  parameter of an overloaded method (circe's `DecodingFailure.apply(…, c.history)` inside every
+  `Lazy` derivation of a sealed trait).
+
 ### 4.3 The limits of soundness
 
 - The expansion result Tree points at **symbols of the runtime universe on the JVM side**. Those are

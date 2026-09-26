@@ -617,6 +617,11 @@ pub struct Typer {
     /// (`crates/typer/src/expand.rs`, `synthType`); this is how the type is
     /// recognised again in the tree that comes back.
     pub(crate) macro_local_tags: HashMap<String, scala_rs_parser::Type>,
+    /// The label each refinement handed to the engine travels under, by
+    /// content (`hash_type`, then equality): one type, one label, so the
+    /// engine can keep what it built for it.
+    pub(crate) macro_refined_labels:
+        rustc_hash::FxHashMap<u64, Vec<(scala_rs_parser::Type, String)>>,
     /// Lexical ownership exposed to the macro mirror, independent of JVM storage owners.
     pub(crate) macro_lexical_owner: SymbolId,
     pub(crate) macro_mirror_owners: HashMap<SymbolId, SymbolId>,
@@ -658,6 +663,12 @@ pub struct Typer {
     pub(crate) compiler_settings: Vec<String>,
     pub(crate) binary: BinaryIndex,
     pub(crate) completed_java: HashSet<String>,
+    /// Class files already read and parsed for a question about their
+    /// declarations, by internal name (`None`: absent or unreadable). The
+    /// classpath does not change during a run, so each file is inflated and
+    /// parsed once, as nsc's `ClassfileParser` runs once per class.
+    pub(crate) parsed_classfiles:
+        rustc_hash::FxHashMap<String, Option<std::rc::Rc<crate::javaclass::JavaClass>>>,
     /// Overload sets whose alternatives do not all belong to one class's
     /// linearization, keyed by the alternative the tree carries as its symbol.
     ///
@@ -886,6 +897,14 @@ pub struct Typer {
     /// detached identity.
     pub(crate) implicit_search_depth: usize,
     pub(crate) whitebox_fits: std::cell::RefCell<crate::implicits::whitebox::WhiteboxFits>,
+    /// How many times an implicit scope has been read (lexical or implicit
+    /// scope of a type), for the run. A whitebox expansion during which this
+    /// did not move cannot have depended on the implicit context.
+    pub(crate) implicit_scope_reads: std::cell::Cell<u64>,
+    /// How many questions the engine asked that depend on the implicit
+    /// context of the expansion (`typecheck`, `inferImplicitValue`,
+    /// `openImplicits`, `resetImplicits`), for the run.
+    pub(crate) macro_context_queries: u64,
     /// What the last `fill_defaults_and_implicits` pinned down by implicit
     /// search alone: `mk(s)` on `def mk[T: TT](s: String): Seq[Int] => Rep[T]`
     /// has no value argument mentioning `T`, so only the witness fixes it, and
@@ -1258,6 +1277,7 @@ impl Typer {
             macro_rpc_span: Span::DUMMY,
             macro_timing: crate::expand_timing::MacroTiming::new(),
             macro_local_tags: HashMap::new(),
+            macro_refined_labels: rustc_hash::FxHashMap::default(),
             macro_lexical_owner: SymbolId::NONE,
             macro_mirror_owners: HashMap::new(),
             macro_function_symbols: HashMap::new(),
@@ -1283,6 +1303,7 @@ impl Typer {
             compiler_settings: opts.compiler_settings.clone(),
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
+            parsed_classfiles: rustc_hash::FxHashMap::default(),
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
             undet_tvars: Vec::new(),
@@ -1332,6 +1353,8 @@ impl Typer {
             implicit_macros_disabled: false,
             implicit_search_depth: 0,
             whitebox_fits: std::cell::RefCell::new(Default::default()),
+            implicit_scope_reads: std::cell::Cell::new(0),
+            macro_context_queries: 0,
             implicit_undet_solved: Vec::new(),
             implicit_arg_missing: false,
         }

@@ -151,6 +151,11 @@ pub(crate) struct ImplicitMemo {
     /// very types, so if they could change inside one search it would already
     /// be wrong.
     candidate_tys: rustc_hash::FxHashMap<u32, Option<std::rc::Rc<Type>>>,
+    /// Per implicit operation under way that keeps its searches' answers for
+    /// building its trees ([`Typer::with_implicit_decisions`]), innermost
+    /// last: the successful searches it made, kept past the search that made
+    /// them, keyed like `entries`.
+    decisions: Vec<rustc_hash::FxHashMap<u64, Vec<MemoEntry>>>,
 }
 
 /// [`Typer::implicits_in_scope`] across searches: nsc's per-context
@@ -266,6 +271,7 @@ impl CandidateTy<'_> {
     }
 }
 
+#[derive(Clone)]
 struct MemoEntry {
     pt: Type,
     undet: Vec<SymbolId>,
@@ -395,6 +401,35 @@ impl Drop for MemoLive<'_> {
         let mut m = self.typer.implicit_memo.borrow_mut();
         m.depth -= 1;
         if m.depth == 0 {
+            // What the search decided is what the operation around it will
+            // build: keep its successful, fully determined answers for that.
+            if !m.decisions.is_empty() {
+                let entries = std::mem::take(&mut m.entries);
+                let mut kept: Vec<(u64, MemoEntry)> = Vec::new();
+                for (key, bucket) in entries {
+                    for entry in bucket {
+                        if !matches!(entry.result, ImplicitSearch::Found(_)) {
+                            continue;
+                        }
+                        if entry.undet.is_empty() {
+                            kept.push((key, entry));
+                            continue;
+                        }
+                        // Found with type variables of the caller still open:
+                        // building asks again with the ones it solved filled
+                        // in, which is the same search nsc does not repeat.
+                        if let Some(solved) = self.typer.instantiated_decision(&entry) {
+                            let key =
+                                memo_key(&solved.pt, &[], self.typer.implicit_macros_disabled);
+                            kept.push((key, solved));
+                        }
+                    }
+                }
+                let decisions = m.decisions.last_mut().expect("checked non-empty");
+                for (key, entry) in kept {
+                    decisions.entry(key).or_default().push(entry);
+                }
+            }
             m.entries.clear();
             m.improves.clear();
             m.in_scope = None;
@@ -578,6 +613,8 @@ impl Typer {
     /// enclosing package object, and it was being redone at every node of the
     /// derivation tree even though nothing it reads can change under `&self`.
     pub(crate) fn implicits_in_scope(&self) -> Vec<SymbolId> {
+        self.implicit_scope_reads
+            .set(self.implicit_scope_reads.get().wrapping_add(1));
         let cached = {
             let m = self.implicit_memo.borrow();
             (m.depth > 0).then(|| m.in_scope.clone())
@@ -1264,6 +1301,8 @@ impl Typer {
     }
 
     pub(crate) fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
+        self.implicit_scope_reads
+            .set(self.implicit_scope_reads.get().wrapping_add(1));
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
         let mut parts = Vec::new();
@@ -3073,6 +3112,97 @@ impl Typer {
         m.routes.extend(routes);
         *self.selected_implicit_fit.borrow_mut() = selected;
         Some(out)
+    }
+
+    /// Run one implicit operation -- the searches for an application's
+    /// implicit arguments and the building of what they found -- keeping the
+    /// answers of its searches for [`Self::implicit_decision`].
+    ///
+    /// nsc builds an implicit argument while searching for it
+    /// (`typedImplicit`), so a candidate's own implicit arguments are
+    /// decided once. Here fitting a candidate searches for them and building
+    /// its tree used to search for each again, from scratch: in a shapeless
+    /// derivation that was nearly half of all searches. The build now takes
+    /// the answer the fit arrived at, under the same open-stack and depth
+    /// rules as a memo hit, and only while the same operation is running:
+    /// an operation started inside it (typing a macro expansion somewhere
+    /// else) keeps a record of its own, dropped when it ends.
+    pub(crate) fn with_implicit_decisions<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.implicit_memo
+            .borrow_mut()
+            .decisions
+            .push(Default::default());
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.implicit_memo.borrow_mut().decisions.pop();
+        match out {
+            Ok(out) => out,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// `entry` with the caller's type variables it solved substituted, when
+    /// it solved all of them.
+    fn instantiated_decision(&self, entry: &MemoEntry) -> Option<MemoEntry> {
+        if !entry
+            .undet
+            .iter()
+            .all(|u| entry.bindings.iter().any(|(b, _)| b == u))
+        {
+            return None;
+        }
+        let pt = self.subst_undet(&entry.pt, &entry.bindings);
+        if entry
+            .undet
+            .iter()
+            .any(|u| crate::check::type_mentions_tparam_deep(&pt, *u))
+        {
+            return None;
+        }
+        Some(MemoEntry {
+            pt,
+            undet: Vec::new(),
+            bindings: Vec::new(),
+            selected_targs: entry.selected_targs.as_ref().map(|targs| {
+                targs
+                    .iter()
+                    .map(|t| self.subst_undet(t, &entry.bindings))
+                    .collect()
+            }),
+            ..entry.clone()
+        })
+    }
+
+    /// What a search for `pt` at `depth` found earlier in the running
+    /// implicit operation, replayed as [`Self::memo_lookup`] replays a hit.
+    pub(crate) fn implicit_decision(&self, pt: &Type, depth: usize) -> Option<ImplicitSearch> {
+        let key = memo_key(pt, &[], self.implicit_macros_disabled);
+        let open = self.open_implicit_mask();
+        let m = self.implicit_memo.borrow();
+        let e = m.decisions.last()?.get(&key)?.iter().find(|e| {
+            (e.depth == depth || (!e.cut && e.depth > depth))
+                && e.probe & open == 0
+                && e.undet.is_empty()
+                && e.pt == *pt
+        })?;
+        let result = e.result.clone();
+        let selected = match (&e.result, &e.selected_targs) {
+            (ImplicitSearch::Found(id), Some(targs)) => {
+                Some((*id, pt.clone(), depth, targs.clone()))
+            }
+            _ => None,
+        };
+        let routes = e.routes.clone();
+        drop(m);
+        let mut via = self.implicit_via_module.borrow_mut();
+        if routes
+            .iter()
+            .any(|(member, module)| via.get(member) != Some(module))
+        {
+            self.implicit_memo.borrow_mut().candidate_tys.clear();
+        }
+        via.extend(routes.iter().map(|(&member, &module)| (member, module)));
+        *self.selected_implicit_fit.borrow_mut() = selected;
+        Some(result)
     }
 
     fn search_implicit_uncached(

@@ -1209,7 +1209,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     // underlying implementation and the boxed bridge. Ordinary function
     // values still erase their target type as before; a SAM's method
     // descriptor is recovered from the erased parameter symbols below.
-    let preserve_sam_target = st.sam_sig(&tree.ty).is_some();
+    let preserve_sam_target = st.is_sam_type(&tree.ty);
     match &mut tree.kind {
         TreeKind::PackageDef { stats, .. } => {
             for s in stats {

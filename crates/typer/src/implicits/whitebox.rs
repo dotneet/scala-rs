@@ -27,6 +27,11 @@ struct FitEntry {
     attempted: bool,
     result: Option<Type>,
     tree: Option<Tree>,
+    /// The expansion took no argument and neither read an implicit scope nor
+    /// asked the engine a context-dependent question, so its result holds in
+    /// any implicit context at this call site, as nsc's single expansion of
+    /// the candidate would.
+    context_free: bool,
 }
 
 impl Typer {
@@ -86,56 +91,84 @@ impl Typer {
                 self.invalidate_implicit_caches();
                 continue;
             }
-            let work = {
-                let mut state = self.whitebox_fits.borrow_mut();
-                state.frames.last_mut().and_then(|frame| {
-                    frame
-                        .entries
-                        .iter_mut()
-                        .enumerate()
-                        .find(|(_, entry)| !entry.attempted)
-                        .map(|(index, entry)| {
-                            entry.attempted = true;
-                            (
-                                index,
-                                entry.origin,
-                                entry.base.clone(),
-                                entry.depth,
-                                entry.open.clone(),
-                                entry.building.clone(),
-                                frame.span,
-                            )
-                        })
-                })
-            };
-            let Some((index, origin, base, depth, open, building, span)) = work else {
-                return result;
-            };
-            let mark = self.diags.len();
-            let key = self.macro_failure_key(span);
-            let saved_open = self.open_implicits.replace(open);
-            let saved_building = std::mem::replace(&mut self.building_implicits, building);
-            let expanded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.with_isolated_macro_failure(key, |this| {
-                    this.implicit_tree(origin, &base, span, depth)
-                })
-            }));
-            self.open_implicits.replace(saved_open);
-            self.building_implicits = saved_building;
-            let (tree, failure) = match expanded {
-                Ok(expanded) => expanded,
-                Err(error) => std::panic::resume_unwind(error),
-            };
-            let errors = self.take_probe_errors(mark);
-            if failure.is_none() && errors.is_none() && !tree.ty.is_error() && !tree.ty.is_no_type()
-            {
-                let mut state = self.whitebox_fits.borrow_mut();
-                let entry = &mut state.frames.last_mut().unwrap().entries[index];
-                entry.result = Some(tree.ty.clone());
-                entry.tree = Some(tree);
+            // Every entry a pass registers is expanded before searching again,
+            // as nsc expands each whitebox candidate while typing it. The loop
+            // ends only when no entry is left unattempted, so this changes
+            // when an expansion happens, not whether: it saves the search
+            // pass that used to follow each one (a labelled-generic
+            // derivation took eight passes for its labelling, generic and
+            // witness expansions).
+            let mut expanded = false;
+            while self.expand_next_whitebox_entry() {
+                expanded = true;
             }
-            self.invalidate_implicit_caches();
+            if !expanded {
+                return result;
+            }
         }
+    }
+
+    /// Expand the first entry of the current frame nobody has attempted, and
+    /// record its result; `false` when there is none.
+    fn expand_next_whitebox_entry(&mut self) -> bool {
+        let work = {
+            let mut state = self.whitebox_fits.borrow_mut();
+            state.frames.last_mut().and_then(|frame| {
+                frame
+                    .entries
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, entry)| !entry.attempted)
+                    .map(|(index, entry)| {
+                        entry.attempted = true;
+                        (
+                            index,
+                            entry.origin,
+                            entry.base.clone(),
+                            entry.depth,
+                            entry.open.clone(),
+                            entry.building.clone(),
+                            frame.span,
+                        )
+                    })
+            })
+        };
+        let Some((index, origin, base, depth, open, building, span)) = work else {
+            return false;
+        };
+        let mark = self.diags.len();
+        let key = self.macro_failure_key(span);
+        let reads = self.implicit_scope_reads.get();
+        let queries = self.macro_context_queries;
+        let saved_open = self.open_implicits.replace(open);
+        let saved_building = std::mem::replace(&mut self.building_implicits, building);
+        let expanded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.with_isolated_macro_failure(key, |this| {
+                this.implicit_tree(origin, &base, span, depth)
+            })
+        }));
+        self.open_implicits.replace(saved_open);
+        self.building_implicits = saved_building;
+        let (tree, failure) = match expanded {
+            Ok(expanded) => expanded,
+            Err(error) => std::panic::resume_unwind(error),
+        };
+        let errors = self.take_probe_errors(mark);
+        if failure.is_none() && errors.is_none() && !tree.ty.is_error() && !tree.ty.is_no_type() {
+            let context_free = self.implicit_scope_reads.get() == reads
+                && self.macro_context_queries == queries
+                && match &self.st.get(origin).ty {
+                    Type::Method { paramss, .. } => paramss.iter().all(|clause| clause.is_empty()),
+                    _ => true,
+                };
+            let mut state = self.whitebox_fits.borrow_mut();
+            let entry = &mut state.frames.last_mut().unwrap().entries[index];
+            entry.result = Some(tree.ty.clone());
+            entry.tree = Some(tree);
+            entry.context_free = context_free;
+        }
+        self.invalidate_implicit_caches();
+        true
     }
 
     pub(super) fn request_whitebox_warm(&self, wanted: &Type, open: &[SymbolId]) {
@@ -222,11 +255,21 @@ impl Typer {
         {
             return None;
         }
-        if let Some(entry) = frame
-            .entries
-            .iter()
-            .find(|entry| entry.origin == origin && entry.base == *base && entry.context == context)
-        {
+        // An entry for this very context first; failing that, an expansion
+        // that did not depend on its context -- as long as the candidate
+        // would not diverge here, which a new entry would be checked for.
+        let exact = frame.entries.iter().position(|entry| {
+            entry.origin == origin && entry.base == *base && entry.context == context
+        });
+        let found = exact.or_else(|| {
+            frame.entries.iter().position(|entry| {
+                entry.context_free && entry.origin == origin && entry.base == *base
+            })
+        });
+        if exact.is_none() && found.is_some() && self.implicit_diverges(id, pt) {
+            return Some(None);
+        }
+        if let Some(entry) = found.map(|index| &frame.entries[index]) {
             let Some(result) = entry.result.as_ref() else {
                 return Some(None);
             };
@@ -302,6 +345,7 @@ impl Typer {
             attempted: false,
             result: None,
             tree: None,
+            context_free: false,
         });
         Some(None)
     }
@@ -345,14 +389,20 @@ impl Typer {
         let context = self.whitebox_context(&self.building_implicits);
         let mut state = self.whitebox_fits.borrow_mut();
         let frame = state.frames.last_mut()?;
-        let entry = frame.entries.iter_mut().find(|entry| {
+        let usable = |entry: &FitEntry, any_context: bool| {
             entry.origin == origin
-                && entry.context == context
+                && (entry.context == context || (any_context && entry.context_free))
+                && entry.tree.is_some()
                 && entry
                     .result
                     .as_ref()
                     .is_some_and(|result| self.implicit_result_conforms(result, pt))
-        })?;
-        entry.tree.take()
+        };
+        let index = frame
+            .entries
+            .iter()
+            .position(|entry| usable(entry, false))
+            .or_else(|| frame.entries.iter().position(|entry| usable(entry, true)))?;
+        frame.entries[index].tree.take()
     }
 }
