@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 
 use zip::ZipArchive;
 
+#[cfg(test)]
+thread_local! {
+    static CLASS_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const ACC_PUBLIC: u16 = 0x0001;
 const ACC_PRIVATE: u16 = 0x0002;
 const ACC_PROTECTED: u16 = 0x0004;
@@ -119,6 +124,10 @@ enum PathKind {
 
 pub struct BinaryIndex {
     paths: Vec<Entry>,
+    /// Enabled only after an ordinary lookup has opened every archive.
+    /// Planning must not expose an invalid later archive before an earlier hit.
+    archives_ready: bool,
+    package_paths: HashMap<String, std::rc::Rc<Vec<usize>>>,
     /// Every answer `find_class` has given, misses included. A miss costs a
     /// probe of every jar and jmod on the classpath, and the typer asks the
     /// same questions over and over (`has_pickle`, `class_file_of`,
@@ -251,6 +260,8 @@ impl BinaryIndex {
             .collect();
         BinaryIndex {
             paths,
+            archives_ready: false,
+            package_paths: HashMap::default(),
             class_cache: HashMap::default(),
             package_cache: HashMap::default(),
         }
@@ -278,7 +289,13 @@ impl BinaryIndex {
         let rel = format!("{internal}.class");
         let alt = format!("classes/{rel}");
         let (package, _) = internal.rsplit_once('/').unwrap_or(("", internal));
-        for i in 0..self.paths.len() {
+        let plan = self
+            .archives_ready
+            .then(|| self.class_package_paths(package));
+        for at in 0..plan.as_ref().map_or(self.paths.len(), |paths| paths.len()) {
+            let i = plan.as_ref().map_or(at, |paths| paths[at]);
+            #[cfg(test)]
+            CLASS_PATH_PROBES.with(|count| count.set(count.get() + 1));
             match self.paths[i].kind {
                 PathKind::Zip => {
                     let e = load_zip(&mut self.paths[i])?;
@@ -329,7 +346,44 @@ impl BinaryIndex {
                 }
             }
         }
+        self.archives_ready = true;
         Ok(None)
+    }
+
+    fn class_package_paths(&mut self, package: &str) -> std::rc::Rc<Vec<usize>> {
+        if let Some(paths) = self.package_paths.get(package) {
+            return paths.clone();
+        }
+        let prefix = if package.is_empty() {
+            String::new()
+        } else {
+            format!("{package}/")
+        };
+        let alt = format!("classes/{prefix}");
+        let paths: std::rc::Rc<Vec<usize>> = std::rc::Rc::new(
+            self.paths
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| {
+                    // Directory contents retain their existing lookup rules. Unknown
+                    // paths must remain in the plan: a later lookup may find a directory.
+                    let possible = match entry.kind {
+                        PathKind::Zip => {
+                            let names = &entry.zip.as_ref().expect("archives opened").sorted_names;
+                            has_sorted_prefix(names, &prefix) || has_sorted_prefix(names, &alt)
+                        }
+                        PathKind::Dir | PathKind::Unknown => true,
+                    };
+                    possible.then_some(i)
+                })
+                .collect(),
+        );
+        if self.package_paths.len() >= 4096 {
+            self.package_paths.clear();
+        }
+        self.package_paths
+            .insert(package.to_string(), paths.clone());
+        paths
     }
 
     pub fn has_package_prefix(&mut self, prefix: &str) -> bool {
@@ -909,6 +963,102 @@ fn nested_is_static(this: &str, inners: &[JavaInnerClass]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, bytes) in entries {
+            zip.start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn class_search_reuses_ordered_package_paths() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-package-plan-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = [root.join("a.jar"), root.join("b.jar"), root.join("c.jar")];
+        test_archive(&paths[0], &[("unrelated/Other.class", b"other")]);
+        test_archive(
+            &paths[1],
+            &[
+                ("p/Found.class", b"first"),
+                ("classes/p/Found.class", b"alternate"),
+            ],
+        );
+        test_archive(
+            &paths[2],
+            &[
+                ("p/Found.class", b"later"),
+                ("classes/p/Jmod.class", b"jmod"),
+                ("Default.class", b"default"),
+            ],
+        );
+        let mut index = BinaryIndex::from_user_paths(paths.to_vec());
+        index.paths.truncate(3);
+        assert_eq!(index.find_class("missing/First").unwrap(), None);
+        CLASS_PATH_PROBES.with(|count| count.set(0));
+        assert_eq!(
+            index.find_class("p/Found").unwrap(),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(CLASS_PATH_PROBES.with(|count| count.get()), 1);
+        assert_eq!(index.find_class("p/Jmod").unwrap(), Some(b"jmod".to_vec()));
+        assert_eq!(
+            index.find_class("Default").unwrap(),
+            Some(b"default".to_vec())
+        );
+        assert_eq!(index.find_class("P/Found").unwrap(), None);
+        CLASS_PATH_PROBES.with(|count| count.set(0));
+        assert_eq!(index.find_class("missing/Second").unwrap(), None);
+        assert_eq!(CLASS_PATH_PROBES.with(|count| count.get()), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn package_path_plans_preserve_lazy_archive_errors_and_late_directories() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-package-plan-order-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let jar = root.join("first.jar");
+        let bad = root.join("bad.jar");
+        let late = root.join("late");
+        test_archive(&jar, &[("p/Found.class", b"jar")]);
+        std::fs::write(&bad, b"not a zip").unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![jar.clone(), bad]);
+        index.paths.truncate(2);
+        assert_eq!(index.find_class("p/Found").unwrap(), Some(b"jar".to_vec()));
+        assert!(!index.archives_ready);
+        assert!(index.paths[1].zip.is_none());
+        assert!(index
+            .find_class("p/Missing")
+            .unwrap_err()
+            .contains("unsupported classfile archive"));
+        assert!(!index.archives_ready);
+
+        let mut index = BinaryIndex::from_user_paths(vec![late.clone(), jar]);
+        index.paths.truncate(2);
+        assert_eq!(index.find_class("p/FirstMissing").unwrap(), None);
+        assert!(index.archives_ready);
+        assert_eq!(index.find_class("p/SecondMissing").unwrap(), None);
+        assert_eq!(&**index.package_paths.get("p").unwrap(), &[0, 1]);
+        std::fs::create_dir_all(late.join("p")).unwrap();
+        std::fs::write(late.join("p/Found.class"), b"directory").unwrap();
+        assert_eq!(
+            index.find_class("p/Found").unwrap(),
+            Some(b"directory".to_vec())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn package_probe_rechecks_path_created_after_indexing() {

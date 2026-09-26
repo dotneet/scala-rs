@@ -496,6 +496,19 @@ fn abstract_param_mask(ty: &Type) -> u32 {
 
 fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {
     let erased = erase_ty(ty, st);
+    // A binary primitive-returning method already has its JVM descriptor.
+    // Its Object-returning bridge must not widen the declaration we call.
+    if st
+        .get(id)
+        .jvm_name
+        .rsplit_once(')')
+        .is_some_and(|(params, ret)| {
+            params.starts_with('(')
+                && matches!(ret, "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D" | "V")
+        })
+    {
+        return erased;
+    }
     // A method whose own *declared* return type is a value class erases to
     // that class's underlying representation (the `Type::Class { sym, .. } if
     // st.is_value_class(sym)` arm of `erase_ty`), and that erasure is
@@ -2581,6 +2594,41 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
 mod settled_erasure_tests {
     use super::*;
     use crate::symbol::SymKind;
+
+    #[test]
+    fn binary_primitive_override_keeps_its_descriptor_result() {
+        let mut st = SymbolTable::new();
+        let parent = st.alloc("Parent", st.root, SymKind::Class, Flags::TRAIT, "Parent");
+        let member = st.alloc("value", parent, SymKind::Method, Flags::ABSTRACT, "");
+        st.get_mut(member).ty = Type::Method {
+            paramss: vec![],
+            ret: TyBox::new(Type::Any),
+        };
+        let child = st.alloc("Child", st.root, SymKind::Class, Flags::EMPTY, "Child");
+        st.get_mut(child).parents = vec![Type::Class {
+            sym: parent,
+            args: vec![].into(),
+        }];
+        let implementation = st.alloc("value", child, SymKind::Method, Flags::EMPTY, "()I");
+        let ty = Type::Method {
+            paramss: vec![],
+            ret: TyBox::new(Type::Int),
+        };
+        st.get_mut(implementation).ty = ty.clone();
+        crate::override_check::record_method_override_families(&mut st);
+        assert_eq!(find_overridden_method(&st, implementation), Some(member));
+        assert_eq!(erase_overriding_method(&st, implementation, &ty), ty);
+        st.get_mut(implementation).jvm_name = "()Ljava/lang/Object;".into();
+        assert_eq!(
+            erase_overriding_method(&st, implementation, &ty),
+            st.get(member).ty
+        );
+        st.get_mut(implementation).jvm_name.clear();
+        assert_eq!(
+            erase_overriding_method(&st, implementation, &ty),
+            st.get(member).ty
+        );
+    }
 
     fn settled_value_class() -> (SymbolTable, SymbolId, SymbolId) {
         let mut st = SymbolTable::new();

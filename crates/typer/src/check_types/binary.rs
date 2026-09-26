@@ -11,6 +11,17 @@ use crate::symbol::SymKind;
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
+#[derive(Default)]
+struct ParentWarmCache {
+    epoch: (u64, usize, u64, SymbolId, SymbolId, usize),
+    classes: rustc_hash::FxHashSet<u32>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARENT_WARM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Typer {
     pub(crate) fn complete_binary_member(&mut self, owner: SymbolId, name: &str, span: Span) {
         if owner.is_none() || name.is_empty() {
@@ -689,6 +700,12 @@ impl Typer {
             let Type::Method { paramss, ret } = &*ty else {
                 continue;
             };
+            if self.st.get(id).macro_impl.is_none()
+                && matches!(wanted, Type::Refined { .. })
+                && !self.plausibly_inhabits_refinement(ret, wanted)
+            {
+                continue;
+            }
             let Some(fit) = self.implicit_solve(id, ret, wanted, &[]) else {
                 continue;
             };
@@ -781,9 +798,13 @@ impl Typer {
                 ty => ty,
             };
             if !wanted.iter().any(|w| {
-                !matches!((declared_result, w), (Type::Class { sym, .. }, Type::Class { .. })
+                !matches!((declared_result, w), (Type::Class { sym, .. }, Type::Class { .. } | Type::Refined { .. })
                     if !self.st.is_inner_class_of_class(*sym))
-                    || self.plausibly_inhabits(declared_result, w)
+                    || if self.st.get(id).macro_impl.is_none() {
+                        self.plausibly_inhabits_refinement(declared_result, w)
+                    } else {
+                        self.plausibly_inhabits(declared_result, w)
+                    }
             }) {
                 continue;
             }
@@ -807,6 +828,11 @@ impl Typer {
                 continue;
             }
             if let Type::Method { paramss, ret } = &*self.implicit_candidate_ty(id) {
+                // Inference here only instantiates the candidate's clauses.
+                // A parameterless witness has no nested scope to prepare.
+                if paramss.iter().all(Vec::is_empty) {
+                    continue;
+                }
                 // This recovery is for typeclass-shaped results. For a
                 // non-class target `plausibly_inhabits` deliberately answers
                 // conservatively, which made nearly every imported implicit
@@ -819,7 +845,11 @@ impl Typer {
                             Type::Class { .. } | Type::Refined { .. },
                             Type::Class { .. } | Type::Refined { .. }
                         )
-                    ) && self.plausibly_inhabits(ret, w)
+                    ) && if self.st.get(id).macro_impl.is_none() {
+                        self.plausibly_inhabits_refinement(ret, w)
+                    } else {
+                        self.plausibly_inhabits(ret, w)
+                    }
                 }) {
                     continue;
                 }
@@ -908,13 +938,16 @@ impl Typer {
             .chain(wanted.iter().cloned())
             .collect();
         let mut fresh = completed;
+        // Candidate types overlap heavily. Reuse only fully completed walks
+        // from this batch while their symbol and lookup context is unchanged.
+        let mut parents = ParentWarmCache::default();
         for t in tys {
             // Parents only. Warming a candidate's *implicit scope* the way
             // `warm_implicit_scope` warms the wanted type's pulls pickled
             // parents onto standard-library companions -- the hazard
             // `warm_own_scope_once` documents -- and cost slick two new
             // `containsSymbol(Set[A])` overload errors when it was tried.
-            fresh |= self.ensure_pickled_parents(&t);
+            fresh |= self.ensure_pickled_parents_in_batch(&t, Some(&mut parents));
         }
         // Loading these parents can add base-class companions to the wanted
         // type's implicit scope. The first scope snapshot could not see them
@@ -1035,16 +1068,59 @@ impl Typer {
     /// until then, so it fits nothing but its own type. Answers whether any
     /// class gained parents.
     pub(crate) fn ensure_pickled_parents(&mut self, ty: &Type) -> bool {
+        self.ensure_pickled_parents_in_batch(ty, None)
+    }
+
+    fn ensure_pickled_parents_in_batch(
+        &mut self,
+        ty: &Type,
+        cache: Option<&mut ParentWarmCache>,
+    ) -> bool {
         if !self.library_abi {
             return false;
         }
+        let mut cache =
+            cache.filter(|_| !self.st.has_ambient_type_context() && self.st.gadt_bounds.is_empty());
+        let epoch = self.parent_warm_epoch();
+        if let Some(cache) = cache.as_mut() {
+            if cache.epoch == epoch
+                && self.implicit_scope_classes_warmed(ty, &mut cache.classes)
+                && self.parent_warm_epoch() == epoch
+            {
+                return false;
+            }
+        }
+        // A miss needs the complete ordered worklist: loading an earlier
+        // root can invalidate a previously completed root later in the list.
         let mut work: Vec<SymbolId> = self.implicit_scope_classes(ty);
+        let epoch = self.parent_warm_epoch();
+        if let Some(cache) = cache.as_mut() {
+            if cache.epoch != epoch {
+                cache.epoch = epoch;
+                cache.classes.clear();
+            }
+            if work.iter().all(|c| cache.classes.contains(&c.0)) {
+                return false;
+            }
+        }
         let mut seen: rustc_hash::FxHashSet<u32> = work.iter().map(|c| c.0).collect();
         let mut fresh = false;
+        let mut settled = true;
         while let Some(c) = work.pop() {
             if c.is_none() {
                 continue;
             }
+            // An earlier completion in this walk may invalidate a later
+            // class, so check at the point of reuse, not before the loop.
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.classes.contains(&c.0))
+                && self.parent_warm_epoch() == epoch
+            {
+                continue;
+            }
+            #[cfg(test)]
+            PARENT_WARM_VISITS.with(|visits| visits.set(visits.get() + 1));
             // Preserve the modeled Scala hierarchy: symbols supplied through
             // a later pickle can also refer back into it. The concurrent API
             // is wholly binary-supplied, so Future/Awaitable and Duration's
@@ -1067,6 +1143,7 @@ impl Typer {
                 .ensure_parents(&mut self.st, &mut self.binary, c);
             fresh |= self.st.get(c).parents.len() != before;
             for p in self.st.get(c).parents.clone() {
+                settled &= crate::lin::parent_names_its_class(&p);
                 if let Some(ps) = self.st.class_sym_of(&p) {
                     if seen.insert(ps.0) {
                         work.push(ps);
@@ -1074,7 +1151,23 @@ impl Typer {
                 }
             }
         }
+        if let Some(cache) = cache {
+            if settled && self.parent_warm_epoch() == epoch {
+                cache.classes.extend(seen);
+            }
+        }
         fresh
+    }
+
+    fn parent_warm_epoch(&self) -> (u64, usize, u64, SymbolId, SymbolId, usize) {
+        (
+            self.st.mutation_gen.get(),
+            self.st.symbols.len(),
+            self.st.scopes.version(),
+            self.st.this_class,
+            self.st.owner,
+            self.st.abs_projection_of.len(),
+        )
     }
 
     /// [`Self::warm_implicit_scope`], reporting whether any class in `pt`'s
@@ -2525,6 +2618,126 @@ impl Typer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_warm_batch_hits_do_not_rebuild_class_sets() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.library_abi = true;
+        let class = typer.st.alloc(
+            "Known",
+            typer.st.root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "test/Known",
+        );
+        let ty = Type::Class {
+            sym: class,
+            args: vec![].into(),
+        };
+        let mut cache = ParentWarmCache::default();
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert!(cache.classes.contains(&class.0));
+        let allocations = crate::allocation_test::count(|| {
+            for _ in 0..128 {
+                assert!(!typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache)));
+            }
+        });
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn parent_warm_batch_reuses_only_unchanged_completed_walks() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.library_abi = true;
+        let root = typer.st.root;
+        let class = typer
+            .st
+            .alloc("Child", root, SymKind::Class, Flags::EMPTY, "test/Child");
+        let parent = typer
+            .st
+            .alloc("Parent", root, SymKind::Class, Flags::EMPTY, "test/Parent");
+        let ty = Type::Class {
+            sym: class,
+            args: vec![].into(),
+        };
+        let mut cache = ParentWarmCache::default();
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        PARENT_WARM_VISITS.with(|visits| visits.set(0));
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert_eq!(PARENT_WARM_VISITS.with(|visits| visits.get()), 0);
+
+        typer.st.get_mut(class).parents.push(Type::Class {
+            sym: parent,
+            args: vec![].into(),
+        });
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert!(PARENT_WARM_VISITS.with(|visits| visits.get()) >= 2);
+        assert!(cache.classes.contains(&parent.0));
+        PARENT_WARM_VISITS.with(|visits| visits.set(0));
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert_eq!(PARENT_WARM_VISITS.with(|visits| visits.get()), 0);
+
+        typer.st.this_class = parent;
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert!(PARENT_WARM_VISITS.with(|visits| visits.get()) >= 2);
+    }
+
+    #[test]
+    fn parent_warm_batch_does_not_reuse_unresolved_or_ambient_walks() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.library_abi = true;
+        let root = typer.st.root;
+        let class = typer
+            .st
+            .alloc("Child", root, SymKind::Class, Flags::EMPTY, "test/Child");
+        let ty = Type::Class {
+            sym: class,
+            args: vec![].into(),
+        };
+        let mut cache = ParentWarmCache::default();
+        typer.st.get_mut(class).parents.push(Type::Named {
+            name: "Unresolved".into(),
+            args: vec![].into(),
+        });
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert!(cache.classes.is_empty());
+        typer.st.get_mut(class).parents.clear();
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert!(cache.classes.contains(&class.0));
+        typer.st.gadt_bounds.push((class, None, Some(Type::Any)));
+        PARENT_WARM_VISITS.with(|visits| visits.set(0));
+        typer.ensure_pickled_parents_in_batch(&ty, Some(&mut cache));
+        assert!(PARENT_WARM_VISITS.with(|visits| visits.get()) > 0);
+    }
+
+    #[test]
+    fn parent_warm_batch_reuses_completed_parts_of_a_new_type() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.library_abi = true;
+        let root = typer.st.root;
+        let first = typer
+            .st
+            .alloc("First", root, SymKind::Class, Flags::EMPTY, "test/First");
+        let second = typer
+            .st
+            .alloc("Second", root, SymKind::Class, Flags::EMPTY, "test/Second");
+        let first = Type::Class {
+            sym: first,
+            args: vec![].into(),
+        };
+        let second = Type::Class {
+            sym: second,
+            args: vec![].into(),
+        };
+        let mut cache = ParentWarmCache::default();
+        typer.ensure_pickled_parents_in_batch(&first, Some(&mut cache));
+        PARENT_WARM_VISITS.with(|visits| visits.set(0));
+        typer.ensure_pickled_parents_in_batch(
+            &Type::Tuple(vec![first, second].into()),
+            Some(&mut cache),
+        );
+        assert_eq!(PARENT_WARM_VISITS.with(|visits| visits.get()), 1);
+    }
 
     #[test]
     fn module_class_of_value_peels_singleton_accessor() {

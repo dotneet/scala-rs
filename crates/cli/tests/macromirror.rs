@@ -151,6 +151,62 @@ fn java_macro_protocol_parser_rejects_malformed_frames() {
     let _ = fs::remove_dir_all(out);
 }
 
+#[test]
+fn java_macro_protocol_parser_materializes_children_on_demand() {
+    if !tool_available("java") || !tool_available("javac") {
+        skip_or_panic("macro lazy parser", "java / javac not available");
+        return;
+    }
+    let out = tmp_dir("lazy-parser");
+    let engine =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../typer/java/ScalaRsMacroEngine.java");
+    let compile = Command::new("javac")
+        .arg("-d")
+        .arg(&out)
+        .arg(engine)
+        .arg(fixtures_dir().join("MacroLazyParseTest.java"))
+        .output()
+        .expect("compile lazy parser regression");
+    assert!(compile.status.success(), "{}", diagnostics(&compile));
+    let run = Command::new("java")
+        .arg("-cp")
+        .arg(&out)
+        .arg("MacroLazyParseTest")
+        .output()
+        .expect("run lazy parser regression");
+    assert!(run.status.success(), "{}", diagnostics(&run));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    let _ = fs::remove_dir_all(out);
+}
+
+#[test]
+fn java_macro_reflection_reuses_method_lists() {
+    if !tool_available("java") || !tool_available("javac") {
+        skip_or_panic("macro method lists", "java / javac not available");
+        return;
+    }
+    let out = tmp_dir("method-lists");
+    let engine =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../typer/java/ScalaRsMacroEngine.java");
+    let compile = Command::new("javac")
+        .args(["--release", "8", "-d"])
+        .arg(&out)
+        .arg(engine)
+        .arg(fixtures_dir().join("MacroMethodListCacheTest.java"))
+        .output()
+        .expect("compile method-list regression");
+    assert!(compile.status.success(), "{}", diagnostics(&compile));
+    let run = Command::new("java")
+        .arg("-cp")
+        .arg(&out)
+        .arg("MacroMethodListCacheTest")
+        .output()
+        .expect("run method-list regression");
+    assert!(run.status.success(), "{}", diagnostics(&run));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    let _ = fs::remove_dir_all(out);
+}
+
 fn diagnostics(out: &std::process::Output) -> String {
     format!(
         "{}{}",

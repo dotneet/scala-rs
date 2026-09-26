@@ -189,8 +189,9 @@ pub(crate) struct InScopeCache {
 /// projections has moved: `abs_projection_of` is the one side table the
 /// substitution reads, and entering a projection mutates no existing symbol.
 /// The scopes are read for a `Type::Named` and for the `TupleN` behind a
-/// `Type::Tuple`, and an ambient expansion guard can truncate the walk; a
-/// type with either is not kept, and neither is an answer under a guard.
+/// `Type::Tuple`. Named types are not kept; tuple views also track the scope
+/// version. An ambient expansion guard can truncate the walk, so answers
+/// under such a guard are not kept either.
 ///
 /// A symbol's own declared type is keyed by the symbol, not by its
 /// structure: it cannot change without a mutation, and hashing and comparing
@@ -224,6 +225,7 @@ struct SeenEntry {
     prefix: Type,
     /// The type that was read, when it is not `id`'s own declared type.
     ty: Option<Type>,
+    scope: Option<u64>,
     seen: std::rc::Rc<Type>,
 }
 
@@ -1244,6 +1246,23 @@ impl Typer {
         parts
     }
 
+    /// Reuse a batch's completed class walks, but still record every prefix.
+    /// The caller must validate the batch epoch. Newly discovered parts are
+    /// only visited, not completed, so leave the completed set unchanged.
+    pub(crate) fn implicit_scope_classes_warmed(
+        &self,
+        ty: &Type,
+        completed: &mut rustc_hash::FxHashSet<u32>,
+    ) -> bool {
+        let mut new = Vec::new();
+        self.collect_type_parts(ty, &mut new, completed);
+        let all_warmed = new.is_empty();
+        for part in new {
+            completed.remove(&part.0);
+        }
+        all_warmed
+    }
+
     pub(crate) fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
@@ -1325,6 +1344,7 @@ impl Typer {
             return std::rc::Rc::new(compute());
         }
         let epoch = (self.st.mutation_gen.get(), self.st.abs_projection_of.len());
+        let scope_version = self.st.scopes.version();
         let declared = declared.map(|d| (d, &self.st.get(d).ty));
         let key = {
             use std::hash::{Hash, Hasher};
@@ -1343,15 +1363,15 @@ impl Typer {
             (Some(t), None) => t == ty,
             _ => false,
         };
+        let same_entry = |e: &SeenEntry| {
+            e.kind == kind && e.id == id && same_ty(e) && e.prefix == *prefix
+        };
         {
             let cache = self.seen_cache.borrow();
             if cache.epoch == epoch {
                 if let Some(hit) = cache.map.get(&key).and_then(|bucket| {
                     bucket.iter().find(|e| {
-                        e.kind == kind
-                            && e.id == id
-                            && same_ty(e)
-                            && e.prefix == *prefix
+                        same_entry(e) && e.scope.is_none_or(|scope| scope == scope_version)
                     })
                 }) {
                     return hit.seen.clone();
@@ -1359,11 +1379,15 @@ impl Typer {
             }
         }
         let seen = std::rc::Rc::new(compute());
-        let named = |t: &Type| t.flags().contains(scala_rs_parser::TypeFlags::NAMED | scala_rs_parser::TypeFlags::TUPLE);
+        let named = |t: &Type| t.flags().contains(scala_rs_parser::TypeFlags::NAMED);
+        let scope = (prefix.flags().contains(scala_rs_parser::TypeFlags::TUPLE)
+            || ty.flags().contains(scala_rs_parser::TypeFlags::TUPLE))
+            .then_some(scope_version);
         // The substitution may itself have completed a symbol.
         if (self.st.mutation_gen.get(), self.st.abs_projection_of.len()) != epoch
             || named(prefix)
             || named(ty)
+            || scope.is_some_and(|scope| scope != self.st.scopes.version())
         {
             return seen;
         }
@@ -1373,12 +1397,22 @@ impl Typer {
             cache.map.clear();
             cache.len = 0;
         }
+        if let Some(entry) = cache
+            .map
+            .get_mut(&key)
+            .and_then(|bucket| bucket.iter_mut().find(|e| same_entry(e)))
+        {
+            entry.scope = scope;
+            entry.seen = seen.clone();
+            return seen;
+        }
         cache.len += 1;
         cache.map.entry(key).or_default().push(SeenEntry {
             kind,
             id,
             prefix: prefix.clone(),
             ty: declared.is_none().then(|| ty.clone()),
+            scope,
             seen: seen.clone(),
         });
         seen
@@ -1684,13 +1718,18 @@ impl Typer {
             Type::Function { params, ret } if params.is_empty() => ret.as_ref(),
             ty => ty,
         };
-        if let (Type::Class { sym, .. }, Type::Class { .. }) = (declared_result, pt) {
+        if let Type::Class { sym, .. } = declared_result {
             // An inner class may gain a path prefix when read through the
             // import; its bare class hierarchy is not enough to reject it.
-            if !self.st.is_inner_class_of_class(*sym)
-                && !self.plausibly_inhabits(declared_result, pt)
-            {
-                return None;
+            if !self.st.is_inner_class_of_class(*sym) {
+                let plausible = if self.st.get(id).macro_impl.is_none() {
+                    self.plausibly_inhabits_refinement(declared_result, pt)
+                } else {
+                    self.plausibly_inhabits(declared_result, pt)
+                };
+                if !plausible {
+                    return None;
+                }
             }
         }
         let cand_ty = self.implicit_candidate_ty(id);
@@ -1704,7 +1743,12 @@ impl Typer {
             Type::Function { params, ret } if params.is_empty() => ret,
             t => t,
         };
-        if !self.plausibly_inhabits(cand_res, pt) {
+        let plausible = if self.st.get(id).macro_impl.is_none() {
+            self.plausibly_inhabits_refinement(cand_res, pt)
+        } else {
+            self.plausibly_inhabits(cand_res, pt)
+        };
+        if !plausible {
             return None;
         }
         // The mirror of the erroneous *wanted* type in
@@ -2462,7 +2506,21 @@ impl Typer {
         };
         s1 == s2
             || self.st.is_function_class_shape(*s1, a1)
-            || self.st.class_reaches(*s1, *s2) != Some(false)
+            // Function parents do not make a class a possible witness for
+            // every unrelated nominal type (for example GetResult vs Shape).
+            || self.st.subtype_class_reaches(*s1, *s2) != Some(false)
+    }
+
+    /// Refinement declarations cannot remove a nominal parent requirement.
+    /// Keep macro candidates on their existing path: a whitebox expansion
+    /// may refine its declared result before it is fitted.
+    pub(crate) fn plausibly_inhabits_refinement(&self, have: &Type, pt: &Type) -> bool {
+        match pt {
+            Type::Refined { parents, .. } => parents
+                .iter()
+                .all(|parent| self.plausibly_inhabits_refinement(have, parent)),
+            _ => self.plausibly_inhabits(have, pt),
+        }
     }
 
     /// ClassTag is invariant. Covariant `is_sub_type` would let
@@ -2714,7 +2772,7 @@ impl Typer {
             return None;
         }
         let from = &params[0];
-        let unknowns: rustc_hash::FxHashSet<u32> = undet.iter().map(|s| s.0).collect();
+        let unknowns = undet.iter().map(|s| (s.0, false)).collect();
         if mentions_unknown(from, &unknowns) {
             return None;
         }
@@ -3574,20 +3632,23 @@ impl Typer {
                 }
             }
         }
-        let out = self.strictly_more_specific_uncached(a, b);
+        let score = self.specificity_score(a, b);
+        let out = score > 0;
         let mut m = self.implicit_memo.borrow_mut();
         if m.depth > 0 {
             m.improves.insert(key, out);
+            // Swapping candidates negates the score, including a zero tie.
+            m.improves.insert((b.0, a.0), score < 0);
         }
         out
     }
 
-    fn strictly_more_specific_uncached(&self, a: SymbolId, b: SymbolId) -> bool {
+    fn specificity_score(&self, a: SymbolId, b: SymbolId) -> i32 {
         let spec =
             i32::from(self.is_as_specific_type(a, b)) - i32::from(self.is_as_specific_type(b, a));
         let sub = i32::from(self.is_as_specific_origin(a, b))
             - i32::from(self.is_as_specific_origin(b, a));
-        spec + sub > 0
+        spec + sub
     }
 
     fn most_specific(&self, cands: Vec<SymbolId>) -> ImplicitSearch {
@@ -5693,6 +5754,255 @@ mod memo_tests {
     use crate::check::TypecheckOptions;
 
     #[test]
+    fn specificity_memo_keeps_both_directions_and_expires_with_search() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let a = typer.st.alloc("a", root, SymKind::Term, Flags::IMPLICIT, "a");
+        let b = typer.st.alloc("b", root, SymKind::Term, Flags::IMPLICIT, "b");
+        let c = typer.st.alloc("c", root, SymKind::Term, Flags::IMPLICIT, "c");
+        typer.st.get_mut(a).ty = Type::Int;
+        typer.st.get_mut(b).ty = Type::Any;
+        typer.st.get_mut(c).ty = Type::Int;
+        {
+            let _live = typer.memo_scope();
+            assert!(typer.strictly_more_specific(a, b));
+            assert_eq!(
+                typer.implicit_memo.borrow().improves.get(&(b.0, a.0)),
+                Some(&false)
+            );
+            assert!(!typer.strictly_more_specific(b, a));
+            assert!(!typer.strictly_more_specific(a, c));
+            assert_eq!(
+                typer.implicit_memo.borrow().improves.get(&(c.0, a.0)),
+                Some(&false)
+            );
+            assert!(!typer.strictly_more_specific(c, a));
+            assert!(!typer.strictly_more_specific(a, a));
+            assert!(
+                matches!(typer.most_specific(vec![a, b]), ImplicitSearch::Found(id) if id == a)
+            );
+            assert!(matches!(
+                typer.most_specific(vec![a, c]),
+                ImplicitSearch::Ambiguous(_)
+            ));
+        }
+        assert!(typer.implicit_memo.borrow().improves.is_empty());
+        typer.st.get_mut(b).ty = Type::Nothing;
+        {
+            let _live = typer.memo_scope();
+            assert!(!typer.strictly_more_specific(a, b));
+            assert_eq!(
+                typer.implicit_memo.borrow().improves.get(&(b.0, a.0)),
+                Some(&true)
+            );
+            assert!(typer.strictly_more_specific(b, a));
+        }
+        assert!(typer.implicit_memo.borrow().improves.is_empty());
+    }
+
+    #[test]
+    fn tuple_seen_cache_reuses_views_only_in_the_same_scope() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let first = typer
+            .st
+            .alloc("First", root, SymKind::Class, Flags::EMPTY, "First");
+        let second = typer
+            .st
+            .alloc("Second", root, SymKind::Class, Flags::EMPTY, "Second");
+        typer.st.push_scope();
+        typer.st.enter_in_current("Tuple2", first);
+        let prefix = Type::Tuple(vec![Type::Int, Type::String].into());
+        let read = |t: &Typer| {
+            t.seen_cached(
+                SeenKind::ImportPrefix,
+                first,
+                None,
+                &prefix,
+                &Type::Int,
+                || Type::Class {
+                    sym: t.st.class_sym_of(&prefix).unwrap(),
+                    args: vec![].into(),
+                },
+            )
+        };
+        let before = read(&typer);
+        assert!(std::rc::Rc::ptr_eq(&before, &read(&typer)));
+        assert!(matches!(&*before, Type::Class { sym, .. } if *sym == first));
+        let generation = typer.st.mutation_gen.get();
+        typer.st.push_scope();
+        typer.st.enter_in_current("Tuple2", second);
+        assert_eq!(typer.st.mutation_gen.get(), generation);
+        let after = read(&typer);
+        assert!(matches!(&*after, Type::Class { sym, .. } if *sym == second));
+        assert!(!std::rc::Rc::ptr_eq(&before, &after));
+        assert!(std::rc::Rc::ptr_eq(&after, &read(&typer)));
+        typer.st.pop_scope();
+        assert!(matches!(&*read(&typer), Type::Class { sym, .. } if *sym == first));
+        assert_eq!(typer.seen_cache.borrow().len, 1);
+    }
+
+    #[test]
+    fn scope_independent_seen_cache_survives_scope_changes() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let id = typer.st.root;
+        let read = |t: &Typer| {
+            t.seen_cached(
+                SeenKind::ImportPrefix,
+                id,
+                None,
+                &Type::Int,
+                &Type::Int,
+                || Type::Int,
+            )
+        };
+        let before = read(&typer);
+        typer.st.push_scope();
+        assert!(std::rc::Rc::ptr_eq(&before, &read(&typer)));
+        typer.st.pop_scope();
+        assert!(std::rc::Rc::ptr_eq(&before, &read(&typer)));
+    }
+
+    #[test]
+    fn function_parents_do_not_disable_nominal_implicit_rejection() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let function = typer.st.alloc(
+            "Function1",
+            root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "scala/Function1",
+        );
+        let have = typer
+            .st
+            .alloc("GetResult", root, SymKind::Class, Flags::EMPTY, "GetResult");
+        let want = typer
+            .st
+            .alloc("Shape", root, SymKind::Class, Flags::EMPTY, "Shape");
+        let bare = |sym| Type::Class {
+            sym,
+            args: vec![].into(),
+        };
+        let function_type = Type::Class {
+            sym: function,
+            args: vec![Type::Int, Type::String].into(),
+        };
+        typer.st.get_mut(have).parents = vec![function_type.clone()];
+        assert!(!typer.plausibly_inhabits(&bare(have), &bare(want)));
+        assert!(typer.plausibly_inhabits(&bare(have), &function_type));
+        assert!(typer.plausibly_inhabits(&bare(have), &bare(have)));
+
+        typer.st.get_mut(have).parents = vec![Type::Function {
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(Type::String),
+        }];
+        assert!(!typer.plausibly_inhabits(&bare(have), &bare(want)));
+        assert!(typer.plausibly_inhabits(&bare(have), &function_type));
+
+        // A real extra parent and an unresolved parent must still survive.
+        typer.st.get_mut(have).parents.push(bare(want));
+        assert!(typer.plausibly_inhabits(&bare(have), &bare(want)));
+        typer.st.get_mut(have).parents = vec![Type::Named {
+            name: "Unresolved".into(),
+            args: vec![].into(),
+        }];
+        assert!(typer.plausibly_inhabits(&bare(have), &bare(want)));
+    }
+
+    #[test]
+    fn unrelated_refinement_candidates_are_rejected_before_unification() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let have = typer
+            .st
+            .alloc("Unrelated", root, SymKind::Class, Flags::EMPTY, "Unrelated");
+        let want = typer
+            .st
+            .alloc("Required", root, SymKind::Class, Flags::EMPTY, "Required");
+        let class_tp = typer
+            .st
+            .alloc("T", have, SymKind::TypeParam, Flags::EMPTY, "T");
+        typer.st.get_mut(have).tparams = vec![class_tp];
+        let candidate = typer
+            .st
+            .alloc("candidate", root, SymKind::Method, Flags::IMPLICIT, "candidate");
+        let tp = typer
+            .st
+            .alloc("A", candidate, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(candidate).tparams = vec![tp];
+        typer.st.get_mut(candidate).ty = Type::Method {
+            paramss: vec![],
+            ret: TyBox::new(Type::Class {
+                sym: have,
+                args: vec![Type::TypeParam(tp)].into(),
+            }),
+        };
+        let wanted = Type::Refined {
+            parents: vec![Type::Class {
+                sym: want,
+                args: vec![].into(),
+            }]
+            .into(),
+            decls: vec![scala_rs_parser::RefineDecl::Val {
+                name: "value".into(),
+                ty: Type::Int,
+            }],
+        };
+        unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
+        assert!(typer.implicit_fit_at(candidate, &wanted, 0, &[]).is_none());
+        assert_eq!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()), 0);
+
+        for blackbox in [false, true] {
+            typer.st.get_mut(candidate).macro_impl = Some(crate::symbol::MacroBinding {
+                pickle: None,
+                is_bundle: false,
+                impl_class: "Impl$".into(),
+                impl_method: "materialize".into(),
+                blackbox,
+                tag_params: 0,
+                expr_args: vec![],
+                tag_targs: vec![],
+            });
+            unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
+            assert!(typer.implicit_fit_at(candidate, &wanted, 0, &[]).is_none());
+            assert!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()) > 0);
+        }
+        typer.st.get_mut(candidate).macro_impl = None;
+
+        let have_type = Type::Class {
+            sym: have,
+            args: vec![Type::Int].into(),
+        };
+        typer.st.get_mut(have).parents.push(Type::Class {
+            sym: want,
+            args: vec![].into(),
+        });
+        assert!(typer.plausibly_inhabits_refinement(&have_type, &wanted));
+        assert!(typer.plausibly_inhabits_refinement(&Type::TypeParam(tp), &wanted));
+        let other = typer
+            .st
+            .alloc("Other", root, SymKind::Class, Flags::EMPTY, "Other");
+        let intersection = Type::Refined {
+            parents: vec![
+                wanted.clone(),
+                Type::Class {
+                    sym: other,
+                    args: vec![].into(),
+                },
+            ]
+            .into(),
+            decls: vec![],
+        };
+        assert!(!typer.plausibly_inhabits_refinement(&have_type, &intersection));
+        typer.st.get_mut(have).parents = vec![Type::Named {
+            name: "PendingParent".into(),
+            args: vec![].into(),
+        }];
+        assert!(typer.plausibly_inhabits_refinement(&have_type, &wanted));
+    }
+
+    #[test]
     fn implicit_class_parts_survive_method_changes_but_not_parent_changes() {
         let mut typer = Typer::new(0, &TypecheckOptions::default());
         let root = typer.st.root;
@@ -5773,6 +6083,78 @@ mod memo_tests {
     }
 
     #[test]
+    fn warmed_scope_walk_replays_prefixes_and_does_not_complete_new_parts() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let outer = typer
+            .st
+            .alloc("Outer", root, SymKind::Class, Flags::EMPTY, "Outer");
+        let inner = typer
+            .st
+            .alloc("Inner", outer, SymKind::Class, Flags::EMPTY, "Outer$Inner");
+        let module = typer.st.alloc(
+            "Inner",
+            outer,
+            SymKind::Module,
+            Flags::MODULE,
+            "Outer$Inner$",
+        );
+        let mcls = typer.st.alloc(
+            "Inner$",
+            outer,
+            SymKind::ModuleClass,
+            Flags::MODULE,
+            "Outer$Inner$",
+        );
+        typer.st.get_mut(module).ty = Type::ModuleRef(mcls);
+        let prefix = Type::ThisType(outer);
+        let view = crate::prefix::with_prefix(
+            Type::Class {
+                sym: inner,
+                args: vec![].into(),
+            },
+            prefix.clone(),
+        );
+        let mut completed: rustc_hash::FxHashSet<u32> = typer
+            .implicit_scope_classes(&view)
+            .into_iter()
+            .map(|s| s.0)
+            .collect();
+        let before = completed.clone();
+        assert_eq!(
+            typer.implicit_memo.borrow().companion_prefixes[&mcls.0],
+            vec![prefix.clone()]
+        );
+        typer.implicit_memo.borrow_mut().companion_prefixes.clear();
+        assert!(typer.implicit_scope_classes_warmed(&view, &mut completed));
+        assert_eq!(completed, before);
+        assert_eq!(
+            typer.implicit_memo.borrow().companion_prefixes[&mcls.0],
+            vec![prefix]
+        );
+
+        let fresh = typer
+            .st
+            .alloc("Fresh", root, SymKind::Class, Flags::EMPTY, "Fresh");
+        let mixed = Type::Tuple(
+            vec![
+                view,
+                Type::Class {
+                    sym: fresh,
+                    args: vec![].into(),
+                },
+            ]
+            .into(),
+        );
+        assert!(!typer.implicit_scope_classes_warmed(&mixed, &mut completed));
+        assert_eq!(completed, before);
+        assert_eq!(
+            typer.implicit_scope_classes(&mixed),
+            vec![inner, outer, fresh]
+        );
+    }
+
+    #[test]
     fn macro_disabled_mode_is_part_of_the_memo_key() {
         let wanted = Type::Class {
             sym: SymbolId(42),
@@ -5843,6 +6225,129 @@ mod memo_tests {
         assert!(typer.implicits_in_scope().contains(&method));
         typer.warm_implicit_candidates(&[wanted_type]);
         assert!(!typer.implicit_instances.contains_key(&method));
+    }
+
+    #[test]
+    fn warming_parameterless_candidate_does_not_solve_unused_arguments() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let owner = typer
+            .st
+            .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
+        let result = typer
+            .st
+            .alloc("Result", root, SymKind::Class, Flags::EMPTY, "Result");
+        let class_tp = typer
+            .st
+            .alloc("T", result, SymKind::TypeParam, Flags::EMPTY, "T");
+        typer.st.get_mut(result).tparams = vec![class_tp];
+        let method = typer
+            .st
+            .alloc("derive", owner, SymKind::Method, Flags::IMPLICIT, "derive");
+        let tp = typer
+            .st
+            .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(method).tparams = vec![tp];
+        let ret = Type::Class {
+            sym: result,
+            args: vec![Type::TypeParam(tp)].into(),
+        };
+        typer.st.get_mut(method).ty = Type::Method {
+            paramss: vec![],
+            ret: TyBox::new(ret.clone()),
+        };
+        typer.st.this_class = owner;
+        let wanted = Type::Class {
+            sym: result,
+            args: vec![Type::Int].into(),
+        };
+        assert!(typer.implicits_in_scope().contains(&method));
+        unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
+        typer.warm_implicit_candidates(std::slice::from_ref(&wanted));
+        assert_eq!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()), 0);
+        assert!(typer.implicit_instances.contains_key(&method));
+
+        let evidence = typer.st.alloc(
+            "evidence",
+            method,
+            SymKind::Term,
+            Flags::IMPLICIT,
+            "evidence",
+        );
+        typer.st.get_mut(evidence).ty = Type::TypeParam(tp);
+        typer.st.get_mut(method).paramss = vec![vec![evidence]];
+        typer.st.get_mut(method).ty = Type::Method {
+            paramss: vec![vec![Type::TypeParam(tp)]],
+            ret: TyBox::new(ret),
+        };
+        typer.warm_implicit_candidates(std::slice::from_ref(&wanted));
+        assert!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()) > 0);
+    }
+
+    #[test]
+    fn warming_refinements_skips_unrelated_candidates_until_parents_change() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let owner = typer
+            .st
+            .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
+        let result = typer
+            .st
+            .alloc("Result", root, SymKind::Class, Flags::EMPTY, "Result");
+        let required = typer
+            .st
+            .alloc("Required", root, SymKind::Class, Flags::EMPTY, "Required");
+        let class_tp = typer
+            .st
+            .alloc("T", result, SymKind::TypeParam, Flags::EMPTY, "T");
+        typer.st.get_mut(result).tparams = vec![class_tp];
+        let method = typer
+            .st
+            .alloc("derive", owner, SymKind::Method, Flags::IMPLICIT, "derive");
+        let tp = typer
+            .st
+            .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(method).tparams = vec![tp];
+        typer.st.get_mut(method).ty = Type::Method {
+            paramss: vec![],
+            ret: TyBox::new(Type::Class {
+                sym: result,
+                args: vec![Type::TypeParam(tp)].into(),
+            }),
+        };
+        typer.st.this_class = owner;
+        let parent = Type::Class {
+            sym: required,
+            args: vec![].into(),
+        };
+        let wanted = Type::Refined {
+            parents: vec![parent.clone()].into(),
+            decls: vec![],
+        };
+        let evidence = typer.st.alloc(
+            "evidence",
+            method,
+            SymKind::Term,
+            Flags::IMPLICIT,
+            "evidence",
+        );
+        typer.st.get_mut(evidence).ty = Type::Int;
+        typer.st.get_mut(method).paramss = vec![vec![evidence]];
+        if let Type::Method { paramss, .. } = &mut typer.st.get_mut(method).ty {
+            *paramss = vec![vec![Type::Int]];
+        }
+        assert!(typer.implicits_in_scope().contains(&method));
+        unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
+        typer.warm_implicit_candidates(std::slice::from_ref(&wanted));
+        assert!(!typer.implicit_instances.contains_key(&method));
+        assert_eq!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()), 0);
+        typer.warm_implicit_derivation_scopes(&wanted);
+        assert_eq!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()), 0);
+
+        typer.st.get_mut(result).parents.push(parent);
+        typer.warm_implicit_candidates(std::slice::from_ref(&wanted));
+        assert!(typer.implicit_instances.contains_key(&method));
+        assert!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()) > 0);
     }
 
     #[test]

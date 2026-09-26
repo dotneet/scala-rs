@@ -205,3 +205,30 @@ fn implfilter_bad_is_still_rejected() {
         assert!(!ok, "real scalac accepted implfilter_bad:\n{msgs}");
     }
 }
+
+#[test]
+fn function_parent_filter_preserves_function_and_mixin_witnesses() {
+    let jar = scala_library_jar().expect("scala-library is required");
+    let scalac = real_scalac().expect("scalac is required");
+    let (ok, msgs, native) = compile(
+        "implfunctionfilter",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    assert!(ok, "native compile failed:\n{msgs}");
+    let reference = tmp_dir("function_parent_reference");
+    let output = Command::new(scalac)
+        .arg("-d")
+        .arg(&reference)
+        .arg(fixtures_dir().join("implfunctionfilter.scala"))
+        .output()
+        .expect("run scalac");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let native_stdout = run_main(&format!("{}:{}", native.display(), jar.display()));
+    let reference_stdout = run_main(&format!("{}:{}", reference.display(), jar.display()));
+    assert_eq!(reference_stdout, "42\n42\ntag\n");
+    assert_eq!(native_stdout, reference_stdout);
+}

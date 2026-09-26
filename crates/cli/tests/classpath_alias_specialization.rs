@@ -188,3 +188,119 @@ object Use {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn binary_applied_alias_completes_its_concrete_projection_before_expansion() {
+    if !PathBuf::from(SCALA_LIBRARY).is_file() || !PathBuf::from(SCALAC).is_file() {
+        eprintln!("skip: Scala 2.13 toolchain is not installed in /tmp");
+        return;
+    }
+    let root = temp_dir();
+    fs::create_dir_all(&root).unwrap();
+    let api = root.join("Api.scala");
+    let client = root.join("Client.scala");
+    let bad = root.join("Bad.scala");
+    fs::write(
+        &api,
+        r#"package projectedmember
+trait Identity[P] { val value: P }
+trait Identify { type ID <: Identity[_] }
+case class Entity[+ID <: Identity[_], +S <: Identify](id: ID, value: S)
+object Identify { type Identified[+T <: Identify] = Entity[T#ID, T] }
+case class IntId(value: Int) extends Identity[Int]
+case class TextId(value: String) extends Identity[String]
+case class Item() extends Identify { type ID = IntId }
+case class TextItem() extends Identify { type ID = TextId }
+case class Latest(lineItem: Option[Identify.Identified[Item]])
+case class TextLatest(lineItem: Option[Identify.Identified[TextItem]])
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &client,
+        r#"import projectedmember._
+object Main {
+  def integer(latest: Latest): Option[Int] = latest.lineItem.map(_.id.value)
+  def text(latest: TextLatest): Option[String] = latest.lineItem.map(_.id.value)
+  def again(latest: Latest): Option[Int] = latest.lineItem.map(_.id.value)
+  def main(args: Array[String]): Unit = {
+    val i: Identify.Identified[Item] = Entity(IntId(7), Item())
+    val s: Identify.Identified[TextItem] = Entity(TextId("eight"), TextItem())
+    println(integer(Latest(Some(i))))
+    println(text(TextLatest(Some(s))))
+    println(again(Latest(Some(i))))
+  }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &bad,
+        r#"import projectedmember._
+object Bad {
+  def wrong(latest: TextLatest): Option[Int] = latest.lineItem.map(_.id.value)
+}
+"#,
+    )
+    .unwrap();
+    let compile = |ours: bool, source: &PathBuf, out: &PathBuf, cp: Option<&str>| {
+        let mut command = Command::new(if ours {
+            env!("CARGO_BIN_EXE_scala-rs")
+        } else {
+            SCALAC
+        });
+        if ours {
+            command.args(["compile", "--scala-library", SCALA_LIBRARY]);
+        }
+        command.arg(source).arg("-d").arg(out);
+        if let Some(cp) = cp {
+            command.args(["-cp", cp]);
+        }
+        command.output().unwrap()
+    };
+    for producer in [false, true] {
+        let lib = root.join(format!("lib-{producer}"));
+        fs::create_dir_all(&lib).unwrap();
+        let result = compile(producer, &api, &lib, None);
+        assert!(
+            result.status.success(),
+            "producer={producer}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let cp = format!("{}:{SCALA_LIBRARY}", lib.display());
+        for consumer in [false, true] {
+            let out = root.join(format!("out-{producer}-{consumer}"));
+            fs::create_dir_all(&out).unwrap();
+            let result = compile(consumer, &client, &out, Some(&cp));
+            assert!(
+                result.status.success(),
+                "producer={producer}, consumer={consumer}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let run = Command::new("java")
+                .args([
+                    "-Xverify:all",
+                    "-cp",
+                    &format!("{}:{cp}", out.display()),
+                    "Main",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&run.stdout),
+                "Some(7)\nSome(eight)\nSome(7)\n"
+            );
+            let result = compile(consumer, &bad, &out, Some(&cp));
+            assert!(
+                !result.status.success(),
+                "accepted the wrong projected result type"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}

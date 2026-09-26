@@ -3,6 +3,11 @@
 use scala_rs_parser::TyBox;
 use scala_rs_parser::{Flags, RefineDecl, SpecializedType, SpecializedTypes, SymbolId, Type};
 
+#[cfg(test)]
+thread_local! {
+    static SAM_METHOD_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decl name that marks a refinement as the as-seen-from view of a type
 /// projection rather than something the program wrote. Not a legal Scala
 /// identifier, so it can never collide with a real member.
@@ -1399,6 +1404,8 @@ pub struct SymbolTable {
     /// [`SymbolTable::class_reaches`]'s answers for the current
     /// `mutation_gen`.
     pub(crate) reach_cache: std::cell::RefCell<ReachCache>,
+    /// Nominal SAM member walks, invalidated by symbol edits or additions.
+    sam_methods_cache: std::cell::RefCell<SamMethodsCache>,
     /// [`SymbolTable::companion_module`]'s answers: class -> (the owner's
     /// member count when it was read, the module).
     pub(crate) companion_cache:
@@ -1406,6 +1413,12 @@ pub struct SymbolTable {
     /// The answer for a receiver that names no class, handed out by reference
     /// so the hot path never allocates for it.
     pub(crate) empty_base_type_args: std::rc::Rc<BaseTypeArgs>,
+}
+
+#[derive(Default)]
+struct SamMethodsCache {
+    epoch: (u64, usize, u32, u32),
+    methods: HashMap<SymbolId, Vec<SymbolId>>,
 }
 
 /// Memo for [`SymbolTable::base_type_args`], with the same validity rule as
@@ -1567,6 +1580,7 @@ impl SymbolTable {
             lin_cache: std::cell::RefCell::new(LinCache::default()),
             bta_cache: std::cell::RefCell::new(BtaCache::default()),
             reach_cache: std::cell::RefCell::new(ReachCache::default()),
+            sam_methods_cache: std::cell::RefCell::new(SamMethodsCache::default()),
             companion_cache: std::cell::RefCell::new(Default::default()),
             empty_base_type_args: std::rc::Rc::new(BaseTypeArgs::default()),
             symbols: vec![Symbol {
@@ -8562,9 +8576,26 @@ impl SymbolTable {
     }
 
     fn abstract_sam_methods(&self, cls: SymbolId) -> Vec<SymbolId> {
+        let epoch = (
+            self.mutation_gen.get(),
+            self.symbols.len(),
+            self.any_sym.0,
+            self.anyref_sym.0,
+        );
+        {
+            let cache = self.sam_methods_cache.borrow();
+            if cache.epoch == epoch {
+                if let Some(methods) = cache.methods.get(&cls) {
+                    return methods.clone();
+                }
+            }
+        }
+        #[cfg(test)]
+        SAM_METHOD_WALKS.with(|count| count.set(count.get() + 1));
         let mut by_name: HashMap<String, SymbolId> = HashMap::default();
         let mut work = vec![cls];
         let mut seen = rustc_hash::FxHashSet::default();
+        let mut nominal = true;
         while let Some(id) = work.pop() {
             if !seen.insert(id.0) {
                 continue;
@@ -8577,6 +8608,16 @@ impl SymbolTable {
                 by_name.entry(s.name.clone()).or_insert(*m);
             }
             for p in &self.get(id).parents {
+                // Other parent forms can resolve through scopes or ambient
+                // type-expansion guards without changing a symbol.
+                nominal &= matches!(
+                    p,
+                    Type::Class { .. }
+                        | Type::ModuleRef(_)
+                        | Type::Any
+                        | Type::AnyRef
+                        | Type::JavaObject
+                );
                 // A parent written as a function type (`trait C[-T] extends
                 // (T => R)`) declares `apply`, which is what makes `C` a SAM.
                 let as_class = self.function_class_form(p);
@@ -8586,10 +8627,19 @@ impl SymbolTable {
                 }
             }
         }
-        by_name
+        let methods: Vec<_> = by_name
             .into_values()
             .filter(|m| self.method_is_deferred(*m))
-            .collect()
+            .collect();
+        if nominal {
+            let mut cache = self.sam_methods_cache.borrow_mut();
+            if cache.epoch != epoch || cache.methods.len() >= 1024 {
+                cache.epoch = epoch;
+                cache.methods.clear();
+            }
+            cache.methods.insert(cls, methods.clone());
+        }
+        methods
     }
 
     /// Names of deferred methods `cls` inherits from a parent and does not
@@ -9467,6 +9517,77 @@ type AncMemo = Vec<(u32, u32, bool)>;
 #[cfg(test)]
 mod api_boundary_tests {
     use super::*;
+
+    #[test]
+    fn sam_method_walk_is_reused_until_a_symbol_changes() {
+        let mut st = SymbolTable::new();
+        let base = st.alloc("Base", st.root, SymKind::Class, Flags::TRAIT, "Base");
+        let method = st.alloc("run", base, SymKind::Method, Flags::ABSTRACT, "");
+        let child = st.alloc("Child", st.root, SymKind::Class, Flags::TRAIT, "Child");
+        st.get_mut(child).parents.push(Type::Class {
+            sym: base,
+            args: Vec::new().into(),
+        });
+        SAM_METHOD_WALKS.with(|count| count.set(0));
+        assert_eq!(st.abstract_sam_methods(child), vec![method]);
+        assert_eq!(st.abstract_sam_methods(child), vec![method]);
+        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 1);
+        st.get_mut(method).flags = Flags::EMPTY;
+        assert!(st.abstract_sam_methods(child).is_empty());
+        assert!(st.abstract_sam_methods(child).is_empty());
+        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 2);
+        let second = st.alloc("next", base, SymKind::Method, Flags::ABSTRACT, "");
+        assert_eq!(st.abstract_sam_methods(child), vec![second]);
+        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 3);
+    }
+
+    #[test]
+    fn sam_method_walk_does_not_cache_scope_resolved_parents() {
+        let mut st = SymbolTable::new();
+        let base = st.alloc("Base", st.root, SymKind::Class, Flags::TRAIT, "Base");
+        let method = st.alloc("run", base, SymKind::Method, Flags::ABSTRACT, "");
+        st.enter_in_current("Base", base);
+        let child = st.alloc("Child", st.root, SymKind::Class, Flags::TRAIT, "Child");
+        st.get_mut(child).parents.push(Type::Named {
+            name: "Base".into(),
+            args: Vec::new().into(),
+        });
+        SAM_METHOD_WALKS.with(|count| count.set(0));
+        assert_eq!(st.abstract_sam_methods(child), vec![method]);
+        assert_eq!(st.abstract_sam_methods(child), vec![method]);
+        assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 2);
+        assert!(!st.sam_methods_cache.borrow().methods.contains_key(&child));
+    }
+
+    #[test]
+    fn sam_method_walk_caches_builtin_roots_and_tracks_their_bindings() {
+        let mut st = SymbolTable::new();
+        let root_a = st.alloc("RootA", st.root, SymKind::Class, Flags::TRAIT, "RootA");
+        let root_b = st.alloc("RootB", st.root, SymKind::Class, Flags::TRAIT, "RootB");
+        let a = st.alloc("a", root_a, SymKind::Method, Flags::ABSTRACT, "");
+        let b = st.alloc("b", root_b, SymKind::Method, Flags::ABSTRACT, "");
+        let child = st.alloc("Child", st.root, SymKind::Class, Flags::TRAIT, "Child");
+        for parent in [Type::Any, Type::AnyRef, Type::JavaObject] {
+            let uses_any = matches!(parent, Type::Any);
+            st.get_mut(child).parents = vec![parent];
+            st.any_sym = root_a;
+            st.anyref_sym = root_a;
+            SAM_METHOD_WALKS.with(|count| count.set(0));
+            assert_eq!(st.abstract_sam_methods(child), vec![a]);
+            assert_eq!(st.abstract_sam_methods(child), vec![a]);
+            assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 1);
+            let generation = st.mutation_gen.get();
+            if uses_any {
+                st.any_sym = root_b;
+            } else {
+                st.anyref_sym = root_b;
+            }
+            assert_eq!(st.mutation_gen.get(), generation);
+            assert_eq!(st.abstract_sam_methods(child), vec![b]);
+            assert_eq!(st.abstract_sam_methods(child), vec![b]);
+            assert_eq!(SAM_METHOD_WALKS.with(|count| count.get()), 2);
+        }
+    }
 
     #[test]
     fn full_base_type_bucket_admits_recent_instantiations() {

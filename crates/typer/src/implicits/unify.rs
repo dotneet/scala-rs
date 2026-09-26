@@ -7,6 +7,11 @@ use scala_rs_parser::{Flags, RefineDecl, SymbolId, Type};
 
 use crate::check::Typer;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static UNIFY_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Two-sided unification for implicit search.
 ///
 /// `unknowns` holds the candidate's own type parameters *and* the call-site
@@ -16,11 +21,11 @@ use crate::check::Typer;
 /// same pass.
 pub(super) struct Unify<'a> {
     typer: &'a Typer,
-    unknowns: rustc_hash::FxHashSet<u32>,
-    own_unknowns: rustc_hash::FxHashSet<u32>,
-    /// The subset of `unknowns` allowed to stand for a *type constructor*.
+    /// Membership and whether a parameter belongs to the candidate.
+    unknowns: rustc_hash::FxHashMap<u32, bool>,
+    /// Whether call-site unknowns may also stand for a *type constructor*.
     ///
-    /// Only the candidate's own parameters are: solving
+    /// By default only the candidate's own parameters are: solving
     /// `buildFromIterableOps[CC[X], A0, A]` means reading `CC := List` off the
     /// wanted type, which is the whole point. A *call site's* undetermined
     /// constructor is not -- it is what ordinary inference from the argument
@@ -29,7 +34,7 @@ pub(super) struct Unify<'a> {
     /// `IterableOnce.iterableOnceExtensionMethods` as a way to reach `M[A]`
     /// from a `List[Int]` that already conformed with `M := List`
     /// (`tests/fixtures/mism12_lib.scala`, a `ClassCastException` at run time).
-    ctor_unknowns: rustc_hash::FxHashSet<u32>,
+    evidence_constructors: bool,
     bound: rustc_hash::FxHashMap<u32, Type>,
 }
 
@@ -38,7 +43,7 @@ impl<'a> Unify<'a> {
     /// `Future[Int] <:< G[B]`). View insertion keeps constructors fixed so a
     /// conversion cannot replace an already applicable argument constructor.
     pub(super) fn allow_evidence_constructors(&mut self) {
-        self.ctor_unknowns.extend(self.unknowns.iter().copied());
+        self.evidence_constructors = true;
     }
 
     /// `own` are the candidate's own type parameters, `undet` the call site's.
@@ -47,27 +52,36 @@ impl<'a> Unify<'a> {
         own: impl IntoIterator<Item = SymbolId>,
         undet: impl IntoIterator<Item = SymbolId>,
     ) -> Self {
-        let ctor_unknowns: rustc_hash::FxHashSet<u32> = own.into_iter().map(|s| s.0).collect();
-        let mut unknowns = ctor_unknowns.clone();
-        unknowns.extend(undet.into_iter().map(|s| s.0));
+        #[cfg(test)]
+        UNIFY_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        let own = own.into_iter();
+        let undet = undet.into_iter();
+        let mut unknowns = rustc_hash::FxHashMap::with_capacity_and_hasher(
+            own.size_hint().0.saturating_add(undet.size_hint().0),
+            Default::default(),
+        );
+        unknowns.extend(own.map(|s| (s.0, true)));
+        for id in undet {
+            unknowns.entry(id.0).or_insert(false);
+        }
         Unify {
             typer,
             unknowns,
-            own_unknowns: ctor_unknowns.clone(),
-            ctor_unknowns,
+            evidence_constructors: false,
             bound: rustc_hash::FxHashMap::default(),
         }
     }
 
     /// Whether `ty` is an unknown this unification may solve to a type
-    /// *constructor*; see [`Unify::ctor_unknowns`].
+    /// *constructor*; see [`Unify::evidence_constructors`].
     fn unknown_ctor(&self, ty: &Type) -> bool {
-        matches!(ty, Type::TypeParam(id) if self.ctor_unknowns.contains(&id.0))
+        matches!(ty, Type::TypeParam(id) if self.unknowns.get(&id.0)
+            .is_some_and(|own| *own || self.evidence_constructors))
     }
 
     fn unknown_of(&self, ty: &Type) -> Option<u32> {
         match ty {
-            Type::TypeParam(id) if self.unknowns.contains(&id.0) => Some(id.0),
+            Type::TypeParam(id) if self.unknowns.contains_key(&id.0) => Some(id.0),
             _ => None,
         }
     }
@@ -128,7 +142,7 @@ impl<'a> Unify<'a> {
             return false;
         }
         // Occurs check: `A = List[A]` would make `expand` loop.
-        if mentions_unknown(ty, &std::iter::once(id).collect()) {
+        if mentions_unknown(ty, &std::iter::once((id, false)).collect()) {
             return false;
         }
         // These constraints come from an expected evidence type, not from a
@@ -379,7 +393,7 @@ impl<'a> Unify<'a> {
                                 let Some(id) = self.unknown_of(x) else {
                                     continue;
                                 };
-                                if !self.own_unknowns.contains(&id)
+                                if self.unknowns.get(&id) != Some(&true)
                                     || self.bound.contains_key(&id)
                                     || mentions_unknown(y, &self.unknowns)
                                 {
@@ -651,9 +665,9 @@ fn strip_annot(ty: &Type) -> &Type {
     }
 }
 
-pub(super) fn mentions_unknown(ty: &Type, unknowns: &rustc_hash::FxHashSet<u32>) -> bool {
+pub(super) fn mentions_unknown(ty: &Type, unknowns: &rustc_hash::FxHashMap<u32, bool>) -> bool {
     match ty {
-        Type::TypeParam(id) => unknowns.contains(&id.0),
+        Type::TypeParam(id) => unknowns.contains_key(&id.0),
         Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
             args.iter().any(|t| mentions_unknown(t, unknowns))
         }
@@ -667,7 +681,7 @@ pub(super) fn mentions_unknown(ty: &Type, unknowns: &rustc_hash::FxHashSet<u32>)
             params.iter().any(|t| mentions_unknown(t, unknowns)) || mentions_unknown(ret, unknowns)
         }
         Type::Refined { .. } => unknowns
-            .iter()
+            .keys()
             .any(|tp| crate::check::type_mentions_tparam_deep(ty, SymbolId(*tp))),
         _ => false,
     }
@@ -687,5 +701,65 @@ fn as_application(ty: &Type) -> Option<(Type, &[Type])> {
         )),
         Type::Applied { ctor, args } if !args.is_empty() => Some(((**ctor).clone(), args)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unifier_parameter_sets_share_one_allocation() {
+        let typer = Typer::new(0, &crate::check::TypecheckOptions::default());
+        let own = [SymbolId(1), SymbolId(2)];
+        let undet = [SymbolId(2), SymbolId(3)];
+        let allocations = crate::allocation_test::count(|| {
+            let mut unify = Unify::new(&typer, own, undet);
+            std::hint::black_box(&unify);
+            unify.allow_evidence_constructors();
+            std::hint::black_box(unify);
+        });
+        assert_eq!(allocations, 1);
+    }
+
+    #[test]
+    fn overlapping_parameters_keep_constructor_permissions() {
+        let typer = Typer::new(0, &crate::check::TypecheckOptions::default());
+        for n in [0, 1, 2, 9, 32, 64] {
+            let own: Vec<_> = (1..=n).map(SymbolId).collect();
+            let undet: Vec<_> = (n..=n + 4).map(SymbolId).collect();
+            let mut unify = Unify::new(&typer, own.iter().copied(), undet.iter().copied());
+            for id in 0..=n + 5 {
+                let tp = Type::TypeParam(SymbolId(id));
+                let known = own.contains(&SymbolId(id)) || undet.contains(&SymbolId(id));
+                assert_eq!(unify.unknown_of(&tp), known.then_some(id));
+                assert_eq!(unify.unknown_ctor(&tp), own.contains(&SymbolId(id)));
+                assert_eq!(mentions_unknown(&tp, &unify.unknowns), known);
+            }
+            unify.allow_evidence_constructors();
+            for id in 0..=n + 5 {
+                let tp = Type::TypeParam(SymbolId(id));
+                assert_eq!(unify.unknown_ctor(&tp), unify.unknown_of(&tp).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn parameter_membership_in_refinements_preserves_occurs_check() {
+        let typer = Typer::new(0, &crate::check::TypecheckOptions::default());
+        let mut unify = Unify::new(&typer, [SymbolId(1)], [SymbolId(2)]);
+        let refined = Type::Refined {
+            parents: vec![Type::AnyRef].into(),
+            decls: vec![RefineDecl::Val {
+                name: "value".into(),
+                ty: Type::TypeParam(SymbolId(2)),
+            }],
+        };
+        assert!(mentions_unknown(&refined, &unify.unknowns));
+        assert!(!unify.bind(2, &refined));
+        assert!(unify.bind(1, &refined));
+        assert!(unify.solved(SymbolId(1)).is_none());
+        assert!(unify.bind(2, &Type::Int));
+        assert!(unify.solved(SymbolId(1)).is_some());
     }
 }

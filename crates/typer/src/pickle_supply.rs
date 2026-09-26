@@ -7595,6 +7595,33 @@ impl PickleSupply {
             return None;
         }
         let a = self.conv_all(st, bin, scope, args, d)?;
+        // Substitution is immutable: complete a concrete argument's projected
+        // members first, or T#ID falls back to the abstract declaration before
+        // the binary class's overriding alias has been read.
+        if let Type::TypeMember(alias) = &t {
+            let info = st.get(*alias);
+            if st.mentions_abs_projection(&info.ty) {
+                let targets: Vec<_> = st
+                    .type_members_in(&info.ty)
+                    .into_iter()
+                    .filter_map(|member| {
+                        let (prefix, decl) = st.abs_projection(member)?;
+                        let i = info.tparams.iter().position(|tp| *tp == prefix)?;
+                        let arg = a.get(i)?;
+                        if matches!(arg, Type::TypeParam(_))
+                            || matches!(arg, Type::TypeMember(id) if st.is_deferred_type_member(*id))
+                        {
+                            return None;
+                        }
+                        let cls = st.class_sym_of(arg)?;
+                        (!st.is_source_class(cls)).then(|| (cls, st.get(decl).name.clone()))
+                    })
+                    .collect();
+                for (cls, name) in targets {
+                    self.complete_type_member(st, bin, cls, &name);
+                }
+            }
+        }
         let applied = st.expand_applied_hk_alias(crate::symbol::apply_type_ctor(t, a));
         Some(st.subst_as_seen_from_at(&pre, Some(&pre), &applied))
     }

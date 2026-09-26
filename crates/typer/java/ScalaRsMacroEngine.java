@@ -643,7 +643,7 @@ public final class ScalaRsMacroEngine {
         boolean bundle = "true".equals(req.field("bundle").items.get(1).text());
         Object receiver = bundle ? null : implCls.getField("MODULE$").get(null);
         Method impl = null;
-        for (Method m : implCls.getMethods()) {
+        for (Method m : methodsOf(implCls)) {
             if (m.getName().equals(methodName)) {
                 impl = m;
                 break;
@@ -1559,7 +1559,7 @@ public final class ScalaRsMacroEngine {
 
     static long flagValue(String name) throws Exception {
         Object flagValues = call(universe, "Flag", 0);
-        for (Method m : flagValues.getClass().getMethods()) {
+        for (Method m : methodsOf(flagValues.getClass())) {
             if (m.getParameterCount() == 0 && m.getReturnType() == long.class
                     && m.getName().equals(name)) {
                 m.setAccessible(true);
@@ -2156,7 +2156,7 @@ public final class ScalaRsMacroEngine {
         sb.append("(mods (f");
         long known = 0;
         Object flagValues = call(universe, "Flag", 0);
-        for (Method m : flagValues.getClass().getMethods()) {
+        for (Method m : methodsOf(flagValues.getClass())) {
             if (m.getParameterCount() != 0 || m.getReturnType() != long.class) {
                 continue;
             }
@@ -3499,91 +3499,138 @@ public final class ScalaRsMacroEngine {
             if (s == null || s.length() > maxChars) {
                 throw new IllegalArgumentException("macro protocol packet is too large");
             }
-            int[] p = {0};
-            Sexp v = parse(s, p, 0, maxDepth);
-            while (p[0] < s.length() && s.charAt(p[0]) == ' ') p[0]++;
-            if (p[0] != s.length()) {
+            Packet packet = new Packet(s);
+            packet.scan(0, maxDepth);
+            while (packet.position < s.length() && s.charAt(packet.position) == ' ') packet.position++;
+            if (packet.position != s.length()) {
                 throw new IllegalArgumentException("trailing input after macro protocol packet");
             }
-            return v;
+            packet.nodes = new Sexp[packet.count];
+            return packet.node(0);
         }
 
-        static Sexp parse(String s, int[] p, int depth, int maxDepth) {
-            while (p[0] < s.length() && s.charAt(p[0]) == ' ') {
-                p[0]++;
-            }
-            if (p[0] >= s.length()) {
-                throw new IllegalArgumentException("empty macro protocol packet");
-            }
-            char c = s.charAt(p[0]);
-            Sexp v = new Sexp();
-            if (c == '(') {
-                if (depth >= maxDepth) {
-                    throw new IllegalArgumentException("macro protocol packet is nested too deeply");
+        /** Validate the entire packet, but materialize only visited children.
+         * A cached runtime type needs its raw wire text, not another object
+         * and decoded string for every node inside that type. */
+        static final class Packet {
+            final String text;
+            // Four integers per node: start, end, next sibling, child count.
+            // Negative child counts distinguish atoms and quoted strings.
+            int[] spans = new int[128];
+            Sexp[] nodes;
+            int count;
+            int position;
+
+            Packet(String text) { this.text = text; }
+
+            void scan(int depth, int maxDepth) {
+                while (position < text.length() && text.charAt(position) == ' ') position++;
+                if (position >= text.length()) {
+                    throw new IllegalArgumentException("empty macro protocol packet");
                 }
-                v.src = s;
-                v.start = p[0];
-                p[0]++;
-                v.items = new ArrayList<>();
-                while (true) {
-                    while (p[0] < s.length() && s.charAt(p[0]) == ' ') {
-                        p[0]++;
+                int slot = count++ * 4;
+                if (slot == spans.length) spans = java.util.Arrays.copyOf(spans, spans.length * 2);
+                spans[slot] = position;
+                char c = text.charAt(position);
+                if (c == '(') {
+                    if (depth >= maxDepth) {
+                        throw new IllegalArgumentException("macro protocol packet is nested too deeply");
                     }
-                    if (p[0] >= s.length()) {
-                        throw new IllegalArgumentException("unterminated macro protocol list");
-                    }
-                    if (s.charAt(p[0]) == ')') {
-                        p[0]++;
-                        break;
-                    }
-                    v.items.add(parse(s, p, depth + 1, maxDepth));
-                }
-                v.end = p[0];
-                return v;
-            }
-            if (c == '"') {
-                int start = ++p[0];
-                StringBuilder sb = null;
-                while (p[0] < s.length() && s.charAt(p[0]) != '"') {
-                    char ch = s.charAt(p[0]);
-                    if (ch == '\\') {
-                        if (sb == null) sb = new StringBuilder();
-                        sb.append(s, start, p[0]++);
-                        if (p[0] >= s.length()) {
-                            throw new IllegalArgumentException("unterminated macro protocol escape");
+                    position++;
+                    int children = 0;
+                    for (;;) {
+                        while (position < text.length() && text.charAt(position) == ' ') position++;
+                        if (position >= text.length()) {
+                            throw new IllegalArgumentException("unterminated macro protocol list");
                         }
-                        char e = s.charAt(p[0]++);
-                        if (e == 'n') sb.append('\n');
-                        else if (e == 't') sb.append('\t');
-                        else if (e == 'r') sb.append('\r');
-                        else if (e == '"' || e == '\\') sb.append(e);
-                        else throw new IllegalArgumentException(
-                            "unknown macro protocol escape: \\" + e);
-                        start = p[0];
-                    } else {
-                        p[0]++;
+                        if (text.charAt(position) == ')') { position++; break; }
+                        scan(depth + 1, maxDepth);
+                        children++;
                     }
+                    spans[slot + 3] = children;
+                } else if (c == '"') {
+                    position++;
+                    while (position < text.length() && text.charAt(position) != '"') {
+                        if (text.charAt(position++) == '\\') {
+                            if (position >= text.length()) {
+                                throw new IllegalArgumentException("unterminated macro protocol escape");
+                            }
+                            char e = text.charAt(position++);
+                            if (e != 'n' && e != 't' && e != 'r' && e != '"' && e != '\\') {
+                                throw new IllegalArgumentException("unknown macro protocol escape: \\" + e);
+                            }
+                        }
+                    }
+                    if (position >= text.length()) {
+                        throw new IllegalArgumentException("unterminated macro protocol string");
+                    }
+                    position++;
+                    spans[slot + 3] = -1;
+                } else {
+                    if (c == ')') throw new IllegalArgumentException("unexpected ) in macro protocol packet");
+                    while (position < text.length() && " ()".indexOf(text.charAt(position)) < 0) position++;
+                    spans[slot + 3] = -2;
                 }
-                if (p[0] >= s.length()) {
-                    throw new IllegalArgumentException("unterminated macro protocol string");
+                spans[slot + 1] = position;
+                spans[slot + 2] = count;
+            }
+
+            Sexp node(int index) {
+                Sexp known = nodes[index];
+                if (known != null) return known;
+                int slot = index * 4;
+                Sexp value = new Sexp();
+                int start = spans[slot], end = spans[slot + 1], children = spans[slot + 3];
+                if (children >= 0) {
+                    value.src = text;
+                    value.start = start;
+                    value.end = end;
+                    value.items = new Children(this, index + 1, children);
+                } else if (children == -2) {
+                    value.atom = text.substring(start, end);
+                } else {
+                    int from = start + 1;
+                    StringBuilder decoded = null;
+                    for (int at = from; at < end - 1; at++) {
+                        if (text.charAt(at) != '\\') continue;
+                        if (decoded == null) decoded = new StringBuilder();
+                        decoded.append(text, from, at);
+                        char escape = text.charAt(++at);
+                        decoded.append(escape == 'n' ? '\n' : escape == 't' ? '\t'
+                            : escape == 'r' ? '\r' : escape);
+                        from = at + 1;
+                    }
+                    value.atom = decoded == null ? text.substring(from, end - 1)
+                        : decoded.append(text, from, end - 1).toString();
                 }
-                v.atom = sb == null ? s.substring(start, p[0])
-                    : sb.append(s, start, p[0]).toString();
-                p[0]++;
-                return v;
+                nodes[index] = value;
+                return value;
             }
-            if (c == ')') {
-                throw new IllegalArgumentException("unexpected ) in macro protocol packet");
+        }
+
+        static final class Children extends java.util.AbstractList<Sexp> {
+            final Packet packet;
+            final int first;
+            final int length;
+            int cursor;
+            int cursorIndex;
+
+            Children(Packet packet, int first, int length) {
+                this.packet = packet;
+                this.first = first;
+                this.length = length;
+                this.cursor = first;
             }
-            int start = p[0];
-            while (p[0] < s.length() && " ()".indexOf(s.charAt(p[0])) < 0) {
-                p[0]++;
+            public int size() { return length; }
+            public Sexp get(int index) {
+                if (index < 0 || index >= length) throw new IndexOutOfBoundsException();
+                if (index < cursorIndex) { cursor = first; cursorIndex = 0; }
+                while (cursorIndex < index) {
+                    cursor = packet.spans[cursor * 4 + 2];
+                    cursorIndex++;
+                }
+                return packet.node(cursor);
             }
-            if (p[0] == start) {
-                throw new IllegalArgumentException("empty macro protocol atom");
-            }
-            v.atom = s.substring(start, p[0]);
-            return v;
         }
 
         static String quote(String s) {

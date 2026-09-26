@@ -235,14 +235,17 @@ impl MacroEngine {
                 (Some(stdout), _) => read_wire_line_with_limit(stdout, wire_limit),
                 (None, Some(reader)) => match reader.ask.send(wire_limit) {
                     Ok(()) => reader.lines.recv().unwrap_or_else(|_| {
-                        Err(std::io::Error::other("the macro engine reply reader stopped"))
+                        Err(std::io::Error::other(
+                            "the macro engine reply reader stopped",
+                        ))
                     }),
-                    Err(_) => Err(std::io::Error::other("the macro engine reply reader stopped")),
+                    Err(_) => Err(std::io::Error::other(
+                        "the macro engine reply reader stopped",
+                    )),
                 },
                 (None, None) => {
                     return self.protocol_failure(
-                        "the macro engine reply pipe is unavailable after a timed read"
-                            .to_string(),
+                        "the macro engine reply pipe is unavailable after a timed read".to_string(),
                     );
                 }
             };
@@ -429,26 +432,54 @@ impl Typer {
 ///
 /// Nothing about the engine differs from a synchronous start: the same
 /// command, and the same error, which is only reported if an expansion is
-/// attempted. A pending start that is never joined is detached, and the
-/// engine it produced is dropped (and terminated) by that thread; a process
-/// that exits first closes the engine's stdin, which ends it too.
+/// attempted. An unused start is cancelled and joined before compiler exit;
+/// stdin EOF alone cannot stop a JVM still initializing its runtime universe.
 pub(crate) struct PendingEngine {
-    handle: std::thread::JoinHandle<Result<MacroEngine, String>>,
+    handle: Option<std::thread::JoinHandle<Result<MacroEngine, String>>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl PendingEngine {
     fn spawn(classpath: Vec<PathBuf>) -> Option<Self> {
-        std::thread::Builder::new()
-            .name("scala-rs-macro-engine-start".to_string())
-            .spawn(move || start_engine(&classpath))
-            .ok()
-            .map(|handle| PendingEngine { handle })
+        Self::spawn_prepared(classpath, engine_dir())
     }
 
-    fn join(self) -> Result<MacroEngine, String> {
+    fn spawn_prepared(classpath: Vec<PathBuf>, dir: PathBuf) -> Option<Self> {
+        // Helper compilation is not cancellable. Defer a cold cache to the
+        // first actual expansion instead of making unused-start shutdown wait
+        // for javac. Published helper directories are complete and immutable.
+        if !valid_engine_class(&dir.join("ScalaRsMacroEngine.class")) {
+            return None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        std::thread::Builder::new()
+            .name("scala-rs-macro-engine-start".to_string())
+            .spawn(move || start_prepared_engine(&classpath, &dir, Some(&worker_cancelled)))
+            .ok()
+            .map(|handle| PendingEngine {
+                handle: Some(handle),
+                cancelled,
+            })
+    }
+
+    fn join(mut self) -> Result<MacroEngine, String> {
         self.handle
+            .take()
+            .expect("pending macro startup handle")
             .join()
             .unwrap_or_else(|_| Err("starting the macro engine panicked".to_string()))
+    }
+}
+
+impl Drop for PendingEngine {
+    fn drop(&mut self) {
+        self.cancelled.store(true, AtomicOrdering::Release);
+        if let Some(handle) = self.handle.take() {
+            // The worker owns containment throughout startup. On cancellation
+            // it reaps the child; an already-ready result is dropped here.
+            let _ = handle.join();
+        }
     }
 }
 
@@ -456,7 +487,7 @@ impl Typer {
     /// Start the engine in the background when this run could expand a
     /// macro at all, which needs scala-reflect.jar on the classpath
     /// ([`start_engine`] refuses to run without it). A run that never
-    /// expands one pays for a JVM on another core and nothing on this one.
+    /// expands one cancels and reaps its unused startup when the typer drops.
     /// `SCALA_RS_MACRO_PRESTART=0` turns it off.
     pub(crate) fn prestart_macro_engine(&mut self) {
         if self.macro_engine.is_some()
@@ -488,6 +519,15 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
     if !valid_engine_class(&class_file) {
         compile_engine(&dir)?;
     }
+    start_prepared_engine(classpath, &dir, None)
+}
+
+fn start_prepared_engine(
+    classpath: &[PathBuf],
+    dir: &Path,
+    cancelled: Option<&AtomicBool>,
+) -> Result<MacroEngine, String> {
+    check_startup_cancelled(cancelled)?;
     let sep = if cfg!(windows) { ';' } else { ':' };
     let mut cp = dir.display().to_string();
     for p in classpath {
@@ -503,6 +543,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_engine_command(&mut command);
+    check_startup_cancelled(cancelled)?;
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start `java` to expand macros: {e}"))?;
@@ -523,7 +564,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
     let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
     let stderr = child.stderr.take().expect("piped stderr");
     let (stderr, stderr_done, stderr_thread) = collect_engine_stderr(stderr);
-    let (stdout, hello) = match read_engine_hello(stdout) {
+    let (stdout, hello) = match read_engine_hello(stdout, cancelled) {
         Ok(result) => result,
         Err(mut reason) => {
             let status = match stop_engine(&mut child, &mut containment, Some(stderr_thread)) {
@@ -732,16 +773,40 @@ fn bounded_text(bytes: &[u8]) -> String {
         .to_string()
 }
 
+fn check_startup_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    if cancelled.is_some_and(|flag| flag.load(AtomicOrdering::Acquire)) {
+        Err("unused macro engine startup cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn read_engine_hello(
     stdout: BufReader<ChildStdout>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(BufReader<ChildStdout>, String), String> {
+    check_startup_cancelled(cancelled)?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut stdout = stdout;
         let result = read_wire_line(&mut stdout);
         let _ = tx.send((stdout, result));
     });
-    match rx.recv_timeout(ENGINE_STARTUP_TIMEOUT) {
+    let deadline = Instant::now() + ENGINE_STARTUP_TIMEOUT;
+    let reply = loop {
+        check_startup_cancelled(cancelled)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let interval = if cancelled.is_some() {
+            remaining.min(Duration::from_millis(10))
+        } else {
+            remaining
+        };
+        match rx.recv_timeout(interval) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+            reply => break reply,
+        }
+    };
+    match reply {
         Ok((_stdout, Ok((0, _)))) => Err("the macro engine exited at startup".to_string()),
         Ok((stdout, Ok((_, hello)))) => Ok((stdout, hello)),
         Ok((_stdout, Err(e))) => Err(format!("the macro engine died at startup ({e})")),
@@ -5298,6 +5363,120 @@ mod tests {
             terminated: false,
             termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[test]
+    fn unused_pending_start_is_joined_before_drop_returns() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&finished);
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let handle = std::thread::spawn(move || {
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            completed.store(true, AtomicOrdering::Release);
+            Err("unused test startup".to_string())
+        });
+        rx.recv().unwrap();
+        drop(PendingEngine {
+            handle: Some(handle),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(
+            finished.load(AtomicOrdering::Acquire),
+            "unused macro startup was detached"
+        );
+    }
+
+    #[test]
+    fn cancelled_start_does_not_spawn_a_process() {
+        let cancelled = AtomicBool::new(true);
+        let error = start_prepared_engine(&[], Path::new("unused"), Some(&cancelled))
+            .err()
+            .expect("cancelled before spawn");
+        assert_eq!(error, "unused macro engine startup cancelled");
+    }
+
+    #[test]
+    fn pending_start_defers_cold_helper_compilation() {
+        let dir = std::env::temp_dir().join(format!(
+            "scala-rs-unused-prestart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!dir.exists());
+        assert!(PendingEngine::spawn_prepared(Vec::new(), dir.clone()).is_none());
+        assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_drop_cancels_readiness_and_reaps_child() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let handle = std::thread::spawn(move || {
+            let mut engine = shell_engine("sleep 30");
+            tx.send(Arc::clone(&engine.termination_attempts)).unwrap();
+            let stdout = engine.stdout.take().unwrap();
+            let (stdout, _) = read_engine_hello(stdout, Some(&worker_cancelled))?;
+            engine.stdout = Some(stdout);
+            Ok(engine)
+        });
+        let attempts = rx.recv().unwrap();
+        let started = Instant::now();
+        drop(PendingEngine {
+            handle: Some(handle),
+            cancelled,
+        });
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_join_keeps_ready_engine_alive() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let handle = std::thread::spawn(move || {
+            let mut engine = shell_engine("printf '(ready)\\n'; sleep 30");
+            let stdout = engine.stdout.take().unwrap();
+            let (stdout, hello) = read_engine_hello(stdout, Some(&worker_cancelled))?;
+            assert_eq!(hello.trim(), "(ready)");
+            engine.stdout = Some(stdout);
+            Ok(engine)
+        });
+        let mut engine = PendingEngine {
+            handle: Some(handle),
+            cancelled,
+        }
+        .join()
+        .unwrap();
+        let attempts = Arc::clone(&engine.termination_attempts);
+        assert!(engine.child.try_wait().unwrap().is_none());
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 0);
+        drop(engine);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_drop_reaps_already_finished_start() {
+        let engine = shell_engine("sleep 30");
+        let attempts = Arc::clone(&engine.termination_attempts);
+        let handle = std::thread::spawn(move || Ok(engine));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        drop(PendingEngine {
+            handle: Some(handle),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[cfg(unix)]

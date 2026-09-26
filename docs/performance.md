@@ -81,6 +81,10 @@ per-run timings and medians as JSON lines.
 battery. Run it every few changes: a check that suddenly doubles is a bug
 report, not a fact of life.
 
+For an optional profile-guided compiler build, see
+[Experimental profile-guided builds](performance-pgo.md). Keep a matched
+non-PGO control and validate held-out workloads before adopting the result.
+
 ### Measuring on a loaded machine
 
 This machine usually has several agents on it. The same binary has produced
@@ -149,7 +153,9 @@ the start, 6.37e10 at the end):
   same pairing in `warm_conversion_witnesses` (`conv_param_matches`, then
   `conv_implicit_params`) now shares one memo too.
 * **`class_reaches`, `is_ancestor_of` and `inherits_from` are cached**
-  (`ReachCache`, same `mutation_gen` rule as `LinCache`; -13%). The two that
+  (`ReachCache`; -13% in the original measurement). Its current epoch is
+  `graph_gen`, which excludes method, term and type-parameter mutations,
+  rather than `LinCache`'s broader `mutation_gen`. The two that
   resolve parents through `class_sym_of` keep an answer only when every
   parent they followed named its class outright, and never under an ambient
   expansion guard, for the reason `lin.rs`'s `parent_names_its_class` gives.

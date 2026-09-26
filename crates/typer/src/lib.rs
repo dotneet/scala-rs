@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod allocation_test;
 mod annot_resolve;
 mod anon_capture;
 mod async_generic;
