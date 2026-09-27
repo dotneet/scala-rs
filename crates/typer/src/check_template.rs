@@ -1916,6 +1916,16 @@ impl Typer {
     /// with no tree of its own (a constructor field) falls back to the
     /// template's.
     fn check_overrides(&mut self, class_id: SymbolId, body: &[Tree], span: Span) {
+        let class = self.st.get(class_id);
+        // This shape has no new method or field to compare with its one parent.
+        if class.kind == SymKind::Class
+            && !class.flags.contains(Flags::CASE)
+            && body.is_empty()
+            && class.ctor_fields.is_empty()
+            && class.parents.len() == 1
+        {
+            return;
+        }
         let names: std::collections::HashSet<String> = body
             .iter()
             .filter_map(|tree| tree.name().map(str::to_owned))
