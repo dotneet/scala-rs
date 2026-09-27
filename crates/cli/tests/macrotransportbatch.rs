@@ -938,6 +938,76 @@ fn deeply_nested_generic_implicit_macro_queries_complete() {
 }
 
 #[test]
+fn unused_implicit_macro_results_are_not_expanded() {
+    let root = root();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/perf/process-lifetime");
+    let implementation = root.join("implementation");
+    fs::create_dir(&implementation).unwrap();
+    let base = format!("{JAR}:{REFLECT}");
+    let provider = Command::new(NSC)
+        .args(["-nowarn", "-cp", &base, "-d"])
+        .arg(&implementation)
+        .arg(source.join("NestedMacro.scala"))
+        .output()
+        .unwrap();
+    assert!(
+        provider.status.success(),
+        "{}",
+        String::from_utf8_lossy(&provider.stderr)
+    );
+    let cp = format!("{}:{base}", implementation.display());
+    for (name, expansions) in [("NestedMacroUse", 1), ("NestedMacroSplicedUse", 63)] {
+        for nsc in [true, false] {
+            let output = root.join(format!("{name}-{nsc}"));
+            fs::create_dir(&output).unwrap();
+            let mut command = Command::new(if nsc {
+                NSC
+            } else {
+                env!("CARGO_BIN_EXE_scala-rs")
+            });
+            if nsc {
+                command.args(["-Ymacro-debug-lite", "-nowarn"]);
+            } else {
+                command.args(["compile", "--scala-library", JAR, "-nowarn"]);
+                command.env("SCALA_RS_MACRO_TIMING", "1");
+            }
+            let result = command
+                .arg(source.join(format!("{name}.scala")))
+                .args(["-cp", &cp, "-d"])
+                .arg(&output)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(result.status.success(), "{name} nsc={nsc}: {stderr}");
+            if nsc && name == "NestedMacroUse" {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                assert_eq!(stdout.matches("performing macro expansion").count(), 1);
+            } else if !nsc {
+                assert!(
+                    stderr.contains(&format!("[macro timing] {expansions} expansions")),
+                    "{stderr}"
+                );
+            }
+            let run = Command::new("java")
+                .args([
+                    "-cp",
+                    &format!("{}:{cp}", output.display()),
+                    &format!("shapeprobe.{name}"),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(run.stdout, b"1\n");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn macro_tags_preserve_unapplied_binary_alias_constructors() {
     let root = root();
     let base_cp = format!("{JAR}:{REFLECT}");

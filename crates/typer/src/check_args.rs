@@ -2198,6 +2198,39 @@ impl Typer {
         })
     }
 
+    /// An implicit query may inspect a macro witness without ever splicing it.
+    /// Keep a blackbox call only when it has a stable serialized path; typing
+    /// expands that call if the enclosing macro uses the returned tree.
+    pub(crate) fn unexpanded_implicit_macro_tree(
+        &mut self,
+        id: SymbolId,
+        pt: &Type,
+        span: Span,
+        depth: usize,
+    ) -> Option<Tree> {
+        let origin = self
+            .implicit_instance_origins
+            .get(&id)
+            .copied()
+            .unwrap_or(id);
+        let candidate = self.st.get(origin);
+        if !candidate.macro_impl.as_ref().is_some_and(|m| m.blackbox)
+            || !matches!(&candidate.ty, Type::Method { paramss, .. } if paramss.iter().all(Vec::is_empty))
+            || crate::expand::static_member_path(&self.st, origin).is_none()
+        {
+            return None;
+        }
+        let fitted_targs = self
+            .selected_implicit_fit
+            .borrow_mut()
+            .take()
+            .filter(|(selected, wanted, selected_depth, _)| {
+                *selected == origin && wanted == pt && *selected_depth == depth
+            })
+            .map(|(_, _, _, targs)| targs);
+        Some(self.implicit_tree_in(origin, pt, span, depth, fitted_targs))
+    }
+
     fn implicit_tree_in(
         &mut self,
         id: SymbolId,

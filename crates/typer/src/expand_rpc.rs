@@ -645,21 +645,27 @@ impl Typer {
             let search = self.search_macro_implicit(pt, depth, &rejected);
             match search {
                 crate::implicits::ImplicitSearch::Found(id) => {
-                    // `implicit_tree` expands a selected implicit macro through a
-                    // nested conversation. Never serialize an unexpanded reference
-                    // as successful evidence when that nested expansion failed.
+                    // A macro witness without arguments can remain a typed call:
+                    // the enclosing macro may inspect it and discard it. Other
+                    // witnesses still need materialization before transport.
                     let attempt_mark = self.diags.len();
                     let key = self.macro_failure_key(span);
-                    let (mut tree, _nested_failure) = self
-                        .with_isolated_macro_failure(key, |this| {
+                    let deferred = self.unexpanded_implicit_macro_tree(id, pt, span, depth);
+                    let skip_macro_report = deferred.is_some();
+                    let (mut tree, _nested_failure) = if let Some(tree) = deferred {
+                        (tree, None)
+                    } else {
+                        self.with_isolated_macro_failure(key, |this| {
                             this.implicit_tree(id, pt, span, depth)
-                        });
+                        })
+                    };
                     self.adapt(&mut tree, pt);
                     // Ordinary implicit methods can contain failed macro
-                    // evidence too. Returning those calls as a successful
-                    // witness lets an enclosing macro re-expand them under
-                    // a different open-implicit stack.
-                    self.report_macro_calls(&tree);
+                    // evidence too. A deliberately deferred macro call is
+                    // expanded when the enclosing expansion uses its tree.
+                    if !skip_macro_report {
+                        self.report_macro_calls(&tree);
+                    }
                     // A nested Lazy-style derivation can deliberately return a
                     // reference to a val that the enclosing macro will place in
                     // its final block. nsc keeps that unbound intermediate tree
