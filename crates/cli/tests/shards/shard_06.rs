@@ -50,6 +50,8 @@ mod pkgalias;
 mod pkgobj_term;
 #[path = "../pkgobjdup.rs"]
 mod pkgobjdup;
+#[path = "../predef_library_implicits.rs"]
+mod predef_library_implicits;
 #[path = "../preludefidelity.rs"]
 mod preludefidelity;
 #[path = "../preludelb.rs"]

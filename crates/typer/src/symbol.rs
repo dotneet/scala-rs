@@ -897,7 +897,11 @@ impl std::ops::DerefMut for Scopes {
 pub struct Scope {
     /// Template whose members and body imports this scope exposes.
     pub(crate) template_owner: Option<SymbolId>,
-    map: HashMap<String, Vec<Binding>>,
+    /// Shared until written: completing a member's signature lazily rebuilds
+    /// the scope stack it was declared in (`Typer::swap_in_scopes`), and
+    /// copying an `object` of 1500 members' own scope for each of them made
+    /// typing one large file quadratic in its length.
+    map: std::rc::Rc<HashMap<String, Vec<Binding>>>,
     /// Owners brought in by a wildcard import (`import p._`) in this scope,
     /// with the names that selector hid (`import p.{X => _, _}`).
     /// A package read from a jar cannot be enumerated up front, so the names
@@ -938,7 +942,9 @@ impl Scope {
     /// with which clause it was.
     pub fn enter_binding(&mut self, name: &str, id: SymbolId, rank: BindRank, origin: u64) {
         self.stamp = next_scope_version();
-        let slot = self.map.entry(name.to_string()).or_default();
+        let slot = std::rc::Rc::make_mut(&mut self.map)
+            .entry(name.to_string())
+            .or_default();
         // One symbol reachable by two routes is still one symbol, not an
         // overload: a template's self alias, for instance, is entered both
         // with the rest of the class's members and by `bind_self_type`.
@@ -967,12 +973,16 @@ impl Scope {
     /// to become the source trait rather than merely be joined by it.
     /// Returns whether anything was there.
     pub fn replace(&mut self, name: &str, victims: &[SymbolId], with: SymbolId) -> bool {
-        let Some(slot) = self.map.get_mut(name) else {
-            return false;
-        };
-        if !slot.iter().any(|b| victims.contains(&b.sym)) {
+        if !self
+            .map
+            .get(name)
+            .is_some_and(|slot| slot.iter().any(|b| victims.contains(&b.sym)))
+        {
             return false;
         }
+        let slot = std::rc::Rc::make_mut(&mut self.map)
+            .get_mut(name)
+            .expect("checked above");
         self.stamp = next_scope_version();
         let rank = slot
             .iter()
@@ -2531,6 +2541,16 @@ impl SymbolTable {
         }
         let owner = self.get(id).owner;
         if owner.is_none() {
+            return;
+        }
+        // A source definition's owner is a package or the source class
+        // declaring it, and a class this run declares holds neither prelude
+        // members nor classpath placeholders: there is nothing for the scan
+        // below to find. The namer enters members before the class is
+        // recorded as a source class, so it is recognised by being newer
+        // than the prelude. Skipping the scan keeps entering an `object` of
+        // thousands of members linear.
+        if owner.0 >= self.prelude_end && self.get(owner).kind != SymKind::Package {
             return;
         }
         let name = self.get(id).name.clone();
@@ -8603,8 +8623,15 @@ impl SymbolTable {
                     t = self.expand_in_type(p, &t);
                 }
                 let t = subst_refine_aliases(self, decls, &t);
-                if crate::prefix::view_prefix(from).is_some() {
-                    self.subst_as_seen_from(from, &t)
+                if let Some(pre) = crate::prefix::view_prefix(from) {
+                    // An inner class's members are written in its enclosing
+                    // class's vocabulary, type members included: `trait
+                    // CompA { type KA; class InnerA(val k: KA) }` seen
+                    // through `AppA.InnerA`, with `type KA = Int` in `AppA`,
+                    // has a `k: Int`. The walk instantiates the enclosing
+                    // class's parameters; its aliases are the prefix's.
+                    let t = self.subst_as_seen_from(from, &t);
+                    self.expand_in_type(pre, &t)
                 } else {
                     t
                 }

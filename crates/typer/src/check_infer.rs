@@ -4394,6 +4394,12 @@ impl Typer {
                     byname_type_marker: false,
                 };
                 *tree = self.fill_conv_implicits(id, &from, applied, span);
+                // A conversion may be a macro: shapeless's `Nat.apply(i:
+                // Int): Nat = macro NatMacros.materializeWidened` is what
+                // turns the `2` of `hlist.take(2)` into a `Nat`. The view is
+                // built here, after the call site was typed, so nothing else
+                // would expand it and the sweep reported it unexpanded.
+                self.expand_macro_application(tree);
                 return;
             }
             ImplicitSearch::Ambiguous(ids) => {

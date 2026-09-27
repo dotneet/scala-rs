@@ -2607,7 +2607,9 @@ impl Typer {
                     .st
                     .subst_tparams(class_id, &written_targs, &self.st.get(id).ty);
                 let ty = match &outer_prefix {
-                    Some(p) => self.st.subst_as_seen_from(p, &ty),
+                    Some(p) => self
+                        .st
+                        .expand_in_type(p, &self.st.subst_as_seen_from(p, &ty)),
                     None => ty,
                 };
                 match ty {
@@ -2980,9 +2982,14 @@ impl Typer {
                 self.st.subst_tparams(class_id, targs, &ty)
             };
             // An inner class's parameters, read through the prefix it is
-            // instantiated on (`Typer::ctor_outer_prefix`).
+            // instantiated on (`Typer::ctor_outer_prefix`): its type
+            // arguments and its aliases for the enclosing class's abstract
+            // type members (`new InnerA(k)` in an `object AppA extends CompA`
+            // with `type KA = Int` takes an `Int`).
             let ty = match &self.ctor_prefix {
-                Some(p) => self.st.subst_as_seen_from(p, &ty),
+                Some(p) => self
+                    .st
+                    .expand_in_type(p, &self.st.subst_as_seen_from(p, &ty)),
                 None => ty,
             };
             match ty {

@@ -92,6 +92,8 @@ mod inherited_bridge_owner;
 mod inherited_extension_pickle;
 #[path = "../inherited_generic_binary.rs"]
 mod inherited_generic_binary;
+#[path = "../inner_class_type_members.rs"]
+mod inner_class_type_members;
 #[path = "../innerclasses.rs"]
 mod innerclasses;
 #[path = "../integral.rs"]

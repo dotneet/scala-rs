@@ -863,6 +863,7 @@ impl Typer {
         // for every standard-library type would change the prelude's carefully
         // limited hierarchy and can expose duplicate methods.
         completed |= self.warm_buildfrom_source_parents(wanted);
+        completed |= self.warm_view_source_parents(wanted);
         let mut cands = self.implicits_in_scope();
         // The companion candidates too. `search_implicit_uncached` falls back
         // to `companion_implicits(pt)` when nothing lexical fits, so those are
@@ -979,8 +980,10 @@ impl Typer {
         // standard-library hierarchies.
         let mut nested = Vec::new();
         let mut concrete_nested = Vec::new();
+        let mut partial_nested = Vec::new();
         let mut nested_seen = crate::implicits::TypeSet::default();
         let mut concrete_seen = crate::implicits::TypeSet::default();
+        let mut partial_seen = crate::implicits::TypeSet::default();
         for &id in &cands {
             if !self.only_implicit_clauses(id) {
                 continue;
@@ -1075,6 +1078,9 @@ impl Typer {
                                 Type::TypeParam(_) | Type::Wildcard | Type::BoundedWildcard { .. }
                             )
                         }) {
+                            if partial_seen.insert(&p) {
+                                partial_nested.push(p);
+                            }
                             continue;
                         }
                         if concrete_seen.insert(&p) {
@@ -1086,6 +1092,26 @@ impl Typer {
         }
         for n in nested.iter().chain(&concrete_nested) {
             completed |= self.warm_implicit_scope_once(n);
+        }
+        // A clause still open in the result it computes (`Reverse0[HNil, L,
+        // Out0]` under shapeless's `Reverse.reverse`) is not warmed
+        // recursively, but the rules that answer it derive themselves one
+        // level at a time (`hlistReverse` asks for another `Reverse0`), and
+        // each level needs its own copy of their type parameters, or the
+        // second level unifies a rule's `Out` with the first level's open
+        // `Out` -- the same symbol -- and fails. Prepare those copies for the
+        // companion's candidates, and go no further.
+        for p in &partial_nested {
+            completed |= self.warm_implicit_scope_once(p);
+            for id in self.companion_implicits(p) {
+                let fits = match &*self.implicit_candidate_ty(id) {
+                    Type::Method { ret, .. } => self.plausibly_inhabits_refinement(ret, p),
+                    other => self.plausibly_inhabits_refinement(other, p),
+                };
+                if fits {
+                    completed |= self.prepare_implicit_instances(id, instance_depth);
+                }
+            }
         }
         if !concrete_nested.is_empty() {
             completed |= self.warm_implicit_candidates_at(&concrete_nested, depth + 1, seen);
@@ -1122,6 +1148,41 @@ impl Typer {
     /// loading their complete member sets can perturb the hand-written
     /// prelude. Only parent declarations are attached here, and only for the
     /// concrete source constructor of a BuildFrom search.
+    /// The same for a view `From => To` whose `To` names a class `From`'s
+    /// class does not reach in the prelude's hierarchy. Predef's
+    /// `tuple2ToZippedOps(xs, ys).zipped` asks for `List[Int] =>
+    /// IterableOps[El1, Iterable, It1] with It1`; the identity answers it,
+    /// but only once `List`'s pickled parents say it is an `IterableOps` at
+    /// all. Only after a search failed, as for `BuildFrom`.
+    fn warm_view_source_parents(&mut self, wanted: &[Type]) -> bool {
+        let mut work = Vec::new();
+        for ty in wanted {
+            let Type::Function { params, ret } = ty else {
+                continue;
+            };
+            let [from] = &params[..] else {
+                continue;
+            };
+            let Some(source) = self.st.class_sym_of(from) else {
+                continue;
+            };
+            let targets: Vec<SymbolId> = match ret.as_ref() {
+                Type::Refined { parents, .. } => parents
+                    .iter()
+                    .filter_map(|p| self.st.class_sym_of(p))
+                    .collect(),
+                t => self.st.class_sym_of(t).into_iter().collect(),
+            };
+            if targets
+                .iter()
+                .any(|&t| t != source && !self.st.is_ancestor_of(t, source))
+            {
+                work.push(source);
+            }
+        }
+        self.warm_source_parents(work)
+    }
+
     fn warm_buildfrom_source_parents(&mut self, wanted: &[Type]) -> bool {
         let mut work = Vec::new();
         for ty in wanted {
@@ -1139,6 +1200,11 @@ impl Typer {
             };
             work.push(source_sym);
         }
+        self.warm_source_parents(work)
+    }
+
+    /// Attach the pickled parents of `work` and, transitively, of theirs.
+    fn warm_source_parents(&mut self, mut work: Vec<SymbolId>) -> bool {
         work.sort_by_key(|id| id.0);
         work.dedup_by_key(|id| id.0);
 
@@ -2042,6 +2108,52 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// Enter the library `Predef`'s implicit members the prelude does not
+    /// declare, the way `import scala.Predef._` would.
+    ///
+    /// The prelude writes `Predef` by hand and copies its members into the
+    /// base scope (`prelude::import_members`); an implicit it never wrote was
+    /// in no scope at all, so no view search could find it.
+    /// `(xs, ys).zipped` is `tuple2ToZippedOps`, `x.ensuring(p)` is the
+    /// implicit class `Ensuring`, `d.formatted(f)` is `StringFormat`: each
+    /// was "not a member". A name the prelude declares keeps its hand-written
+    /// member.
+    pub(crate) fn supply_library_predef_implicits(&mut self) {
+        let predef = self.st.predef;
+        if !self.library_abi || predef.is_none() || self.st.predef_superseded {
+            return;
+        }
+        let cls = match self.st.get(predef).ty {
+            Type::ModuleRef(c) => c,
+            _ => predef,
+        };
+        let names = self
+            .pickle
+            .implicit_member_names(&self.st, &mut self.binary, cls);
+        let scope = self.st.prelude_scope;
+        for name in names {
+            // A term: an implicit class's conversion shares its name with the
+            // class, which the class file already entered.
+            if self.st.get(cls).members.iter().any(|&m| {
+                let s = self.st.get(m);
+                s.name == name && matches!(s.kind, SymKind::Method | SymKind::Term)
+            }) {
+                continue;
+            }
+            let installed = self
+                .pickle
+                .complete(&mut self.st, &mut self.binary, cls, &name);
+            for id in installed {
+                if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
+                    continue;
+                }
+                if let Some(sc) = self.st.scopes.get_mut(scope) {
+                    sc.enter(&name, id);
+                }
+            }
+        }
     }
 
     /// Read the members a structural type names from `subject`'s pickle, so

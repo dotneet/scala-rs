@@ -32,6 +32,8 @@ mod seqpickle;
 mod setapply;
 #[path = "../setmap.rs"]
 mod setmap;
+#[path = "../shapeless_hlist_ops.rs"]
+mod shapeless_hlist_ops;
 #[path = "../sibover.rs"]
 mod sibover;
 #[path = "../signature.rs"]

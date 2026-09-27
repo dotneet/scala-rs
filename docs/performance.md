@@ -650,6 +650,42 @@ and one file of it now takes 29.6 s rather than 47.2 s (scalac: about
 on the pipe; the reads already block on the pipe itself, so what is left
 is the number of trips, which the engine's lazily completed symbols set.
 
+### Scale: one large object, many files, deep implicits (2026-09-27)
+
+Eleven more shapes: one `object` of thousands of members, 400 tiny files,
+deep source-defined type-class derivation, shapeless `HList` operations,
+F-bounded hierarchies, 40-deep alias chains, a 20-component cake,
+anonymous classes, 22-element tuples, `@specialized` classes and 500
+implicits imported at once. All but one ran in 0.06--0.39 of scalac's time.
+Three did not compile at first and do now: the cake pattern
+(`inner_class_type_members.rs`), the tuple `zipped` of `Predef`
+(`predef_library_implicits.rs`) and shapeless's `take`/`reverse`
+(`shapeless_hlist_ops.rs`).
+
+The exception grew faster than the file: `bigfile` (one `object`, each
+member a case class, a method and a value) took 0.45, 1.14, 2.07 and 5.0 s
+for 500, 1000, 1500 and 2500 members. Three scans of the object's member
+list ran once per member:
+
+* completing a member's signature lazily re-created the scope stack it was
+  declared in, and copied the object's scope -- thousands of names -- each
+  time. A scope's table is now shared until it is written;
+* every implicit search in a body collected the enclosing classes' members
+  named like a candidate, reading each member of the object; the result is
+  kept while the member lists stand still;
+* entering each case class looked for a prelude symbol to shadow among the
+  object's members (there are none in a class this run declares), and for
+  its companion without the per-class cache `companion_module` keeps.
+
+| members | typecheck before | after | scalac (whole compile) |
+|---:|---:|---:|---:|
+| 1000 | 0.37 s | 0.29 s | 6.6 s |
+| 2500 | 1.36 s | 0.74 s | 11.0 s |
+| 5000 | 4.55 s | 1.76 s | (class too large) |
+
+What is left grows slowly: a member looked up by a name nobody asked for
+before still reads the owner's member list once.
+
 ### What is left
 
 From the profiles of 2026-09-24:

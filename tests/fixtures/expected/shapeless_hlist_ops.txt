@@ -1,0 +1,6 @@
+1 :: a :: HNil
+true :: a :: 1 :: HNil
+true
+3
+2.5 :: false :: b :: 1 :: HNil
+List(x)

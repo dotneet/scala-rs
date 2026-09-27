@@ -626,7 +626,18 @@ pub(crate) fn dominates(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
             match complexity(new_pt).cmp(&complexity(open_pt)) {
                 std::cmp::Ordering::Less => false,
                 std::cmp::Ordering::Greater => !driver_shrinks,
-                std::cmp::Ordering::Equal => !driver_shrinks,
+                // nsc's `dominates` at equal complexity: only the same type
+                // again (`dtor =:= dted`). shapeless's `Reverse0[P, L, Out]`
+                // moves one element from `L` to the accumulator `P` at every
+                // step, so the size stays and the type changes; reading that
+                // as divergence made `hlist.reverse` "diverging implicit
+                // expansion ... starting with method hlistReverse".
+                std::cmp::Ordering::Equal => {
+                    !driver_shrinks
+                        && (new_pt == open_pt
+                            || (typer.st.is_sub_type(new_pt, open_pt)
+                                && typer.st.is_sub_type(open_pt, new_pt)))
+                }
             }
         }
         // A bare type parameter target (`implicit def loop[A](implicit a: A): A`)
@@ -972,11 +983,39 @@ impl Typer {
         // thousands of members and a handful of implicit names.
         let names: rustc_hash::FxHashSet<&str> =
             cands.iter().map(|&c| self.st.get(c).name.as_str()).collect();
-        let declarations: Vec<SymbolId> = lin
-            .iter()
-            .flat_map(|id| self.st.get(*id).members.iter().copied())
-            .filter(|&m| names.contains(self.st.get(m).name.as_str()))
-            .collect();
+        // Every search in a body asks this again of the same enclosing class
+        // and mostly the same names, and the scan reads each member of the
+        // class once: typing an `object` of 5000 members this way was
+        // quadratic in its length. The member lists are part of the key --
+        // their generation, and their lengths, which a list edited in place
+        // changes -- so the answer is the scan's.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut sorted: Vec<&str> = names.iter().copied().collect();
+            sorted.sort_unstable();
+            let mut h = rustc_hash::FxHasher::default();
+            sorted.hash(&mut h);
+            let lengths: usize = lin.iter().map(|id| self.st.get(*id).members.len()).sum();
+            (start.0, h.finish(), self.st.member_graph_gen(), lengths)
+        };
+        let cached = self.shadowing_decls_cache.borrow().get(&key).cloned();
+        let declarations = match cached {
+            Some(hit) => hit,
+            None => {
+                let found: std::rc::Rc<Vec<SymbolId>> = std::rc::Rc::new(
+                    lin.iter()
+                        .flat_map(|id| self.st.get(*id).members.iter().copied())
+                        .filter(|&m| names.contains(self.st.get(m).name.as_str()))
+                        .collect(),
+                );
+                let mut cache = self.shadowing_decls_cache.borrow_mut();
+                if cache.len() >= 1024 {
+                    cache.clear();
+                }
+                cache.insert(key, found.clone());
+                found
+            }
+        };
         let receiver = self.st.self_type_of_class(self.st.this_class);
         // Once per symbol: the comparison below asks it for every pair, and
         // each answer is an as-seen-from substitution over the whole type.
@@ -1987,7 +2026,15 @@ impl Typer {
                             .unwrap_or(*prior)
                             == origin
                             && (complexity(pt) < complexity(previous)
-                                || contravariant_driver_shrinks(self, pt, previous))
+                                || contravariant_driver_shrinks(self, pt, previous)
+                                // Progress at the same size, as `dominates`
+                                // counts it: shapeless's `Reverse0` moves an
+                                // element to the accumulator at each step,
+                                // so an eight-element `reverse` is ten
+                                // levels deep. The same type again is still
+                                // cut off.
+                                || (complexity(pt) == complexity(previous)
+                                    && !dominates(self, pt, previous)))
                     });
                 // Depth alone is not a recursion proof: a valid derivation
                 // may be deeper than the historical cutoff (e.g. a 12-level
@@ -4420,11 +4467,23 @@ impl Typer {
                 // install `java.lang.String#toUpperCase(Locale)` onto Predef
                 // String and shadow StringOps.
                 self.ensure_java_loaded(cls, span);
+                // A member `Any` or `AnyRef` declares is the receiver's own
+                // already, with the same access, so no view is ever needed to
+                // reach it. Counting it let `Predef`'s `Ensuring` -- a view
+                // from every type, inheriting `AnyRef`'s protected `clone` --
+                // win the lexical pool for `foo.clone(1, 2)` and hide the
+                // companion's `Enrich.clone` (`pos/t10206`).
+                let universal = |m: SymbolId| {
+                    let owner = self.st.get(m).owner;
+                    owner == self.st.any_sym
+                        || owner == self.st.anyref_sym
+                        || self.st.get(owner).jvm_name == "java/lang/Object"
+                };
                 let mut members: Vec<SymbolId> = self
                     .st
                     .lookup_member(cls, name)
                     .into_iter()
-                    .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
+                    .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC) && !universal(m))
                     .collect();
                 // The hand-written prelude is not a complete `StringOps` (or
                 // `ArrayOps`, …), and until now nothing asked the library pickle
@@ -7352,13 +7411,21 @@ mod memo_tests {
         assert!(!dominates(&typer, &shrinking_input, &open));
 
         // A decrease in an invariant or covariant slot is not an input
-        // decrease and must retain the ordinary complexity guard.
+        // decrease, so the ordinary complexity guard decides -- nsc's: a
+        // strictly larger target dominates, and at the same size only the
+        // same type again. Moving size between slots at the same total is a
+        // different type and not a divergence; shapeless's `Reverse0`
+        // derivation is exactly that shape.
         let covariant_open = shape_ty(Type::Int, Type::Int, large.clone());
         let covariant_only = shape_ty(Type::Int, large.clone(), Type::Int);
-        assert!(dominates(&typer, &covariant_only, &covariant_open));
+        assert!(!dominates(&typer, &covariant_only, &covariant_open));
+        let covariant_grows = shape_ty(Type::Int, large.clone(), large.clone());
+        assert!(dominates(&typer, &covariant_grows, &covariant_open));
         let invariant_open = shape_ty(Type::Int, large.clone(), Type::Int);
         let invariant_only = shape_ty(Type::Int, Type::Int, large.clone());
-        assert!(dominates(&typer, &invariant_only, &invariant_open));
+        assert!(!dominates(&typer, &invariant_only, &invariant_open));
+        let invariant_grows = shape_ty(Type::Int, large.clone(), large.clone());
+        assert!(dominates(&typer, &invariant_grows, &invariant_open));
 
         // An unchanged recursive target remains a divergence.
         assert!(dominates(&typer, &open, &open));

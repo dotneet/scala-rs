@@ -8258,7 +8258,9 @@ fn implicit_class_conversion_from(
     owner: &str,
     m: &scala_rs_pickle::Member,
 ) -> bool {
-    if !m.is_implicit_class_conversion() || class_sym.0 < st.prelude_end {
+    if !m.is_implicit_class_conversion()
+        || (class_sym.0 < st.prelude_end && !prelude_predef_lacks(st, class_sym, &m.name))
+    {
         return false;
     }
     let owner = owner.replace('/', ".").replace('$', ".");
@@ -8270,6 +8272,42 @@ fn implicit_class_conversion_from(
     let quasiquote =
         owner.trim_end_matches('.') == "scala.reflect.api.Quasiquotes" && m.name == "Quasiquote";
     !duration && !quasiquote
+}
+
+/// Whether `class_sym` is the prelude's hand-written `Predef` and it models
+/// the implicit class `name` neither by its name nor by any conversion into
+/// it. The prelude writes `Predef`'s conversions itself, sometimes under
+/// another name (`any2ArrowAssoc` for `ArrowAssoc`), and those must not be
+/// doubled; `Ensuring` and `StringFormat` it never wrote, and without the
+/// pickled ones `x.ensuring(p)` and `d.formatted(f)` were not members.
+fn prelude_predef_lacks(st: &SymbolTable, class_sym: SymbolId, name: &str) -> bool {
+    let predef = st.predef;
+    if predef.is_none() || st.predef_superseded {
+        return false;
+    }
+    let predef_class = match st.get(predef).ty {
+        Type::ModuleRef(c) => c,
+        _ => predef,
+    };
+    if class_sym != predef_class {
+        return false;
+    }
+    let target = format!("scala/Predef${name}");
+    !st.get(class_sym).members.iter().any(|&m| {
+        let s = st.get(m);
+        if !matches!(s.kind, SymKind::Method | SymKind::Term) {
+            return false;
+        }
+        let result = match &s.ty {
+            Type::Method { ret, .. } => ret.as_ref(),
+            t => t,
+        };
+        s.name == name
+            || (s.flags.contains(Flags::IMPLICIT)
+                && st
+                    .class_sym_of(result)
+                    .is_some_and(|c| st.get(c).jvm_name == target))
+    })
 }
 
 /// The unspecialized class a `@specialized` variant was generated from.

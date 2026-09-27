@@ -341,6 +341,12 @@ pub(crate) type OuterImplicits = (
     std::rc::Rc<Vec<(SymbolId, String)>>,
 );
 
+/// See [`Typer::shadowing_decls_cache`]: keyed by where the walk starts, a
+/// hash of the names asked for, `member_graph_gen` and the summed lengths of
+/// the member lists read.
+pub(crate) type ShadowingDecls =
+    rustc_hash::FxHashMap<(u32, u64, u64, usize), std::rc::Rc<Vec<SymbolId>>>;
+
 pub struct Typer {
     pub st: SymbolTable,
     pub diags: Vec<Diagnostic>,
@@ -725,6 +731,10 @@ pub struct Typer {
     pub(crate) idle_candidate_warms: (u64, Vec<IdleWarm>),
     /// [`Typer::outer_implicits`]' last answers, most recent last.
     pub(crate) outer_implicits_cache: std::cell::RefCell<Vec<OuterImplicits>>,
+    /// The declarations `shadow_inherited_implicits` compares its candidates
+    /// with, by where the walk starts, which names it asked for, and the
+    /// state of the member lists it read.
+    pub(crate) shadowing_decls_cache: std::cell::RefCell<ShadowingDecls>,
     /// [`Typer::companion_implicits_of_class`]'s answers while the class
     /// graph and its member lists (`member_graph_gen`) stand still: the
     /// implicit members, and the module each one inherited from a mixed-in
@@ -1229,6 +1239,9 @@ pub fn typecheck_units_src(
     // `crate::predef_reimport`; a no-op for every program that does not
     // define `scala.Predef` itself.
     crate::predef_reimport::reimport_source_predef(&mut t.st);
+    // The library's `Predef` stands otherwise; the implicits the prelude did
+    // not write by hand are read from its pickle.
+    t.supply_library_predef_implicits();
     phase!("signatures");
     // Default arguments are bodies, not signatures: typing them during the
     // pass above would let one name only the members of the units that come
@@ -1420,6 +1433,7 @@ impl Typer {
             derivation_scopes_warmed: Default::default(),
             idle_candidate_warms: Default::default(),
             outer_implicits_cache: Default::default(),
+            shadowing_decls_cache: Default::default(),
             scope_search_cache: Default::default(),
             overridden_cache: Default::default(),
             overload_groups: HashMap::new(),

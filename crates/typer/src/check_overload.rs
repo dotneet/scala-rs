@@ -2938,6 +2938,8 @@ impl Typer {
             };
             let mut filled = self.fill_conv_implicits(id, &from, applied, span);
             filled.ty = solved.clone();
+            // As in `adapt`: a macro conversion is expanded where it is put.
+            self.expand_macro_application(&mut filled);
             args[i] = filled;
             if let Some(t) = arg_tys.get_mut(i) {
                 *t = solved;

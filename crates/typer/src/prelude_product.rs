@@ -224,17 +224,14 @@ pub(crate) fn link_companion_function(
 fn companion_module_class(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> {
     let name = st.get(class_id).name.clone();
     let owner = st.get(class_id).owner;
-    let m = st
-        .get(owner)
-        .members
-        .iter()
-        .copied()
-        .find(|&s| st.get(s).kind == SymKind::Module && st.get(s).name == name)
-        .or_else(|| {
-            st.lookup(&name)
-                .into_iter()
-                .find(|&s| st.get(s).kind == SymKind::Module && st.get(s).owner == owner)
-        })?;
+    // `companion_module` is the same scan of the owner's members, kept per
+    // class: asked for every case class of an `object` of thousands, the
+    // plain scan made typing it quadratic.
+    let m = st.companion_module(class_id).or_else(|| {
+        st.lookup(&name)
+            .into_iter()
+            .find(|&s| st.get(s).kind == SymKind::Module && st.get(s).owner == owner)
+    })?;
     match st.get(m).ty {
         Type::ModuleRef(c) => Some(c),
         _ => Some(m),
