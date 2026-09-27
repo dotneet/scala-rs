@@ -2334,9 +2334,46 @@ public final class ScalaRsMacroEngine {
      * falls back to class loading only for a name nobody entered, so a class
      * entered here is found and a class file is never looked for. */
     static Object sourceSymbol(long id) throws Exception {
+        return sourceSymbol(id, java.util.Collections.emptyMap());
+    }
+
+    /** Fetch independent symbol descriptions together, but construct their
+     * mutable mirror symbols in the original order and only when requested. */
+    static java.util.Map<Long, Sexp> sourceSymbolMetadata(List<Long> ids) throws Exception {
+        java.util.LinkedHashSet<Long> missing = new java.util.LinkedHashSet<>();
+        for (Long id : ids) if (!sourceSymbols.containsKey(id)) missing.add(id);
+        if (missing.size() < 2) return java.util.Collections.emptyMap();
+        List<Long> ordered = new ArrayList<>(missing);
+        java.util.Map<Long, Sexp> metadata = new java.util.HashMap<>();
+        for (int from = 0; from < ordered.size(); from += 32) {
+            int until = Math.min(from + 32, ordered.size());
+            StringBuilder request = new StringBuilder("(q symbols");
+            for (int at = from; at < until; at++) request.append(' ').append(ordered.get(at));
+            Sexp answer = query(request.append(')').toString());
+            if (answer.items.size() != until - from + 2
+                    || !"a".equals(answer.items.get(0).text())
+                    || !"symbols".equals(answer.items.get(1).text())) {
+                throw gap("scala-rs returned a malformed symbol batch");
+            }
+            for (int at = from; at < until; at++) {
+                Sexp row = answer.items.get(at - from + 2);
+                if (!row.isList() || row.items.size() < 7
+                        || !"a".equals(row.items.get(0).text())
+                        || !"symbol".equals(row.items.get(1).text())
+                        || !ordered.get(at).toString().equals(row.items.get(2).text())) {
+                    throw gap("scala-rs returned a malformed symbol batch entry");
+                }
+                metadata.put(ordered.get(at), row);
+            }
+        }
+        return metadata;
+    }
+
+    static Object sourceSymbol(long id, java.util.Map<Long, Sexp> metadata) throws Exception {
         Object known = sourceSymbols.get(id);
         if (known != null) return known;
-        Sexp answer = query("(q symbol " + id + ")");
+        Sexp answer = metadata.get(id);
+        if (answer == null) answer = query("(q symbol " + id + ")");
         String kind = answer.items.get(3).text();
         String name = answer.items.get(4).text();
         String full = answer.items.get(5).text();
@@ -2385,7 +2422,7 @@ public final class ScalaRsMacroEngine {
                 // mirror to unpickle the unrelated package object.
             }
         }
-        Object owner = parent == 0 ? call(mirror, "EmptyPackageClass", 0) : sourceSymbol(parent);
+        Object owner = parent == 0 ? call(mirror, "EmptyPackageClass", 0) : sourceSymbol(parent, metadata);
         known = sourceSymbols.get(id);
         if (known != null) return known;
         if (!binaryName.isEmpty() && Boolean.TRUE.equals(call(owner, "isPackageClass", 0))) {
@@ -2464,7 +2501,7 @@ public final class ScalaRsMacroEngine {
         if ("Class".equals(kind)) {
             enterInOwner(owner, symbol);
             long companion = companionId(id);
-            if (companion != 0) sourceSymbol(companion);
+            if (companion != 0) sourceSymbol(companion, metadata);
         }
         return symbol;
     }
@@ -2681,12 +2718,22 @@ public final class ScalaRsMacroEngine {
     }
 
     /** A declaration of a class described lazily (`crate::expand_mirror`). */
-    static Object lazyDecl(Object owner, Sexp d) throws Exception {
+    static void collectDeclSymbolIds(Sexp d, List<Long> ids) {
         String form = d.items.get(0).atom;
-        if ("ds".equals(form)) return sourceSymbol(Long.parseLong(d.items.get(1).text()));
+        if ("ds".equals(form)) ids.add(Long.parseLong(d.items.get(1).text()));
         if ("scoped".equals(form)) {
-            Object symbol = lazyDecl(owner, d.items.get(2));
-            call(symbol, "privateWithin_$eq", 1, sourceSymbol(Long.parseLong(d.items.get(1).text())));
+            ids.add(Long.parseLong(d.items.get(1).text()));
+            collectDeclSymbolIds(d.items.get(2), ids);
+        }
+    }
+
+    static Object lazyDecl(Object owner, Sexp d, java.util.Map<Long, Sexp> metadata) throws Exception {
+        String form = d.items.get(0).atom;
+        if ("ds".equals(form)) return sourceSymbol(Long.parseLong(d.items.get(1).text()), metadata);
+        if ("scoped".equals(form)) {
+            Object symbol = lazyDecl(owner, d.items.get(2), metadata);
+            call(symbol, "privateWithin_$eq", 1,
+                sourceSymbol(Long.parseLong(d.items.get(1).text()), metadata));
             return symbol;
         }
         Object pos = call(universe, "NoPosition", 0);
@@ -2745,15 +2792,27 @@ public final class ScalaRsMacroEngine {
         if ("bounds".equals(kind)) return call(internal, "typeBounds", 2,
             typeFor(s.items.get(1)), typeFor(s.items.get(2)));
         if ("poly".equals(kind)) {
+            List<Sexp> arguments = s.items.get(1).items.subList(1, s.items.get(1).items.size());
+            List<Long> ids = new ArrayList<>();
+            for (Sexp id : arguments) ids.add(Long.parseLong(id.text()));
+            java.util.Map<Long, Sexp> metadata = sourceSymbolMetadata(ids);
             List<Object> params = new ArrayList<>();
-            for (Sexp id : s.items.get(1).items.subList(1, s.items.get(1).items.size())) {
-                params.add(sourceSymbol(Long.parseLong(id.text())));
+            for (Long id : ids) {
+                params.add(sourceSymbol(id, metadata));
             }
             return call(internal, "polyType", 2, list(params), sourceInfo(owner, s.items.get(2)));
         }
         if ("method".equals(kind)) {
+            List<Sexp> arguments = s.items.get(1).items.subList(1, s.items.get(1).items.size());
+            List<Long> ids = new ArrayList<>();
+            for (Sexp arg : arguments) {
+                if (!"argn".equals(arg.items.get(0).atom)) {
+                    ids.add(Long.parseLong(arg.items.get(1).text()));
+                }
+            }
+            java.util.Map<Long, Sexp> metadata = sourceSymbolMetadata(ids);
             List<Object> params = new ArrayList<>();
-            for (Sexp arg : s.items.get(1).items.subList(1, s.items.get(1).items.size())) {
+            for (Sexp arg : arguments) {
                 if ("argn".equals(arg.items.get(0).atom)) {
                     // A parameter with no scala-rs symbol of its own: nsc's
                     // `x$1`, or a case constructor's parameter, whose symbol
@@ -2765,7 +2824,7 @@ public final class ScalaRsMacroEngine {
                     params.add(param);
                     continue;
                 }
-                Object param = sourceSymbol(Long.parseLong(arg.items.get(1).text()));
+                Object param = sourceSymbol(Long.parseLong(arg.items.get(1).text()), metadata);
                 call(param, "setInfo", 1, typeFor(arg.items.get(2)));
                 params.add(param);
             }
@@ -2779,14 +2838,26 @@ public final class ScalaRsMacroEngine {
         if ("classinfo".equals(kind)) {
             List<Object> parents = new ArrayList<>();
             for (Sexp ty : s.items.get(1).items.subList(1, s.items.get(1).items.size())) parents.add(typeFor(ty));
+            List<Long> ids = new ArrayList<>();
+            for (Sexp decl : s.items.get(2).items.subList(1, s.items.get(2).items.size())) {
+                collectDeclSymbolIds(decl, ids);
+            }
+            for (Sexp field : s.items.subList(3, s.items.size())) {
+                if (field.isList() && !field.items.isEmpty() && "children".equals(field.items.get(0).text())) {
+                    for (Sexp child : field.items.subList(1, field.items.size())) {
+                        ids.add(Long.parseLong(child.text()));
+                    }
+                }
+            }
+            java.util.Map<Long, Sexp> metadata = sourceSymbolMetadata(ids);
             List<Object> decls = new ArrayList<>();
             for (Sexp decl : s.items.get(2).items.subList(1, s.items.get(2).items.size())) {
-                decls.add(lazyDecl(owner, decl));
+                decls.add(lazyDecl(owner, decl, metadata));
             }
             for (Sexp field : s.items.subList(3, s.items.size())) {
                 if (field.isList() && !field.items.isEmpty() && "children".equals(field.items.get(0).text())) {
                     for (Sexp child : field.items.subList(1, field.items.size()))
-                        call(owner, "addChild", 1, sourceSymbol(Long.parseLong(child.text())));
+                        call(owner, "addChild", 1, sourceSymbol(Long.parseLong(child.text()), metadata));
                 }
             }
             return call(internal, "classInfoType", 3, list(parents), call(internal, "newScopeWith", 1, seq(decls)), owner);

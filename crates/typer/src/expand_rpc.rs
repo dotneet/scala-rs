@@ -56,6 +56,7 @@ pub(crate) fn query_kind(items: &[Sexp]) -> &'static str {
         "enclosingOwner" => "enclosingOwner",
         "functionSymbol" => "functionSymbol",
         "symbol" => "symbol",
+        "symbols" => "symbols",
         "symbolInfo" => "symbolInfo",
         "companion" => "companion",
         "modulePair" => "modulePair",
@@ -400,6 +401,7 @@ impl Typer {
                 self.invalidate_implicit_caches();
                 String::from("(a reset)")
             }
+            "symbols" => self.answer_mirror_symbols(items),
             "functionSymbol" | "symbol" | "symbolInfo" | "companion" | "modulePair" => {
                 self.answer_mirror_symbol(items)
             }
@@ -408,6 +410,31 @@ impl Typer {
                 "the macro engine asked scala-rs `{other}`, which it does not answer"
             )),
         }
+    }
+
+    fn answer_mirror_symbols(&mut self, items: &[Sexp]) -> String {
+        if items.len() < 3 || items.len() > 34 {
+            return refusal("a symbol batch must contain between 1 and 32 identities");
+        }
+        let mut answer = String::from("(a symbols");
+        for item in &items[2..] {
+            let Ok(id) = item.text().parse::<u32>() else {
+                return refusal("invalid mirror symbol identity");
+            };
+            let query = [
+                Sexp::Atom("q".into()),
+                Sexp::Atom("symbol".into()),
+                Sexp::Atom(id.to_string()),
+            ];
+            let single = self.answer_mirror_symbol(&query);
+            if !single.starts_with("(a symbol ") {
+                return single;
+            }
+            answer.push(' ');
+            answer.push_str(&single);
+        }
+        answer.push(')');
+        answer
     }
 
     fn answer_accessible(&mut self, items: &[Sexp]) -> String {
@@ -1631,6 +1658,25 @@ mod tests {
 
     fn atom(value: &str) -> Sexp {
         Sexp::Atom(value.to_string())
+    }
+
+    #[test]
+    fn symbol_batch_preserves_individual_answers_and_order() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let ids = [typer.st.int_sym.0, typer.st.boolean_sym.0];
+        let single = ids.map(|id| {
+            typer.answer_query(&[atom("q"), atom("symbol"), atom(&id.to_string())])
+        });
+        let batch = typer.answer_query(&[
+            atom("q"),
+            atom("symbols"),
+            atom(&ids[0].to_string()),
+            atom(&ids[1].to_string()),
+        ]);
+        assert_eq!(batch, format!("(a symbols {} {})", single[0], single[1]));
+        assert!(typer
+            .answer_query(&[atom("q"), atom("symbols"), atom("99999999")])
+            .starts_with("(no "));
     }
 
     fn string(value: &str) -> Sexp {

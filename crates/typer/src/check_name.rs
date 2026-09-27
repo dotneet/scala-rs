@@ -1618,6 +1618,7 @@ impl Typer {
             // walk overrides; entering both immediately makes one wildcard
             // import look like two competing implicit candidates.
             let mut pending: Vec<(String, Vec<SymbolId>)> = Vec::new();
+            let mut pending_index = rustc_hash::FxHashMap::<String, usize>::default();
             // `import o._` imports what `o` *has*, not only what it declares
             // (SLS 4.7). `cats.syntax.all` is an object whose own member list
             // is empty: every `toFlatMapOps` / `catsSyntaxApplicativeId` comes
@@ -1843,9 +1844,10 @@ impl Typer {
                     if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {
                         continue;
                     }
-                    if let Some((_, members)) = pending.iter_mut().find(|(name, _)| name == &n) {
-                        members.push(m);
+                    if let Some(&at) = pending_index.get(&n) {
+                        pending[at].1.push(m);
                     } else {
+                        pending_index.insert(n.clone(), pending.len());
                         pending.push((n, vec![m]));
                     }
                 }
