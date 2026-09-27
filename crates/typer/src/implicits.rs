@@ -6398,11 +6398,12 @@ impl Typer {
         {
             return None;
         }
-        // A member of the enclosing class is already reachable through `this`.
-        if !self.st.this_class.is_none()
-            && (owner == self.st.this_class
-                || crate::pickle_supply::inherits_from(&self.st, self.st.this_class, owner))
-        {
+        // A member of an enclosing class is already reachable through its
+        // `this`, as nsc selects it. Not only the innermost one: in cats'
+        // `EvalInstances` an anonymous instance's `Functor[Eval]` went
+        // through the companion `Eval`, whose `MODULE$` is still null while
+        // its parent constructor runs.
+        if self.st.enclosing_class_reaching(owner).is_some() {
             return None;
         }
         for sc in self.st.scopes.iter().rev() {

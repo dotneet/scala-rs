@@ -686,6 +686,60 @@ list ran once per member:
 What is left grows slowly: a member looked up by a name nobody asked for
 before still reads the owner's member list once.
 
+### Deep branches, literal lists and more shapes (2026-09-28)
+
+Two more rounds, 22 shapes: long methods, 700 locals, wide hierarchies,
+thousands of case objects, mixins, low-priority implicits, Java overloads,
+`BigDecimal` arithmetic, generic inference, tail recursion, sealed matches
+with nested patterns, closures, for-comprehensions, nested `try`/`finally`,
+literal collections, lazy vals, value classes, Peano arithmetic in
+implicits, extension methods and interpolators. Nineteen ran in 0.01--0.32
+of scalac's time; scalac spent 274 s on the case objects and 426 s on a
+60-case match with nested patterns, against our 2.0 and 2.5 s. circe's
+automatic derivation stays at 1.04, bound by macro round trips. The other
+two were slower than they should be.
+
+**Deeply nested branches.** Twelve levels of `if { val y = …; … } else
+(x match …)` took 1828 s against scalac's 460 s (both then reject the
+method as too large). Every `val` of every branch kept a slot of its own to
+the end of the method, so each branch target's stack map frame was as long
+as the method's locals, and emitting was quadratic. A block's locals now go
+out of scope at its end and their slots are reused, as javac does
+(`local_slot_reuse.rs`); the assembler forgets the released slots too, or a
+loop head records a type a later reuse contradicts. Each level doubles the
+source:
+
+| depth | source | before | after | scalac |
+|---:|---:|---:|---:|---:|
+| 7 | 0.3 MB | 0.26 s | 0.20 s | 2.3 s |
+| 8 | 0.6 MB | 0.70 s | 0.44 s | 3.5 s |
+| 9 | 1.3 MB | 2.04 s | 0.94 s | 4.3 s |
+
+**Long literal lists.** `List("s0", …, "s1499")` was quadratic in its
+length. Arguments are typed left to right, and each takes a prototype
+solved from the ones before it; repeated (formal, type) pairs reuse the
+last solution, but every literal has a constant type of its own, so every
+pair was new. Only a formal that mentions the callee's type variables and
+is not one itself uses that prototype, and `A*` is one itself: the solution
+is now computed only for formals that can use it, and the earlier formals
+are no longer rebuilt at every argument. 20 objects of 1500 elements each:
+
+| literal | before | after | scalac |
+|---|---:|---:|---:|
+| `List` of strings | 0.96 s | 0.06 s | 6.6 s |
+| `List` of ints | 0.58 s | 0.04 s | 1.2 s |
+| `Array` of ints | 0.60 s | 0.06 s | |
+| `Map` of `k -> v` | 0.79 s | 0.65 s | 4.2 s |
+
+A string list of 8000 elements type-checks in 0.026 s instead of 1.26 s.
+`Map` remains linear: it pays one extension search for `->` per element,
+since each literal receiver is a type of its own.
+
+The differential run of cats found an initialization-order bug on the way: an
+implicit member of an enclosing class was selected through a companion
+object that inherits it, whose `MODULE$` is still null while its parent's
+constructor runs (`outer_this_implicit.rs`).
+
 ### What is left
 
 From the profiles of 2026-09-24:

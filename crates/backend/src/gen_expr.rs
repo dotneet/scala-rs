@@ -752,10 +752,12 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
         // its `Any` lub, and only the arms whose own type was not `Unit` left
         // anything on the stack ("Inconsistent stackmap frames").
         TreeKind::Block { stats, expr } => {
+            let mark = frame.scope_mark();
             for s in stats {
                 gen_stat(asm, frame, ctx, s);
             }
             gen_stat(asm, frame, ctx, expr);
+            frame.release_to(asm, mark);
         }
         TreeKind::Try {
             block,
@@ -1004,6 +1006,7 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
             }
         }
         TreeKind::Block { stats, expr } => {
+            let mark = frame.scope_mark();
             for s in stats {
                 gen_stat(asm, frame, ctx, s);
             }
@@ -1024,6 +1027,7 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
             if !copied {
                 gen_expr(asm, frame, ctx, expr);
             }
+            frame.release_to(asm, mark);
         }
         TreeKind::If { cond, thenp, elsep } => {
             gen_if(asm, frame, ctx, cond, thenp, elsep, &tree.ty);

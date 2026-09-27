@@ -1180,6 +1180,10 @@ impl JvmSort {
 pub(crate) struct Frame {
     pub(crate) locals: HashMap<SymbolId, (u16, JvmSort)>,
     pub(crate) next_slot: u16,
+    /// The most slots ever in use at once: `max_locals`. A block's slots are
+    /// released when it ends ([`Frame::release_to`]), so `next_slot` alone
+    /// can end lower than what the method needed.
+    pub(crate) max_slot: u16,
     /// Exit labels of the enclosing `try ... finally` blocks, outermost first.
     /// A direct `return` from inside one has to run the finalizers before it
     /// leaves the method, so it jumps to the innermost exit instead of
@@ -1195,6 +1199,7 @@ impl Frame {
         Frame {
             locals: HashMap::new(),
             next_slot: 1,
+            max_slot: 1,
             finally_exits: Vec::new(),
             return_slot: None,
             tail_loop: None,
@@ -1219,7 +1224,42 @@ impl Frame {
             self.locals.insert(id, (slot, sort));
         }
         self.next_slot += sort.slots();
+        self.max_slot = self.max_slot.max(self.next_slot);
         slot
+    }
+
+    /// `max_locals` for the method this frame generated.
+    pub(crate) fn max_locals(&self) -> u16 {
+        self.max_slot.max(self.next_slot)
+    }
+
+    /// Where a block's own locals will start.
+    pub(crate) fn scope_mark(&self) -> u16 {
+        self.next_slot
+    }
+
+    /// End a block's scope: its locals are out of reach, and their slots are
+    /// free for what follows, as javac reuses them. (nsc does not, but ASM
+    /// computes its frames without paying for their length.) Every slot left
+    /// in use made each branch target's stack map frame -- one per `if` and
+    /// `case` -- longer, so a method of deeply nested branches, each with a
+    /// `val` of its own, had frames as long as its whole body and was emitted
+    /// in quadratic time. The slot parking a `return` for `finally` outlives
+    /// any block it was first asked for in.
+    ///
+    /// The assembler has to forget the released slots too
+    /// ([`Assembler::release_locals_from`]); both halves are done here.
+    pub(crate) fn release_to(&mut self, asm: &mut crate::code::Assembler, mark: u16) {
+        let floor = match self.return_slot {
+            Some(s) => mark.max(s + 2),
+            None => mark,
+        };
+        if floor >= self.next_slot {
+            return;
+        }
+        self.locals.retain(|_, (slot, _)| *slot < floor);
+        self.next_slot = floor;
+        asm.release_locals_from(floor);
     }
 
     /// Allocate the slot an incoming *parameter* occupies. Identical to
@@ -1236,12 +1276,14 @@ impl Frame {
             self.locals.insert(id, (slot, sort));
         }
         self.next_slot += param_slots(ty).max(sort.slots());
+        self.max_slot = self.max_slot.max(self.next_slot);
         slot
     }
 
     pub(crate) fn alloc_tmp(&mut self, sort: JvmSort) -> u16 {
         let slot = self.next_slot;
         self.next_slot += sort.slots();
+        self.max_slot = self.max_slot.max(self.next_slot);
         slot
     }
 

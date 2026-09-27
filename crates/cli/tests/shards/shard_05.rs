@@ -90,6 +90,8 @@ mod ordsummon;
 mod outer;
 #[path = "../outercapture.rs"]
 mod outercapture;
+#[path = "../outer_this_implicit.rs"]
+mod outer_this_implicit;
 #[path = "../overload_module.rs"]
 mod overload_module;
 #[path = "../overloadshadow.rs"]

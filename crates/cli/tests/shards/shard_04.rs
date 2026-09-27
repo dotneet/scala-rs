@@ -70,6 +70,8 @@ mod linearization;
 mod list_alias_implicit;
 #[path = "../listcore_text.rs"]
 mod listcore_text;
+#[path = "../local_slot_reuse.rs"]
+mod local_slot_reuse;
 #[path = "../localcc.rs"]
 mod localcc;
 #[path = "../localconv.rs"]

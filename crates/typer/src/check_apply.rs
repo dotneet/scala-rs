@@ -1309,6 +1309,8 @@ impl Typer {
         let mut seq_upto = 0usize;
         let mut seq_new = 0usize;
         let mut seq_solved: Option<(usize, Vec<(SymbolId, Type)>)> = None;
+        let mut seq_formals: Vec<Type> = Vec::new();
+        let mut seq_formals_upto = 0usize;
         for (ai, a) in args.iter_mut().enumerate() {
             if let Some(alts) = &argument_overloads {
                 self.overload_member_types.insert(fun.sym.0, alts.clone());
@@ -1569,10 +1571,42 @@ impl Typer {
                         if ai > 0 && !fun.sym.is_none() && !parameterless_method_ref =>
                     {
                         let params = paramss.first().cloned().unwrap_or_default();
-                        let prior: Vec<Type> = (0..ai)
-                            .filter_map(|i| param_at(&params, i).cloned())
-                            .collect();
-                        if prior.len() != arg_tys.len() {
+                        // Not for a parameter that *is* a type variable
+                        // (`A` in `apply[A](elems: A*)`): nsc joins such a
+                        // variable's arguments after typing them all, by
+                        // weak lub, and a prototype taken from the first
+                        // one decides that join early. `List('a', 1)`
+                        // typed the `1` against `Char`, narrowed the
+                        // literal, and built a `List[Char]` where scalac
+                        // builds a `List[Int]`. Nor for one that mentions
+                        // none of the callee's variables. Neither needs
+                        // the earlier arguments solved, which a literal
+                        // list -- each element its own constant type, so
+                        // each pair new -- paid for at every element.
+                        let callee_tparams = self.st.get(fun.sym).tparams.clone();
+                        let current = param_at(&params, ai).cloned().filter(|p| {
+                            !matches!(
+                                match p {
+                                    Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                                    other => other,
+                                },
+                                Type::TypeParam(_)
+                            ) && {
+                                let mut mentioned = Vec::new();
+                                collect_tparams(p, &mut mentioned);
+                                mentioned.iter().any(|tp| callee_tparams.contains(tp))
+                            }
+                        });
+                        // The earlier arguments' formals, extended as they
+                        // are typed rather than rebuilt at each one.
+                        while seq_formals_upto < ai {
+                            if let Some(p) = param_at(&params, seq_formals_upto) {
+                                seq_formals.push(p.clone());
+                            }
+                            seq_formals_upto += 1;
+                        }
+                        let prior = &seq_formals;
+                        if current.is_none() || prior.len() != arg_tys.len() {
                             None
                         } else {
                             while seq_upto < ai {
@@ -1594,9 +1628,11 @@ impl Typer {
                             let solved = match &seq_solved {
                                 Some((upto, solved)) if *upto >= seq_new => solved.clone(),
                                 _ => {
+                                    #[cfg(test)]
+                                    SEQUENTIAL_SOLVES.with(|n| n.set(n.get() + 1));
                                     let solved = self.infer_method_tparams_in(
                                         fun.sym,
-                                        &prior,
+                                        prior,
                                         &arg_tys,
                                         recv_ty.as_ref(),
                                     );
@@ -1604,24 +1640,6 @@ impl Typer {
                                     solved
                                 }
                             };
-                            // Not for a parameter that *is* a type variable
-                            // (`A` in `apply[A](elems: A*)`): nsc joins such a
-                            // variable's arguments after typing them all, by
-                            // weak lub, and a prototype taken from the first
-                            // one decides that join early. `List('a', 1)`
-                            // typed the `1` against `Char`, narrowed the
-                            // literal, and built a `List[Char]` where scalac
-                            // builds a `List[Int]`.
-                            let current = param_at(&params, ai).cloned().filter(|p| {
-                                !matches!(
-                                    match p {
-                                        Type::ByName(inner) | Type::Repeated(inner) =>
-                                            inner.as_ref(),
-                                        other => other,
-                                    },
-                                    Type::TypeParam(_)
-                                )
-                            });
                             current.and_then(|current| {
                                 let ids: Vec<_> = solved.iter().map(|(id, _)| *id).collect();
                                 // Only a parameter the earlier arguments
@@ -5263,5 +5281,52 @@ impl Typer {
             return result;
         }
         crate::prefix::with_prefix(result, prefix)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sequential prototypes solved from the earlier arguments, for the tests.
+    static SEQUENTIAL_SOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod sequential_prototype_tests {
+    use super::SEQUENTIAL_SOLVES;
+
+    const DECLS: &str = "class Box[A]\n\
+        object F {\n\
+          def seq[A](xs: A*): Box[A] = new Box[A]\n\
+          def pairs[K, V](xs: (K, V)*): Box[(K, V)] = new Box[(K, V)]\n\
+        }\n";
+
+    fn solves(body: &str) -> usize {
+        let src = format!("{DECLS}object A {{ {body} }}\n");
+        SEQUENTIAL_SOLVES.with(|n| n.set(0));
+        let (_, _, diags) = crate::typecheck_str(&src);
+        assert!(diags.is_empty(), "{diags:?}");
+        SEQUENTIAL_SOLVES.with(|n| n.get())
+    }
+
+    /// Each literal of `seq("s0", "s1", ...)` has a constant type of its
+    /// own, so every (formal, argument) pair was new, and the earlier
+    /// arguments were solved again at each element: quadratic in the list.
+    /// The formal `A*` is a type variable itself and never takes that
+    /// prototype.
+    #[test]
+    fn a_type_variable_formal_solves_no_earlier_arguments() {
+        let elems: Vec<String> = (0..200).map(|i| format!("\"s{i}\"")).collect();
+        assert_eq!(solves(&format!("val a = F.seq({})", elems.join(", "))), 0);
+    }
+
+    /// A formal that does mention the variables is still solved, once per
+    /// new pair: `(K, V)*` given the same `(String, Int)` throughout. Each
+    /// tuple literal is itself an application whose `T2` solved the `T1`
+    /// argument before: 201 solves for this call.
+    #[test]
+    fn a_formal_mentioning_the_variables_solves_new_pairs_only() {
+        let elems: Vec<String> = (0..200).map(|i| format!("(\"k{i}\", {i})")).collect();
+        let n = solves(&format!("val a = F.pairs({})", elems.join(", ")));
+        assert!((1..=3).contains(&n), "{n} solves");
     }
 }

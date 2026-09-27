@@ -188,6 +188,16 @@ impl Assembler {
         self.local_class.insert(slot, name.to_string());
     }
 
+    /// The locals from slot `n` on have gone out of scope (a block ended):
+    /// their types and declared classes are forgotten, so a frame recorded
+    /// later does not claim them, and a reuse of the slot starts afresh.
+    pub fn release_locals_from(&mut self, n: u16) {
+        for t in self.vlocals.iter_mut().skip(n as usize) {
+            *t = VType::Top;
+        }
+        self.local_class.retain(|&k, _| k < n);
+    }
+
     fn set_local(&mut self, n: u16, t: VType) {
         let i = n as usize;
         let t = match (self.local_class.get(&n), &t) {

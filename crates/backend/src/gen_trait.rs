@@ -197,7 +197,7 @@ impl<'a> Gen<'a> {
         }
         let iface_owned = iface.to_string();
         let st = self.st;
-        let max_locals = frame.next_slot;
+        let max_locals = frame.max_locals();
         let ret_for_body = ret.clone();
         let extras = &self.extras;
         let lambda_n = &self.lambda_n;
@@ -3750,7 +3750,7 @@ impl<'a> Gen<'a> {
             }
             let class_name = b.this_name.clone();
             let st = self.st;
-            let max_locals = frame.next_slot.max(1);
+            let max_locals = frame.max_locals().max(1);
             let extras = &self.extras;
             let lambda_n = &self.lambda_n;
             let lambda_bodies = &self.lambda_bodies;
@@ -3812,6 +3812,7 @@ impl<'a> Gen<'a> {
             let mut frame = Frame {
                 locals: HashMap::new(),
                 next_slot: 0,
+                max_slot: 0,
                 finally_exits: Vec::new(),
                 return_slot: None,
                 tail_loop: None,
@@ -3828,7 +3829,7 @@ impl<'a> Gen<'a> {
             }
             let class_name = b.this_name.clone();
             let ret_for_body = ret.clone();
-            let max_locals = frame.next_slot.max(1);
+            let max_locals = frame.max_locals().max(1);
             let under_c = under.clone();
             b.add_code(
                 ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
