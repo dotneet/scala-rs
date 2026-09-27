@@ -1772,10 +1772,32 @@ impl Typer {
                         .adopt_binary_class(&mut self.st, &mut self.binary, cur);
                 }
                 if self.library_abi && self.pickle.pickle_readable(&self.st, cur) {
-                    for n in self
+                    let implicit_names = self
                         .pickle
-                        .implicit_member_names(&self.st, &mut self.binary, cur)
-                    {
+                        .implicit_member_names(&self.st, &mut self.binary, cur);
+                    // Most pickled implicits are already direct members. For
+                    // wide imports, avoid a full inherited lookup per name.
+                    let direct_implicit_names = (implicit_names.len() >= 32).then(|| {
+                        self.st
+                            .get(cur)
+                            .members
+                            .iter()
+                            .filter_map(|&id| {
+                                let member = self.st.get(id);
+                                member
+                                    .flags
+                                    .contains(Flags::IMPLICIT)
+                                    .then(|| member.name.clone())
+                            })
+                            .collect::<rustc_hash::FxHashSet<String>>()
+                    });
+                    for n in implicit_names {
+                        if direct_implicit_names
+                            .as_ref()
+                            .is_some_and(|names| names.contains(n.as_str()))
+                        {
+                            continue;
+                        }
                         if !self
                             .st
                             .lookup_member(cur, &n)
