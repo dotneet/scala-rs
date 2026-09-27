@@ -594,6 +594,61 @@ fn contravariant_driver_shrinks(typer: &Typer, new_pt: &Type, open_pt: &Type) ->
         .any(|(new, old)| new < &old)
 }
 
+/// nsc strips free type parameters to wildcards before testing equal-sized
+/// recursive targets. Fresh inference symbols must not hide an identical core.
+fn same_core_with_type_param_wildcards(new: &Type, old: &Type) -> bool {
+    match (new, old) {
+        (Type::TypeParam(_), Type::TypeParam(_)) => true,
+        (
+            Type::Class {
+                sym: new_sym,
+                args: new_args,
+            },
+            Type::Class {
+                sym: old_sym,
+                args: old_args,
+            },
+        ) => {
+            new_sym == old_sym
+                && new_args.len() == old_args.len()
+                && new_args
+                    .iter()
+                    .zip(old_args)
+                    .all(|(new, old)| same_core_with_type_param_wildcards(new, old))
+        }
+        (
+            Type::Applied {
+                ctor: new_ctor,
+                args: new_args,
+            },
+            Type::Applied {
+                ctor: old_ctor,
+                args: old_args,
+            },
+        ) => {
+            same_core_with_type_param_wildcards(new_ctor, old_ctor)
+                && new_args.len() == old_args.len()
+                && new_args
+                    .iter()
+                    .zip(old_args)
+                    .all(|(new, old)| same_core_with_type_param_wildcards(new, old))
+        }
+        (Type::Tuple(new), Type::Tuple(old)) => {
+            new.len() == old.len()
+                && new
+                    .iter()
+                    .zip(old)
+                    .all(|(new, old)| same_core_with_type_param_wildcards(new, old))
+        }
+        (Type::Array(new), Type::Array(old))
+        | (Type::ByName(new), Type::ByName(old))
+        | (Type::Repeated(new), Type::Repeated(old)) => {
+            same_core_with_type_param_wildcards(new, old)
+        }
+        _ => new == old,
+    }
+}
+
 /// nsc `Types#dominates`: same head symbol and no simpler than the open one.
 /// A declared contravariant input may provide a product-order progress measure
 /// for a recursive rule whose other output or input slot grows. The caller
@@ -635,6 +690,7 @@ pub(crate) fn dominates(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
                 std::cmp::Ordering::Equal => {
                     !driver_shrinks
                         && (new_pt == open_pt
+                            || same_core_with_type_param_wildcards(new_pt, open_pt)
                             || (typer.st.is_sub_type(new_pt, open_pt)
                                 && typer.st.is_sub_type(open_pt, new_pt)))
                 }
@@ -7458,6 +7514,22 @@ mod memo_tests {
         let driver_open = driver_ty(large.clone(), Type::Int);
         let driver_balanced = driver_ty(Type::Int, large.clone());
         assert!(!dominates(&typer, &driver_balanced, &driver_open));
+
+        // Distinct concrete leaves can be a finite derivation at the same
+        // size, but fresh type parameter symbols have the same stripped core.
+        let leaf_open = driver_ty(Type::Int, Type::Int);
+        let leaf_substitution = driver_ty(Type::Int, Type::Long);
+        assert_eq!(complexity(&leaf_open), complexity(&leaf_substitution));
+        assert!(!dominates(&typer, &leaf_substitution, &leaf_open));
+        let first = typer
+            .st
+            .alloc("First", root, SymKind::TypeParam, Flags::EMPTY, "First");
+        let second = typer
+            .st
+            .alloc("Second", root, SymKind::TypeParam, Flags::EMPTY, "Second");
+        let variable_open = driver_ty(Type::Int, Type::TypeParam(first));
+        let variable_substitution = driver_ty(Type::Int, Type::TypeParam(second));
+        assert!(dominates(&typer, &variable_substitution, &variable_open));
 
         // A strictly larger result can still be a valid step when a declared
         // input shrinks. The stack-wide product-order check, rather than an
