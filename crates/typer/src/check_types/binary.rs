@@ -20,6 +20,9 @@ struct ParentWarmCache {
 #[cfg(test)]
 thread_local! {
     static PARENT_WARM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PARTIAL_CLAUSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PARTIAL_COMPANION_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PARTIAL_PREP_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Typer {
@@ -1105,16 +1108,51 @@ impl Typer {
         // second level unifies a rule's `Out` with the first level's open
         // `Out` -- the same symbol -- and fails. Prepare those copies for the
         // companion's candidates, and go no further.
+        #[cfg(test)]
+        PARTIAL_CLAUSES.with(|count| count.set(count.get() + partial_nested.len()));
+        let mut prepared_at = rustc_hash::FxHashMap::default();
+        let mut visited_partial_scopes = rustc_hash::FxHashSet::default();
         for p in &partial_nested {
             completed |= self.warm_implicit_scope_once(p);
-            for id in self.companion_implicits(p) {
+            // Only class-shaped clauses have a nominal fit independent of
+            // their arguments. Equal implicit-scope parts offer the same
+            // companions until a symbol changes.
+            let parts = matches!(p, Type::Class { .. }).then(|| self.implicit_scope_classes(p));
+            if parts.as_ref().is_some_and(|parts| {
+                visited_partial_scopes.contains(&(self.st.mutation_gen.get(), parts.clone()))
+            }) {
+                continue;
+            }
+            #[cfg(test)]
+            PARTIAL_COMPANION_WALKS.with(|count| count.set(count.get() + 1));
+            let companions = self.companion_implicits(p);
+            let mut newly_prepared = Vec::new();
+            for id in companions {
+                // A prepared signature depends on the candidate and depth,
+                // not the partial clause through which it was reached.
+                if prepared_at.get(&id) == Some(&self.st.mutation_gen.get()) {
+                    continue;
+                }
                 let fits = match &*self.implicit_candidate_ty(id) {
                     Type::Method { ret, .. } => self.plausibly_inhabits_refinement(ret, p),
                     other => self.plausibly_inhabits_refinement(other, p),
                 };
                 if fits {
+                    #[cfg(test)]
+                    PARTIAL_PREP_ATTEMPTS.with(|count| count.set(count.get() + 1));
                     completed |= self.prepare_implicit_instances(id, instance_depth);
+                    newly_prepared.push(id);
                 }
+            }
+            // Preparing another candidate allocates detached symbols and
+            // advances the table generation, but does not change any of the
+            // source declarations prepared earlier in this same batch.
+            let gen = self.st.mutation_gen.get();
+            for id in newly_prepared {
+                prepared_at.insert(id, gen);
+            }
+            if let Some(parts) = parts {
+                visited_partial_scopes.insert((gen, parts));
             }
         }
         if !concrete_nested.is_empty() {
@@ -3133,5 +3171,124 @@ mod tests {
             typer.module_class_of_value(accessor, &prefixed),
             Some(module)
         );
+    }
+
+    #[test]
+    fn partial_witnesses_share_unchanged_companion_preparation() {
+        check_partial_witnesses(false);
+    }
+
+    #[test]
+    fn partial_witnesses_share_prepared_candidates_across_distinct_scopes() {
+        check_partial_witnesses(true);
+    }
+
+    fn check_partial_witnesses(different_bounds: bool) {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let scope = typer
+            .st
+            .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
+        let goal = typer
+            .st
+            .alloc("Goal", root, SymKind::Class, Flags::EMPTY, "Goal");
+        let shape = typer
+            .st
+            .alloc("Shape", root, SymKind::Class, Flags::EMPTY, "Shape");
+        let bounds = (0..2)
+            .map(|i| {
+                typer.st.alloc(
+                    format!("Bound{i}"),
+                    root,
+                    SymKind::Class,
+                    Flags::EMPTY,
+                    format!("Bound{i}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let module = typer
+            .st
+            .alloc("Shape", root, SymKind::Module, Flags::MODULE, "Shape$");
+        let module_class = typer.st.alloc(
+            "Shape$",
+            root,
+            SymKind::ModuleClass,
+            Flags::MODULE,
+            "Shape$",
+        );
+        typer.st.get_mut(module).ty = Type::ModuleRef(module_class);
+        for i in 0..2 {
+            let rule = typer.st.alloc(
+                format!("rule{i}"),
+                module_class,
+                SymKind::Method,
+                Flags::IMPLICIT,
+                format!("rule{i}"),
+            );
+            let tp = typer
+                .st
+                .alloc("X", rule, SymKind::TypeParam, Flags::EMPTY, "X");
+            typer.st.get_mut(rule).tparams = vec![tp];
+            typer.st.get_mut(rule).ty = Type::Method {
+                paramss: vec![].into(),
+                ret: TyBox::new(Type::Class {
+                    sym: shape,
+                    args: vec![Type::TypeParam(tp)].into(),
+                }),
+            };
+        }
+        for i in 0..2 {
+            let derive = typer.st.alloc(
+                format!("derive{i}"),
+                scope,
+                SymKind::Method,
+                Flags::IMPLICIT,
+                format!("derive{i}"),
+            );
+            let a = typer
+                .st
+                .alloc("A", derive, SymKind::TypeParam, Flags::EMPTY, "A");
+            let b = typer
+                .st
+                .alloc("B", derive, SymKind::TypeParam, Flags::EMPTY, "B");
+            if different_bounds {
+                typer.st.get_mut(b).bound_hi = Some(Type::Class {
+                    sym: bounds[i],
+                    args: vec![].into(),
+                });
+            }
+            let witness = Type::Class {
+                sym: shape,
+                args: vec![Type::TypeParam(b)].into(),
+            };
+            let param =
+                typer
+                    .st
+                    .alloc("witness", derive, SymKind::Term, Flags::IMPLICIT, "witness");
+            typer.st.get_mut(param).ty = witness.clone();
+            typer.st.get_mut(derive).tparams = vec![a, b];
+            typer.st.get_mut(derive).paramss = vec![vec![param]];
+            typer.st.get_mut(derive).ty = Type::Method {
+                paramss: vec![vec![witness]].into(),
+                ret: TyBox::new(Type::Class {
+                    sym: goal,
+                    args: vec![Type::TypeParam(a)].into(),
+                }),
+            };
+        }
+        typer.st.this_class = scope;
+        PARTIAL_CLAUSES.with(|count| count.set(0));
+        PARTIAL_COMPANION_WALKS.with(|count| count.set(0));
+        PARTIAL_PREP_ATTEMPTS.with(|count| count.set(0));
+        typer.warm_implicit_candidates(&[Type::Class {
+            sym: goal,
+            args: vec![Type::Int].into(),
+        }]);
+        assert_eq!(PARTIAL_CLAUSES.with(|count| count.get()), 2);
+        assert_eq!(
+            PARTIAL_COMPANION_WALKS.with(|count| count.get()),
+            if different_bounds { 2 } else { 1 }
+        );
+        assert_eq!(PARTIAL_PREP_ATTEMPTS.with(|count| count.get()), 2);
     }
 }
