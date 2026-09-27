@@ -604,11 +604,51 @@ the engine's questions in about 3 s of that. Engine flags (GC, JIT tiers)
 change nothing.
 
 **Found on the way.** A parser-combinator grammar's `~` was "not found"
-as a type, a value and an extractor; fixed (`parser_combinators.rs`). Not
-yet fixed: ScalaTest's `should have length` and `should not be empty` are
-"ambiguous implicit" here (the `Length` / `Emptiness` instances over
-structural and higher-kinded bounds), and an XML program's `\\` / `\`
-query prints `List()` where scalac's prints the items.
+as a type, a value and an extractor; fixed (`parser_combinators.rs`).
+ScalaTest's `should have length` and `should not be empty` were "ambiguous
+implicit" (the `Length` / `Emptiness` instances over structural and
+higher-kinded bounds); fixed (`implicit_structural.rs`). Not yet fixed: an
+XML program's `\\` / `\` query prints `List()` where scalac's prints the
+items.
+
+### Matchers, Free monads, circe parsing and more language shapes (2026-09-27)
+
+Eleven further shapes, 20 files each: ScalaTest's `AnyFlatSpec` with
+`must` matchers and inspectors, a `cats.free.Free` key-value DSL, circe
+parsing and cursor navigation, and language shapes -- long
+`for`-comprehensions, a 60-case sealed hierarchy matched with nested
+patterns, `f`/`s`/`raw` interpolation, `Future` chains, generic `Numeric`
+code, long collection pipelines, curried and partial functions, and
+default and named arguments.
+
+| kind | scalac | scala-rs | ratio |
+|---|---:|---:|---:|
+| `st_flatspec` | 5.39 s | 2.90 s | 0.54 |
+| `catsfree` | 3.78 s | 0.40 s | 0.11 |
+| `circeparse` | 3.07 s | 0.43 s | 0.14 |
+| `forcomp` | 5.86 s | 0.71 s | 0.12 |
+| `sealedmatch` | 8099 s | 953 s | 0.12 |
+| `interp` | 2.49 s | 0.13 s | 0.05 |
+| `futures` | 5.78 s | 0.74 s | 0.13 |
+| `numeric` | 3.97 s | 0.53 s | 0.13 |
+| `collchains` | 6.93 s | 0.76 s | 0.11 |
+| `closures` | 5.56 s | 0.40 s | 0.07 |
+| `defaults` | 4.29 s | 0.48 s | 0.11 |
+
+`st_flatspec` did not compile at first ("no matching overload" for every
+`forAll (xs) { ... }` and `contain allOf (a, b)`); it is measured after the
+fixes. None is slower than scalac. `sealedmatch` is slow in both compilers
+for the same reason: the exhaustivity and reachability analysis is nsc's
+DPLL solver, run over a formula per case. Two of its costs were ours
+alone -- the pure-literal scan rebuilt two ordered sets per step, and unit
+propagation rewrote every clause whether or not it held the literal --
+and one file of it now takes 29.6 s rather than 47.2 s (scalac: about
+400 s), with the same warnings and class files.
+
+`circeauto` remains the one workload behind scalac (18.8 s against
+18.0 s). Its 139,000 round trips to the macro engine cost about 76 µs each
+on the pipe; the reads already block on the pipe itself, so what is left
+is the number of trips, which the engine's lazily completed symbols set.
 
 ### What is left
 

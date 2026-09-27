@@ -32,6 +32,8 @@ mod gz2;
 mod gzero;
 #[path = "../hinf.rs"]
 mod hinf;
+#[path = "../hk_bound_overloads.rs"]
+mod hk_bound_overloads;
 #[path = "../hk_emptiness.rs"]
 mod hk_emptiness;
 #[path = "../hkbound.rs"]
@@ -66,6 +68,8 @@ mod implguard;
 mod implicit_derived_tag_undet;
 #[path = "../implicit_misc.rs"]
 mod implicit_misc;
+#[path = "../implicit_structural.rs"]
+mod implicit_structural;
 #[path = "../implicitcast.rs"]
 mod implicitcast;
 #[path = "../implicitmemo.rs"]

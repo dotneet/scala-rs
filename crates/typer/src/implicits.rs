@@ -2222,6 +2222,13 @@ impl Typer {
                 return None;
             }
             let targs = self.implicit_targs(id, ret, pt)?;
+            // The guess answers to the candidate's bounds like any solution:
+            // ScalaTest's `emptinessOfJavaMap[K, V, JMAP[k, v] <:
+            // java.util.Map[k, v]]` does not unify with `Emptiness[List[Int]]`,
+            // and guessed its way to competing with `emptinessOfGenTraversable`.
+            if !self.candidate_bounds_hold(&tps, &targs) {
+                return None;
+            }
             let inst = crate::symbol::subst_tparams_slice(&tps, &targs, ret);
             return self
                 .implicit_result_conforms(&inst, pt)
@@ -2587,6 +2594,22 @@ impl Typer {
                 )
             };
             let hi = crate::symbol::subst_tparams_slice(tps, targs, &hi);
+            // A structural bound is a test of the solution's members.
+            // ScalaTest's `Length` companion offers
+            // `lengthOfAnyRefWithGetLengthMethodForInt[T <: AnyRef { def
+            // getLength(): Int }]` beside eight more like it, and with only
+            // the `AnyRef` parent checked, every one of them applied to a
+            // `List[Int]`: "ambiguous implicit" where nsc finds exactly
+            // `lengthOfGenSeq`. Conformance already decides a refinement;
+            // it is asked only of a class type, whose members are known.
+            if let Type::Refined { decls, .. } = &hi {
+                if !decls.is_empty()
+                    && matches!(subject, Type::Class { .. } | Type::String)
+                    && !self.st.is_sub_type(&subject, &hi)
+                {
+                    return false;
+                }
+            }
             let parents: Vec<Type> = match &hi {
                 Type::Refined { parents, .. } => parents.clone().into_vec(),
                 other => vec![other.clone()],
@@ -2601,8 +2624,18 @@ impl Typer {
                 if self.st.class_sym_of(&subject) == Some(psym) {
                     continue;
                 }
-                if self.base_type_instance(&subject, psym, 0).is_none() {
-                    return false;
+                match self.base_type_instance(&subject, psym, 0) {
+                    None => return false,
+                    // A constructor fitted by partial application still has
+                    // to meet its bound as applied to its own binders: for
+                    // ScalaTest's `emptinessOfGenTraversable[E, TRAV[e] <:
+                    // GenTraversable[e]]` a `Map[Int, Int]` solves `TRAV :=
+                    // Map[Int, *]`, and `Map[Int, e]` is an `Iterable[(Int,
+                    // e)]`, not an `Iterable[e]`.
+                    Some(base) if !inner.is_empty() && !self.st.is_sub_type(&base, parent) => {
+                        return false;
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -3925,7 +3958,21 @@ impl Typer {
             let raw = self.implicit_candidate_ty(b).result().clone();
             !tps.is_empty()
                 && self.implicit_targs(b, &raw, a_result).is_some_and(|args| {
-                    self.candidate_bounds_hold(tps, &args)
+                    // `a`'s parameters were erased to wildcards, and what one
+                    // stands for is only as good as its upper bound: `T <:
+                    // AnyRef { def length: Int }` is no `SEQ <: GenSeq[_]`,
+                    // so ScalaTest's structural `Length` instance is not as
+                    // specific as `lengthOfGenSeq`, where
+                    // `candidate_bounds_hold`, which lets a wildcard pass,
+                    // said it was.
+                    let bounded: Vec<Type> = args
+                        .iter()
+                        .map(|t| match t {
+                            Type::BoundedWildcard { hi: Some(hi), .. } => (**hi).clone(),
+                            t => t.clone(),
+                        })
+                        .collect();
+                    self.candidate_bounds_hold(tps, &bounded)
                         && self.st.is_sub_type(
                             a_result,
                             &crate::symbol::subst_tparams_slice(tps, &args, &raw),

@@ -8753,11 +8753,14 @@ impl SymbolTable {
                         return false;
                     }
                 }
-                RefineDecl::Def { name, ret, .. } => {
-                    let Some(have) = self.lookup_term_member_on(a, name) else {
-                        return false;
-                    };
-                    if !self.is_sub_type(have.result(), ret) {
+                RefineDecl::Def {
+                    name, paramss, ret, ..
+                } => {
+                    if !self
+                        .term_members_on(a, name)
+                        .iter()
+                        .any(|have| self.def_decl_is_met(have, paramss, ret))
+                    {
                         return false;
                     }
                 }
@@ -8833,6 +8836,28 @@ impl SymbolTable {
         })
     }
 
+    /// Does a member of type `have` implement the structural `def` with
+    /// these parameter lists and result?
+    ///
+    /// nsc's `specializesSym` compares the member's whole signature, and a
+    /// parameterless `def` (or a `val`) is not the same signature as one with
+    /// an empty parameter list, in either direction: `List(1)` is no
+    /// `AnyRef { def length(): Int }` and `java.util.ArrayList` is no
+    /// `AnyRef { def size: Int }`. ScalaTest's `Length` companion relies on
+    /// exactly that to keep `lengthOfAnyRefWithLengthMethodForInt` from
+    /// competing with `lengthOfGenSeq` for a `List`.
+    fn def_decl_is_met(&self, have: &Type, paramss: &[Vec<Type>], ret: &Type) -> bool {
+        let (have_ps, have_ret): (&[Vec<Type>], &Type) = match have {
+            Type::Method { paramss, ret } => (paramss, ret),
+            other => (&[], other),
+        };
+        have_ps.len() == paramss.len()
+            && have_ps.iter().zip(paramss).all(|(h, d)| {
+                h.len() == d.len() && h.iter().zip(d).all(|(x, y)| self.types_same_enough(x, y))
+            })
+            && self.is_sub_type(have_ret, ret)
+    }
+
     fn types_same_enough(&self, a: &Type, b: &Type) -> bool {
         a == b || (self.is_sub_type(a, b) && self.is_sub_type(b, a))
     }
@@ -8872,6 +8897,39 @@ impl SymbolTable {
             }
         }
         None
+    }
+
+    /// Every term member `name` of `ty`, each seen from `ty`: the
+    /// alternatives of an overload are all candidates for a structural
+    /// declaration, where [`Self::lookup_term_member_on`] answers with one.
+    fn term_members_on(&self, ty: &Type, name: &str) -> Vec<Type> {
+        if let Type::Refined { parents, decls } = ty {
+            if decls.iter().any(|d| {
+                matches!(
+                    d,
+                    RefineDecl::Def { name: n, .. } | RefineDecl::Val { name: n, .. } if n == name
+                )
+            }) {
+                return Self::refine_member_type(decls, name).into_iter().collect();
+            }
+            for p in parents {
+                let found = self.term_members_on(p, name);
+                if !found.is_empty() {
+                    return found;
+                }
+            }
+        }
+        let Some(cls) = self.class_sym_of(ty) else {
+            return Vec::new();
+        };
+        self.lookup_member(cls, name)
+            .into_iter()
+            .filter_map(|m| {
+                let s = self.get(m);
+                matches!(s.kind, SymKind::Method | SymKind::Term)
+                    .then(|| self.expand_in_type(ty, &s.ty))
+            })
+            .collect()
     }
 
     fn lookup_term_member_on(&self, ty: &Type, name: &str) -> Option<Type> {

@@ -2457,7 +2457,10 @@ impl Typer {
             self.warm_implicit_derivation_scopes(&pty);
             *self.diverged_implicit.borrow_mut() = None;
             let mut search = self.retry_whitebox_fits(|this| this.search_implicit_at(&pty, depth));
-            if matches!(search, ImplicitSearch::None)
+            // An ambiguity can be one that reading the candidates settles as
+            // well: ScalaTest's `lengthOfGenSeq` ranks above the structural
+            // `Length` instances only once `Seq`'s `length` is in the table.
+            if matches!(search, ImplicitSearch::None | ImplicitSearch::Ambiguous(_))
                 && self.warm_implicit_candidates(std::slice::from_ref(&pty))
             {
                 search = self.retry_whitebox_fits(|this| this.search_implicit_at(&pty, depth));

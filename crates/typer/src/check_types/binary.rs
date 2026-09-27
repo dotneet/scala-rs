@@ -892,6 +892,51 @@ impl Typer {
                 completed |= self.st.get(id).ty != before;
             }
         }
+        // A candidate whose type parameter is bounded structurally
+        // (ScalaTest's `lengthOfAnyRefWithParameterlessLengthMethodForInt[T
+        // <: AnyRef { def length: Int }]`) is tested against the wanted type's
+        // arguments, and ranked against the other candidates' class bounds
+        // (`lengthOfGenSeq[SEQ <: GenSeq[_]]`); both need those members read.
+        let mut structural = Vec::new();
+        let mut subjects: Vec<Type> = Vec::new();
+        for &id in &cands {
+            for &tp in &self.st.get(id).tparams {
+                match self
+                    .st
+                    .get(tp)
+                    .bound_hi
+                    .as_ref()
+                    .map(|b| self.st.dealias(b))
+                {
+                    Some(b @ Type::Refined { .. }) if matches!(&b, Type::Refined { decls, .. } if !decls.is_empty()) => {
+                        structural.push(b)
+                    }
+                    Some(b)
+                        if !matches!(b, Type::Any | Type::AnyRef)
+                            && self.st.class_sym_of(&b).is_some() =>
+                    {
+                        subjects.push(b)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !structural.is_empty() {
+            for w in wanted {
+                if let Type::Class { args, .. } = w {
+                    subjects.extend(
+                        args.iter()
+                            .filter(|a| matches!(a, Type::Class { .. }))
+                            .cloned(),
+                    );
+                }
+            }
+            for subject in &subjects {
+                for bound in &structural {
+                    self.complete_structural_members(subject, bound);
+                }
+            }
+        }
         let instance_depth = wanted
             .iter()
             .map(crate::implicits::complexity)
@@ -1997,6 +2042,30 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// Read the members a structural type names from `subject`'s pickle, so
+    /// that conformance to it can see them.
+    ///
+    /// `SymbolTable::conforms_to_refinement` looks members up in the table,
+    /// and a jar class's inherited members are there only once something has
+    /// asked for them: `collection.Seq` gets `length` from `SeqOps`, so a
+    /// `Seq[_]` was no `AnyRef { def length: Int }`, and ScalaTest's
+    /// `lengthOfGenSeq` could not be ranked above
+    /// `lengthOfAnyRefWithParameterlessLengthMethodForInt` for a `List`.
+    pub(crate) fn complete_structural_members(&mut self, subject: &Type, structural: &Type) {
+        let Type::Refined { decls, .. } = self.st.dealias(structural) else {
+            return;
+        };
+        if !self.library_abi || self.st.class_sym_of(subject).is_none() {
+            return;
+        }
+        for d in decls.iter() {
+            // `complete_named` remembers each class and name it was asked.
+            if let RefineDecl::Def { name, .. } | RefineDecl::Val { name, .. } = d {
+                self.supply_from_pickle(subject, name);
+            }
+        }
     }
 
     /// Install `name` on the receiver's class from the library `ScalaSignature`

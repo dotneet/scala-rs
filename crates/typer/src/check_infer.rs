@@ -329,7 +329,30 @@ impl Typer {
             (self.st.get(tp).bound_lo.clone(), false),
         ] {
             let Some(bound) = bound else { continue };
-            if bound.is_error() || bound.is_no_type() || mentions_any_tparam(&bound) {
+            if bound.is_error() || bound.is_no_type() {
+                continue;
+            }
+            if mentions_any_tparam(&bound) {
+                // A constructor parameter's bound is written over its own
+                // binders (`MAP[k, v] <: GenMap[k, v]`), and so is tested
+                // with the solution applied to them. ScalaTest's
+                // `Inspectors.forAll` overloads on `C[E]`, `MAP[K, V] <:
+                // GenMap[K, V]` and `JMAP[K, V] <: java.util.Map[K, V]`; with
+                // the bounds unchecked, a `List` fitted all three and the call
+                // was ambiguous.
+                let inner = self.st.get(tp).tparams.clone();
+                let mut mentioned = Vec::new();
+                crate::check::collect_tparams(&bound, &mut mentioned);
+                if !upper || inner.is_empty() || mentioned.iter().any(|m| !inner.contains(m)) {
+                    continue;
+                }
+                let subject = crate::symbol::apply_type_ctor(
+                    t.clone(),
+                    inner.iter().map(|p| Type::TypeParam(*p)).collect(),
+                );
+                if !self.st.is_sub_type(&subject, &bound) {
+                    return false;
+                }
                 continue;
             }
             let ok = if upper {
@@ -4120,6 +4143,9 @@ impl Typer {
             && self.is_stable_path(tree)
         {
             tree.ty = self.singleton_to_type(tree.span, tree);
+        }
+        if matches!(pt, Type::Refined { decls, .. } if !decls.is_empty()) {
+            self.complete_structural_members(&tree.ty.clone(), pt);
         }
         if self.st.is_sub_type(&tree.ty, pt) {
             // `b.x` with `{ type A <: Int }` stays a TypeMember; pin it to the

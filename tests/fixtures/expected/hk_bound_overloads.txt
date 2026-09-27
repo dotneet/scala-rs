@@ -1,0 +1,8 @@
+coll List(2, 3)
+coll List(1)
+map List(2)
+jmap 1
+string List(97, 98)
+1 2
+1 2 3
+1|2

@@ -1,0 +1,12 @@
+seq:3
+seq:1
+string:4
+jlist:1
+length:7
+length():8
+length: Long:9
+getLength():10
+trav
+isEmpty
+jmap
+isEmpty

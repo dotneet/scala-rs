@@ -4800,13 +4800,19 @@ impl Typer {
     }
 
     fn infix_accepts_arity(&self, ty: &Type, arity: usize) -> bool {
+        // A clause ending in a repeated parameter takes any number of
+        // arguments from its fixed ones on: ScalaTest's `xs should contain
+        // allOf (1, 2)` is `allOf(firstEle: Any, secondEle: Any,
+        // remainingEles: Any*)`, which nsc calls with two arguments.
+        let accepts = |params: &[Type]| match params.last() {
+            Some(Type::Repeated(_)) => arity >= params.len() - 1,
+            _ => params.len() == arity,
+        };
         match ty {
-            Type::Method { paramss, .. } => {
-                paramss.first().is_some_and(|params| params.len() == arity)
-            }
+            Type::Method { paramss, .. } => paramss.first().is_some_and(|params| accepts(params)),
             Type::Overload(alts) => alts.iter().any(|alt| match alt {
                 Type::Method { paramss, .. } => {
-                    paramss.first().is_some_and(|params| params.len() == arity)
+                    paramss.first().is_some_and(|params| accepts(params))
                 }
                 _ => false,
             }),

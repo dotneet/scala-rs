@@ -641,7 +641,13 @@ fn drop_unit(clauses: &mut [Option<Clause>], unit: Lit) -> Scan {
             break;
         };
         if !c.contains(&unit) {
-            let kept = c.excl(&negated);
+            // Most clauses mention neither literal; leave those untouched
+            // rather than rebuilding each one at every propagation step.
+            let kept = if c.contains(&negated) {
+                c.excl(&negated)
+            } else {
+                c
+            };
             match kept.len() {
                 0 => scan.empty = true,
                 1 if scan.unit.is_none() => scan.unit = Some(j),
@@ -707,24 +713,26 @@ fn find_tseitin_model(clauses: &[Clause]) -> Option<Vec<Lit>> {
             stack.push((clauses, a, Some(next)));
             continue;
         }
-        // Pure literals.
-        let mut pos = std::collections::BTreeSet::new();
-        let mut neg = std::collections::BTreeSet::new();
+        // Pure literals: the least variable that occurs with one polarity
+        // only. Variables are small positive numbers, so the polarities seen
+        // are flags indexed by variable; two ordered sets rebuilt at every
+        // step were a third of the exhaustivity check of a match over a
+        // large sealed hierarchy.
+        let mut seen: Vec<u8> = Vec::new();
         for c in clauses.iter().flatten() {
             c.for_each_unordered(|l| {
-                if l.positive() {
-                    pos.insert(l.variable());
-                } else {
-                    neg.insert(l.variable());
+                let v = l.variable() as usize;
+                if v >= seen.len() {
+                    seen.resize(v + 1, 0);
                 }
+                seen[v] |= if l.positive() { 1 } else { 2 };
             });
         }
-        let pures: Vec<i32> = pos.symmetric_difference(&neg).copied().collect();
-        if let Some(&pure_var) = pures.iter().min() {
-            let pure_lit = if neg.contains(&pure_var) {
-                Lit(-pure_var)
+        if let Some(pure_var) = seen.iter().position(|&f| f == 1 || f == 2) {
+            let pure_lit = if seen[pure_var] == 2 {
+                Lit(-(pure_var as i32))
             } else {
-                Lit(pure_var)
+                Lit(pure_var as i32)
             };
             let simplified: Vec<Option<Clause>> = clauses
                 .into_iter()
@@ -806,5 +814,41 @@ pub(crate) fn find_all_models(s: &Solvable) -> (Vec<Solution>, bool) {
         clauses.push(ScalaSet::list_from(negated));
         models.insert(0, solution);
         depth -= 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clause(lits: &[i32]) -> Clause {
+        ScalaSet::from_iter(lits.iter().map(|&l| Lit(l)))
+    }
+
+    fn model(clauses: &[&[i32]]) -> Option<Vec<i32>> {
+        let cs: Vec<Clause> = clauses.iter().map(|c| clause(c)).collect();
+        find_tseitin_model(&cs).map(|m| m.into_iter().map(|l| l.0).collect())
+    }
+
+    /// The model is part of what a warning prints, so the search order is
+    /// nsc's: the least pure variable, with the polarity it occurs in.
+    #[test]
+    fn the_least_pure_variable_is_assigned_first() {
+        // 2 is the least pure variable and satisfies the first clause; 3 is
+        // then pure in the rest. Most recent first.
+        assert_eq!(model(&[&[3, 2], &[3, -4]]), Some(vec![3, 2]));
+        assert_eq!(model(&[&[-2, 3], &[-2, -3]]), Some(vec![-2]));
+        assert_eq!(model(&[&[5, -1], &[-1, 6]]), Some(vec![-1]));
+    }
+
+    #[test]
+    fn units_propagate_before_pure_literals_and_splits() {
+        // `-1` is a unit; it empties `1 ∨ 2` down to the unit `2`.
+        assert_eq!(model(&[&[-1], &[1, 2], &[2, 3]]), Some(vec![2, -1]));
+        assert_eq!(model(&[&[1], &[-1]]), None);
+        // No unit and no pure literal: split on the first clause's head,
+        // positive first.
+        assert_eq!(model(&[&[1, 2], &[-1, -2], &[1, -2], &[-1, 2]]), None);
+        assert_eq!(model(&[&[1, 2], &[-1, -2]]).map(|m| m.len()), Some(2));
     }
 }

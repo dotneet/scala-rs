@@ -8607,6 +8607,21 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
                 ) => hi,
                 _ => return None,
             },
+            // An applied constructor parameter erases as the constructor's
+            // bound does, and to `Object` with none: ScalaTest's
+            // `Inspectors.forAll` is overloaded on `C[E]`, `MAP[K, V] <:
+            // GenMap[K, V]` and `JMAP[K, V] <: java.util.Map[K, V]`, whose
+            // class files take `Object`, `scala.collection.Map` and
+            // `java.util.Map`. Left unnamed, each matched all three and none
+            // was supplied, so `forAll (xs) { ... }` saw only the `String`
+            // overload.
+            Type::Applied { ctor, .. } => match ctor.as_ref() {
+                Type::TypeParam(id) => match st.get(*id).bound_hi.clone() {
+                    Some(hi) => st.dealias(&hi),
+                    None => return Some("Ljava/lang/Object;".into()),
+                },
+                _ => return None,
+            },
             _ => return None,
         };
     }
