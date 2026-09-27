@@ -4646,6 +4646,14 @@ impl Typer {
                 if !members.is_empty() {
                     let own = self.st.get(id).tparams.clone();
                     if crate::check::mentions_tparam(&to, &own) {
+                        // A missing witness is conclusive only when no
+                        // candidate for it can be reached. Otherwise the
+                        // chain below may complete a companion derivation.
+                        if let Some(missing) = self.missing_conv_implicit(id, from, span) {
+                            if self.witness_definitely_unavailable(&missing) {
+                                continue;
+                            }
+                        }
                         for want in self
                             .conv_implicit_params(id, from, &Type::NoType)
                             .into_iter()
@@ -5036,7 +5044,7 @@ impl Typer {
     ) {
         let mut i = 0;
         while i < hits.len() {
-            if self.conv_implicits_available(hits[i].0, from, span) {
+            if self.missing_conv_implicit(hits[i].0, from, span).is_none() {
                 i += 1;
             } else {
                 hits.remove(i);
@@ -5044,13 +5052,13 @@ impl Typer {
         }
     }
 
-    /// Whether every implicit clause of a conversion can actually be filled,
+    /// The first implicit argument of a conversion that cannot be filled,
     /// warming exactly what [`Self::fill_conv_implicits`] warms.
     ///
     /// The two must agree: a clause this rejects costs a conversion nsc
     /// applies, and one it accepts that the fill then cannot satisfy is the
     /// duplicate diagnostic this pass exists to remove.
-    fn conv_implicits_available(&mut self, id: SymbolId, from: &Type, span: Span) -> bool {
+    fn missing_conv_implicit(&mut self, id: SymbolId, from: &Type, span: Span) -> Option<Type> {
         let clauses = self.conv_implicit_params(id, from, &Type::NoType);
         for want in clauses.iter().flatten() {
             // `ClassTag[A]` with `A` still the conversion's own parameter is
@@ -5092,9 +5100,42 @@ impl Typer {
             {
                 continue;
             }
+            return Some(want.clone());
+        }
+        None
+    }
+
+    /// A failed witness search cannot be revived by warming another clause
+    /// when its class has no plausible lexical or companion candidate at all.
+    fn witness_definitely_unavailable(&self, want: &Type) -> bool {
+        if !matches!(want, Type::Class { .. }) {
             return false;
         }
-        true
+        let candidate = |id: SymbolId| {
+            let symbol = self.st.get(id);
+            if !symbol.flags.contains(Flags::IMPLICIT) || !self.only_implicit_clauses(id) {
+                return false;
+            }
+            let result = match &symbol.ty {
+                Type::Method { ret, .. } => ret.as_ref(),
+                Type::Function { params, ret } if params.is_empty() => ret.as_ref(),
+                ty => ty,
+            };
+            if result.is_no_type() || symbol.macro_impl.is_some() {
+                return true;
+            }
+            if let Type::Class { sym, .. } = result {
+                if self.st.is_inner_class_of_class(*sym) {
+                    return true;
+                }
+            }
+            self.plausibly_inhabits_refinement(result, want)
+        };
+        !self
+            .implicits_in_scope()
+            .into_iter()
+            .chain(self.companion_implicits(want))
+            .any(candidate)
     }
 
     /// `ClassTag[A]` where `A` is one of the conversion's own type parameters.
