@@ -118,6 +118,9 @@ pub(crate) struct ImplicitMemo {
     /// search started in. Recomputing it walks every enclosing scope, every
     /// base class of `this` and the enclosing package object, once per node.
     in_scope: Option<std::rc::Rc<Vec<SymbolId>>>,
+    /// In a wide import, most candidate results have a fixed nominal head.
+    /// Reuse that partition for nested searches with different target heads.
+    in_scope_heads: Option<std::rc::Rc<InScopeHeads>>,
     entries: rustc_hash::FxHashMap<u64, Vec<MemoEntry>>,
     /// nsc's `improvesCache`: [`Typer::strictly_more_specific`] by candidate
     /// pair. [`Typer::most_specific`] compares every pair of the candidates
@@ -156,6 +159,12 @@ pub(crate) struct ImplicitMemo {
     /// last: the successful searches it made, kept past the search that made
     /// them, keyed like `entries`.
     decisions: Vec<rustc_hash::FxHashMap<u64, Vec<MemoEntry>>>,
+}
+
+#[derive(Default)]
+struct InScopeHeads {
+    by_head: rustc_hash::FxHashMap<(SymbolId, usize), Vec<(usize, SymbolId)>>,
+    flexible: Vec<(usize, SymbolId)>,
 }
 
 /// [`Typer::implicits_in_scope`] across searches: nsc's per-context
@@ -463,6 +472,7 @@ impl Drop for MemoLive<'_> {
             m.entries.clear();
             m.improves.clear();
             m.in_scope = None;
+            m.in_scope_heads = None;
             m.probe = 0;
             m.cut = false;
             m.routes.clear();
@@ -726,6 +736,65 @@ impl Typer {
             None => {}
         }
         self.implicits_in_scope_cached().as_ref().clone()
+    }
+
+    fn in_scope_candidates_for(&self, pt: &Type) -> Vec<SymbolId> {
+        let in_scope = self.implicits_in_scope();
+        let Type::Class { sym: wanted, .. } = pt else {
+            return in_scope;
+        };
+        if in_scope.len() < 64 {
+            return in_scope;
+        }
+        let cached = { self.implicit_memo.borrow().in_scope_heads.clone() };
+        let heads = if let Some(heads) = cached {
+            heads
+        } else {
+            let mut heads = InScopeHeads::default();
+            for (position, &id) in in_scope.iter().enumerate() {
+                let symbol = self.st.get(id);
+                let result = match &symbol.ty {
+                    Type::Method { ret, .. } => ret.as_ref(),
+                    Type::Function { params, ret } if params.is_empty() => ret.as_ref(),
+                    ty => ty,
+                };
+                if let Type::Class { sym, args } = result {
+                    if symbol.macro_impl.is_none() && !self.st.is_inner_class_of_class(*sym) {
+                        heads
+                            .by_head
+                            .entry((*sym, args.len()))
+                            .or_default()
+                            .push((position, id));
+                        continue;
+                    }
+                }
+                heads.flexible.push((position, id));
+            }
+            let heads = std::rc::Rc::new(heads);
+            let mut memo = self.implicit_memo.borrow_mut();
+            if memo.depth > 0 {
+                memo.in_scope_heads = Some(heads.clone());
+            }
+            heads
+        };
+        let mut selected = heads.flexible.clone();
+        for (&(head, arity), members) in &heads.by_head {
+            let function_shape = self
+                .st
+                .get(head)
+                .jvm_name
+                .strip_prefix("scala/Function")
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .is_some_and(|n| arity == n + 1);
+            if head == *wanted
+                || function_shape
+                || self.st.subtype_class_reaches(head, *wanted) != Some(false)
+            {
+                selected.extend(members);
+            }
+        }
+        selected.sort_unstable_by_key(|(position, _)| *position);
+        selected.into_iter().map(|(_, id)| id).collect()
     }
 
     /// [`Self::implicits_in_scope_uncached`] through [`InScopeCache`].
@@ -3603,7 +3672,7 @@ impl Typer {
         undet: &[SymbolId],
         depth: usize,
     ) -> (ImplicitSearch, Vec<(SymbolId, Type)>) {
-        let in_scope = self.implicits_in_scope();
+        let in_scope = self.in_scope_candidates_for(pt);
         let mut fits: Vec<(SymbolId, ImplicitFit)> = in_scope
             .into_iter()
             .filter(|id| !self.implicit_macros_disabled || self.st.get(*id).macro_impl.is_none())
@@ -4353,6 +4422,7 @@ impl Typer {
             let mut memo = self.implicit_memo.borrow_mut();
             if memo.depth > 0 {
                 memo.in_scope = None;
+                memo.in_scope_heads = None;
                 memo.entries.clear();
                 memo.improves.clear();
                 memo.candidate_tys.clear();
@@ -4367,6 +4437,7 @@ impl Typer {
     pub(crate) fn invalidate_implicit_caches(&self) {
         let mut memo = self.implicit_memo.borrow_mut();
         memo.in_scope = None;
+        memo.in_scope_heads = None;
         memo.entries.clear();
         memo.improves.clear();
         memo.candidate_tys.clear();
