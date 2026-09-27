@@ -2359,6 +2359,7 @@ impl Typer {
             st: &self.st,
             types: &types,
             function_symbols: Some((&self.macro_function_symbols, self.file_index)),
+            prefix_ref: None,
         };
         let mut out = String::from("(expand ");
         quote_into(&mut out, &binding.impl_class);
@@ -2431,6 +2432,7 @@ impl Typer {
         // on an awkward receiver would stop expanding for a member it never
         // touches.
         out.push_str(" (prefix ");
+        let mut prefix_written = false;
         match prefix {
             None => {
                 out.push_str("(no ");
@@ -2454,6 +2456,7 @@ impl Typer {
                         out.push_str(&built);
                         out.push(')');
                         splices.push(p.clone());
+                        prefix_written = true;
                     }
                 }
             }
@@ -2505,8 +2508,23 @@ impl Typer {
         }
         out.push(')');
         out.push_str(" (app ");
+        // A Block receiver has the same wire form in both fields. Share the
+        // already built prefix instead of serializing and rebuilding its
+        // growing statement list a second time for each macro call.
+        let receiver = application_receiver(application_for_wire).filter(|receiver| {
+            matches!(receiver.kind, TreeKind::Block { .. })
+                && prefix.is_some_and(|p| matches!(p.kind, TreeKind::Block { .. }))
+        });
+        let app_cx = WireCx {
+            prefix_ref: if prefix_written {
+                receiver.map(std::ptr::from_ref)
+            } else {
+                None
+            },
+            ..cx
+        };
         let mut built = String::new();
-        match typed_tree_to_wire(&cx, application_for_wire, &mut built) {
+        match typed_tree_to_wire(&app_cx, application_for_wire, &mut built) {
             Err(why) => {
                 out.push_str("(no ");
                 quote_into(&mut out, &why);
@@ -4583,6 +4601,16 @@ fn peel_application(tree: &Tree) -> (Vec<Vec<Tree>>, Vec<Type>, Option<Tree>) {
     (argss, targs, prefix)
 }
 
+fn application_receiver(mut tree: &Tree) -> Option<&Tree> {
+    while let TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } = &tree.kind {
+        tree = fun;
+    }
+    match &tree.kind {
+        TreeKind::Select { qual, .. } => Some(qual),
+        _ => None,
+    }
+}
+
 // ------------------------------------------------------------ our tree → wire
 
 /// A type descriptor for each typed leaf of the trees being sent, by node
@@ -4599,6 +4627,7 @@ pub(crate) struct WireCx<'a> {
         &'a std::collections::HashMap<(usize, NodeId), SymbolId>,
         usize,
     )>,
+    pub(crate) prefix_ref: Option<*const Tree>,
 }
 
 impl WireCx<'_> {
@@ -4798,6 +4827,10 @@ pub(crate) fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<Strin
 /// type-checked again at the call site -- where an unqualified name still
 /// means what the source meant, and a `This` we did not resolve would not.
 fn typed_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
+    if cx.prefix_ref == Some(std::ptr::from_ref(t)) {
+        out.push_str("(t \"PrefixRef\" (s0))");
+        return Ok(());
+    }
     if let Some(body) = byname_thunk_body(t) {
         // Written as the thunk's body always was; only the wrapper goes.
         return tree_to_wire(cx, body, out);
@@ -4878,6 +4911,10 @@ pub(crate) fn byname_thunk_body(t: &Tree) -> Option<&Tree> {
 /// refusing those by name is the honest answer until the bridge carries typed
 /// trees (`docs/macros.md` §4.3).
 pub(crate) fn tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
+    if cx.prefix_ref == Some(std::ptr::from_ref(t)) {
+        out.push_str("(t \"PrefixRef\" (s0))");
+        return Ok(());
+    }
     if let Some(body) = byname_thunk_body(t) {
         return tree_to_wire(cx, body, out);
     }
@@ -6523,6 +6560,7 @@ mod macro_runtime_tests {
             st: &st,
             types: &types,
             function_symbols: Some((&symbols, 0)),
+            prefix_ref: None,
         };
         let mut wire = String::from("(t \"Function\" (s0) (l) (t \"Empty\" (s0)))");
         mirror_tree_identity(&cx, &function, 0, &mut wire);

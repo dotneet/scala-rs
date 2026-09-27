@@ -483,6 +483,7 @@ fn original_block_children_use_compact_splices() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let trace = String::from_utf8_lossy(&output.stderr);
     assert!(trace.contains("OrigBlockChild"), "{trace}");
+    assert!(trace.contains("PrefixRef"), "{trace}");
     assert_eq!(run(&native, &cp), run(&reference, &cp));
     fs::remove_dir_all(root).unwrap();
 }

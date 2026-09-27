@@ -508,6 +508,7 @@ impl Typer {
                 st: &self.st,
                 types: &types,
                 function_symbols: Some((&self.macro_function_symbols, self.file_index)),
+                prefix_ref: None,
             };
             if let Err(why) = answer_tree_to_wire(&cx, &reference, &mut tree) {
                 return refusal(&format!("open implicit reference: {why}"));
@@ -543,6 +544,7 @@ impl Typer {
             st: &self.st,
             types: &types,
             function_symbols: Some((&self.macro_function_symbols, self.file_index)),
+            prefix_ref: None,
         };
         let mut tree = String::new();
         match answer_tree_to_wire(&cx, &parsed.tree, &mut tree) {
@@ -748,6 +750,7 @@ impl Typer {
                         st: &self.st,
                         types: &types,
                         function_symbols: Some((&self.macro_function_symbols, self.file_index)),
+                        prefix_ref: None,
                     };
                     return match answer_tree_to_wire(&cx, &tree, &mut built) {
                         Ok(()) => format!("(a ok {ty} {built})"),
@@ -1072,6 +1075,7 @@ impl Typer {
             st: &self.st,
             types: &types,
             function_symbols: Some((&self.macro_function_symbols, self.file_index)),
+            prefix_ref: None,
         };
         match answer_tree_to_wire(&cx, tree, &mut built) {
             Ok(()) => format!("(a ok {ty} {built})"),

@@ -471,6 +471,7 @@ public final class ScalaRsMacroEngine {
         emittedBlockChildren.clear();
         emittedBlockRoots.clear();
         usedBlockRoots.clear();
+        appPrefixTree = null;
         transportedTermSymbols.clear();
         ambiguousTransportedTerms.clear();
         typeCache.clear();
@@ -983,6 +984,7 @@ public final class ScalaRsMacroEngine {
         emittedBlockChildren.clear();
         emittedBlockRoots.clear();
         usedBlockRoots.clear();
+        appPrefixTree = null;
         structuralTypes.clear();
         structuralParams.clear();
         asyncMarks.clear();
@@ -1004,7 +1006,12 @@ public final class ScalaRsMacroEngine {
         if (app.isList() && "no".equals(app.items.get(0).atom)) {
             handler.appWhy = app.items.get(1).text();
         } else {
-            handler.appTree = buildTree(app);
+            appPrefixTree = handler.prefixTree;
+            try {
+                handler.appTree = buildTree(app);
+            } finally {
+                appPrefixTree = null;
+            }
             for (Sexp field : req.items) {
                 if (field.isList() && field.items.size() == 2
                         && "appSymbol".equals(field.items.get(0).text())) {
@@ -1198,6 +1205,7 @@ public final class ScalaRsMacroEngine {
             new java.util.IdentityHashMap<>(emittedBlockChildren);
         final java.util.HashSet<Long> emittedRoots = new java.util.HashSet<>(emittedBlockRoots);
         final java.util.HashSet<Long> usedRoots = new java.util.HashSet<>(usedBlockRoots);
+        final Object prefix = appPrefixTree;
         final java.util.IdentityHashMap<Object, String> types = new java.util.IdentityHashMap<>(structuralTypes);
         final java.util.HashMap<Long, Object> params = new java.util.HashMap<>(structuralParams);
         final java.util.IdentityHashMap<Object, Object[]> async = new java.util.IdentityHashMap<>(asyncMarks);
@@ -1217,6 +1225,7 @@ public final class ScalaRsMacroEngine {
             emittedBlockChildren.clear(); emittedBlockChildren.putAll(emittedChildren);
             emittedBlockRoots.clear(); emittedBlockRoots.addAll(emittedRoots);
             usedBlockRoots.clear(); usedBlockRoots.addAll(usedRoots);
+            appPrefixTree = prefix;
             structuralTypes.clear(); structuralTypes.putAll(types);
             structuralParams.clear(); structuralParams.putAll(params);
             asyncMarks.clear(); asyncMarks.putAll(async);
@@ -1447,11 +1456,18 @@ public final class ScalaRsMacroEngine {
         new java.util.IdentityHashMap<>();
     static final java.util.Set<Long> emittedBlockRoots = new java.util.HashSet<>();
     static final java.util.Set<Long> usedBlockRoots = new java.util.HashSet<>();
+    // Valid only while rebuilding the current macro application's tree.
+    static Object appPrefixTree;
     static final java.util.Map<String, Object> transportedTermSymbols = new java.util.HashMap<>();
     static final java.util.Set<String> ambiguousTransportedTerms = new java.util.HashSet<>();
 
     /** A tree the request describes, built in the runtime universe. */
     static Object buildTree(Sexp s) throws Exception {
+        if (s.isList() && s.items.size() >= 2 && "t".equals(s.items.get(0).atom)
+                && "PrefixRef".equals(s.items.get(1).text())) {
+            if (appPrefixTree == null) throw new IllegalArgumentException("missing macro prefix tree");
+            return appPrefixTree;
+        }
         if (s.isList() && s.items.size() == 3 && "orig".equals(s.items.get(0).atom)) {
             Object tree = buildTree(s.items.get(2));
             long root = Long.parseLong(s.items.get(1).text());
