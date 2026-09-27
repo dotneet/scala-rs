@@ -893,6 +893,10 @@ impl Typer {
                 completed |= self.st.get(id).ty != before;
             }
         }
+        // Explicit-parameter conversions can never answer an implicit-value
+        // search. Do not warm their result hierarchies for every missing
+        // witness in a wide imported API.
+        cands.retain(|&id| self.only_implicit_clauses(id));
         // A candidate whose type parameter is bounded structurally
         // (ScalaTest's `lengthOfAnyRefWithParameterlessLengthMethodForInt[T
         // <: AnyRef { def length: Int }]`) is tested against the wanted type's
