@@ -459,17 +459,18 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             }
             // Lazy classpath loading can allocate after source_start; those
             // classes are not emitted and do not need a new pickle.
-            let emitted_classes = st
+            let emitted_symbols: Vec<_> = st
                 .symbols
                 .iter()
                 .filter(|s| {
                     s.id.0 >= st.source_start
                         && !s.flags.contains(scala_rs_parser::ast::Flags::JAVA)
                 })
-                .map(|s| s.id);
+                .map(|s| s.id)
+                .collect();
             let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_selected(
                 &st,
-                emitted_classes,
+                emitted_symbols.iter().copied(),
             ));
             // nsc's specialize phase runs after pickler.  Keep the generic
             // declaration (and its @specialized type-parameter metadata) in
@@ -501,7 +502,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             // types in place, so this is the last moment the information
             // exists -- nsc reads it at the same point, `enteringErasure`.
             generic_sigs = Some(std::rc::Rc::new(
-                scala_rs_backend::record_generic_signatures(&st),
+                scala_rs_backend::record_generic_signatures_for(&st, emitted_symbols),
             ));
             for u in units.iter_mut() {
                 u.pickles = std::rc::Rc::clone(&pickles);

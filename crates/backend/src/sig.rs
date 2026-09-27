@@ -56,9 +56,32 @@ pub type GenericSignatures = HashMap<SymbolId, GenericSignature>;
 /// [`scala_rs_typer::erasure::erase`], which destroys the type arguments and
 /// type-parameter references this reads.
 pub fn record_generic_signatures(st: &SymbolTable) -> GenericSignatures {
+    record_generic_signatures_filtered(st, |_| true)
+}
+
+/// Record signatures only for this run's output symbols and their members.
+/// A classpath method may have a large generic type, but its existing
+/// classfile already carries its signature and the backend never writes it.
+pub fn record_generic_signatures_for(
+    st: &SymbolTable,
+    symbols: impl IntoIterator<Item = SymbolId>,
+) -> GenericSignatures {
+    let symbols: std::collections::HashSet<SymbolId> = symbols.into_iter().collect();
+    record_generic_signatures_filtered(st, |id| {
+        symbols.contains(&id) || symbols.contains(&st.get(id).owner)
+    })
+}
+
+fn record_generic_signatures_filtered(
+    st: &SymbolTable,
+    include: impl Fn(SymbolId) -> bool,
+) -> GenericSignatures {
     let mut out: GenericSignatures = HashMap::default();
     for i in 1..st.symbols.len() {
         let id = SymbolId(i as u32);
+        if !include(id) {
+            continue;
+        }
         let s = st.get(id);
         match s.kind {
             SymKind::Method => {
@@ -948,6 +971,63 @@ object M {
             erase_signature(&signature.sig, &signature.tvars).as_deref(),
             Some("(LTableQuery;)I")
         );
+    }
+
+    #[test]
+    fn selected_signatures_exclude_unemitted_class_members() {
+        let src = r#"
+class Selected[A] { def value(x: A): A = x }
+class Skipped[B] { def value(x: B): B = x }
+"#;
+        let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(!scala_rs_typer::has_errors(&diags));
+        let selected_class = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Class && s.name == "Selected")
+            .unwrap()
+            .id;
+        let skipped_class = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Class && s.name == "Skipped")
+            .unwrap()
+            .id;
+        let all = record_generic_signatures(&st);
+        let selected = record_generic_signatures_for(&st, [selected_class]);
+        for (&id, signature) in &selected {
+            assert_eq!(signature.sig, all.get(&id).unwrap().sig);
+        }
+        assert!(selected.contains_key(&selected_class));
+        assert!(selected
+            .keys()
+            .any(|&id| st.get(id).owner == selected_class));
+        assert!(!selected.contains_key(&skipped_class));
+        assert!(!selected.keys().any(|&id| st.get(id).owner == skipped_class));
+    }
+
+    #[test]
+    fn selected_signatures_keep_local_method_symbols() {
+        let src = r#"
+object Holder {
+  def outer[A](value: A): A = {
+    def inner[B](item: B): B = item
+    inner(value)
+  }
+}
+"#;
+        let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(!scala_rs_typer::has_errors(&diags));
+        let inner = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Method && s.name == "inner")
+            .unwrap()
+            .id;
+        assert_eq!(st.get(st.get(inner).owner).kind, SymKind::Method);
+        let all = record_generic_signatures(&st);
+        let selected = record_generic_signatures_for(&st, [inner]);
+        assert_eq!(selected.get(&inner).unwrap().sig, all.get(&inner).unwrap().sig);
     }
 
     #[test]

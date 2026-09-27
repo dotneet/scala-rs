@@ -30,4 +30,6 @@ pub use load::{
 };
 pub use pickle::{PickledType, PickledTypeParam};
 pub use runtime::emit_runtime;
-pub use sig::{record_generic_signatures, GenericSignature, GenericSignatures};
+pub use sig::{
+    record_generic_signatures, record_generic_signatures_for, GenericSignature, GenericSignatures,
+};
