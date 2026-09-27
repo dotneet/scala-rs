@@ -146,6 +146,106 @@ fn root() -> PathBuf {
     fs::create_dir(&p).unwrap();
     p
 }
+
+#[test]
+fn macro_request_batches_source_symbol_descriptions() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base = format!("{JAR}:{REFLECT}");
+    fs::create_dir(&implementation).unwrap();
+    let parameters = (0..10)
+        .map(|i| format!("a{i}: Int"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expressions = (0..10)
+        .map(|i| format!("a{i}: c.Expr[Int]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sum = (0..10)
+        .map(|i| format!("$a{i}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let provider = root.join("Provider.scala");
+    fs::write(
+        &provider,
+        format!(
+            "import scala.language.experimental.macros\n\
+             import scala.reflect.macros.blackbox\n\
+             object Ten {{ def sum({parameters}): Int = macro TenImpl.sum }}\n\
+             object TenImpl {{\n\
+               def sum(c: blackbox.Context)({expressions}): c.Expr[Int] = {{\n\
+                 import c.universe._\n\
+                 c.Expr[Int](q\"{sum}\")\n\
+               }}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+    let compiled_provider = Command::new(NSC)
+        .args(["-nowarn", "-cp", &base, "-d"])
+        .arg(&implementation)
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert!(
+        compiled_provider.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled_provider.stderr)
+    );
+    let mut client = String::from("object Main {\n");
+    for call in 0..20 {
+        for arg in 0..10 {
+            client.push_str(&format!("  val v{call}_{arg} = {arg}\n"));
+        }
+        let arguments = (0..10)
+            .map(|arg| format!("v{call}_{arg}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        client.push_str(&format!("  val result{call} = Ten.sum({arguments})\n"));
+    }
+    client.push_str("  def main(args: Array[String]): Unit = println(result0)\n}\n");
+    let consumer = root.join("Consumer.scala");
+    fs::write(&consumer, client).unwrap();
+    let cp = format!("{}:{base}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        fs::create_dir(&out).unwrap();
+        let mut command = Command::new(if nsc {
+            NSC
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            command.args(["compile", "--scala-library", JAR, "-nowarn"]);
+            command.env("SCALA_RS_MACRO_TIMING", "1");
+        }
+        let result = command
+            .arg(&consumer)
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "nsc={nsc}: {stderr}");
+        assert_eq!(run(&out, &cp), b"45\n");
+        if !nsc {
+            let question_count = |name| {
+                stderr
+                    .lines()
+                    .filter_map(|line| {
+                        let fields = line.split_whitespace().collect::<Vec<_>>();
+                        (fields.get(3) == Some(&name))
+                            .then(|| fields.get(4).and_then(|n| n.parse::<usize>().ok()))
+                            .flatten()
+                    })
+                    .sum::<usize>()
+            };
+            assert!(question_count("symbols") >= 20, "{stderr}");
+            assert!(question_count("symbol") <= 10, "{stderr}");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn bidirectional_macro_transport_and_access() {
     let root = root();

@@ -42,6 +42,7 @@ import java.util.List;
  */
 public final class ScalaRsMacroEngine {
     static final java.util.Map<Long, Object> sourceSymbols = new java.util.HashMap<>();
+    static java.util.Map<Long, Sexp> activeSymbolMetadata = java.util.Collections.emptyMap();
     static final java.util.IdentityHashMap<Object, Long> sourceSymbolIds = new java.util.IdentityHashMap<>();
     static final java.util.IdentityHashMap<Object, String> binaryClassNames = new java.util.IdentityHashMap<>();
     static final java.util.Set<Object> binarySymbols = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
@@ -447,6 +448,7 @@ public final class ScalaRsMacroEngine {
         }
         runtimeEntries = new ArrayList<>(entries);
         sourceSymbols.clear();
+        activeSymbolMetadata = java.util.Collections.emptyMap();
         sourceSymbolIds.clear();
         binaryClassNames.clear();
         binarySymbols.clear();
@@ -912,6 +914,16 @@ public final class ScalaRsMacroEngine {
         if (!"expand".equals(head)) {
             return err("unknown request " + head);
         }
+        java.util.Map<Long, Sexp> previousMetadata = activeSymbolMetadata;
+        try {
+            activeSymbolMetadata = sourceSymbolMetadata(requestSymbolIds(req));
+            return expand(req);
+        } finally {
+            activeSymbolMetadata = previousMetadata;
+        }
+    }
+
+    static String expand(Sexp req) throws Exception {
         String className = req.items.get(1).text();
         String methodName = req.items.get(2).text();
         Sexp argss = req.field("argss");
@@ -1066,6 +1078,7 @@ public final class ScalaRsMacroEngine {
         for (Sexp t : tags.items.subList(1, tags.items.size())) {
             argv.add(buildTag(t));
         }
+        activeSymbolMetadata = java.util.Collections.emptyMap();
         if (argv.size() != impl.getParameterCount()) {
             return err("macro implementation " + className + "." + methodName + " takes "
                 + impl.getParameterCount() + " arguments, the call site supplies " + argv.size());
@@ -2645,6 +2658,29 @@ public final class ScalaRsMacroEngine {
         return sourceSymbol(id, java.util.Collections.emptyMap());
     }
 
+    /** Only source references in the request's trees are fetched up front. */
+    static List<Long> requestSymbolIds(Sexp request) {
+        java.util.LinkedHashSet<Long> ids = new java.util.LinkedHashSet<>();
+        collectRequestSymbolIds(request, ids);
+        return new ArrayList<>(ids);
+    }
+
+    static void collectRequestSymbolIds(Sexp value, java.util.Set<Long> ids) {
+        if (!value.isList() || value.items.isEmpty()) return;
+        if (value.items.size() >= 3 && "t".equals(value.items.get(0).text())) {
+            Sexp meta = value.items.get(2);
+            if (meta.isList() && meta.items.size() >= 2
+                    && ("sr".equals(meta.items.get(0).text())
+                        || "srm".equals(meta.items.get(0).text()))) {
+                ids.add(Long.parseLong(meta.items.get(1).text()));
+            }
+        }
+        if (value.items.size() == 2 && "appSymbol".equals(value.items.get(0).text())) {
+            ids.add(Long.parseLong(value.items.get(1).text()));
+        }
+        for (Sexp part : value.items) collectRequestSymbolIds(part, ids);
+    }
+
     /** Fetch independent symbol descriptions together, but construct their
      * mutable mirror symbols in the original order and only when requested. */
     static java.util.Map<Long, Sexp> sourceSymbolMetadata(List<Long> ids) throws Exception {
@@ -2681,6 +2717,7 @@ public final class ScalaRsMacroEngine {
         Object known = sourceSymbols.get(id);
         if (known != null) return known;
         Sexp answer = metadata.get(id);
+        if (answer == null) answer = activeSymbolMetadata.get(id);
         if (answer == null) answer = query("(q symbol " + id + ")");
         String kind = answer.items.get(3).text();
         String name = answer.items.get(4).text();
