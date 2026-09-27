@@ -181,6 +181,26 @@ pub(crate) struct OuterImplicitsKey {
     gen: u64,
 }
 
+/// Top-level implicit searches' answers across implicit operations.
+///
+/// [`ImplicitMemo`] lives for one operation, so every statement that asks for
+/// a `Foldable[List]` fitted the whole implicit scope again: cats' instance
+/// scopes hold a few hundred candidates, and a file that writes
+/// `xs.combineAll` sixty times ran sixty identical searches -- 60% of its
+/// type checking. An answer at depth 0, with no type variables of the caller
+/// to solve and nothing open on the divergence stack, is a function of the
+/// wanted type, the candidates in scope and the symbol graph, so it is kept
+/// under a fingerprint of those: the member graph generation, `this_class`,
+/// the lexical candidates, and the declared types of the candidates defined
+/// in source (an `implicit val` typed later changes its answer). Only found,
+/// non-macro winners are kept; their own implicit arguments are searched
+/// again when the tree is built, so a macro among them still expands.
+#[derive(Default)]
+pub(crate) struct ScopeSearchCache {
+    gen: u64,
+    map: rustc_hash::FxHashMap<(u64, u64), Vec<MemoEntry>>,
+}
+
 #[derive(Default)]
 pub(crate) struct InScopeCache {
     epoch: (u64, usize),
@@ -1863,6 +1883,22 @@ impl Typer {
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
+        // A view -- an implicit with an explicit parameter list -- is never
+        // an implicit *value*; the `Method` arm below says so too, but only
+        // after the candidate has been read through its import prefix and
+        // checked for plausibility. `import cats.syntax.all._` puts some two
+        // hundred views in scope, and every search for a `Foldable[List]`
+        // paid that reading for each of them first.
+        {
+            let s = self.st.get(id);
+            if s.macro_impl.is_none()
+                && matches!(s.ty, Type::Method { .. })
+                && s.paramss.iter().any(|c| !c.is_empty())
+                && !self.only_implicit_clauses(id)
+            {
+                return None;
+            }
+        }
         // Reading an imported candidate through its prefix can walk and
         // substitute a large inheritance graph. If its declared result is
         // already a concrete class that cannot reach the wanted class, that
@@ -2666,6 +2702,24 @@ impl Typer {
             || self.st.subtype_class_reaches(*s1, *s2) != Some(false)
     }
 
+    /// [`Self::plausibly_inhabits`] for a view's declared result, reading
+    /// through the two shapes that answer "maybe" there: a refinement is one
+    /// of its parents (cats' syntax views all return `Ops[F, A] { type
+    /// TypeClassType = ... }`), and a wanted function type is its `FunctionN`.
+    /// A lambda the for-comprehension over `EitherT` retypes against `Int =>
+    /// EitherT[IO, String, B]` otherwise had every one of the two hundred
+    /// views of `cats.syntax.all._` solved and its witnesses searched, only
+    /// for none to apply -- three quarters of that file's type checking.
+    fn view_result_plausible(&self, result: &Type, to: &Type) -> bool {
+        if let Type::Refined { parents, .. } = result {
+            return parents.iter().any(|p| self.view_result_plausible(p, to));
+        }
+        match self.st.function_class_form(to) {
+            Some(fun) => self.plausibly_inhabits(result, &fun),
+            None => self.plausibly_inhabits(result, to),
+        }
+    }
+
     /// Refinement declarations cannot remove a nominal parent requirement.
     /// Keep macro candidates on their existing path: a whitebox expansion
     /// may refine its declared result before it is fitted.
@@ -3100,6 +3154,40 @@ impl Typer {
         if let Some(hit) = self.memo_lookup(key, pt, undet, depth, open) {
             return hit;
         }
+        let scope_key = (depth == 0
+            && undet.is_empty()
+            && open == 0
+            && self.open_implicits.borrow().is_empty()
+            && !self.st.has_ambient_type_context())
+        .then(|| (key, self.scope_search_fingerprint(pt)));
+        if let Some(sk) = scope_key {
+            let entry = {
+                let mut c = self.scope_search_cache.borrow_mut();
+                let gen = self.st.member_graph_gen();
+                if c.gen != gen {
+                    c.gen = gen;
+                    c.map.clear();
+                }
+                c.map
+                    .get(&sk)
+                    .and_then(|b| b.iter().find(|e| e.pt == *pt).cloned())
+            };
+            if let Some(entry) = entry {
+                // Replayed through the operation's memo, so the routes, the
+                // selected instantiation and the build's decisions come out
+                // exactly as a search would have left them.
+                let _live = self.memo_scope();
+                self.implicit_memo
+                    .borrow_mut()
+                    .entries
+                    .entry(key)
+                    .or_default()
+                    .push(entry);
+                if let Some(hit) = self.memo_lookup(key, pt, undet, depth, open) {
+                    return hit;
+                }
+            }
+        }
         // The memo lives from here until the outermost implicit operation
         // returns; see [`ImplicitMemo`] for why the context it was computed in
         // does not have to be part of the key.
@@ -3132,8 +3220,7 @@ impl Typer {
             (p, c, routes)
         };
         if probe & open == 0 {
-            let mut m = self.implicit_memo.borrow_mut();
-            m.entries.entry(key).or_default().push(MemoEntry {
+            let entry = MemoEntry {
                 pt: pt.clone(),
                 undet: undet.to_vec(),
                 probe,
@@ -3143,10 +3230,56 @@ impl Typer {
                 bindings: out.1.clone(),
                 selected_targs,
                 routes,
+            };
+            let keep = scope_key.filter(|_| {
+                !cut && matches!(&out.0, ImplicitSearch::Found(w)
+                    if self.st.get(*w).macro_impl.is_none())
             });
+            if let Some(sk) = keep {
+                let mut c = self.scope_search_cache.borrow_mut();
+                if c.gen == self.st.member_graph_gen() {
+                    c.map.entry(sk).or_default().push(entry.clone());
+                }
+            }
+            let mut m = self.implicit_memo.borrow_mut();
+            m.entries.entry(key).or_default().push(entry);
         }
         drop(live);
         out
+    }
+
+    /// The context a [`ScopeSearchCache`] entry for `pt` holds in: the
+    /// lexical candidates, `this_class`, and the declared types of every
+    /// candidate -- lexical or from `pt`'s implicit scope -- that is defined
+    /// in source.
+    fn scope_search_fingerprint(&self, pt: &Type) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        self.st.this_class.0.hash(&mut h);
+        let in_scope = self.implicits_in_scope();
+        in_scope.len().hash(&mut h);
+        // Allocated after the prelude and not supplied by a pickle or a class
+        // file: members completed from a library later also get fresh ids.
+        let source = |id: SymbolId| {
+            let s = self.st.get(id);
+            id.0 >= self.st.source_start
+                && s.pickled_origin.is_empty()
+                && !s.flags.contains(Flags::JAVA)
+                && !self.st.binary_read.contains(&s.owner.0)
+        };
+        for &id in in_scope.iter() {
+            id.0.hash(&mut h);
+            if source(id) {
+                hash_type(&self.st.get(id).ty, &mut h);
+            }
+        }
+        for id in self.companion_implicits(pt) {
+            if source(id) {
+                id.0.hash(&mut h);
+                hash_type(&self.st.get(id).ty, &mut h);
+            }
+        }
+        h.finish()
     }
 
     /// Keeps [`ImplicitMemo`] alive for the whole of one `&self` implicit
@@ -3444,7 +3577,7 @@ impl Typer {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => ret.as_ref(),
                 ty => ty,
             };
-            if !self.plausibly_inhabits(result, to) {
+            if !self.view_result_plausible(result, to) {
                 continue;
             }
             let Some(param) = self.conversion_arg_ty(id) else {
@@ -4467,6 +4600,37 @@ impl Typer {
             Type::Function { params, ret } if params.len() == 1 => ret.as_ref(),
             _ => return true,
         };
+        // cats' syntax conversions answer a refinement of their `Ops` trait,
+        // `Traverse.Ops[F, A] { type TypeClassType = Traverse[F] }`: the
+        // members are its class parents' (and whatever it declares itself).
+        // Read as "anything may have it", every one of the ~200 views of
+        // `cats.syntax.all._` had its type arguments and witnesses solved for
+        // every selection -- 80% of a file that writes `xs.traverse(f)`.
+        if let Type::Refined { parents, decls } = ret {
+            if decls.iter().any(|d| match d {
+                scala_rs_parser::RefineDecl::Def { name: n, .. }
+                | scala_rs_parser::RefineDecl::Val { name: n, .. } => n == name,
+                scala_rs_parser::RefineDecl::Type { .. } => false,
+            }) {
+                return true;
+            }
+            let classes: Option<Vec<Type>> = parents
+                .iter()
+                .map(|p| matches!(p, Type::Class { .. }).then(|| p.clone()))
+                .collect();
+            let Some(classes) = classes else {
+                return true;
+            };
+            return classes
+                .iter()
+                .any(|p| self.view_class_may_have_member(p, name, span));
+        }
+        let ret = ret.clone();
+        self.view_class_may_have_member(&ret, name, span)
+    }
+
+    /// [`Self::view_result_may_have_member`] for one class type.
+    fn view_class_may_have_member(&mut self, ret: &Type, name: &str, span: Span) -> bool {
         let Type::Class { sym: cls, .. } = ret else {
             return true;
         };
@@ -4490,13 +4654,12 @@ impl Typer {
             ms.into_iter()
                 .any(|m| !this.st.get(m).flags.contains(Flags::STATIC))
         };
-        let ret = ret.clone();
         self.ensure_java_loaded(cls, span);
         let declared = self.st.lookup_member(cls, name);
         if non_static(self, declared) {
             return true;
         }
-        let supplied = self.supply_from_pickle(&ret, name);
+        let supplied = self.supply_from_pickle(ret, name);
         non_static(self, supplied)
     }
 
@@ -6804,6 +6967,206 @@ mod memo_tests {
         typer.st.get_mut(conversion).ty = method_ty(class_ty(child));
         typer.warm_conversion_witnesses(&input_ty, &wanted_ty);
         assert!(typer.implicit_instances.contains_key(&witness));
+    }
+
+    #[test]
+    fn conversion_warmup_reads_refined_results_and_function_targets() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let class = |typer: &mut Typer, name: &str| {
+            typer.st.alloc(name, root, SymKind::Class, Flags::EMPTY, name)
+        };
+        let owner = class(&mut typer, "Scope");
+        let input = class(&mut typer, "Input");
+        let wanted = class(&mut typer, "Wanted");
+        let ops = class(&mut typer, "Ops");
+        let child = class(&mut typer, "Child");
+        let evidence = class(&mut typer, "Evidence");
+        let class_ty = |sym| Type::Class {
+            sym,
+            args: vec![].into(),
+        };
+        typer.st.get_mut(child).parents.push(class_ty(wanted));
+        let witness = typer
+            .st
+            .alloc("witness", owner, SymKind::Method, Flags::IMPLICIT, "witness");
+        let tp = typer
+            .st
+            .alloc("A", witness, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(witness).tparams = vec![tp];
+        typer.st.get_mut(witness).ty = Type::Method {
+            paramss: vec![].into(),
+            ret: TyBox::new(Type::Class {
+                sym: evidence,
+                args: vec![Type::TypeParam(tp)].into(),
+            }),
+        };
+        let conversion = typer.st.alloc(
+            "conversion",
+            owner,
+            SymKind::Method,
+            Flags::IMPLICIT,
+            "conversion",
+        );
+        let evidence_ty = Type::Class {
+            sym: evidence,
+            args: vec![Type::Int].into(),
+        };
+        let input_ty = class_ty(input);
+        let method_ty = |result| Type::Method {
+            paramss: vec![vec![input_ty.clone()], vec![evidence_ty.clone()]].into(),
+            ret: TyBox::new(result),
+        };
+        let refined = |parent| Type::Refined {
+            parents: vec![class_ty(parent)].into(),
+            decls: vec![],
+        };
+        typer.st.this_class = owner;
+
+        // cats' shape: a refinement of an `Ops` trait, which is no `Wanted`.
+        typer.st.get_mut(conversion).ty = method_ty(refined(ops));
+        typer.warm_conversion_witnesses(&input_ty, &class_ty(wanted));
+        assert!(!typer.implicit_instances.contains_key(&witness));
+        // Nor is it a function, whatever the function type wanted.
+        let function = Type::Function {
+            params: vec![Type::Int].into(),
+            ret: TyBox::new(class_ty(wanted)),
+        };
+        typer.warm_conversion_witnesses(&input_ty, &function);
+        assert!(!typer.implicit_instances.contains_key(&witness));
+        // A refinement whose parent is a `Wanted` is a candidate.
+        typer.st.get_mut(conversion).ty = method_ty(refined(child));
+        typer.warm_conversion_witnesses(&input_ty, &class_ty(wanted));
+        assert!(typer.implicit_instances.contains_key(&witness));
+    }
+
+    #[test]
+    fn extension_view_filter_reads_a_refined_result_at_its_parents() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let ops = typer
+            .st
+            .alloc("Ops", root, SymKind::Class, Flags::EMPTY, "pkg/Ops");
+        let traverse = typer
+            .st
+            .alloc("traverse", ops, SymKind::Method, Flags::EMPTY, "traverse");
+        typer.st.get_mut(traverse).ty = Type::Method {
+            paramss: vec![].into(),
+            ret: TyBox::new(Type::Int),
+        };
+        let view = typer
+            .st
+            .alloc("toOps", root, SymKind::Method, Flags::IMPLICIT, "toOps");
+        typer.st.get_mut(view).ty = Type::Method {
+            paramss: vec![vec![Type::Int]].into(),
+            ret: TyBox::new(Type::Refined {
+                parents: vec![Type::Class {
+                    sym: ops,
+                    args: vec![].into(),
+                }]
+                .into(),
+                decls: vec![scala_rs_parser::RefineDecl::Type {
+                    name: "TypeClassType".into(),
+                    rhs: Some(Type::Int),
+                    tparams: 0,
+                    lo: None,
+                    hi: None,
+                }],
+            }),
+        };
+        assert!(typer.view_result_may_have_member(view, "traverse", Span::DUMMY));
+        assert!(!typer.view_result_may_have_member(view, "combineAll", Span::DUMMY));
+    }
+
+    #[test]
+    fn top_level_search_answers_are_kept_until_a_source_candidate_changes() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.st.source_start = typer.st.symbols.len() as u32;
+        let root = typer.st.root;
+        let owner = typer
+            .st
+            .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
+        let ev = typer.st.alloc("Ev", root, SymKind::Class, Flags::EMPTY, "Ev");
+        let other = typer
+            .st
+            .alloc("Other", root, SymKind::Class, Flags::EMPTY, "Other");
+        let ev_tp = typer.st.alloc("T", ev, SymKind::TypeParam, Flags::EMPTY, "T");
+        typer.st.get_mut(ev).tparams = vec![ev_tp];
+        let candidate = typer
+            .st
+            .alloc("inst", owner, SymKind::Method, Flags::IMPLICIT, "inst");
+        let tp = typer
+            .st
+            .alloc("A", candidate, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(candidate).tparams = vec![tp];
+        let returning = |sym| Type::Method {
+            paramss: vec![].into(),
+            ret: TyBox::new(Type::Class {
+                sym,
+                args: vec![Type::TypeParam(tp)].into(),
+            }),
+        };
+        typer.st.get_mut(candidate).ty = returning(ev);
+        typer.st.this_class = owner;
+        let wanted = Type::Class {
+            sym: ev,
+            args: vec![Type::Int].into(),
+        };
+
+        unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
+        assert!(matches!(typer.search_implicit(&wanted), ImplicitSearch::Found(c) if c == candidate));
+        assert!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()) > 0);
+        // The same search from the same scope is answered without fitting.
+        unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
+        assert!(matches!(typer.search_implicit(&wanted), ImplicitSearch::Found(c) if c == candidate));
+        assert_eq!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()), 0);
+        // A source candidate whose type changed (an `implicit def` typed
+        // later) makes it a different search.
+        typer.st.get_mut(candidate).ty = returning(other);
+        assert!(!typer.search_implicit(&wanted).is_found());
+    }
+
+    #[test]
+    fn a_view_is_rejected_as_an_implicit_value_before_it_is_read() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let ops = typer
+            .st
+            .alloc("Ops", root, SymKind::Class, Flags::EMPTY, "Ops");
+        let wanted = typer
+            .st
+            .alloc("Foldable", root, SymKind::Class, Flags::EMPTY, "Foldable");
+        let view = typer
+            .st
+            .alloc("toOps", root, SymKind::Method, Flags::IMPLICIT, "toOps");
+        let param = typer
+            .st
+            .alloc("fa", view, SymKind::Term, Flags::PARAM, "fa");
+        typer.st.get_mut(param).ty = Type::Int;
+        typer.st.get_mut(view).params = vec![param];
+        typer.st.get_mut(view).paramss = vec![vec![param]];
+        typer.st.get_mut(view).ty = Type::Method {
+            paramss: vec![vec![Type::Int]].into(),
+            ret: TyBox::new(Type::Refined {
+                parents: vec![Type::Class {
+                    sym: ops,
+                    args: vec![].into(),
+                }]
+                .into(),
+                decls: vec![],
+            }),
+        };
+        let wanted = Type::Class {
+            sym: wanted,
+            args: vec![].into(),
+        };
+        let _live = typer.memo_scope();
+        assert!(typer.implicit_fit_at(view, &wanted, 0, &[]).is_none());
+        assert!(!typer
+            .implicit_memo
+            .borrow()
+            .candidate_tys
+            .contains_key(&view.0));
     }
 
     #[test]

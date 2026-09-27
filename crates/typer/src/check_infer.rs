@@ -2250,6 +2250,15 @@ impl Typer {
         // `def sink[T](f: T => Unit)` is solved.
         let mut acc_contra: Option<Type> = None;
         let mut all_direct = true;
+        // The argument types already joined into `acc` / `acc_contra`. A join
+        // is idempotent, so a repeat changes nothing: `List(A, B, Cc(1), A,
+        // ...)` with 1500 elements has three distinct element types, and
+        // joining each element into the compound `Product with Serializable
+        // with T` again was 1500 lubs -- the whole of that file's type
+        // checking. Bounded, so that thousands of distinct types cannot make
+        // the check itself quadratic.
+        let mut joined: Vec<(bool, Type)> = Vec::new();
+        const JOINED_MAX: usize = 64;
         for (i, a) in args.iter().enumerate() {
             let Some(p) = param_at(params, i) else {
                 break;
@@ -2418,6 +2427,12 @@ impl Typer {
                     1,
                 ) == Some(-1);
             if let Some(t) = hit {
+                if joined.iter().any(|(c, j)| *c == contra && *j == t) {
+                    continue;
+                }
+                if joined.len() < JOINED_MAX {
+                    joined.push((contra, t.clone()));
+                }
                 let slot = if contra { &mut acc_contra } else { &mut acc };
                 *slot = Some(match slot.take() {
                     None => t,
@@ -2431,6 +2446,8 @@ impl Typer {
                     // at `Seq` and answered `Seq[AnyRef]`
                     // (slick `compiler/MergeToComprehensions.scala:218`).
                     Some(prev) => {
+                        #[cfg(test)]
+                        ARG_JOINS.with(|n| n.set(n.get() + 1));
                         let prev = self.minimize_undet(&prev);
                         let t = self.minimize_undet(&t);
                         if contra {
@@ -5519,8 +5536,47 @@ enum SingletonRecv<'t> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Joins [`Typer::unify_tparam_all`] performed, for the tests.
+    static ARG_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod direct_result_tests {
     use super::*;
+
+    #[test]
+    fn repeated_argument_types_are_joined_once() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let base = typer.st.alloc("T", root, SymKind::Class, Flags::TRAIT, "T");
+        let class_ty = |sym| Type::Class {
+            sym,
+            args: vec![].into(),
+        };
+        let sub = |typer: &mut Typer, name: &str| {
+            let c = typer
+                .st
+                .alloc(name, root, SymKind::Class, Flags::EMPTY, name);
+            typer.st.get_mut(c).parents = vec![Type::AnyRef, class_ty(base)];
+            c
+        };
+        let a = sub(&mut typer, "A");
+        let b = sub(&mut typer, "B");
+        let e = typer
+            .st
+            .alloc("E", root, SymKind::TypeParam, Flags::EMPTY, "E");
+        let params = [Type::Repeated(TyBox::new(Type::TypeParam(e)))];
+        // `List(A, B, A, B, ...)`: two distinct element types.
+        let args: Vec<Type> = (0..200)
+            .map(|i| class_ty(if i % 2 == 0 { a } else { b }))
+            .collect();
+        ARG_JOINS.with(|n| n.set(0));
+        let joined = typer.unify_tparam_all(e, &params, &args);
+        assert_eq!(ARG_JOINS.with(|n| n.get()), 1);
+        let pair = typer.unify_tparam_all(e, &params, &args[..2]);
+        assert_eq!(joined, pair);
+    }
 
     #[test]
     fn direct_result_inference_checks_dependent_bounds_and_repeated_variables() {

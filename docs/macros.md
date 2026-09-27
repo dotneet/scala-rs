@@ -350,6 +350,17 @@ Operational notes this probe turned up:
   scala-library.jar as optional (`--no-scala-library` gives a private runtime). Macros become "a
   feature that only works when the jar is present". When the jar is missing we **do not silently
   accept the program; we emit a diagnostic**.
+- **Where the jars come from (2026-09-27).** nsc loads a macro implementation in a class loader
+  whose parent is the compiler's own, so scala-reflect and scala-compiler are always there, and a
+  scalac user lists neither. The engine's JVM classpath now gets them the same way: the driver
+  looks for the library's version beside the scala-library jar, under `$SCALA_HOME/lib`, in
+  `/tmp/scala-<version>/lib` and in the Coursier cache (`find_macro_runtime`), and adds the kinds
+  the compilation classpath does not already hold (`expand::macro_engine_classpath`). They are
+  never on the *compilation* classpath: the program is not typed against them. shapeless's
+  `Generic` and `Lazy` need scala-compiler (`Global`); with only shapeless listed, a derivation
+  was "could not find implicit value". When no jar is found, that message now says why
+  (`crates/cli/tests/macro_runtime.rs`). The engine is prestarted only when the run's own
+  classpath names scala-reflect; otherwise it starts at the first expansion.
 - The engine has to be written in **Java**, not Rust (implementing Scala traits from Java). The build
   then needs `javac`. Whether to ship a prebuilt engine or run `javac` on first use is a separate
   decision.

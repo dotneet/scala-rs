@@ -381,13 +381,27 @@ impl Typer {
             let pkg = qual.sym;
             let span = tree.span;
             if !pkg.is_none() && self.st.get(pkg).kind == SymKind::Package {
+                // A term is wanted, so a type alias of the same name is no
+                // answer: cats' `package object data` declares both `type
+                // State[S, A] = IndexedStateT[Eval, S, S, A]` and `object
+                // State`. Once the alias had been read (any mention of the
+                // type does that), `cats.data.State.modify` stopped at it,
+                // typed the alias as a value, and selected `IndexedStateT`'s
+                // *instance* `modify` -- a lambda whose parameter is the
+                // unsolved `SB`, `value updated is not a member of S`.
+                let terms = |st: &crate::symbol::SymbolTable, mut ms: Vec<SymbolId>| {
+                    ms.retain(|&m| {
+                        !matches!(st.get(m).kind, SymKind::TypeMember | SymKind::TypeParam)
+                    });
+                    ms
+                };
                 self.complete_binary_member(pkg, &name, span);
-                let mut cand = self.st.lookup_member(pkg, &name);
+                let mut cand = terms(&self.st, self.st.lookup_member(pkg, &name));
                 let po = self.package_object_of(pkg, span);
                 if cand.is_empty() {
                     if let Some(po) = po {
                         self.complete_binary_member(po, &name, span);
-                        cand = self.st.lookup_member(po, &name);
+                        cand = terms(&self.st, self.st.lookup_member(po, &name));
                     }
                 }
                 // A package is not a value: a `val`/`def` reached through one

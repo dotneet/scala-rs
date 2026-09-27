@@ -46,6 +46,8 @@ mod pickleparams;
 mod pkgalias;
 #[path = "../pkgobjdup.rs"]
 mod pkgobjdup;
+#[path = "../pkgobj_term.rs"]
+mod pkgobj_term;
 #[path = "../preludefidelity.rs"]
 mod preludefidelity;
 #[path = "../preludelb.rs"]

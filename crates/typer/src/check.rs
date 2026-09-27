@@ -62,6 +62,12 @@ pub struct TypecheckOptions {
     pub classpath: Vec<ClasspathClass>,
     /// Directories and jars/jmods searched for Java `.class` files (plus the JDK).
     pub binary_path: Vec<PathBuf>,
+    /// The compiler's own jars, scala-reflect and scala-compiler, that nsc
+    /// runs macro implementations with. Only the macro engine sees them, and
+    /// only where `binary_path` has no jar of the same kind: the program is
+    /// never typed against them, as nsc's compilation classpath does not hold
+    /// them either.
+    pub macro_runtime: Vec<PathBuf>,
     /// `-language:postfixOps` / `-language:implicitConversions` / `-language:dynamics`.
     pub language_features: Vec<String>,
     /// `-Xsource-features:<features>`, already reconciled with `-Xsource`
@@ -302,6 +308,7 @@ impl Default for TypecheckOptions {
             library_abi: false,
             classpath: Vec::new(),
             binary_path: Vec::new(),
+            macro_runtime: Vec::new(),
             language_features: Vec::new(),
             source_features: crate::source_features::SourceFeatures::default(),
             scala3: false,
@@ -610,6 +617,9 @@ pub struct Typer {
     /// the macro implementation, scala-library.jar and scala-reflect.jar are
     /// all on it.
     pub(crate) macro_classpath: Vec<PathBuf>,
+    /// Whether the run's own classpath names scala-reflect, the sign that it
+    /// expands macros at all ([`Typer::prestart_macro_engine`]).
+    pub(crate) macro_prestart: bool,
     /// Why a macro application could not be expanded, by span. Reported by
     /// `report_macro_calls`, which is the one place that guarantees every
     /// unexpanded call site is an error.
@@ -933,6 +943,9 @@ pub struct Typer {
     /// Candidate types as seen from a prefix; see [`crate::implicits::SeenCache`].
     pub(crate) seen_cache: std::cell::RefCell<crate::implicits::SeenCache>,
     pub(crate) implicit_class_parts: std::cell::RefCell<crate::implicits::ImplicitClassParts>,
+    /// Top-level implicit searches' answers across operations; see
+    /// [`crate::implicits::ScopeSearchCache`].
+    pub(crate) scope_search_cache: std::cell::RefCell<crate::implicits::ScopeSearchCache>,
     /// The implicits in scope per context; see [`crate::implicits::InScopeCache`].
     pub(crate) in_scope_cache: std::cell::RefCell<crate::implicits::InScopeCache>,
     /// The companion object an implicit was reached *through*, for the ones a
@@ -1326,7 +1339,14 @@ impl Typer {
             open_implicit_handles: Default::default(),
             type_wire_cache: Default::default(),
             macro_engine_error: None,
-            macro_classpath: opts.binary_path.clone(),
+            macro_classpath: crate::expand::macro_engine_classpath(
+                &opts.binary_path,
+                &opts.macro_runtime,
+            ),
+            macro_prestart: opts
+                .binary_path
+                .iter()
+                .any(|p| crate::expand::is_scala_reflect(p)),
             macro_failures: HashMap::new(),
             macro_depth: 0,
             macro_context_stack: Vec::new(),
@@ -1368,6 +1388,7 @@ impl Typer {
             derivation_scopes_warmed: Default::default(),
             idle_candidate_warms: Default::default(),
             outer_implicits_cache: Default::default(),
+            scope_search_cache: Default::default(),
             overridden_cache: Default::default(),
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),

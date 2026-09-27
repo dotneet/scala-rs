@@ -90,6 +90,8 @@ mod lz2;
 mod lzorigin;
 #[path = "../macromirror.rs"]
 mod macromirror;
+#[path = "../macro_runtime.rs"]
+mod macro_runtime;
 #[path = "../macros.rs"]
 mod macros;
 #[path = "../macrotag.rs"]

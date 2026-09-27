@@ -287,9 +287,10 @@ fn tq_type_argument_from_this_run_expands() {
 /// An inherited abstract type member in a companion module is part of a
 /// pickled macro's result type. It must be retained when the macro candidate
 /// is reconstructed; otherwise the candidate disappears and the caller gets
-/// a misleading "no implicit" diagnostic. The fixture deliberately omits
-/// scala-reflect from the consumer classpath, so the test stops immediately
-/// after candidate discovery with the known macro-engine diagnostic.
+/// a misleading "no implicit" diagnostic. The consumer classpath omits
+/// scala-reflect, as a scalac user's does: the macro engine runs with the
+/// compiler's own copy (`crates/cli/tests/macro_runtime.rs`), so the candidate
+/// is found and expanded, and the consumer compiles as it does with scalac.
 #[test]
 fn pickled_macro_with_module_inherited_type_is_supplied() {
     if !prerequisites("tracer_mdef") {
@@ -318,16 +319,12 @@ fn pickled_macro_with_module_inherited_type_is_supplied() {
     let out = compile_without_reflect("tracer_muse", &out_dir, &lib);
     let text = diagnostics(&out);
     assert!(
-        !out.status.success(),
-        "expected missing scala-reflect to stop expansion"
-    );
-    assert!(
-        text.contains("macro expansion is not implemented"),
-        "expected macro candidate to be supplied, got: {text}"
-    );
-    assert!(
         !text.contains("no implicit"),
         "macro candidate was lost during pickle reconstruction: {text}"
+    );
+    assert!(
+        out.status.success(),
+        "expected the macro candidate to be supplied and expanded: {text}"
     );
     let _ = fs::remove_dir_all(&out_dir);
     let _ = fs::remove_dir_all(&lib);

@@ -3396,10 +3396,19 @@ impl Typer {
         if let Some(msg) = self.implicit_not_found_msg(ty) {
             return msg;
         }
-        format!(
+        let mut msg = format!(
             "no implicit: could not find implicit value of type {}",
             self.st.display_type(ty)
-        )
+        );
+        // A candidate a macro materialises (shapeless's `Generic`, `Lazy`)
+        // fails quietly inside a search when no macro can run at all, and
+        // "not found" alone then sends the reader looking at the derivation.
+        if let Some(why) = &self.macro_engine_error {
+            msg.push_str("\n(no macro could be expanded to supply it: ");
+            msg.push_str(why);
+            msg.push(')');
+        }
+        msg
     }
 
     fn implicit_not_found_msg(&self, ty: &Type) -> Option<String> {

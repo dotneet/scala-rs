@@ -57,6 +57,9 @@ rather than an absolute benchmark:
 * **2026-09-27, later** (below): the large synthetic kinds another 13--24%
   fewer instructions; gitbucket 4.3 s against scalac's 10.9 s and cats 3.3 s
   against 14.2 s, both with no errors.
+* **Library-heavy code, 2026-09-27** (below): code over cats, cats-effect and
+  monad transformers had been 1.8--5.3 times slower than scalac; it is now
+  0.3--0.5 of scalac's time.
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -498,6 +501,70 @@ classes, names and package included (`pk/M$$anonfun$m0$1`, extending
 types, so it cannot run on threads without making `Type` `Send`; forking
 the process after typing was considered and left out, since the classpath
 and writer threads are running by then.
+
+### Library-heavy code against scalac (2026-09-27)
+
+**Where scalac still won.** The synthetic kinds above lean on the standard
+library. `tests/library_bench_gen.py` adds code written against libraries,
+compiled against their jars from the Coursier cache (cats 2.13.0, cats-effect
+3.7.1, fs2 3.13.0, circe 0.14.7), and `tests/library_bench.sh` compares both
+compilers on it, running both programs. Of twenty candidate shapes, five
+were slower than scalac, by 1.7 to 5.3 times, all written over
+`cats.syntax.all._`; one more, very large literal collections, was even:
+
+| kind | scalac | before | after |
+|---|---:|---:|---:|
+| `catsyntax` (`traverse`, `mapN`, `foldMap`, `\|+\|`, `Validated`) | 9.1 s | 49.3 s | 4.2 s |
+| `catsdata` (`Validated`, `NonEmptyList`, `Ior`, `Kleisli`) | 8.0 s | 27.6 s | 2.5 s |
+| `monadtrans` (`EitherT` / `OptionT` / `StateT` over `IO`) | 5.4 s | 17.0 s | 1.8 s |
+| `catseffect` (`IO`, `Ref`, `parTraverse`, `Resource`) | 5.8 s | 12.6 s | 1.7 s |
+| `tagless` (`F[_]: Monad` programs run in `State`) | 6.3 s | 10.9 s, rejected | 2.4 s |
+| `biglits` (`List(...)` of 2000, `Map(...)` of 1000 elements) | 4.4 s | 4.3 s | 2.1 s |
+| `fs2s` (fs2 `Stream` pipelines) | 4.1 s | 0.9 s | 0.9 s |
+| `circeprod` (circe `forProduct5` codecs) | 5.1 s | 1.5 s | 1.5 s |
+
+The other shapes -- type-level `Nat` induction, deep trait linearisation,
+heavy overloading, long method chains, 22-field case classes, tuple
+`Ordering`s, Java streams, source-defined syntax and instances -- run in
+0.1--0.75 of scalac's time before and after.
+
+**What was slow.** `import cats.syntax.all._` puts about two hundred views
+in scope, each returning a refinement of an `Ops` trait
+(`Traverse.Ops[F, A] { type TypeClassType = Traverse[F] }`). Every filter
+that asks "can this view's result have member `m`" or "can it be a `T`"
+answered *maybe* for a refinement, so each `xs.traverse(f)` solved the type
+arguments and searched the witnesses of all two hundred views, and so did
+each lambda a for-comprehension over `EitherT` retypes. Now:
+
+* A view's refined result is read at its class parents, both when looking
+  for an extension member and when warming a conversion's witnesses (where
+  a wanted function type is read as its `FunctionN`).
+* A view is rejected as an implicit *value* before it is read through its
+  import prefix, which the fit did anyway, only later.
+* Top-level searches keep their answers across implicit operations
+  (`ScopeSearchCache`): at depth 0, with no caller type variables and
+  nothing open, an answer is a function of the wanted type, the candidates
+  in scope and the symbol graph, and is kept under a fingerprint of those
+  (member graph generation, `this`, the lexical candidates, the declared
+  types of candidates defined in source). Sixty `xs.combineAll` in a file
+  were sixty identical searches over cats' instance scopes.
+* `unify_tparam_all` joins an argument type once: `List(A, B, Cc(1), ...)`
+  of 1500 elements has three element types and made 1500 compound lubs.
+
+Each has a unit test that counts the work (`implicits::memo_tests`,
+`check_infer::direct_result_tests::repeated_argument_types_are_joined_once`).
+slick went from 26.9G to 25.4G instructions; gitbucket, cats and the
+standard library produce the same diagnostics as before.
+
+**Found on the way.** `tagless` was rejected: `cats.data.State.modify(f)`
+written out in full reached the type alias `State` of `package object data`
+instead of the object beside it, and selected the aliased class's instance
+`modify` (`pkgobj_term`). A shapeless `Generic`-based derivation was "could
+not find implicit value" with only shapeless on the classpath: its macros
+need scala-compiler, which nsc always has and the macro engine now finds by
+itself (`docs/macros.md` §2.4, `macro_runtime`).
+The macro-heavy circe workload above is now the closest to scalac, at 13.0 s
+against 17.8 s; most of it is the macro engine answering `inferImplicitValue`.
 
 ### What is left
 

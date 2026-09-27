@@ -353,6 +353,11 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                     }
                     p
                 },
+                macro_runtime: opts
+                    .scala_library
+                    .as_deref()
+                    .map(find_macro_runtime)
+                    .unwrap_or_default(),
                 language_features: opts.language_features.clone(),
                 source_features: opts.source_features,
                 scala3: opts.xsource3,
@@ -1019,6 +1024,53 @@ pub fn find_scala_library() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
+/// The scala-reflect and scala-compiler jars of `library`'s version, which
+/// nsc runs macro implementations with: beside the library jar, under
+/// `$SCALA_HOME/lib` or the `/tmp/scala-<version>` distribution the tests use,
+/// or in the Coursier cache. The ones not found are left out; a macro that
+/// needs one then says which is missing.
+pub fn find_macro_runtime(library: &Path) -> Vec<PathBuf> {
+    let version = library
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("scala-library-"))
+        .and_then(|n| n.strip_suffix(".jar"))
+        .unwrap_or("2.13.16")
+        .to_string();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = library.parent() {
+        dirs.push(dir.to_path_buf());
+    }
+    if let Some(home) = std::env::var_os("SCALA_HOME") {
+        dirs.push(PathBuf::from(home).join("lib"));
+    }
+    dirs.push(PathBuf::from(format!("/tmp/scala-{version}/lib")));
+    let caches: Vec<PathBuf> = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| {
+            vec![
+                home.join("Library/Caches/Coursier/v1/https/repo1.maven.org/maven2"),
+                home.join(".cache/coursier/v1/https/repo1.maven.org/maven2"),
+            ]
+        })
+        .unwrap_or_default();
+    ["scala-reflect", "scala-compiler"]
+        .into_iter()
+        .filter_map(|kind| {
+            let versioned = format!("{kind}-{version}.jar");
+            dirs.iter()
+                .flat_map(|d| [d.join(&versioned), d.join(format!("{kind}.jar"))])
+                .chain(caches.iter().map(|c| {
+                    c.join("org/scala-lang")
+                        .join(kind)
+                        .join(&version)
+                        .join(&versioned)
+                }))
+                .find(|p| p.is_file())
+        })
+        .collect()
+}
+
 /// Locate a scala-xml 2.13 jar: `SCALA_XML_JAR`, then `/tmp/scala-rs-lib`, cwd, `lib/`.
 pub fn find_scala_xml() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("SCALA_XML_JAR") {
@@ -1077,6 +1129,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).expect("create temp dir");
         TempDir(p)
+    }
+
+    #[test]
+    fn macro_runtime_is_found_beside_the_library_jar() {
+        let dir = fresh_dir();
+        let lib = dir.0.join("scala-library-2.13.99.jar");
+        std::fs::write(&lib, b"").unwrap();
+        // Nothing of version 2.13.99 anywhere else on the machine.
+        assert!(find_macro_runtime(&lib).is_empty());
+        let reflect = dir.0.join("scala-reflect-2.13.99.jar");
+        let compiler = dir.0.join("scala-compiler-2.13.99.jar");
+        std::fs::write(&reflect, b"").unwrap();
+        std::fs::write(&compiler, b"").unwrap();
+        assert_eq!(find_macro_runtime(&lib), vec![reflect, compiler]);
     }
 
     fn java_available() -> bool {

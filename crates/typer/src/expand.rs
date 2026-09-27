@@ -617,14 +617,17 @@ impl Drop for PendingEngine {
 
 impl Typer {
     /// Start the engine in the background when this run could expand a
-    /// macro at all, which needs scala-reflect.jar on the classpath
-    /// ([`start_engine`] refuses to run without it). A run that never
-    /// expands one cancels and reaps its unused startup when the typer drops.
+    /// macro at all, which its own classpath naming scala-reflect.jar says
+    /// (the compiler's copy is added for every run, so it says nothing). A
+    /// run that never expands one cancels and reaps its unused startup when
+    /// the typer drops; one that expands a macro without having named the
+    /// jar starts the engine at its first expansion instead.
     /// `SCALA_RS_MACRO_PRESTART=0` turns it off.
     pub(crate) fn prestart_macro_engine(&mut self) {
         if self.macro_engine.is_some()
             || self.macro_engine_pending.is_some()
             || std::env::var_os("SCALA_RS_MACRO_PRESTART").is_some_and(|v| v == "0")
+            || !self.macro_prestart
             || !self.macro_classpath.iter().any(|p| is_scala_reflect(p))
         {
             return;
@@ -1386,10 +1389,37 @@ fn startup_failure(
     message
 }
 
-fn is_scala_reflect(p: &Path) -> bool {
-    p.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("scala-reflect"))
+pub(crate) fn is_scala_reflect(p: &Path) -> bool {
+    jar_kind(p) == Some("scala-reflect")
+}
+
+/// `scala-reflect` or `scala-compiler`, for a jar of either.
+fn jar_kind(p: &Path) -> Option<&'static str> {
+    let name = p.file_name()?.to_str()?;
+    ["scala-reflect", "scala-compiler"]
+        .into_iter()
+        .find(|kind| name.starts_with(kind))
+}
+
+/// The macro engine's classpath: the compilation's binary path, then each of
+/// the compiler's own jars in `runtime` whose kind the binary path does not
+/// already hold.
+///
+/// nsc loads a macro implementation in a class loader whose parent is the
+/// compiler's own, so scala-reflect and scala-compiler are always there;
+/// shapeless's `Generic` and `Lazy` reach into scala-compiler (`Global`). A
+/// scalac user never lists either jar, and a derivation that needed them
+/// failed here with nothing but "could not find implicit value of type
+/// Enc[R0]".
+pub(crate) fn macro_engine_classpath(binary: &[PathBuf], runtime: &[PathBuf]) -> Vec<PathBuf> {
+    let mut cp = binary.to_vec();
+    for jar in runtime {
+        let kind = jar_kind(jar);
+        if kind.is_some() && !binary.iter().any(|p| jar_kind(p) == kind) {
+            cp.push(jar.clone());
+        }
+    }
+    cp
 }
 
 /// Where the compiled engine is cached, keyed by the source it was built from
@@ -5966,5 +5996,35 @@ pub(crate) fn mirror_tree_identity(st: &SymbolTable, t: &Tree, start: usize, out
         if out[offset..].starts_with("(s0)") {
             out.replace_range(offset..offset + 4, &marker);
         }
+    }
+}
+
+#[cfg(test)]
+mod macro_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn engine_classpath_adds_only_the_compiler_jars_the_run_lacks() {
+        let user = vec![
+            PathBuf::from("/cp/shapeless_2.13-2.3.13.jar"),
+            PathBuf::from("/cp/scala-reflect-2.13.16.jar"),
+        ];
+        let runtime = vec![
+            PathBuf::from("/dist/lib/scala-reflect.jar"),
+            PathBuf::from("/dist/lib/scala-compiler.jar"),
+        ];
+        // The run's own scala-reflect stays the one; the compiler is added.
+        assert_eq!(
+            macro_engine_classpath(&user, &runtime),
+            vec![
+                user[0].clone(),
+                user[1].clone(),
+                PathBuf::from("/dist/lib/scala-compiler.jar"),
+            ]
+        );
+        assert_eq!(
+            macro_engine_classpath(&user[..1], &runtime)[1..],
+            runtime[..]
+        );
     }
 }
