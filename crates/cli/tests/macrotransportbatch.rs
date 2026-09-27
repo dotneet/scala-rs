@@ -460,6 +460,34 @@ fn source_ownership_and_macro_console_match_scalac() {
 }
 
 #[test]
+fn original_block_children_use_compact_splices() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let cp = format!("{JAR}:{REFLECT}");
+    compile("macroblockchild_impl", true, &implementation, &cp, true);
+    let cp = format!("{}:{cp}", implementation.display());
+    let native = root.join("native");
+    let reference = root.join("reference");
+    fs::create_dir(&native).unwrap();
+    compile("macroblockchild_use", true, &reference, &cp, true);
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/macroblockchild_use.scala");
+    let output = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
+        .args(["compile", "--scala-library", JAR])
+        .arg(source)
+        .args(["-cp", &cp, "-d"])
+        .arg(&native)
+        .env("SCALA_RS_MACRO_TRACE", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert!(trace.contains("OrigBlockChild"), "{trace}");
+    assert_eq!(run(&native, &cp), run(&reference, &cp));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn macro_bundle_metadata_and_expansion_interoperate_with_scalac() {
     let root = root();
     let base_cp = format!("{JAR}:{REFLECT}");

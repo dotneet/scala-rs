@@ -3701,6 +3701,35 @@ impl Typer {
                     None => self.tree_from_reply(at(kids, 1)?, span),
                 }
             }
+            "OrigBlockChild" => {
+                let root = at(kids, 0)?
+                    .text()
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?;
+                let index = at(kids, 1)?
+                    .text()
+                    .parse::<isize>()
+                    .map_err(|e| e.to_string())?;
+                let typed = self.macro_splices.get(root).and_then(Option::as_ref).and_then(|t| {
+                    if let TreeKind::Block { stats, expr } = &t.kind {
+                        if index == -1 {
+                            Some(expr.as_ref())
+                        } else {
+                            stats.get(index as usize)
+                        }
+                    } else {
+                        None
+                    }
+                });
+                match typed {
+                    Some(t) => {
+                        let mut typed = t.clone();
+                        typed.id = NodeId::PRETYPED_SPLICE;
+                        Ok(typed)
+                    }
+                    None => Err("macro returned an unknown original Block child".to_string()),
+                }
+            }
             other => Err(format!(
                 "the expansion contains a `{other}`, which scala-rs cannot rebuild yet"
             )),

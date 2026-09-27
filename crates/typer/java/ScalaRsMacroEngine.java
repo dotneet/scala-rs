@@ -467,6 +467,10 @@ public final class ScalaRsMacroEngine {
         invokeNanos = waitNanos = handleNanos = 0;
         reflectionBundles.clear();
         origTrees.clear();
+        origBlockChildren.clear();
+        emittedBlockChildren.clear();
+        emittedBlockRoots.clear();
+        usedBlockRoots.clear();
         transportedTermSymbols.clear();
         ambiguousTransportedTerms.clear();
         typeCache.clear();
@@ -975,6 +979,10 @@ public final class ScalaRsMacroEngine {
         }
 
         origTrees.clear();
+        origBlockChildren.clear();
+        emittedBlockChildren.clear();
+        emittedBlockRoots.clear();
+        usedBlockRoots.clear();
         structuralTypes.clear();
         structuralParams.clear();
         asyncMarks.clear();
@@ -1184,6 +1192,12 @@ public final class ScalaRsMacroEngine {
      * Symbol identities and the fresh-name supply remain shared for the run. */
     static final class ExpansionFrame {
         final java.util.IdentityHashMap<Object, Long> trees = new java.util.IdentityHashMap<>(origTrees);
+        final java.util.IdentityHashMap<Object, OrigBlockChild> blockChildren =
+            new java.util.IdentityHashMap<>(origBlockChildren);
+        final java.util.IdentityHashMap<Object, Boolean> emittedChildren =
+            new java.util.IdentityHashMap<>(emittedBlockChildren);
+        final java.util.HashSet<Long> emittedRoots = new java.util.HashSet<>(emittedBlockRoots);
+        final java.util.HashSet<Long> usedRoots = new java.util.HashSet<>(usedBlockRoots);
         final java.util.IdentityHashMap<Object, String> types = new java.util.IdentityHashMap<>(structuralTypes);
         final java.util.HashMap<Long, Object> params = new java.util.HashMap<>(structuralParams);
         final java.util.IdentityHashMap<Object, Object[]> async = new java.util.IdentityHashMap<>(asyncMarks);
@@ -1199,6 +1213,10 @@ public final class ScalaRsMacroEngine {
             java.util.HashSet<String> nestedAmbiguous =
                 new java.util.HashSet<>(ambiguousTransportedTerms);
             origTrees.clear(); origTrees.putAll(trees);
+            origBlockChildren.clear(); origBlockChildren.putAll(blockChildren);
+            emittedBlockChildren.clear(); emittedBlockChildren.putAll(emittedChildren);
+            emittedBlockRoots.clear(); emittedBlockRoots.addAll(emittedRoots);
+            usedBlockRoots.clear(); usedBlockRoots.addAll(usedRoots);
             structuralTypes.clear(); structuralTypes.putAll(types);
             structuralParams.clear(); structuralParams.putAll(params);
             asyncMarks.clear(); asyncMarks.putAll(async);
@@ -1416,6 +1434,19 @@ public final class ScalaRsMacroEngine {
      * nsc splices a typed tree without typing it again.
      */
     static final java.util.IdentityHashMap<Object, Long> origTrees = new java.util.IdentityHashMap<>();
+    // A macro may move the direct children of an original Block into a new
+    // Block. Preserve their typed identity without repeating their full wire shape.
+    static final class OrigBlockChild {
+        final long root;
+        final int index;
+        OrigBlockChild(long root, int index) { this.root = root; this.index = index; }
+    }
+    static final java.util.IdentityHashMap<Object, OrigBlockChild> origBlockChildren =
+        new java.util.IdentityHashMap<>();
+    static final java.util.IdentityHashMap<Object, Boolean> emittedBlockChildren =
+        new java.util.IdentityHashMap<>();
+    static final java.util.Set<Long> emittedBlockRoots = new java.util.HashSet<>();
+    static final java.util.Set<Long> usedBlockRoots = new java.util.HashSet<>();
     static final java.util.Map<String, Object> transportedTermSymbols = new java.util.HashMap<>();
     static final java.util.Set<String> ambiguousTransportedTerms = new java.util.HashSet<>();
 
@@ -1423,7 +1454,17 @@ public final class ScalaRsMacroEngine {
     static Object buildTree(Sexp s) throws Exception {
         if (s.isList() && s.items.size() == 3 && "orig".equals(s.items.get(0).atom)) {
             Object tree = buildTree(s.items.get(2));
-            origTrees.put(tree, Long.parseLong(s.items.get(1).text()));
+            long root = Long.parseLong(s.items.get(1).text());
+            origTrees.put(tree, root);
+            if ("Block".equals(call(tree, "productPrefix", 0))) {
+                Object stats = call(tree, "stats", 0);
+                Object iterator = call(stats, "iterator", 0);
+                int index = 0;
+                while (Boolean.TRUE.equals(call(iterator, "hasNext", 0))) {
+                    origBlockChildren.put(call(iterator, "next", 0), new OrigBlockChild(root, index++));
+                }
+                origBlockChildren.put(call(tree, "expr", 0), new OrigBlockChild(root, -1));
+            }
             return tree;
         }
         Object symbol = null;
@@ -2054,10 +2095,27 @@ public final class ScalaRsMacroEngine {
         }
         Long orig = origTrees.get(t);
         if (orig != null) {
+            // Once a child was spliced, the whole Block cannot also consume
+            // the same typed source tree.
+            if (usedBlockRoots.contains(orig)) {
+                serTreeShape(t, sb);
+                return;
+            }
+            emittedBlockRoots.add(orig);
             // Its shape goes too: scala-rs uses it for a second mention.
             sb.append("(t \"Orig\" (s0) ").append(orig).append(' ');
             serTreeShape(t, sb);
             sb.append(')');
+            return;
+        }
+        OrigBlockChild child = origBlockChildren.get(t);
+        // If the whole Block was already returned, its children must instead
+        // be rebuilt from shape; the original typed tree was consumed.
+        if (child != null && !emittedBlockRoots.contains(child.root)
+                && emittedBlockChildren.put(t, Boolean.TRUE) == null) {
+            usedBlockRoots.add(child.root);
+            sb.append("(t \"OrigBlockChild\" (s0) ").append(child.root)
+                .append(' ').append(child.index).append(')');
             return;
         }
         Object attributed = call(t, "tpe", 0);
