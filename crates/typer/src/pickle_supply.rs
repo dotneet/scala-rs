@@ -18,8 +18,8 @@
 //! 3. **Nothing is read ahead of time.** One classfile per (receiver, name)
 //!    miss, cached.
 
-use std::collections::{HashMap, HashSet};
 use scala_rs_parser::TyBox;
+use std::collections::{HashMap, HashSet};
 
 use scala_rs_parser::{Flags, SymbolId, Type};
 use scala_rs_pickle::read::pflags;
@@ -89,6 +89,15 @@ struct BinSource<'a>(&'a mut BinaryIndex);
 
 impl ClassSource for BinSource<'_> {
     fn class_bytes(&mut self, internal_name: &str) -> Option<Vec<u8>> {
+        // JDK classes cannot carry a ScalaSignature. The signature reader's
+        // dotted-name fallbacks would otherwise probe every JDK module for
+        // impossible names such as `java/io$Serializable`.
+        if internal_name == "java"
+            || internal_name.starts_with("java/")
+            || internal_name.starts_with("java$")
+        {
+            return None;
+        }
         self.0.find_class(internal_name).ok().flatten()
     }
 }
@@ -2620,7 +2629,10 @@ impl PickleSupply {
         match ty {
             Type::Method { paramss, ret } => Type::Method {
                 paramss,
-                ret: TyBox::new(crate::prefix::with_prefix(<scala_rs_parser::Type as Clone>::clone(&*ret), pre)),
+                ret: TyBox::new(crate::prefix::with_prefix(
+                    <scala_rs_parser::Type as Clone>::clone(&*ret),
+                    pre,
+                )),
             },
             t => crate::prefix::with_prefix(t, pre),
         }
@@ -4362,9 +4374,7 @@ impl PickleSupply {
         // different type. The `This` prefix names the class to read it on.
         let enclosing_self = match (result_prefix, &shape.ret) {
             (Some(SigType::This(this_owner)), SigType::Ref { sym, .. })
-                if this_owner != pickle_owner
-                    && !sym.contains('.')
-                    && !scope.contains_key(sym) =>
+                if this_owner != pickle_owner && !sym.contains('.') && !scope.contains_key(sym) =>
             {
                 self.ensure_class(st, bin, this_owner, false)
                     .map(|cls| Type::Class {
@@ -4910,7 +4920,12 @@ impl PickleSupply {
 
     /// [`Self::ensure_parents`] for `cls` and, transitively, every class it
     /// inherits from, so [`SymbolTable::is_ancestor_of`] sees the whole chain.
-    fn ensure_ancestor_parents(&mut self, st: &mut SymbolTable, bin: &mut BinaryIndex, cls: SymbolId) {
+    fn ensure_ancestor_parents(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        cls: SymbolId,
+    ) {
         let mut stack = vec![cls];
         let mut seen = rustc_hash::FxHashSet::default();
         while let Some(c) = stack.pop() {
@@ -6779,8 +6794,7 @@ impl PickleSupply {
             // chain before handing out a `this.type` of an ancestor.
             SigType::This(owner) => {
                 let this = self.ensure_class(st, bin, owner, false);
-                if let (Some(this), Some(Type::Class { sym, .. })) = (this, self.self_ty.clone())
-                {
+                if let (Some(this), Some(Type::Class { sym, .. })) = (this, self.self_ty.clone()) {
                     if this != sym && !st.is_ancestor_of(this, sym) {
                         self.ensure_ancestor_parents(st, bin, sym);
                     }
@@ -7284,7 +7298,9 @@ impl PickleSupply {
                         return None;
                     };
                     let id = st.abstract_projection(p, decl);
-                    trace(format_args!("projection {sym}: kept unreduced on the prefix's bound"));
+                    trace(format_args!(
+                        "projection {sym}: kept unreduced on the prefix's bound"
+                    ));
                     return Some(Type::TypeMember(id));
                 }
             }
@@ -7501,7 +7517,10 @@ impl PickleSupply {
                 return None;
             }
         }
-        Some(Type::Class { sym: cls, args: a.into() })
+        Some(Type::Class {
+            sym: cls,
+            args: a.into(),
+        })
     }
 
     /// Convert `p1#Shape.Packed` using the exact formal path retained by the
@@ -8861,6 +8880,18 @@ fn ensure_value_class_field(
 mod tests {
     use super::*;
     use crate::TypecheckOptions;
+
+    #[test]
+    fn scala_signature_source_skips_java_classfiles() {
+        let mut binary = BinaryIndex::from_user_paths(Vec::new());
+        assert!(binary.find_class("java/lang/String").unwrap().is_some());
+        assert!(BinSource(&mut binary)
+            .class_bytes("java/lang/String")
+            .is_none());
+        assert!(BinSource(&mut binary)
+            .class_bytes("java/io$Serializable")
+            .is_none());
+    }
 
     fn jar() -> Option<std::path::PathBuf> {
         let p = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");

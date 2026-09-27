@@ -5,6 +5,7 @@
 // here (the map is only ever looked up by key).
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
+use std::cell::{Cell, RefCell};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -105,11 +106,127 @@ impl AsRef<[u8]> for SharedBytes {
 /// directory (scala-library has ~10k entries); doing that per class lookup, for
 /// each of the ~15 jars on a classpath, was the single largest cost in the
 /// typer.
+#[derive(Clone)]
 struct ZipIndex {
     archive: ZipArchive<Cursor<SharedBytes>>,
     /// Entry names, sorted, so a package-prefix query is a binary search rather
     /// than a linear walk over every entry.
-    sorted_names: Vec<String>,
+    sorted_names: std::rc::Rc<Vec<String>>,
+}
+
+const RESIDENT_ARCHIVE_LIMIT: usize = 512 * 1024 * 1024;
+
+#[cfg(unix)]
+#[derive(PartialEq, Eq)]
+struct ArchiveStamp {
+    size: u64,
+    device: u64,
+    inode: u64,
+    modified_seconds: i64,
+    modified_nanos: i64,
+    changed_seconds: i64,
+    changed_nanos: i64,
+}
+
+#[cfg(unix)]
+impl ArchiveStamp {
+    fn of(path: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = std::fs::metadata(path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        Ok(Self {
+            size: meta.len(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            modified_seconds: meta.mtime(),
+            modified_nanos: meta.mtime_nsec(),
+            changed_seconds: meta.ctime(),
+            changed_nanos: meta.ctime_nsec(),
+        })
+    }
+}
+
+#[cfg(unix)]
+struct CachedArchive {
+    stamp: ArchiveStamp,
+    index: ZipIndex,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct ResidentArchives {
+    by_path: HashMap<PathBuf, CachedArchive>,
+    total_bytes: usize,
+    tick: u64,
+}
+
+thread_local! {
+    static RESIDENT_ARCHIVES_ENABLED: Cell<bool> = const { Cell::new(false) };
+    #[cfg(unix)]
+    static RESIDENT_ARCHIVES: RefCell<ResidentArchives> = RefCell::new(ResidentArchives::default());
+    #[cfg(test)]
+    static ARCHIVE_LOADS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Reuse immutable archive indexes between sequential compiler runs in one
+/// process. Directory classpaths stay per-run because earlier output
+/// directories can gain class files while a dependency graph is compiled.
+pub fn enable_resident_archive_cache() {
+    RESIDENT_ARCHIVES_ENABLED.set(true);
+}
+
+#[cfg(unix)]
+fn cached_archive(path: &Path, stamp: &ArchiveStamp) -> Option<ZipIndex> {
+    RESIDENT_ARCHIVES.with_borrow_mut(|cache| {
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        let hit = cache.by_path.get_mut(path)?;
+        if &hit.stamp != stamp {
+            let removed = cache.by_path.remove(path).unwrap();
+            cache.total_bytes -= removed.bytes;
+            return None;
+        }
+        hit.last_used = tick;
+        Some(hit.index.clone())
+    })
+}
+
+#[cfg(unix)]
+fn remember_archive(path: &Path, stamp: ArchiveStamp, index: ZipIndex, bytes: usize) {
+    if bytes > RESIDENT_ARCHIVE_LIMIT {
+        return;
+    }
+    RESIDENT_ARCHIVES.with_borrow_mut(|cache| {
+        while cache.total_bytes + bytes > RESIDENT_ARCHIVE_LIMIT {
+            let Some(oldest) = cache
+                .by_path
+                .iter()
+                .min_by_key(|(_, value)| value.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            cache.total_bytes -= cache.by_path.remove(&oldest).unwrap().bytes;
+        }
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        let previous = cache.by_path.insert(
+            path.to_path_buf(),
+            CachedArchive {
+                stamp,
+                index,
+                bytes,
+                last_used: tick,
+            },
+        );
+        if let Some(previous) = previous {
+            cache.total_bytes -= previous.bytes;
+        }
+        cache.total_bytes += bytes;
+    });
 }
 
 /// What a classpath entry turned out to be, decided once. `is_dir()`/`is_file()`
@@ -124,6 +241,9 @@ enum PathKind {
 
 pub struct BinaryIndex {
     paths: Vec<Entry>,
+    /// JDK modules cannot provide Scala classes; keep the user/JDK boundary
+    /// so a missing `scala.*` name does not open every module archive.
+    user_paths: usize,
     /// Enabled only after an ordinary lookup has opened every archive.
     /// Planning must not expose an invalid later archive before an earlier hit.
     archives_ready: bool,
@@ -226,9 +346,7 @@ impl Entry {
                     .filter(|entry| {
                         entry.file_type().map_or_else(
                             |_| entry.path().is_file(),
-                            |kind| {
-                                kind.is_file() || (kind.is_symlink() && entry.path().is_file())
-                            },
+                            |kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()),
                         )
                     })
                     .map(|entry| entry.file_name())
@@ -244,6 +362,7 @@ impl Entry {
 
 impl BinaryIndex {
     pub fn from_user_paths(user: Vec<PathBuf>) -> Self {
+        let user_paths = user.len();
         let mut raw = user;
         raw.extend(discover_jdk_jmods());
         let paths = raw
@@ -274,6 +393,7 @@ impl BinaryIndex {
             .collect();
         BinaryIndex {
             paths,
+            user_paths,
             archives_ready: false,
             package_paths: HashMap::default(),
             class_cache: HashMap::default(),
@@ -322,14 +442,31 @@ impl BinaryIndex {
     }
 
     fn find_class_uncached(&mut self, internal: &str) -> Result<Option<Vec<u8>>, String> {
+        // Scala's top types are compiler-defined, not class files. In
+        // particular, looking for `scala/Any` would open every JDK module on
+        // the first library completion just to establish a guaranteed miss.
+        if matches!(internal, "scala/Any" | "scala/AnyRef") {
+            return Ok(None);
+        }
         let rel = format!("{internal}.class");
         let alt = format!("classes/{rel}");
         let (package, _) = internal.rsplit_once('/').unwrap_or(("", internal));
+        // Named JDK modules cannot contain default-package classes either.
+        let jdk_companion = internal.ends_with('$')
+            && (internal.starts_with("java/") || internal.starts_with("javax/"));
+        let limit = if !internal.contains('/') || internal.starts_with("scala/") || jdk_companion {
+            self.user_paths
+        } else {
+            self.paths.len()
+        };
         let plan = self
             .archives_ready
             .then(|| self.class_package_paths(package));
-        for at in 0..plan.as_ref().map_or(self.paths.len(), |paths| paths.len()) {
+        for at in 0..plan.as_ref().map_or(limit, |paths| paths.len()) {
             let i = plan.as_ref().map_or(at, |paths| paths[at]);
+            if i >= limit {
+                continue;
+            }
             #[cfg(test)]
             CLASS_PATH_PROBES.with(|count| count.set(count.get() + 1));
             match self.paths[i].kind {
@@ -385,7 +522,9 @@ impl BinaryIndex {
                 }
             }
         }
-        self.archives_ready = true;
+        if limit == self.paths.len() {
+            self.archives_ready = true;
+        }
         Ok(None)
     }
 
@@ -446,7 +585,12 @@ impl BinaryIndex {
     fn has_package_prefix_uncached(&mut self, prefix: &str) -> bool {
         let dir_rel = prefix.trim_end_matches('/');
         let alt = format!("classes/{prefix}");
-        for i in 0..self.paths.len() {
+        let limit = if prefix.starts_with("scala/") || prefix.starts_with("scala$") {
+            self.user_paths
+        } else {
+            self.paths.len()
+        };
+        for i in 0..limit {
             match self.paths[i].kind {
                 PathKind::Zip => {
                     let Ok(e) = load_zip(&mut self.paths[i]) else {
@@ -512,8 +656,23 @@ fn path_case_matches(root: &Path, rel: &str) -> bool {
 /// Parse `e`'s archive if it has not been parsed yet, and hand `e` back.
 fn load_zip(e: &mut Entry) -> Result<&mut Entry, String> {
     if e.zip.is_none() {
+        #[cfg(unix)]
+        let stamp = if RESIDENT_ARCHIVES_ENABLED.get() {
+            let stamp = ArchiveStamp::of(&e.path)?;
+            if let Some(index) = cached_archive(&e.path, &stamp) {
+                e.zip = Some(index);
+                return Ok(e);
+            }
+            Some(stamp)
+        } else {
+            None
+        };
         let data = std::fs::read(&e.path)
             .map_err(|err| format!("cannot read {}: {err}", e.path.display()))?;
+        #[cfg(test)]
+        ARCHIVE_LOADS.with(|count| count.set(count.get() + 1));
+        #[cfg(unix)]
+        let bytes = data.len();
         // A `.jmod` puts a four-byte `JM\x01\0` header before the zip.
         let off = usize::from(data.len() >= 4 && data[0] == b'J' && data[1] == b'M') * 4;
         let shared = SharedBytes {
@@ -526,8 +685,12 @@ fn load_zip(e: &mut Entry) -> Result<&mut Entry, String> {
         sorted_names.sort_unstable();
         e.zip = Some(ZipIndex {
             archive,
-            sorted_names,
+            sorted_names: std::rc::Rc::new(sorted_names),
         });
+        #[cfg(unix)]
+        if let Some(stamp) = stamp {
+            remember_archive(&e.path, stamp, e.zip.as_ref().unwrap().clone(), bytes);
+        }
     }
     Ok(e)
 }
@@ -547,67 +710,58 @@ fn is_zip_like(p: &Path) -> bool {
 }
 
 fn discover_jdk_jmods() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut homes = Vec::new();
-    if let Ok(h) = std::env::var("JAVA_HOME") {
-        homes.push(PathBuf::from(h));
-    }
-    if let Ok(java) = std::fs::read_link("/usr/bin/java")
-        .or_else(|_| std::fs::read_link("/bin/java"))
-        .or_else(|_| which_java())
+    if let Some(paths) = std::env::var_os("JAVA_HOME")
+        .as_deref()
+        .and_then(|home| jdk_class_paths(Path::new(home)))
     {
-        // …/bin/java → home
-        if let Some(home) = java.parent().and_then(|b| b.parent()) {
-            homes.push(home.to_path_buf());
-        }
+        return paths;
     }
-    // macOS: `/usr/bin/java` is a stub, not a symlink into a JDK. Ask java_home.
-    if let Ok(o) = std::process::Command::new("/usr/libexec/java_home").output() {
-        if o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() {
-                homes.push(PathBuf::from(s));
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let Ok(java) = dir.join("java").canonicalize() else {
+                continue;
+            };
+            if let Some(paths) = java
+                .parent()
+                .and_then(Path::parent)
+                .and_then(jdk_class_paths)
+            {
+                return paths;
             }
         }
     }
-    homes.push(PathBuf::from("/usr/lib/jvm/default-java"));
-    homes.push(PathBuf::from("/usr/lib/jvm/java-21-openjdk-amd64"));
-    let mut seen = std::collections::HashSet::new();
-    for home in homes {
-        let jmods = home.join("jmods");
-        let base = jmods.join("java.base.jmod");
-        if base.is_file() && seen.insert(base.clone()) {
-            out.push(base);
-            if let Ok(rd) = std::fs::read_dir(&jmods) {
-                for ent in rd.flatten() {
-                    let p = ent.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("jmod")
-                        && seen.insert(p.clone())
-                    {
-                        out.push(p);
-                    }
-                }
+    // `/usr/bin/java` is a launcher stub on macOS, not a path into the JDK.
+    if let Ok(output) = std::process::Command::new("/usr/libexec/java_home").output() {
+        if output.status.success() {
+            let home = String::from_utf8_lossy(&output.stdout);
+            if let Some(paths) = jdk_class_paths(Path::new(home.trim())) {
+                return paths;
             }
         }
-        let rt = home.join("lib/rt.jar");
-        if rt.is_file() && seen.insert(rt.clone()) {
-            out.push(rt);
-        }
     }
-    out
+    [
+        "/usr/lib/jvm/default-java",
+        "/usr/lib/jvm/java-21-openjdk-amd64",
+    ]
+    .iter()
+    .find_map(|home| jdk_class_paths(Path::new(home)))
+    .unwrap_or_default()
 }
 
-fn which_java() -> std::io::Result<PathBuf> {
-    let p = std::process::Command::new("which").arg("java").output()?;
-    if !p.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "which java",
-        ));
+fn jdk_class_paths(home: &Path) -> Option<Vec<PathBuf>> {
+    let jmods = home.join("jmods");
+    let base = jmods.join("java.base.jmod");
+    if base.is_file() {
+        let mut paths = vec![base.clone()];
+        if let Ok(entries) = std::fs::read_dir(jmods) {
+            paths.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+                path != &base && path.extension().and_then(|s| s.to_str()) == Some("jmod")
+            }));
+        }
+        return Some(paths);
     }
-    let s = String::from_utf8_lossy(&p.stdout).trim().to_string();
-    let path = PathBuf::from(s);
-    std::fs::read_link(&path).or(Ok(path))
+    let rt = home.join("lib/rt.jar");
+    rt.is_file().then_some(vec![rt])
 }
 
 pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
@@ -1012,6 +1166,123 @@ mod tests {
             zip.write_all(bytes).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    #[test]
+    fn virtual_scala_classes_do_not_open_classpath_archives() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-virtual-class-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let bad = root.join("bad.jar");
+        std::fs::write(&bad, b"not a zip").unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![bad]);
+        index.paths.truncate(1);
+        assert_eq!(index.find_class("scala/Any").unwrap(), None);
+        assert_eq!(index.find_class("scala/AnyRef").unwrap(), None);
+        assert!(index.paths[0].zip.is_none());
+        assert!(index.find_class("p/Real").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scala_names_stop_before_jdk_modules_but_java_names_reach_them() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-jdk-boundary-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let user = root.join("user.jar");
+        let jdk = root.join("java.base.jmod");
+        test_archive(&user, &[("scala/Custom.class", b"user")]);
+        test_archive(
+            &jdk,
+            &[
+                ("classes/scala/Hidden.class", b"not a user class"),
+                ("classes/scala$Hidden.class", b"not a user class"),
+                ("classes/java/io/Hidden$.class", b"not a Scala companion"),
+                ("classes/java/lang/Visible.class", b"jdk"),
+            ],
+        );
+        let mut index = BinaryIndex::from_user_paths(vec![user]);
+        index.paths.truncate(1);
+        index.paths.push(Entry {
+            path: jdk,
+            kind: PathKind::Zip,
+            scala_distribution: false,
+            zip: None,
+            dir_packages: HashMap::default(),
+            dir_children: HashMap::default(),
+        });
+        assert_eq!(
+            index.find_class("scala/Custom").unwrap(),
+            Some(b"user".to_vec())
+        );
+        assert_eq!(index.find_class("scala/Hidden").unwrap(), None);
+        assert_eq!(index.find_class("scala$Hidden").unwrap(), None);
+        assert_eq!(index.find_class("java/io/Hidden$").unwrap(), None);
+        assert!(index.paths[1].zip.is_none());
+        assert!(!index.archives_ready);
+        assert_eq!(
+            index.find_class("java/lang/Visible").unwrap(),
+            Some(b"jdk".to_vec())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_archive_index_is_shared_and_invalidated_after_rewrite() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-resident-archive-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let jar = root.join("one.jar");
+        test_archive(&jar, &[("p/Value.class", b"one")]);
+        let before = std::fs::metadata(&jar).unwrap();
+        enable_resident_archive_cache();
+        ARCHIVE_LOADS.with(|count| count.set(0));
+        for _ in 0..2 {
+            let mut index = BinaryIndex::from_user_paths(vec![jar.clone()]);
+            index.paths.truncate(1);
+            assert_eq!(index.find_class("p/Value").unwrap(), Some(b"one".to_vec()));
+        }
+        assert_eq!(ARCHIVE_LOADS.with(|count| count.get()), 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        test_archive(&jar, &[("p/Value.class", b"two")]);
+        assert_eq!(std::fs::metadata(&jar).unwrap().len(), before.len());
+        let file = std::fs::File::options().write(true).open(&jar).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![jar.clone()]);
+        index.paths.truncate(1);
+        assert_eq!(index.find_class("p/Value").unwrap(), Some(b"two".to_vec()));
+        assert_eq!(ARCHIVE_LOADS.with(|count| count.get()), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jdk_class_paths_prioritize_base_without_duplicates() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-jdk-paths-{unique}"));
+        let jmods = root.join("jmods");
+        std::fs::create_dir_all(&jmods).unwrap();
+        let base = jmods.join("java.base.jmod");
+        let other = jmods.join("java.logging.jmod");
+        std::fs::write(&base, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        let paths = jdk_class_paths(&root).unwrap();
+        assert_eq!(paths, vec![base, other]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

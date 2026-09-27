@@ -1075,6 +1075,20 @@ pub fn typecheck_units_src(
     opts: &TypecheckOptions,
     sources: &[String],
 ) -> (SymbolTable, Vec<Diagnostic>) {
+    let mut phase_start =
+        std::env::var_os("SCALA_RS_TYPER_PHASE_TIMING").map(|_| std::time::Instant::now());
+    macro_rules! phase {
+        ($name:literal) => {
+            if let Some(start) = phase_start {
+                eprintln!(
+                    "[typer timing] {} {:.3} s",
+                    $name,
+                    start.elapsed().as_secs_f64()
+                );
+                phase_start = Some(std::time::Instant::now());
+            }
+        };
+    }
     let first = units.first().map(|(_, i)| *i).unwrap_or(0);
     let mut t = Typer::new(first, opts);
     t.prestart_macro_engine();
@@ -1099,6 +1113,7 @@ pub fn typecheck_units_src(
     t.link_tuple_products();
     t.link_string_parents();
     t.defer_default_rhs = true;
+    phase!("setup");
     {
         let refs: Vec<(&Tree, usize)> = units.iter().map(|(t, i)| (&**t, *i)).collect();
         t.check_duplicate_names(&refs);
@@ -1109,6 +1124,7 @@ pub fn typecheck_units_src(
         t.namer(tree);
         t.register_sealed_from_namer(tree);
     }
+    phase!("namer");
     // `@compileTimeOnly` is checked only when some source can carry it (only
     // source definitions keep annotations). A caller with no source text
     // checks unconditionally.
@@ -1175,6 +1191,7 @@ pub fn typecheck_units_src(
     // A source `Predef`'s type aliases are named by signatures, so they have
     // to be open before the pass below; its terms follow after it.
     crate::predef_reimport::reimport_source_predef_types(&mut t.st);
+    phase!("headers");
     {
         // Member types first, across every unit: typing a body may call a
         // member declared further down the file, or in a file that comes
@@ -1212,6 +1229,7 @@ pub fn typecheck_units_src(
     // `crate::predef_reimport`; a no-op for every program that does not
     // define `scala.Predef` itself.
     crate::predef_reimport::reimport_source_predef(&mut t.st);
+    phase!("signatures");
     // Default arguments are bodies, not signatures: typing them during the
     // pass above would let one name only the members of the units that come
     // before its own on the command line.
@@ -1220,6 +1238,7 @@ pub fn typecheck_units_src(
     t.inherit_overridden_defaults();
     t.defer_default_rhs = false;
     t.type_pending_defaults();
+    phase!("defaults");
     let unit_timing = std::env::var_os("SCALA_RS_UNIT_TIMING").is_some();
     for (tree, file_index) in units.iter_mut() {
         let started = unit_timing.then(std::time::Instant::now);
@@ -1235,6 +1254,7 @@ pub fn typecheck_units_src(
             );
         }
     }
+    phase!("bodies");
     for (tree, file_index) in units.iter() {
         t.file_index = *file_index;
         t.check_compile_time_only(tree);
@@ -1265,6 +1285,8 @@ pub fn typecheck_units_src(
         crate::warn_patmat::run(&mut t, units);
     }
     t.macro_timing.report();
+    phase!("checks");
+    let _ = phase_start;
     (t.st, t.diags)
 }
 

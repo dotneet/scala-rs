@@ -171,6 +171,7 @@ mod prelude_stringops_core;
 mod prelude_xmlenum;
 
 pub use anon_capture::mark_anon_captures;
+pub use anonfun_names::{anonfun_class_names, AnonfunClassNames};
 pub use check::{
     find_mains, has_errors, typecheck, typecheck_opts, typecheck_opts_src, typecheck_units,
     typecheck_units_src, ClasspathClass, ClasspathField, ClasspathMethod, ClasspathPickleMethod,
@@ -182,11 +183,11 @@ pub use erasure::{
     erase, erase_type, erase_value_class_default_getters, note_source_value_classes,
     tree_mentions_symbol,
 };
+pub use expand::enable_resident_direct_macro;
 pub use expand_private::{expand_private_names, expand_trait_private_vals};
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;
 pub use lin::{is_interface, linearize, trait_superclass};
-pub use anonfun_names::{anonfun_class_names, AnonfunClassNames};
 pub use localobj::{check_local_case_class_captures, check_local_objects, defines_local_classes};
 pub use named_eval_order::restore_named_arg_order;
 pub use rassoc::restore_rassoc_order;

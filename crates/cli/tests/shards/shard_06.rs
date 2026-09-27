@@ -46,10 +46,10 @@ mod pickle_lib;
 mod pickleparams;
 #[path = "../pkgalias.rs"]
 mod pkgalias;
-#[path = "../pkgobjdup.rs"]
-mod pkgobjdup;
 #[path = "../pkgobj_term.rs"]
 mod pkgobj_term;
+#[path = "../pkgobjdup.rs"]
+mod pkgobjdup;
 #[path = "../preludefidelity.rs"]
 mod preludefidelity;
 #[path = "../preludelb.rs"]
@@ -78,6 +78,8 @@ mod reify2;
 mod reifydefs;
 #[path = "../reject.rs"]
 mod reject;
+#[path = "../resident_batch.rs"]
+mod resident_batch;
 #[path = "../resultprefix.rs"]
 mod resultprefix;
 #[path = "../retfamily.rs"]

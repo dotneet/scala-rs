@@ -8,11 +8,10 @@
 //! Tuple4(a, b, c, d)` — slick's generated `TupleSupport` — fails on every
 //! arity, and so does any plain `val p: Product = (1, 2)`.
 //!
-//! `scala.Product` and `java.io.Serializable` belong to the classpath, not the
-//! prelude, so this runs *after* the classpath is installed and links nothing
-//! when those classes are absent: the private runtime (`--no-scala-library`)
-//! ships a `scala/Tuple2` that implements neither, and claiming otherwise
-//! would be a lie the backend could not back up.
+//! `scala.Product` and `java.io.Serializable` are classpath-backed. The typer
+//! reserves their type hierarchy before this pass and completes members on
+//! demand. This runs only in the library ABI: the private runtime
+//! (`--no-scala-library`) ships a `scala/Tuple2` that implements neither.
 
 use crate::symbol::SymbolTable;
 use scala_rs_parser::Type;

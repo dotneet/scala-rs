@@ -1,6 +1,10 @@
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
@@ -66,6 +70,89 @@ public final class ScalaRsMacroEngine {
     static Object universe;
     static Object mirror;
     static ClassLoader macroCl;
+    static RuntimeLoader runtimeCl;
+    static List<String> runtimeEntries = java.util.Collections.emptyList();
+
+    static final class RuntimeLoader extends java.net.URLClassLoader {
+        final java.util.Set<String> entries = new java.util.HashSet<>();
+        final java.util.Set<String> sharedRuntimeUrls = new java.util.HashSet<>();
+        final java.util.Map<String, LoadedResource> loadedResources = new java.util.HashMap<>();
+
+        static final class LoadedResource {
+            final String url;
+            final byte[] digest;
+
+            LoadedResource(String url, byte[] digest) {
+                this.url = url;
+                this.digest = digest;
+            }
+        }
+
+        RuntimeLoader(ClassLoader parent) {
+            super(new java.net.URL[0], parent);
+        }
+
+        void addPath(String entry) throws Exception {
+            if (entries.add(entry)) {
+                java.net.URL url = new java.io.File(entry).toURI().toURL();
+                addURL(url);
+                String name = new java.io.File(entry).getName();
+                if (name.startsWith("scala-library") || name.startsWith("scala-reflect")
+                        || name.startsWith("scala-compiler")) {
+                    sharedRuntimeUrls.add(url.toExternalForm());
+                }
+            }
+        }
+
+        @Override
+        protected Class<?> findClass(String name) throws ClassNotFoundException {
+            Class<?> cls = super.findClass(name);
+            java.security.CodeSource source = cls.getProtectionDomain().getCodeSource();
+            if (source != null && source.getLocation() != null
+                    && !sharedRuntimeUrls.contains(source.getLocation().toExternalForm())) {
+                String path = name.replace('.', '/') + ".class";
+                java.net.URL resource = findResource(path);
+                if (resource != null) {
+                    try {
+                        loadedResources.put(path,
+                            new LoadedResource(resource.toExternalForm(), digest(resource)));
+                    } catch (java.io.IOException | java.security.NoSuchAlgorithmException failure) {
+                        throw new ClassNotFoundException(name, failure);
+                    }
+                }
+            }
+            return cls;
+        }
+
+        boolean conflicts(List<String> currentEntries) throws Exception {
+            if (loadedResources.isEmpty()) return false;
+            try (RuntimeLoader current = new RuntimeLoader(null)) {
+                for (String entry : currentEntries) current.addPath(entry);
+                for (java.util.Map.Entry<String, LoadedResource> entry : loadedResources.entrySet()) {
+                    java.net.URL resource = current.findResource(entry.getKey());
+                    LoadedResource loaded = entry.getValue();
+                    if (resource == null || !loaded.url.equals(resource.toExternalForm())
+                            || !java.util.Arrays.equals(loaded.digest, digest(resource))) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        static byte[] digest(java.net.URL resource)
+                throws java.io.IOException, java.security.NoSuchAlgorithmException {
+            java.net.URLConnection connection = resource.openConnection();
+            connection.setUseCaches(false);
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            try (java.io.InputStream stream = connection.getInputStream()) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = stream.read(buffer)) != -1) digest.update(buffer, 0, read);
+            }
+            return digest.digest();
+        }
+    }
     /** Proxies retained only while their expansion is active in the typer. */
     static final java.util.Map<Long, Object> macroContexts = new java.util.HashMap<>();
     /** The run's source files by file index, sent once each: `(position src
@@ -140,6 +227,10 @@ public final class ScalaRsMacroEngine {
             protocolSelfTest();
             return;
         }
+        if ((args.length == 3 || args.length == 4) && "--daemon".equals(args[0])) {
+            runDaemon(args[1], args[2], args.length == 4 ? args[3] : null);
+            return;
+        }
         if (args.length != 0) {
             throw new IllegalArgumentException("unexpected macro engine argument");
         }
@@ -184,6 +275,217 @@ public final class ScalaRsMacroEngine {
         }
     }
 
+    /** Keep the Scala runtime warm while each compiler run gets a fresh mirror. */
+    static void runDaemon(String endpointPath, String token, String unixPath) throws Exception {
+        ClassLoader baseCl = ScalaRsMacroEngine.class.getClassLoader();
+        final java.util.concurrent.Semaphore session = new java.util.concurrent.Semaphore(1);
+        try (ServerSocket server = new ServerSocket(0, 32,
+                InetAddress.getByName("127.0.0.1"))) {
+            server.setSoTimeout(1000);
+            java.nio.channels.ServerSocketChannel unixServer = null;
+            if (unixPath != null) {
+                try {
+                    Class<?> familyClass = Class.forName("java.net.StandardProtocolFamily");
+                    @SuppressWarnings({"unchecked", "rawtypes"})
+                    Object unix = Enum.valueOf((Class) familyClass, "UNIX");
+                    unixServer = (java.nio.channels.ServerSocketChannel)
+                        java.nio.channels.ServerSocketChannel.class
+                            .getMethod("open", java.net.ProtocolFamily.class).invoke(null, unix);
+                    java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(unixPath));
+                    java.net.SocketAddress address = (java.net.SocketAddress)
+                        Class.forName("java.net.UnixDomainSocketAddress")
+                            .getMethod("of", String.class).invoke(null, unixPath);
+                    unixServer.bind(address, 32);
+                    final java.nio.channels.ServerSocketChannel listener = unixServer;
+                    Thread acceptor = new Thread(() -> {
+                        while (listener.isOpen()) {
+                            try {
+                                java.nio.channels.SocketChannel client = listener.accept();
+                                startDaemonSession(client,
+                                    java.nio.channels.Channels.newInputStream(client),
+                                    java.nio.channels.Channels.newOutputStream(client),
+                                    token, baseCl, session);
+                            } catch (Exception ignored) {
+                                if (!listener.isOpen()) break;
+                            }
+                        }
+                    }, "macro-unix-accept");
+                    acceptor.setDaemon(true);
+                    acceptor.start();
+                } catch (Exception unsupported) {
+                    if (unixServer != null) unixServer.close();
+                    unixServer = null;
+                }
+            }
+            java.nio.file.Path endpoint = java.nio.file.Paths.get(endpointPath);
+            java.nio.file.Path staging = java.nio.file.Paths.get(endpointPath + "." +
+                Long.toHexString(System.nanoTime()) + ".tmp");
+            java.nio.file.Files.write(staging,
+                (server.getLocalPort() + " " + token +
+                    (unixServer == null ? "" : " " + unixPath) + "\n")
+                    .getBytes(StandardCharsets.UTF_8));
+            java.nio.file.Files.move(staging, endpoint,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            long idle = System.nanoTime();
+            while (true) {
+                Socket socket;
+                try {
+                    socket = server.accept();
+                } catch (SocketTimeoutException timeout) {
+                    if (session.availablePermits() == 1 &&
+                            System.nanoTime() - idle > java.util.concurrent.TimeUnit.MINUTES.toNanos(3)) {
+                        break;
+                    }
+                    continue;
+                }
+                idle = System.nanoTime();
+                try {
+                    socket.setSoTimeout(5000);
+                    startDaemonSession(socket, socket.getInputStream(), socket.getOutputStream(),
+                        token, baseCl, session);
+                } catch (Throwable failure) {
+                    socket.close();
+                }
+            }
+            if (unixServer != null) {
+                unixServer.close();
+                java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(unixPath));
+            }
+            java.nio.file.Files.deleteIfExists(endpoint);
+        }
+    }
+
+    static void startDaemonSession(AutoCloseable client, java.io.InputStream input,
+                                   java.io.OutputStream output, String token, ClassLoader baseCl,
+                                   java.util.concurrent.Semaphore session) throws Exception {
+        WireReader reader = new WireReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+        String line = readWireLine(reader);
+        if (line == null) {
+            client.close();
+            return;
+        }
+        Sexp request = Sexp.parse(line);
+        if (!request.isList() || request.items.size() < 2 ||
+                !token.equals(request.items.get(1).text())) {
+            client.close();
+            return;
+        }
+        String command = request.items.get(0).text();
+        if ("shutdown".equals(command) && request.items.size() == 2) {
+            System.exit(0);
+        }
+        if (!"start".equals(command)) {
+            client.close();
+            return;
+        }
+        Thread worker = new Thread(() -> runDaemonSession(
+            client, reader, output, request, baseCl, session), "macro-session");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    static void runDaemonSession(AutoCloseable client, WireReader reader,
+                                 java.io.OutputStream output, Sexp request,
+                                 ClassLoader baseCl,
+                                 java.util.concurrent.Semaphore session) {
+        boolean acquired = false;
+        try {
+            session.acquire();
+            acquired = true;
+            if (client instanceof Socket) ((Socket) client).setSoTimeout(0);
+            in = reader;
+            out = new PrintStream(output, true, "UTF-8");
+            System.setOut(new PrintStream(new MacroOutput("stdout"), true, "UTF-8"));
+            System.setErr(new PrintStream(new MacroOutput("stderr"), true, "UTF-8"));
+            List<String> entries = new ArrayList<>();
+            for (int i = 2; i < request.items.size(); i++) {
+                entries.add(request.items.get(i).text());
+            }
+            resetRun(baseCl, entries);
+            out.println("(ready)");
+            String line;
+            while ((line = readWireLine(in)) != null) {
+                if (line.isEmpty()) continue;
+                String reply;
+                long handleStarted = System.nanoTime();
+                try {
+                    reply = handle(line);
+                } catch (Throwable failure) {
+                    reply = err(describe(failure));
+                }
+                handleNanos += System.nanoTime() - handleStarted;
+                out.println(reply);
+            }
+        } catch (Throwable failure) {
+            if (out != null) out.println(err(describe(failure)));
+        } finally {
+            try { client.close(); } catch (Exception ignored) { }
+            if (acquired) session.release();
+        }
+    }
+
+    static void resetRun(ClassLoader baseCl, List<String> entries) throws Exception {
+        boolean sameClasspath = runtimeCl != null && runtimeEntries.equals(entries);
+        boolean changedClasses = runtimeCl != null && runtimeCl.conflicts(entries);
+        if (changedClasses) {
+            if (macroCl instanceof java.net.URLClassLoader) {
+                ((java.net.URLClassLoader) macroCl).close();
+            }
+            runtimeCl.close();
+            runtimeCl = null;
+        }
+        if (runtimeCl == null) runtimeCl = new RuntimeLoader(baseCl);
+        for (String entry : entries) {
+            runtimeCl.addPath(entry);
+        }
+        if (!sameClasspath || changedClasses || universe == null) {
+            Class<?> universeClass = Class.forName("scala.reflect.runtime.JavaUniverse", true, runtimeCl);
+            universe = universeClass.getConstructor().newInstance();
+            mirror = find(universe.getClass(), "runtimeMirror", 1).invoke(universe, runtimeCl);
+        }
+        runtimeEntries = new ArrayList<>(entries);
+        sourceSymbols.clear();
+        sourceSymbolIds.clear();
+        binaryClassNames.clear();
+        binarySymbols.clear();
+        lazyInfoClass = null;
+        sourceSymbolClasses.clear();
+        mutableSourceSymbols.clear();
+        macroContexts.clear();
+        sourceFiles.clear();
+        openImplicitEntries.clear();
+        openMacroContexts.clear();
+        pendingGap = null;
+        pendingTypecheckFailure = null;
+        fresh = 0;
+        compilerSettings.clear();
+        invokeNanos = waitNanos = handleNanos = 0;
+        reflectionBundles.clear();
+        origTrees.clear();
+        transportedTermSymbols.clear();
+        ambiguousTransportedTerms.clear();
+        typeCache.clear();
+        refinedLabels.clear();
+        structuralTypes.clear();
+        structuralParams.clear();
+        asyncMarks.clear();
+        companionIds.clear();
+        viewCodes.clear();
+        nextViewCode = -1;
+        classCache.clear();
+        universeDefinitions = null;
+        universeMembers.clear();
+        definitionsMembers.clear();
+        overloadCache.clear();
+        paramTypesCache.clear();
+        methodsCache.clear();
+        if (macroCl instanceof java.net.URLClassLoader) {
+            ((java.net.URLClassLoader) macroCl).close();
+        }
+        macroCl = macroClassLoader(runtimeCl, entries);
+    }
+
     /**
      * ScalaTest's assertion macros finish by calling scalactic's
      * `MacroOwnerRepair`.  That helper casts the public macro `Context` to
@@ -202,6 +504,10 @@ public final class ScalaRsMacroEngine {
     static ClassLoader macroClassLoader(ClassLoader parent) throws Exception {
         String[] entries = System.getProperty("java.class.path", "")
             .split(java.util.regex.Pattern.quote(java.io.File.pathSeparator));
+        return macroClassLoader(parent, java.util.Arrays.asList(entries));
+    }
+
+    static ClassLoader macroClassLoader(ClassLoader parent, List<String> entries) throws Exception {
         List<java.net.URL> urls = new ArrayList<>();
         for (String entry : entries) {
             if (!entry.isEmpty()) urls.add(new java.io.File(entry).toURI().toURL());
@@ -707,7 +1013,7 @@ public final class ScalaRsMacroEngine {
         // `Method.invoke`, which is not a diagnostic. The handler also answers
         // whitebox-specific context members through this proxy.
         Object ctx = Proxy.newProxyInstance(
-            ScalaRsMacroEngine.class.getClassLoader(),
+            macroCl,
             new Class<?>[]{loadClass("scala.reflect.macros.whitebox.Context")},
             handler);
         List<Long> contextIds = new ArrayList<>();
@@ -2506,6 +2812,7 @@ public final class ScalaRsMacroEngine {
         return symbol;
     }
 
+
     /** An object: its module symbol and its module class, made once, both
      * registered under their scala-rs identities. The module's info is the
      * module class's type; the module class's info is asked for lazily. */
@@ -2556,6 +2863,11 @@ public final class ScalaRsMacroEngine {
         Object decls = call(call(owner, "info", 0), "decls", 0);
         Object existing = call(decls, "lookup", 1, call(symbol, "name", 0));
         if (existing == symbol) return;
+        // A previous session may have loaded this run's source class as a
+        // binary dependency. The source definition must shadow that symbol.
+        if (existing != call(universe, "NoSymbol", 0) && !sourceSymbolIds.containsKey(existing)) {
+            call(decls, "unlink", 1, existing);
+        }
         call(decls, "enter", 1, symbol);
     }
 
@@ -3366,7 +3678,7 @@ public final class ScalaRsMacroEngine {
 
         static Class<?> cls(String name) {
             try {
-                return Class.forName(name, false, ScalaRsMacroEngine.class.getClassLoader());
+                return Class.forName(name, false, macroCl);
             } catch (Throwable unavailable) {
                 return null;
             }

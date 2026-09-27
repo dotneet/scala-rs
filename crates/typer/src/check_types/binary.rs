@@ -280,29 +280,80 @@ impl Typer {
     /// Give the prelude's `TupleN` classes the `Product` / `Serializable`
     /// parents nsc gives them.
     ///
-    /// Both interfaces live in the library jar, which is read on demand, so
-    /// they are forced here -- once, before any unit is named, so that every
-    /// later `is_sub_type` sees the same hierarchy. Without the jar
-    /// (`--no-scala-library`) neither class is found and nothing is linked:
-    /// the private runtime's `scala/Tuple2` implements neither, and a parent
-    /// the backend cannot back up would be a lie.
+    /// Reserve the binary interfaces before any unit is named, so every later
+    /// `is_sub_type` sees the same hierarchy. Their methods are completed on
+    /// demand. Without the library ABI (`--no-scala-library`) nothing is
+    /// linked: the private runtime's `scala/Tuple2` implements neither.
     pub(crate) fn link_tuple_products(&mut self) {
         if !self.library_abi {
             return;
         }
-        // `ProductN` too: `TupleN extends ProductN[T1, …]`, so an
-        // `Option[Product2[Int, String]]` extractor may return `Some((1, "a"))`
-        // (`run/unapply`, `pos/unapplySeq`).
-        let products: Vec<String> = (1..=crate::check::MAX_TUPLE_ARITY)
-            .map(|n| format!("scala/Product{n}"))
-            .collect();
-        for jvm in ["scala/Product", "java/io/Serializable"]
-            .into_iter()
-            .chain(products.iter().map(String::as_str))
-        {
-            let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-            let owner = crate::classpath::ensure_package(&mut self.st, pkg);
-            self.load_binary_into(jvm, owner, Span::new(0, 0), false);
+        let mut roots = Vec::new();
+        for jvm in ["scala/Equals", "scala/Product", "java/io/Serializable"] {
+            match self.binary.has_class(jvm) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    self.error(
+                        Span::new(0, 0),
+                        format!("unsupported classfile {jvm}: {error}"),
+                    );
+                    continue;
+                }
+            }
+            let cls = crate::classpath::find_or_stub_java_class(&mut self.st, jvm);
+            self.st.get_mut(cls).flags = Flags::JAVA
+                .with(Flags::INTERFACE)
+                .with(Flags::ABSTRACT)
+                .with(if jvm.starts_with("scala/") {
+                    Flags::TRAIT
+                } else {
+                    Flags::EMPTY
+                });
+            roots.push((jvm, cls));
+        }
+        let equals = roots
+            .iter()
+            .find_map(|&(jvm, cls)| (jvm == "scala/Equals").then_some(cls));
+        let product = roots
+            .iter()
+            .find_map(|&(jvm, cls)| (jvm == "scala/Product").then_some(cls));
+        if let (Some(product), Some(equals)) = (product, equals) {
+            self.st.get_mut(product).parents = vec![
+                Type::AnyRef,
+                Type::Class {
+                    sym: equals,
+                    args: vec![].into(),
+                },
+            ];
+        }
+        // The tuple hierarchy needs `ProductN[T1, …, TN]` immediately, but
+        // not its methods. Like the prelude's `TupleN` classes, these are part
+        // of the Scala 2.13 library ABI. Reserve their type parameters here;
+        // ordinary binary completion fills their members on first use.
+        for n in 1..=crate::check::MAX_TUPLE_ARITY {
+            let jvm = format!("scala/Product{n}");
+            let cls = crate::classpath::find_or_stub_java_class(&mut self.st, &jvm);
+            if self.st.get(cls).tparams.is_empty() {
+                let tps: Vec<SymbolId> = (1..=n)
+                    .map(|i| {
+                        let id = crate::prelude::type_param(&mut self.st, cls, &format!("T{i}"));
+                        self.st.get_mut(id).flags = Flags::COVARIANT;
+                        id
+                    })
+                    .collect();
+                self.st.get_mut(cls).tparams = tps;
+                if let Some(product) = product {
+                    self.st.get_mut(cls).parents = vec![Type::Class {
+                        sym: product,
+                        args: vec![].into(),
+                    }];
+                }
+                self.st.get_mut(cls).flags = Flags::JAVA
+                    .with(Flags::TRAIT)
+                    .with(Flags::INTERFACE)
+                    .with(Flags::ABSTRACT);
+            }
         }
         crate::prelude_genrep::link_tuple_products(&mut self.st);
     }
@@ -1598,8 +1649,7 @@ impl Typer {
             };
             // The table also mentions descendants of nested objects. Their
             // members belong to those objects, not directly to this owner.
-            if scala_rs_pickle::names::last_nesting_separator(rest.trim_end_matches('$'))
-                .is_some()
+            if scala_rs_pickle::names::last_nesting_separator(rest.trim_end_matches('$')).is_some()
             {
                 continue;
             }
@@ -1617,10 +1667,7 @@ impl Typer {
             // already have named the class without loading the object.
             if self.st.get(nest_owner).members.iter().any(|&m| {
                 self.st.get(m).name == simple
-                    && matches!(
-                        self.st.get(m).kind,
-                        SymKind::Module | SymKind::ModuleClass
-                    )
+                    && matches!(self.st.get(m).kind, SymKind::Module | SymKind::ModuleClass)
             }) {
                 continue;
             }
@@ -2715,6 +2762,33 @@ impl Typer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tuple_product_hierarchy_does_not_eagerly_complete_product_classes() {
+        let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if !jar.is_file() {
+            return;
+        }
+        let mut typer = Typer::new(
+            0,
+            &TypecheckOptions {
+                library_abi: true,
+                binary_path: vec![jar],
+                ..TypecheckOptions::default()
+            },
+        );
+        typer.link_tuple_products();
+        let product = crate::classpath::find_by_jvm(&typer.st, "scala/Product2").unwrap();
+        assert_eq!(typer.st.get(product).tparams.len(), 2);
+        assert!(!typer.completed_java.contains("scala/Product2"));
+        let tuple = crate::classpath::find_by_jvm(&typer.st, "scala/Tuple2").unwrap();
+        assert!(typer
+            .st
+            .get(tuple)
+            .parents
+            .iter()
+            .any(|parent| { matches!(parent, Type::Class { sym, .. } if *sym == product) }));
+    }
 
     #[test]
     fn parent_warm_batch_hits_do_not_rebuild_class_sets() {

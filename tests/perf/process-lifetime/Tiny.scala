@@ -1,4 +1,1 @@
-object Tiny {
-  def answer: Int = 42
-  def main(args: Array[String]): Unit = println(answer)
-}
+object Tiny { def main(args: Array[String]): Unit = println(42) }

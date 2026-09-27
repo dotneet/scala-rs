@@ -100,6 +100,8 @@ object Main {
     println(p2.productArity)
     val p3: Product = pairOf(1, "y")
     println(p3.productArity)
+    val pn2: Product2[Int, String] = (1, "z")
+    println(pn2._1)
 
     println(unapply3((1, "x", true)))
     val o: Option[(Int, String)] = Some(1, "x")

@@ -507,6 +507,7 @@ impl Typer {
             let cx = WireCx {
                 st: &self.st,
                 types: &types,
+                function_symbols: Some((&self.macro_function_symbols, self.file_index)),
             };
             if let Err(why) = answer_tree_to_wire(&cx, &reference, &mut tree) {
                 return refusal(&format!("open implicit reference: {why}"));
@@ -541,6 +542,7 @@ impl Typer {
         let cx = WireCx {
             st: &self.st,
             types: &types,
+            function_symbols: Some((&self.macro_function_symbols, self.file_index)),
         };
         let mut tree = String::new();
         match answer_tree_to_wire(&cx, &parsed.tree, &mut tree) {
@@ -745,6 +747,7 @@ impl Typer {
                     let cx = crate::expand::WireCx {
                         st: &self.st,
                         types: &types,
+                        function_symbols: Some((&self.macro_function_symbols, self.file_index)),
                     };
                     return match answer_tree_to_wire(&cx, &tree, &mut built) {
                         Ok(()) => format!("(a ok {ty} {built})"),
@@ -1068,6 +1071,7 @@ impl Typer {
         let cx = crate::expand::WireCx {
             st: &self.st,
             types: &types,
+            function_symbols: Some((&self.macro_function_symbols, self.file_index)),
         };
         match answer_tree_to_wire(&cx, tree, &mut built) {
             Ok(()) => format!("(a ok {ty} {built})"),
@@ -1160,8 +1164,14 @@ impl Typer {
     pub(crate) fn type_to_wire(&mut self, ty: &Type) -> Result<String, String> {
         use scala_rs_parser::TypeFlags as F;
         let context_free = !ty.flags().contains(
-            F::TYPE_PARAM | F::TYPE_MEMBER | F::REFINED | F::SINGLETON | F::NAMED | F::WILDCARD
-                | F::APPLIED | F::ERROR,
+            F::TYPE_PARAM
+                | F::TYPE_MEMBER
+                | F::REFINED
+                | F::SINGLETON
+                | F::NAMED
+                | F::WILDCARD
+                | F::APPLIED
+                | F::ERROR,
         ) && !matches!(ty, Type::Refined { .. } | Type::Annotated { .. });
         if !context_free {
             return self.type_to_wire_uncached(ty);
@@ -1177,9 +1187,12 @@ impl Typer {
             self.type_wire_cache.0 = gen;
             self.type_wire_cache.1.clear();
         }
-        if let Some(hit) = self.type_wire_cache.1.get(&key).and_then(|bucket| {
-            bucket.iter().find(|(t, _)| t == ty).map(|(_, w)| w.clone())
-        }) {
+        if let Some(hit) = self
+            .type_wire_cache
+            .1
+            .get(&key)
+            .and_then(|bucket| bucket.iter().find(|(t, _)| t == ty).map(|(_, w)| w.clone()))
+        {
             return Ok(hit);
         }
         let wire = self.type_to_wire_uncached(ty)?;
@@ -1532,7 +1545,7 @@ fn answer_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), St
     }
     let start = out.len();
     answer_tree_to_wire_body(cx, t, out)?;
-    super::expand::mirror_tree_identity(cx.st, t, start, out);
+    super::expand::mirror_tree_identity(cx, t, start, out);
     Ok(())
 }
 
@@ -1670,9 +1683,8 @@ mod tests {
     fn symbol_batch_preserves_individual_answers_and_order() {
         let mut typer = Typer::new(0, &TypecheckOptions::default());
         let ids = [typer.st.int_sym.0, typer.st.boolean_sym.0];
-        let single = ids.map(|id| {
-            typer.answer_query(&[atom("q"), atom("symbol"), atom(&id.to_string())])
-        });
+        let single =
+            ids.map(|id| typer.answer_query(&[atom("q"), atom("symbol"), atom(&id.to_string())]));
         let batch = typer.answer_query(&[
             atom("q"),
             atom("symbols"),

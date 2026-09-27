@@ -36,6 +36,10 @@
 
 use scala_rs_parser::TyBox;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{atomic::AtomicBool, atomic::Ordering as AtomicOrdering, Arc, Mutex};
@@ -71,6 +75,11 @@ const MAX_WIRE_DEPTH: usize = 512;
 const ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const ENGINE_TIMING_TIMEOUT: Duration = Duration::from_secs(2);
 const ENGINE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+static RESIDENT_DIRECT_MACRO: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_resident_direct_macro() {
+    RESIDENT_DIRECT_MACRO.store(true, AtomicOrdering::Release);
+}
 
 #[cfg(windows)]
 const ENGINE_WINDOWS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
@@ -87,14 +96,14 @@ const MAX_ENGINE_QUERIES: u32 = 1024;
 
 // ---------------------------------------------------------------- the process
 
-/// The engine process, started on the first expansion of a run.
+/// The engine transport, opened on the first expansion of a run.
 pub(crate) struct MacroEngine {
-    child: Child,
-    containment: EngineContainment,
-    stdin: ChildStdin,
+    child: Option<Child>,
+    containment: Option<EngineContainment>,
+    stdin: EngineInput,
     /// Temporarily `None` while a timed reader thread owns the pipe. A timeout
     /// poisons the engine, so that thread never has to hand a placeholder back.
-    stdout: Option<BufReader<ChildStdout>>,
+    stdout: Option<BufReader<EngineOutput>>,
     /// The thread that owns the reply pipe once a read has had to be timed;
     /// see [`ReplyReader`].
     reader: Option<ReplyReader>,
@@ -111,6 +120,123 @@ pub(crate) struct MacroEngine {
     terminated: bool,
     #[cfg(test)]
     termination_attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+enum EngineInput {
+    Pipe(ChildStdin),
+    #[cfg(unix)]
+    Socket(DaemonSocket),
+}
+
+#[cfg(unix)]
+enum DaemonSocket {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+#[cfg(unix)]
+impl DaemonSocket {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Tcp(socket) => socket.try_clone().map(Self::Tcp),
+            Self::Unix(socket) => socket.try_clone().map(Self::Unix),
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.set_read_timeout(timeout),
+            Self::Unix(socket) => socket.set_read_timeout(timeout),
+        }
+    }
+
+    fn shutdown(&self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.shutdown(std::net::Shutdown::Both),
+            Self::Unix(socket) => socket.shutdown(std::net::Shutdown::Both),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Read for DaemonSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.read(buf),
+            Self::Unix(socket) => socket.read(buf),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Write for DaemonSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.write(buf),
+            Self::Unix(socket) => socket.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.flush(),
+            Self::Unix(socket) => socket.flush(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for DaemonSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Tcp(socket) => std::os::fd::AsRawFd::as_raw_fd(socket),
+            Self::Unix(socket) => std::os::fd::AsRawFd::as_raw_fd(socket),
+        }
+    }
+}
+
+impl Write for EngineInput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Pipe(pipe) => pipe.write(buf),
+            #[cfg(unix)]
+            Self::Socket(socket) => socket.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Pipe(pipe) => pipe.flush(),
+            #[cfg(unix)]
+            Self::Socket(socket) => socket.flush(),
+        }
+    }
+}
+
+enum EngineOutput {
+    Pipe(ChildStdout),
+    #[cfg(unix)]
+    Socket(DaemonSocket),
+}
+
+impl Read for EngineOutput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Pipe(pipe) => pipe.read(buf),
+            #[cfg(unix)]
+            Self::Socket(socket) => socket.read(buf),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for EngineOutput {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Pipe(pipe) => std::os::fd::AsRawFd::as_raw_fd(pipe),
+            Self::Socket(socket) => std::os::fd::AsRawFd::as_raw_fd(socket),
+        }
+    }
 }
 
 impl Drop for MacroEngine {
@@ -170,7 +296,16 @@ impl MacroEngine {
             self.termination_attempts
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
-        terminate_engine_process(&mut self.child, &mut self.containment)
+        if let (Some(child), Some(containment)) = (&mut self.child, &mut self.containment) {
+            return terminate_engine_process(child, containment);
+        }
+        #[cfg(unix)]
+        if let EngineInput::Socket(socket) = &self.stdin {
+            socket
+                .shutdown()
+                .map_err(|error| format!("cannot close macro daemon session: {error}"))?;
+        }
+        Ok(None)
     }
 
     fn protocol_failure<T>(&mut self, mut reason: String) -> Result<T, String> {
@@ -351,7 +486,7 @@ struct ReplyReader {
 }
 
 impl ReplyReader {
-    fn spawn(mut stdout: BufReader<ChildStdout>) -> ReplyReader {
+    fn spawn(mut stdout: BufReader<EngineOutput>) -> ReplyReader {
         let (ask, asked) = std::sync::mpsc::channel::<usize>();
         let (answer, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -379,7 +514,7 @@ fn read_wire_line<R: BufRead>(reader: &mut R) -> std::io::Result<(usize, String)
 /// `poll(2)` first, so a partial line cannot hold the caller past it.
 #[cfg(unix)]
 fn read_wire_line_before(
-    reader: &mut BufReader<ChildStdout>,
+    reader: &mut BufReader<EngineOutput>,
     limit: usize,
     deadline: Instant,
 ) -> std::io::Result<(usize, String)> {
@@ -657,6 +792,182 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
     start_prepared_engine(classpath, &dir, None)
 }
 
+#[cfg(unix)]
+fn direct_daemon_endpoint(dir: &Path, classpath: &str, refresh: bool) -> Result<PathBuf, String> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static ENDPOINTS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let runtime = classpath
+        .split(':')
+        .filter(|entry| {
+            let name = Path::new(entry)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.starts_with("scala-library")
+                || name.starts_with("scala-reflect")
+                || name.starts_with("scala-compiler")
+        })
+        .collect::<Vec<_>>()
+        .join(":");
+    let key = format!(
+        "{}\0{}\0{}\0{}",
+        dir.display(),
+        runtime,
+        std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .display(),
+        jdk_tool("java").display()
+    );
+    let cache = ENDPOINTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if !refresh {
+        if let Some(endpoint) = cache
+            .lock()
+            .map_err(|_| "macro daemon endpoint cache is poisoned")?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(endpoint);
+        }
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot locate the macro daemon helper: {error}"))?;
+    let endpoint_reply = Command::new(executable)
+        .arg("__macro_endpoint")
+        .arg(dir)
+        .arg(classpath)
+        .output()
+        .map_err(|error| format!("cannot locate the macro daemon endpoint: {error}"))?;
+    if !endpoint_reply.status.success() {
+        return Err(format!(
+            "cannot start macro daemon: {}",
+            bounded_text(&endpoint_reply.stderr)
+        ));
+    }
+    let path = String::from_utf8(endpoint_reply.stdout)
+        .map_err(|_| "macro daemon endpoint path is not UTF-8".to_string())?;
+    let endpoint = PathBuf::from(path.trim());
+    let mut cache = cache
+        .lock()
+        .map_err(|_| "macro daemon endpoint cache is poisoned")?;
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(key, endpoint.clone());
+    Ok(endpoint)
+}
+
+#[cfg(unix)]
+fn start_direct_daemon_engine(
+    dir: &Path,
+    classpath: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<MacroEngine, String> {
+    check_startup_cancelled(cancelled)?;
+    let mut connected = None;
+    for refresh in [false, true] {
+        let path = direct_daemon_endpoint(dir, classpath, refresh)?;
+        let endpoint = match std::fs::read_to_string(path) {
+            Ok(endpoint) => endpoint,
+            Err(_) if !refresh => continue,
+            Err(error) => return Err(format!("cannot read macro daemon endpoint: {error}")),
+        };
+        let mut fields = endpoint.split_whitespace();
+        let (Some(port), Some(token)) = (fields.next(), fields.next()) else {
+            if !refresh {
+                continue;
+            }
+            return Err("malformed macro daemon endpoint".to_string());
+        };
+        let address: std::net::SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .map_err(|error| format!("invalid macro daemon endpoint: {error}"))?;
+        let unix = fields
+            .next()
+            .filter(|_| std::env::var_os("SCALA_RS_MACRO_FORCE_TCP").is_none());
+        let socket = unix
+            .and_then(|path| UnixStream::connect(path).ok().map(DaemonSocket::Unix))
+            .map(Ok)
+            .unwrap_or_else(|| {
+                TcpStream::connect_timeout(&address, Duration::from_secs(5)).map(DaemonSocket::Tcp)
+            });
+        match socket {
+            Ok(socket) => {
+                connected = Some((socket, token.to_string()));
+                break;
+            }
+            Err(_) if !refresh => continue,
+            Err(error) => return Err(format!("cannot connect to macro daemon: {error}")),
+        }
+    }
+    let (mut socket, token) = connected.ok_or("cannot connect to macro daemon")?;
+    check_startup_cancelled(cancelled)?;
+    if let DaemonSocket::Tcp(tcp) = &socket {
+        let _ = tcp.set_nodelay(true);
+    }
+    let mut start = String::from("(start ");
+    quote_into(&mut start, &token);
+    for entry in classpath.split(':') {
+        start.push(' ');
+        quote_into(&mut start, entry);
+    }
+    start.push_str(")\n");
+    socket
+        .write_all(start.as_bytes())
+        .map_err(|error| format!("cannot start macro daemon session: {error}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|error| format!("cannot time macro daemon readiness: {error}"))?;
+    let deadline = Instant::now() + ENGINE_STARTUP_TIMEOUT;
+    let mut hello = Vec::new();
+    loop {
+        check_startup_cancelled(cancelled)?;
+        if Instant::now() >= deadline {
+            return Err("the macro daemon did not report readiness in time".to_string());
+        }
+        let mut byte = [0u8; 1];
+        match socket.read(&mut byte) {
+            Ok(0) => return Err("the macro daemon closed before readiness".to_string()),
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if hello.len() < MAX_WIRE_BYTES => hello.push(byte[0]),
+            Ok(_) => return Err("the macro daemon readiness line is too long".to_string()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(format!("cannot read macro daemon readiness: {error}")),
+        }
+    }
+    socket
+        .set_read_timeout(None)
+        .map_err(|error| format!("cannot clear macro daemon read timeout: {error}"))?;
+    if hello != b"(ready)" {
+        return Err(format!(
+            "the macro daemon rejected the session: {}",
+            bounded_text(&hello)
+        ));
+    }
+    let input = socket
+        .try_clone()
+        .map_err(|error| format!("cannot clone macro daemon socket: {error}"))?;
+    Ok(MacroEngine {
+        child: None,
+        containment: None,
+        stdin: EngineInput::Socket(input),
+        stdout: Some(BufReader::new(EngineOutput::Socket(socket))),
+        reader: None,
+        stderr: Arc::new(Mutex::new(Vec::new())),
+        stderr_done: Arc::new(AtomicBool::new(true)),
+        stderr_thread: None,
+        poisoned: false,
+        terminated: false,
+        #[cfg(test)]
+        termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
 fn start_prepared_engine(
     classpath: &[PathBuf],
     dir: &Path,
@@ -669,11 +980,40 @@ fn start_prepared_engine(
         cp.push(sep);
         cp.push_str(&p.display().to_string());
     }
-    let mut command = Command::new(jdk_tool("java"));
+    #[cfg(unix)]
+    if direct_macro_daemon_requested(
+        RESIDENT_DIRECT_MACRO.load(AtomicOrdering::Acquire),
+        std::env::var_os("SCALA_RS_MACRO_DAEMON").as_deref(),
+    ) {
+        match start_direct_daemon_engine(dir, &cp, cancelled) {
+            Ok(engine) => return Ok(engine),
+            Err(error)
+                if std::env::var_os("SCALA_RS_MACRO_DAEMON_REQUIRE")
+                    .is_some_and(|value| value == "1") =>
+            {
+                return Err(error)
+            }
+            Err(_) => {}
+        }
+    }
+    let mut command = if let Some(endpoint) = std::env::var_os("SCALA_RS_MACRO_DAEMON_ENDPOINT") {
+        let executable = std::env::current_exe()
+            .map_err(|e| format!("cannot locate the macro proxy executable: {e}"))?;
+        let mut proxy = Command::new(executable);
+        proxy.arg("__macro_proxy").arg(endpoint).arg(&cp);
+        proxy
+    } else if std::env::var_os("SCALA_RS_MACRO_DAEMON").is_some_and(|value| value == "1") {
+        let executable = std::env::current_exe()
+            .map_err(|e| format!("cannot locate the macro proxy executable: {e}"))?;
+        let mut proxy = Command::new(executable);
+        proxy.arg("__macro_proxy").arg("--auto").arg(dir).arg(&cp);
+        proxy
+    } else {
+        let mut java = Command::new(jdk_tool("java"));
+        java.arg("-cp").arg(&cp).arg("ScalaRsMacroEngine");
+        java
+    };
     command
-        .arg("-cp")
-        .arg(&cp)
-        .arg("ScalaRsMacroEngine")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -696,7 +1036,9 @@ fn start_prepared_engine(
     };
     start_contained_engine(&mut child, &mut containment)?;
     let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let stdout = BufReader::new(EngineOutput::Pipe(
+        child.stdout.take().expect("piped stdout"),
+    ));
     let stderr = child.stderr.take().expect("piped stderr");
     let (stderr, stderr_done, stderr_thread) = collect_engine_stderr(stderr);
     let (stdout, hello) = match read_engine_hello(stdout, cancelled) {
@@ -715,9 +1057,9 @@ fn start_prepared_engine(
         }
     };
     let engine = MacroEngine {
-        child,
-        containment,
-        stdin,
+        child: Some(child),
+        containment: Some(containment),
+        stdin: EngineInput::Pipe(stdin),
         stdout: Some(stdout),
         reader: None,
         stderr,
@@ -750,6 +1092,15 @@ fn start_prepared_engine(
         return Err(startup_failure(&why, status, &engine.stderr));
     }
     Ok(engine)
+}
+
+#[cfg(unix)]
+fn direct_macro_daemon_requested(resident: bool, setting: Option<&std::ffi::OsStr>) -> bool {
+    resident
+        && match setting {
+            None => true,
+            Some(value) => value == std::ffi::OsStr::new("1"),
+        }
 }
 
 /// Resolve both JVM tools from the same `JAVA_HOME` when one is supplied.
@@ -917,9 +1268,9 @@ fn check_startup_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), String>
 }
 
 fn read_engine_hello(
-    stdout: BufReader<ChildStdout>,
+    stdout: BufReader<EngineOutput>,
     cancelled: Option<&AtomicBool>,
-) -> Result<(BufReader<ChildStdout>, String), String> {
+) -> Result<(BufReader<EngineOutput>, String), String> {
     check_startup_cancelled(cancelled)?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -2007,6 +2358,7 @@ impl Typer {
         let cx = WireCx {
             st: &self.st,
             types: &types,
+            function_symbols: Some((&self.macro_function_symbols, self.file_index)),
         };
         let mut out = String::from("(expand ");
         quote_into(&mut out, &binding.impl_class);
@@ -2190,6 +2542,11 @@ impl Typer {
     /// ([`WireCx::types`]); a type that cannot be described is recorded as
     /// the reason, which the serialiser raises only if it reaches the node.
     pub(crate) fn collect_wire_types(&mut self, t: &Tree, types: &mut WireTypes) {
+        if let TreeKind::Function { body, .. } = &t.kind {
+            if !t.byname_thunk && !is_source_run_symbol(&self.st, t.sym) {
+                self.macro_function_symbol(body.id);
+            }
+        }
         let leaf = match &t.kind {
             TreeKind::Ident { name } => {
                 name == "$classOf" || name == crate::materialize::RESOLVED_TYPE
@@ -4209,6 +4566,10 @@ pub(crate) type WireTypes = std::collections::HashMap<*const Tree, Result<String
 pub(crate) struct WireCx<'a> {
     pub(crate) st: &'a SymbolTable,
     pub(crate) types: &'a WireTypes,
+    pub(crate) function_symbols: Option<(
+        &'a std::collections::HashMap<(usize, NodeId), SymbolId>,
+        usize,
+    )>,
 }
 
 impl WireCx<'_> {
@@ -4414,7 +4775,7 @@ fn typed_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), Str
     }
     let start = out.len();
     typed_tree_to_wire_body(cx, t, out)?;
-    mirror_tree_identity(cx.st, t, start, out);
+    mirror_tree_identity(cx, t, start, out);
     Ok(())
 }
 
@@ -4493,7 +4854,7 @@ pub(crate) fn tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<()
     }
     let start = out.len();
     tree_to_wire_body(cx, t, out)?;
-    mirror_tree_identity(cx.st, t, start, out);
+    mirror_tree_identity(cx, t, start, out);
     Ok(())
 }
 
@@ -5454,6 +5815,18 @@ pub(crate) fn quote_into(out: &mut String, s: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn resident_compilation_uses_direct_macro_daemon_by_default() {
+        let enabled = std::ffi::OsStr::new("1");
+        let disabled = std::ffi::OsStr::new("0");
+        assert!(direct_macro_daemon_requested(true, None));
+        assert!(direct_macro_daemon_requested(true, Some(enabled)));
+        assert!(!direct_macro_daemon_requested(true, Some(disabled)));
+        assert!(!direct_macro_daemon_requested(false, None));
+        assert!(!direct_macro_daemon_requested(false, Some(enabled)));
+    }
+
     /// A file's text goes to the engine with the first request from that
     /// file only; later requests name it by index.
     #[test]
@@ -5531,13 +5904,15 @@ mod tests {
         let mut child = command.spawn().expect("spawn fake macro engine");
         let containment = EngineContainment::attach(&child).expect("contain fake macro engine");
         let stdin = child.stdin.take().expect("fake stdin");
-        let stdout = Some(BufReader::new(child.stdout.take().expect("fake stdout")));
+        let stdout = Some(BufReader::new(EngineOutput::Pipe(
+            child.stdout.take().expect("fake stdout"),
+        )));
         let stderr = child.stderr.take().expect("fake stderr");
         let (stderr, stderr_done, stderr_thread) = collect_engine_stderr(stderr);
         MacroEngine {
-            child,
-            containment,
-            stdin,
+            child: Some(child),
+            containment: Some(containment),
+            stdin: EngineInput::Pipe(stdin),
             stdout,
             reader: None,
             stderr,
@@ -5547,6 +5922,98 @@ mod tests {
             terminated: false,
             termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_daemon_socket_round_trip_and_close() {
+        use std::net::TcpListener;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let responder = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let mut request = String::new();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            reader.read_line(&mut request).unwrap();
+            assert_eq!(request, "(hello)\n");
+            socket.write_all(b"(ok)\n").unwrap();
+            request.clear();
+            assert_eq!(reader.read_line(&mut request).unwrap(), 0);
+        });
+        let socket = DaemonSocket::Tcp(TcpStream::connect(address).unwrap());
+        let input = socket.try_clone().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut engine = MacroEngine {
+            child: None,
+            containment: None,
+            stdin: EngineInput::Socket(input),
+            stdout: Some(BufReader::new(EngineOutput::Socket(socket))),
+            reader: None,
+            stderr: Arc::new(Mutex::new(Vec::new())),
+            stderr_done: Arc::new(AtomicBool::new(true)),
+            stderr_thread: None,
+            poisoned: false,
+            terminated: false,
+            termination_attempts: Arc::clone(&attempts),
+        };
+        engine.send("(hello)").unwrap();
+        let reply = engine
+            .read_reply(&mut Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(reply.list().unwrap()[0].atom(), Some("ok"));
+        drop(engine);
+        responder.join().unwrap();
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_daemon_unix_socket_round_trip_and_close() {
+        use std::os::unix::net::UnixListener;
+
+        let path = PathBuf::from(format!(
+            "/tmp/scala-rs-macro-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let server = UnixListener::bind(&path).unwrap();
+        let responder = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let mut request = String::new();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            reader.read_line(&mut request).unwrap();
+            assert_eq!(request, "(hello)\n");
+            socket.write_all(b"(ok)\n").unwrap();
+            request.clear();
+            assert_eq!(reader.read_line(&mut request).unwrap(), 0);
+        });
+        let socket = DaemonSocket::Unix(UnixStream::connect(&path).unwrap());
+        let input = socket.try_clone().unwrap();
+        let mut engine = MacroEngine {
+            child: None,
+            containment: None,
+            stdin: EngineInput::Socket(input),
+            stdout: Some(BufReader::new(EngineOutput::Socket(socket))),
+            reader: None,
+            stderr: Arc::new(Mutex::new(Vec::new())),
+            stderr_done: Arc::new(AtomicBool::new(true)),
+            stderr_thread: None,
+            poisoned: false,
+            terminated: false,
+            termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        engine.send("(hello)").unwrap();
+        let reply = engine
+            .read_reply(&mut Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(reply.list().unwrap()[0].atom(), Some("ok"));
+        drop(engine);
+        responder.join().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -5639,7 +6106,7 @@ mod tests {
         .join()
         .unwrap();
         let attempts = Arc::clone(&engine.termination_attempts);
-        assert!(engine.child.try_wait().unwrap().is_none());
+        assert!(engine.child.as_mut().unwrap().try_wait().unwrap().is_none());
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 0);
         drop(engine);
         assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
@@ -5983,11 +6450,17 @@ pub(crate) fn is_source_run_symbol(st: &SymbolTable, mut sym: SymbolId) -> bool 
 /// trees.  External symbols intentionally keep the plain `(s0)` marker: the
 /// macro runtime resolves their names through its normal classpath mirror,
 /// while source-run locals need the identity to retain their lexical owner.
-pub(crate) fn mirror_tree_identity(st: &SymbolTable, t: &Tree, start: usize, out: &mut String) {
-    let marker = if is_source_run_symbol(st, t.sym) {
+pub(crate) fn mirror_tree_identity(cx: &WireCx, t: &Tree, start: usize, out: &mut String) {
+    let marker = if is_source_run_symbol(cx.st, t.sym) {
         format!("(sr {})", t.sym.0)
     } else if let TreeKind::Function { body, .. } = &t.kind {
-        format!("(fn {})", body.id.0)
+        match cx
+            .function_symbols
+            .and_then(|(symbols, file)| symbols.get(&(file, body.id)))
+        {
+            Some(sym) => format!("(sr {})", sym.0),
+            None => format!("(fn {})", body.id.0),
+        }
     } else {
         return;
     };
@@ -6002,6 +6475,31 @@ pub(crate) fn mirror_tree_identity(st: &SymbolTable, t: &Tree, start: usize, out
 #[cfg(test)]
 mod macro_runtime_tests {
     use super::*;
+
+    #[test]
+    fn function_wire_uses_preallocated_symbol_without_reverse_rpc() {
+        let st = SymbolTable::new();
+        let types = WireTypes::default();
+        let body = Tree::new(NodeId(7), Span::DUMMY, TreeKind::Empty);
+        let function = Tree::new(
+            NodeId(8),
+            Span::DUMMY,
+            TreeKind::Function {
+                vparams: Vec::new(),
+                body: Box::new(body),
+            },
+        );
+        let symbols = std::collections::HashMap::from([((0, NodeId(7)), SymbolId(42))]);
+        let cx = WireCx {
+            st: &st,
+            types: &types,
+            function_symbols: Some((&symbols, 0)),
+        };
+        let mut wire = String::from("(t \"Function\" (s0) (l) (t \"Empty\" (s0)))");
+        mirror_tree_identity(&cx, &function, 0, &mut wire);
+        assert!(wire.contains("(sr 42)"));
+        assert!(!wire.contains("(fn 7)"));
+    }
 
     #[test]
     fn engine_classpath_adds_only_the_compiler_jars_the_run_lacks() {

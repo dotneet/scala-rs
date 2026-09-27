@@ -170,7 +170,8 @@ fn parse(bytes: &[u8]) -> Option<Info> {
 
 /// Lazily parsed super-type class files, shared by every unit of a run.
 pub struct BinaryParents {
-    idx: RefCell<BinaryIndex>,
+    paths: Vec<PathBuf>,
+    idx: RefCell<Option<BinaryIndex>>,
     cache: RefCell<HashMap<String, Option<Rc<Info>>>>,
     impls_cache: RefCell<HashMap<String, Option<ImplList>>>,
 }
@@ -201,7 +202,8 @@ fn class_of(desc: &str) -> Option<&str> {
 impl BinaryParents {
     pub fn new(paths: Vec<PathBuf>) -> Self {
         BinaryParents {
-            idx: RefCell::new(BinaryIndex::from_user_paths(paths)),
+            paths,
+            idx: RefCell::new(None),
             cache: RefCell::new(HashMap::new()),
             impls_cache: RefCell::new(HashMap::new()),
         }
@@ -211,9 +213,9 @@ impl BinaryParents {
         if let Some(hit) = self.cache.borrow().get(name) {
             return hit.clone();
         }
-        let parsed = self
-            .idx
-            .borrow_mut()
+        let mut idx = self.idx.borrow_mut();
+        let parsed = idx
+            .get_or_insert_with(|| BinaryIndex::from_user_paths(self.paths.clone()))
             .find_class(name)
             .ok()
             .flatten()
@@ -536,5 +538,18 @@ impl BinaryParents {
                 },
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BinaryParents;
+
+    #[test]
+    fn binary_index_is_created_only_on_first_lookup() {
+        let parents = BinaryParents::new(Vec::new());
+        assert!(parents.idx.borrow().is_none());
+        assert!(parents.info("missing/UnrelatedClass").is_none());
+        assert!(parents.idx.borrow().is_some());
     }
 }
