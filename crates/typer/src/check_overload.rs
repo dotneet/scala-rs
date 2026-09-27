@@ -2894,6 +2894,15 @@ impl Typer {
             if !mentions_tparam(&p, &open) {
                 continue;
             }
+            // A by-name parameter is filled by a value of its underlying
+            // type, and it is that type a view has to reach: without the
+            // unwrapping, scala-parser-combinators' `p <~ ")"` (`def <~[U](q:
+            // => Parser[U])`) searched for a view to `=> Parser[U]`, found
+            // none, and the thunk handed back the `String` itself.
+            let p = match p {
+                Type::ByName(inner) => (*inner).clone(),
+                other => other,
+            };
             let a_ty = args[i].ty.clone();
             if a_ty.is_no_type() || a_ty.is_error() || self.arg_score(&a_ty, &p).is_some() {
                 continue;

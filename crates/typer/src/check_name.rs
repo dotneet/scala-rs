@@ -2118,10 +2118,11 @@ impl Typer {
         // A type member an enclosing class inherits from a jar ancestor. The
         // template scope holds what `enter_inherited_members` found in the
         // symbol table, and a jar class's aliases are not there: an alias
-        // leaves no trace in the bytecode. Only asked when the name has no
-        // binding at all -- a default import (`scala._`, `Predef`) keeps
-        // answering as it always has.
-        if !default_type && self.library_abi && self.expose_inherited_binary_type(name, span) {
+        // leaves no trace in the bytecode. It outranks a default import too
+        // (SLS 2): in a `RegexParsers`, `Success[_]` and `Error` are
+        // scala-parser-combinators' `Parsers.Success` and `Parsers.Error`,
+        // not `scala.util.Success` and `java.lang.Error`.
+        if self.library_abi && self.expose_inherited_binary_type(name, span) {
             return;
         }
         // Not from a jar: a source package member. `lookup_member` already
@@ -2251,6 +2252,18 @@ impl Typer {
                 ) {
                     self.st.enter_in_current(name, id);
                     return true;
+                }
+                // A nested class nothing has entered yet: no signature read so
+                // far mentioned scala-parser-combinators' `Parsers.Error`, and
+                // `case e: Error` bound `java.lang.Error` instead.
+                if let Some(Type::Class { sym, args }) =
+                    self.pickle
+                        .complete_type_member(&mut self.st, &mut self.binary, pid, name)
+                {
+                    if args.is_empty() && self.st.get(sym).kind == SymKind::Class {
+                        self.st.enter_in_current(name, sym);
+                        return true;
+                    }
                 }
             }
         }

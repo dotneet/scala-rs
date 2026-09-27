@@ -1,0 +1,4 @@
+p <~ lit())
+p | lit())
+p ~ lit())
+p strict lit())

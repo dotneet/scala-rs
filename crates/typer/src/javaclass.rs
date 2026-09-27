@@ -139,12 +139,19 @@ pub struct BinaryIndex {
     /// Package probes are frequent during implicit search. Directory entries
     /// need filesystem checks, so remember stable answers just like classes.
     package_cache: HashMap<String, bool>,
+    /// The entry each class found so far was read from, for
+    /// [`Self::from_scala_distribution`].
+    class_origin: HashMap<String, usize>,
 }
 
 /// One classpath entry, with its archive once something has been looked up in it.
 struct Entry {
     path: PathBuf,
     kind: PathKind,
+    /// Part of the Scala distribution: the `--scala-library` jar, or a
+    /// `scala-library`, `scala-reflect` or `scala-compiler` jar a build tool
+    /// put on `-cp`.
+    scala_distribution: bool,
     zip: Option<ZipIndex>,
     /// Directory package existence is shared by many distinct class probes.
     /// A missing package lets us skip a class-file `stat` for this root.
@@ -249,9 +256,16 @@ impl BinaryIndex {
                 } else {
                     PathKind::Unknown
                 };
+                let scala_distribution = is_zip_like(&p)
+                    && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        ["scala-library", "scala-reflect", "scala-compiler"]
+                            .iter()
+                            .any(|jar| n.starts_with(jar))
+                    });
                 Entry {
                     path: p,
                     kind,
+                    scala_distribution,
                     zip: None,
                     dir_packages: HashMap::default(),
                     dir_children: HashMap::default(),
@@ -264,7 +278,29 @@ impl BinaryIndex {
             package_paths: HashMap::default(),
             class_cache: HashMap::default(),
             package_cache: HashMap::default(),
+            class_origin: HashMap::default(),
         }
+    }
+
+    /// Mark the entry at `path` as the Scala standard library whatever the
+    /// file is called.
+    pub fn mark_scala_library(&mut self, path: &Path) {
+        for e in &mut self.paths {
+            if e.path == path {
+                e.scala_distribution = true;
+            }
+        }
+    }
+
+    /// Whether the class file `internal` is read from the Scala distribution
+    /// (the standard library, scala-reflect or scala-compiler), or `None`
+    /// when no entry has it. A `scala.*` name alone does not say so:
+    /// scala-parser-combinators, scala-xml and the parallel collections are
+    /// modules of their own under that same package.
+    pub fn from_scala_distribution(&mut self, internal: &str) -> Option<bool> {
+        self.find_class(internal).ok()??;
+        let i = *self.class_origin.get(internal)?;
+        Some(self.paths[i].scala_distribution)
     }
 
     /// Whether `internal` names a class file on the path, without copying
@@ -311,6 +347,7 @@ impl BinaryIndex {
                                         path.display()
                                     )
                                 })?;
+                                self.class_origin.insert(internal.to_string(), i);
                                 return Ok(Some(buf));
                             }
                             Err(zip::result::ZipError::FileNotFound) => {}
@@ -332,6 +369,7 @@ impl BinaryIndex {
                             continue;
                         }
                         let f = self.paths[i].path.join(&rel);
+                        self.class_origin.insert(internal.to_string(), i);
                         return std::fs::read(&f)
                             .map(Some)
                             .map_err(|e| format!("cannot read {}: {e}", f.display()));
@@ -339,6 +377,7 @@ impl BinaryIndex {
                     let root = self.paths[i].path.clone();
                     let f = root.join(&rel);
                     if f.is_file() && path_case_matches(&root, &rel) {
+                        self.class_origin.insert(internal.to_string(), i);
                         return std::fs::read(&f)
                             .map(Some)
                             .map_err(|e| format!("cannot read {}: {e}", f.display()));
@@ -1018,6 +1057,33 @@ mod tests {
         CLASS_PATH_PROBES.with(|count| count.set(0));
         assert_eq!(index.find_class("missing/Second").unwrap(), None);
         assert_eq!(CLASS_PATH_PROBES.with(|count| count.get()), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_scala_module_jar_is_not_the_scala_distribution() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-distribution-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let module = root.join("scala-parser-combinators_2.13-2.4.0.jar");
+        let library = root.join("scala-library-2.13.16.jar");
+        let renamed = root.join("stdlib.jar");
+        test_archive(&module, &[("scala/util/parsing/P.class", b"module")]);
+        test_archive(&library, &[("scala/Option.class", b"library")]);
+        test_archive(&renamed, &[("scala/Some.class", b"renamed")]);
+        let mut index = BinaryIndex::from_user_paths(vec![module, library, renamed.clone()]);
+        assert_eq!(
+            index.from_scala_distribution("scala/util/parsing/P"),
+            Some(false)
+        );
+        assert_eq!(index.from_scala_distribution("scala/Option"), Some(true));
+        assert_eq!(index.from_scala_distribution("scala/Some"), Some(false));
+        assert_eq!(index.from_scala_distribution("scala/Missing"), None);
+        index.mark_scala_library(&renamed);
+        assert_eq!(index.from_scala_distribution("scala/Some"), Some(true));
         std::fs::remove_dir_all(root).unwrap();
     }
 

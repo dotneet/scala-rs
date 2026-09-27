@@ -1,0 +1,8 @@
+ok 6 12
+ok 4 8
+failure at 3: '(' expected but end of source found
+[1.5] parsed: none
+success 7
+no success '(' expected but 'x' found
+error boom
+failure string matching regex '\d+' expected but 'x' found

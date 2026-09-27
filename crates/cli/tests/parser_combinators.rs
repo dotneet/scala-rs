@@ -58,68 +58,107 @@ fn parser_combinators_jar() -> Option<PathBuf> {
     jar.is_file().then_some(jar)
 }
 
-fn run_java(out: &Path, cp: &str) -> String {
+fn run_java(out: &Path, cp: &str, main: &str) -> String {
     let o = Command::new("java")
         .args([
             "-Xverify:all",
             "-cp",
             &format!("{}:{cp}", out.display()),
-            "pcg.Main",
+            main,
         ])
         .output()
         .expect("run java");
     assert!(
         o.status.success(),
-        "pcg.Main failed: {}",
+        "{main} failed: {}",
         String::from_utf8_lossy(&o.stderr)
     );
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-#[test]
-fn a_grammar_using_tilde_as_type_extractor_and_value_runs_like_scalac() {
-    let (Some(jar), Some(pc)) = (scala_library_jar(), parser_combinators_jar()) else {
-        eprintln!("skip: scala-library or scala-parser-combinators 2.4.0 not present");
+/// Compile `fixture` with scala-rs (and with scalac when it is present)
+/// against `cp`, run `main` from both, and compare the output with each
+/// other and with `expected/<fixture>.txt`.
+fn compiles_and_runs_like_scalac(fixture: &str, cp: Option<&Path>, main: &str) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library not present");
         return;
     };
-    let src = fixtures_dir().join("parser_combinators_tilde.scala");
+    let src = fixtures_dir().join(format!("{fixture}.scala"));
     let ours = tmp_dir("ours");
-    let o = Command::new(bin())
-        .arg("compile")
-        .arg(&src)
-        .arg("-d")
-        .arg(&ours)
-        .arg("-cp")
-        .arg(&pc)
+    let mut cmd = Command::new(bin());
+    cmd.arg("compile").arg(&src).arg("-d").arg(&ours);
+    if let Some(cp) = cp {
+        cmd.arg("-cp").arg(cp);
+    }
+    let o = cmd
         .arg("--scala-library")
         .arg(&jar)
         .output()
         .expect("run scala-rs compile");
     assert!(
         o.status.success(),
-        "scala-rs rejected the grammar: {}{}",
+        "scala-rs rejected {fixture}: {}{}",
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     );
-    let run_cp = format!("{}:{}", pc.display(), jar.display());
-    let actual = run_java(&ours, &run_cp);
+    let run_cp = match cp {
+        Some(cp) => format!("{}:{}", cp.display(), jar.display()),
+        None => jar.display().to_string(),
+    };
+    let actual = run_java(&ours, &run_cp, main);
     let _ = fs::remove_dir_all(&ours);
     let expected =
-        fs::read_to_string(fixtures_dir().join("expected/parser_combinators_tilde.txt")).unwrap();
+        fs::read_to_string(fixtures_dir().join(format!("expected/{fixture}.txt"))).unwrap();
     if let Some(scalac) = scalac() {
         let theirs = tmp_dir("scalac");
-        let o = Command::new(scalac)
-            .env("JAVA_OPTS", "-Xmx2g -Xss8m")
-            .arg("-cp")
-            .arg(&pc)
+        let mut cmd = Command::new(scalac);
+        cmd.env("JAVA_OPTS", "-Xmx2g -Xss8m");
+        if let Some(cp) = cp {
+            cmd.arg("-cp").arg(cp);
+        }
+        let o = cmd
             .arg("-d")
             .arg(&theirs)
             .arg(&src)
             .output()
             .expect("run scalac");
-        assert!(o.status.success(), "scalac rejected the grammar");
-        assert_eq!(run_java(&theirs, &run_cp), expected);
+        assert!(o.status.success(), "scalac rejected {fixture}");
+        assert_eq!(run_java(&theirs, &run_cp, main), expected);
         let _ = fs::remove_dir_all(&theirs);
     }
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn a_grammar_using_tilde_as_type_extractor_and_value_runs_like_scalac() {
+    let Some(pc) = parser_combinators_jar() else {
+        eprintln!("skip: scala-parser-combinators 2.4.0 not present");
+        return;
+    };
+    compiles_and_runs_like_scalac("parser_combinators_tilde", Some(&pc), "pcg.Main");
+}
+
+/// Matching a parse result and passing strings to the by-name combinators,
+/// as every grammar does. `case Success(v, _)` called `Parsers`' three-argument
+/// `def Success` for the object (`VerifyError`) and typed `v` as `T`;
+/// `NoSuccess`, `Success[_]` and `Error` as types were read as the standard
+/// library's classes or as package-level stubs with no parents ("pattern type
+/// is incompatible"); and `"(" ~> expr <~ ")"` handed the `String` itself to
+/// `<~` (`ClassCastException`).
+#[test]
+fn matching_parse_results_and_string_combinators_run_like_scalac() {
+    let Some(pc) = parser_combinators_jar() else {
+        eprintln!("skip: scala-parser-combinators 2.4.0 not present");
+        return;
+    };
+    compiles_and_runs_like_scalac("parser_combinators_results", Some(&pc), "pcr.Main");
+}
+
+/// The by-name half of the last case with no library involved: a view
+/// applies to an argument of a by-name parameter whose type still mentions
+/// the callee's type parameter, as it does for a strict one.
+#[test]
+fn a_by_name_argument_takes_a_view_like_a_strict_one() {
+    compiles_and_runs_like_scalac("byname_view", None, "Main");
 }

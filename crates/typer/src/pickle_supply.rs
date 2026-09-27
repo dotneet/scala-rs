@@ -3700,6 +3700,20 @@ impl PickleSupply {
             if !matches!(st.get(id).kind, SymKind::Method | SymKind::Term) {
                 continue;
             }
+            // Only a parameterless member can be the accessor. The name may
+            // be overloaded: scala-parser-combinators' `Parsers` declares
+            // `def Success[U](res: U, next: Input, lastFailure:
+            // Option[Failure])` beside `object Success`, and "repairing" that
+            // method gave it the object's type over its three-argument
+            // descriptor, so `case Success(v, _)` called it for the object.
+            let nullary = match &st.get(id).ty {
+                Type::Method { paramss, .. } => paramss.iter().all(|c| c.is_empty()),
+                _ => true,
+            };
+            let jvm = &st.get(id).jvm_name;
+            if !nullary || (jvm.starts_with('(') && !jvm.starts_with("()")) {
+                continue;
+            }
             // Only a *method* is repaired: a `Term` of this name is a field
             // some other path installed, and rewriting its type into a method
             // type would break whatever reads it.
@@ -5170,6 +5184,15 @@ impl PickleSupply {
             self.stubs.insert(key, id);
             return Some(id);
         }
+        // The library is the class files of the Scala distribution, not
+        // every `scala.*` name: scala-parser-combinators' `Parsers.NoSuccess`
+        // took the library's path below, became a package-level
+        // `Parsers$NoSuccess` with `AnyRef` for its only parent beside the
+        // class the class-file reader had entered, and `case ns: NoSuccess`
+        // on a `ParseResult[Int]` was "incompatible with scrutinee type". A
+        // name no class file answers keeps the old reading.
+        let library =
+            full_name.starts_with("scala.") && bin.from_scala_distribution(&key) != Some(false);
         // A symbol already in the table wins, whatever shape it is in. An
         // earlier version gave an under-specified one (`scala/collection/Seq`,
         // entered by `find_or_stub_java_class` with no type parameters) the
@@ -5184,7 +5207,7 @@ impl PickleSupply {
             self.rehome_static_nested_module(st, bin, id, &key, module);
             self.stubs.insert(key.clone(), id);
             self.give_stub_its_kinds(st, bin, id, full_name, module);
-            if !full_name.starts_with("scala.") {
+            if !library {
                 // A signature referenced this class while its own pickle was
                 // being read. JVM metadata can complete its other parents,
                 // but must not replace the Scala parent arguments already
@@ -5217,7 +5240,7 @@ impl PickleSupply {
         // below would keep its empty member list forever. It still gets its
         // kinds now, since that is what the signature being converted is about
         // to apply.
-        if !full_name.starts_with("scala.") {
+        if !library {
             // A Scala nested class may have no ScalaSignature of its own: the
             // enclosing class carries the pickle for source aliases, while
             // `Owner$Empty.class` still carries the constructor and members

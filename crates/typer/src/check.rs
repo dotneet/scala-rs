@@ -1381,7 +1381,17 @@ impl Typer {
             source_features: opts.source_features,
             scala3: opts.scala3,
             compiler_settings: opts.compiler_settings.clone(),
-            binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
+            binary: {
+                let mut binary = BinaryIndex::from_user_paths(opts.binary_path.clone());
+                // Under the library ABI the driver appends `--scala-library`
+                // to the path last.
+                if opts.library_abi {
+                    if let Some(lib) = opts.binary_path.last() {
+                        binary.mark_scala_library(lib);
+                    }
+                }
+                binary
+            },
             completed_java: HashSet::new(),
             parsed_classfiles: rustc_hash::FxHashMap::default(),
             companion_implicit_cache: Default::default(),
