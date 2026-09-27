@@ -457,7 +457,20 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             for u in units.iter() {
                 scala_rs_backend::gen::mark_super_accessors(&u.tree, &mut st);
             }
-            let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_all(&st));
+            // Lazy classpath loading can allocate after source_start; those
+            // classes are not emitted and do not need a new pickle.
+            let emitted_classes = st
+                .symbols
+                .iter()
+                .filter(|s| {
+                    s.id.0 >= st.source_start
+                        && !s.flags.contains(scala_rs_parser::ast::Flags::JAVA)
+                })
+                .map(|s| s.id);
+            let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_selected(
+                &st,
+                emitted_classes,
+            ));
             // nsc's specialize phase runs after pickler.  Keep the generic
             // declaration (and its @specialized type-parameter metadata) in
             // the source pickle, then add only the method-owned JVM entries

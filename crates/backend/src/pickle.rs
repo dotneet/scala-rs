@@ -4710,15 +4710,29 @@ fn pickle_class_with(facts: &PickleFacts<'_>, class_id: SymbolId) -> Vec<u8> {
 /// Snapshot pickles before erasure. nsc pickles pre-erasure signatures so
 /// `id[T]` / `Box[A]#get` stay type parameters, not `Object`.
 pub fn pickle_all(st: &SymbolTable) -> std::collections::HashMap<u32, Vec<u8>> {
+    pickle_selected(
+        st,
+        st.symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Class | SymKind::ModuleClass))
+            .map(|s| s.id),
+    )
+}
+
+/// Snapshot only the classes whose class files this run will emit.
+pub fn pickle_selected(
+    st: &SymbolTable,
+    classes: impl IntoIterator<Item = SymbolId>,
+) -> std::collections::HashMap<u32, Vec<u8>> {
     let facts = PickleFacts::new(st);
     let mut out = std::collections::HashMap::new();
-    for s in &st.symbols {
-        if matches!(s.kind, SymKind::Class | SymKind::ModuleClass) && !s.id.is_none() {
+    for id in classes {
+        if !id.is_none() && matches!(st.get(id).kind, SymKind::Class | SymKind::ModuleClass) {
             // `pickle_class_with` gets a fresh writer every time. Sharing
             // `facts` must never share the pickle-local SymbolId -> entry map.
-            let raw = pickle_class_with(&facts, s.id);
+            let raw = pickle_class_with(&facts, id);
             if !raw.is_empty() {
-                out.insert(s.id.0, raw);
+                out.insert(id.0, raw);
             }
         }
     }
@@ -4860,6 +4874,9 @@ class Beta { def same(x: String): Int = x.length }
         let all = pickle_all(&st);
         assert_eq!(all.get(&alpha.0), Some(&alpha_first));
         assert_eq!(all.get(&beta.0), Some(&beta_raw));
+        let selected = pickle_selected(&st, [alpha]);
+        assert_eq!(selected.get(&alpha.0), Some(&alpha_first));
+        assert!(!selected.contains_key(&beta.0));
     }
 
     #[test]
