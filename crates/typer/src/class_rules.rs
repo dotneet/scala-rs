@@ -249,7 +249,10 @@ impl Typer {
     ///
     /// Run once the signature pass has given every source method its
     /// parameter symbols and types, before any body (any call) is typed.
-    pub(crate) fn inherit_overridden_defaults(&mut self) {
+    pub(crate) fn inherit_overridden_defaults(
+        &mut self,
+        source_owners: &rustc_hash::FxHashSet<SymbolId>,
+    ) {
         let end = self.st.symbols.len();
         for idx in self.st.prelude_end as usize..end {
             let m = SymbolId(idx as u32);
@@ -260,6 +263,7 @@ impl Typer {
                 || !s.pickled_origin.is_empty()
                 || s.owner.is_none()
                 || !self.st.get(s.owner).is_class_like()
+                || !source_owners.contains(&s.owner)
             {
                 continue;
             }

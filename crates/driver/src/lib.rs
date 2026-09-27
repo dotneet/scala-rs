@@ -11,6 +11,7 @@ use scala_rs_span::{
 };
 use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects,
+    collect_source_classes,
     defines_local_classes, erase, expand_private_names, expand_trait_private_vals, find_mains,
     hoist_default_receivers, lambda_lift, lazy_locals, mark_anon_captures,
     note_source_value_classes, restore_named_arg_order, restore_rassoc_order, typecheck_units_src,
@@ -457,14 +458,26 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             for u in units.iter() {
                 scala_rs_backend::gen::mark_super_accessors(&u.tree, &mut st);
             }
+            let mut source_classes = Vec::new();
+            for u in units.iter() {
+                collect_source_classes(&u.tree, &mut source_classes);
+            }
+            let mut output_owners: std::collections::HashSet<_> =
+                source_classes.iter().copied().collect();
+            for id in source_classes {
+                output_owners.insert(st.module_class_of(id));
+                if let Some(companion) = st.companion_module(id) {
+                    output_owners.insert(companion);
+                    output_owners.insert(st.module_class_of(companion));
+                }
+            }
             // Lazy classpath loading can allocate after source_start; those
             // classes are not emitted and do not need a new pickle.
             let emitted_symbols: Vec<_> = st
                 .symbols
                 .iter()
                 .filter(|s| {
-                    s.id.0 >= st.source_start
-                        && !s.flags.contains(scala_rs_parser::ast::Flags::JAVA)
+                    output_owners.contains(&s.id) || output_owners.contains(&s.owner)
                 })
                 .map(|s| s.id)
                 .collect();

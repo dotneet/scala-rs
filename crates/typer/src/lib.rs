@@ -180,7 +180,8 @@ pub use check::{
 pub use classpath::adapt_classpath;
 pub use default_recv::hoist_default_receivers;
 pub use erasure::{
-    erase, erase_type, erase_value_class_default_getters, note_source_value_classes,
+    collect_source_classes, erase, erase_type, erase_value_class_default_getters,
+    note_source_value_classes,
     tree_mentions_symbol,
 };
 pub use expand::enable_resident_direct_macro;

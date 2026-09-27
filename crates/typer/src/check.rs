@@ -1248,7 +1248,16 @@ pub fn typecheck_units_src(
     // before its own on the command line.
     // Every source method has its parameters now; an override inherits the
     // defaults of the method it overrides before any call is typed.
-    t.inherit_overridden_defaults();
+    let mut source_owners = rustc_hash::FxHashSet::default();
+    for (tree, _) in units.iter() {
+        let mut classes = Vec::new();
+        crate::erasure::collect_source_classes(tree, &mut classes);
+        for class in classes {
+            source_owners.insert(class);
+            source_owners.insert(t.st.module_class_of(class));
+        }
+    }
+    t.inherit_overridden_defaults(&source_owners);
     t.defer_default_rhs = false;
     t.type_pending_defaults();
     phase!("defaults");

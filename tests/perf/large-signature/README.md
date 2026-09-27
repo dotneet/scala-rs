@@ -17,3 +17,14 @@ check runs in both orders and fails when the native/scalac ratio reaches 2.0.
 The original linear lookup exceeds this limit; the indexed lookup stays below
 it. This is a performance regression gate, not a claim that this isolated
 workload or every larger build is faster than scalac.
+
+The wider variant exercises late classpath symbols that should not be pickled,
+included in output generic-signature recording, or checked for inherited
+source defaults. It is intended for local base-versus-candidate checks, since
+the ratio is sensitive to machine load:
+
+```sh
+python3 tests/perf/large-signature/check.py \
+  target/release/scala-rs /tmp/scala-2.13.16 /path/to/jdk \
+  --members 6000 --repeats 8 --maximum-ratio 13.0
+```

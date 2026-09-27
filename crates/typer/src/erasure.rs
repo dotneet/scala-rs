@@ -2292,7 +2292,7 @@ pub fn note_source_value_classes(tree: &Tree, st: &mut SymbolTable) {
 }
 
 /// Every class and object this unit defines.
-fn collect_source_classes(tree: &Tree, out: &mut Vec<SymbolId>) {
+pub fn collect_source_classes(tree: &Tree, out: &mut Vec<SymbolId>) {
     if matches!(
         tree.kind,
         TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }

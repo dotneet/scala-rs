@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("jdk", type=Path)
     parser.add_argument("--members", type=int, default=1000)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--maximum-ratio", type=float, default=2.0)
     args = parser.parse_args()
     if args.members < 128:
         parser.error("--members must be at least 128")
@@ -69,7 +70,7 @@ def main() -> None:
                 "--repeats",
                 str(args.repeats),
                 "--maximum-ratio",
-                "2.0",
+                str(args.maximum_ratio),
             ],
             check=True,
         )
