@@ -2951,6 +2951,40 @@ impl Typer {
         let mut modules = Vec::new();
         for cls in classes {
             let jvm = self.st.get(cls).jvm_name.clone();
+            // A class declared in a binary *class or trait* has a member
+            // object for a companion, reached through an accessor on the
+            // enclosing instance; it has no `MODULE$`. Its enclosing class's
+            // pickle supplies that accessor. The companion found by JVM name
+            // below is the placeholder a signature entered, which reads as a
+            // static object: `case a ~ b` inside a `RegexParsers` went out as
+            // `getstatic Parsers$$tilde$.MODULE$` (`NoSuchFieldError`).
+            let owner = self.st.get(cls).owner;
+            if !owner.is_none()
+                && self.st.get(owner).kind == SymKind::Class
+                && !self.st.is_source_class(owner)
+            {
+                let name = self.st.get(cls).name.clone();
+                let owner_ty = Type::Class {
+                    sym: owner,
+                    args: Vec::new().into(),
+                };
+                let accessors: Vec<SymbolId> = self
+                    .supply_from_pickle(&owner_ty, &name)
+                    .into_iter()
+                    .filter(|&m| {
+                        let s = self.st.get(m);
+                        s.kind == SymKind::Method && s.flags.contains(Flags::ACCESSOR)
+                    })
+                    .collect();
+                if !accessors.is_empty() {
+                    for m in accessors {
+                        if !modules.contains(&m) {
+                            modules.push(m);
+                        }
+                    }
+                    continue;
+                }
+            }
             if self.st.companion_module(cls).is_none() {
                 if jvm.is_empty() || jvm.starts_with('[') {
                     continue;

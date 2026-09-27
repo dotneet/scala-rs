@@ -3,14 +3,14 @@
 
 The kinds scalac used to win: code over `cats.syntax.all._` (syntax views,
 type-class instances, `Validated`/`Ior`/`Kleisli`), cats-effect `IO`, monad
-transformers, and very large literal collections; with fs2 and circe's
+transformers, very large literal collections and XML literals; with fs2 and circe's
 hand-written codecs beside them. `docs/performance.md` ("Library-heavy code
 against scalac") records the timings; `tests/library_bench.sh` runs them.
 
 Usage: tests/library_bench_gen.py OUT_DIR [KIND...]   (all kinds by default)
 
 Each kind is a directory of sources, a `Main`, and a `cp.txt` naming the
-libraries it needs (`cats`, `ce`, `fs2`, `circe`), which `library_bench.sh`
+libraries it needs (`cats`, `ce`, `fs2`, `circe`, `xml`), which `library_bench.sh`
 resolves from the Coursier cache. `NF` sets the file count (20).
 Generation is deterministic.
 """
@@ -141,6 +141,18 @@ def biglits(d):
         w(d, f"F{f}.scala", "\n".join(L) + "\n")
     main(d, "    println((bl0.L0.ints.sum, bl0.L0.mixed.size, bl0.L0.m.size, bl0.L0.v.size))")
     cp(d, [])
+
+# XML literals over scala-xml: child lists, attributes, `\\` / `\` queries
+def xmllits(d):
+    for f in range(NF):
+        L = [f"package xl{f}", "import scala.xml._", f"object X{f} {{"]
+        for m in range(60):
+            L.append(f"  def m{m}(xs: List[(String, Int)]): Elem = <root id=\"r{m}\">{{xs.map {{ case (k, v) => <item key={{k}} n={{v.toString}}>{{k * 2}}<b>{m}</b></item> }}}}<footer attr=\"x\">{{xs.size + {m}}}</footer></root>")
+            L.append(f"  def q{m}(e: Elem): Seq[String] = (e \\\\ \"item\").map(n => (n \\ \"@key\").text + (n \\ \"b\").text)")
+        L.append("}")
+        w(d, f"F{f}.scala", "\n".join(L) + "\n")
+    main(d, "    println(xl0.X0.q1(xl0.X0.m1(List(\"a\" -> 1, \"b\" -> 2))))")
+    cp(d, ["xml"])
 
 
 KINDS = {k: v for k, v in globals().items() if callable(v) and k not in ('w', 'main', 'cp')}

@@ -2367,6 +2367,25 @@ pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId
     if let Some(id) = find_by_jvm(st, internal) {
         return id;
     }
+    // A Scala class whose name is an operator is spelled encoded on the JVM:
+    // scala-parser-combinators' `case class ~` inside `trait Parsers` is
+    // `Parsers$$tilde`, which the Java reading splits at the last `$` into a
+    // class `tilde` of a phantom `Parsers$`, so `String ~ Int` could never
+    // find it. Where the Scala reading is an operator, the name and its
+    // owner can only be Scala's. A *module* is left to the pickle: its term
+    // is an accessor on the enclosing instance or a static object, which
+    // only the declaring class's signature says (`install_nested_module`),
+    // and a placeholder visible by name would be read as the latter.
+    let scala = scala_simple_name(internal);
+    if !internal.ends_with('$')
+        && scala
+            .chars()
+            .any(|c| !c.is_alphanumeric() && c != '_' && c != '$')
+        && scala != java_simple_name(internal)
+    {
+        let owner = scala_class_owner(st, internal);
+        return stub_class_in(st, internal, scala, owner);
+    }
     let simple = java_simple_name(internal);
     let owner = java_class_owner(st, internal);
     stub_class_in(st, internal, simple, owner)

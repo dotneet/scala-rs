@@ -566,6 +566,50 @@ itself (`docs/macros.md` §2.4, `macro_runtime`).
 The macro-heavy circe workload above is now the closest to scalac, at 13.0 s
 against 17.8 s; most of it is the macro engine answering `inferImplicitValue`.
 
+### Test frameworks, parsers, XML and derivation against scalac (2026-09-27)
+
+A further twelve shapes: ScalaTest suites (`AnyFunSuite`, `AnyWordSpec` with
+`should` matchers), scala-parser-combinators grammars, XML literals, circe's
+`generic.auto` and `semiauto` derivation, and language shapes -- a trait of
+300 abstract members implemented six times per file, `Enumeration`s,
+custom and regex extractors, objects of 1500 `val`s, eight-deep generic
+types. One was far behind, one about even:
+
+| kind | scalac | before | after |
+|---|---:|---:|---:|
+| `xmllits` (60 XML literals per file, 20 files) | 4.4 s | 71.7 s | 2.3 s |
+| `circeauto` (`io.circe.generic.auto._`, 20 files) | 17.5 s | 18.1 s | 18.1 s |
+| `overloads` (earlier round) | 4.8 s | 2.5 s | 1.1 s |
+
+The rest ran in 0.05--0.68 of scalac's time before and after
+(`xmllits` is in `tests/library_bench_gen.py` now).
+
+**What was slow.** A file of XML literals spent its type checking in
+subtype questions with obvious answers. The view search tries every
+primitive, array and string view of `Predef` against each receiver, and
+each `List[Node] <: Short` walked `List`'s forty ancestors to say no --
+220,000 times; `Text <: B` for a bare type parameter walked `Text`'s the
+same way. And `::[B >: A]` joined `Atom` and `Elem` at every child, each
+join comparing two deep hierarchies from scratch. Now:
+
+* A class type is not below a primitive, an array or `String`, and not below
+  a type parameter except through its lower bound; both are answered before
+  any parent walk (`class_never_below`).
+* Joins of two ground types -- no parameter, member, path or wildcard -- are
+  kept across calls while the class graph stands still (`LubMemo::settled`).
+
+**Still even.** `circeauto` is bound by the macro engine: 17,000 expansions
+and 139,000 round trips to the JVM for 20 files, with scala-rs answering
+the engine's questions in about 3 s of that. Engine flags (GC, JIT tiers)
+change nothing.
+
+**Found on the way.** A parser-combinator grammar's `~` was "not found"
+as a type, a value and an extractor; fixed (`parser_combinators.rs`). Not
+yet fixed: ScalaTest's `should have length` and `should not be empty` are
+"ambiguous implicit" here (the `Length` / `Emptiness` instances over
+structural and higher-kinded bounds), and an XML program's `\\` / `\`
+query prints `List()` where scalac's prints the items.
+
 ### What is left
 
 From the profiles of 2026-09-24:

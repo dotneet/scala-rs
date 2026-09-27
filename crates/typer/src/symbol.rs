@@ -6,6 +6,10 @@ use scala_rs_parser::{Flags, RefineDecl, SpecializedType, SpecializedTypes, Symb
 #[cfg(test)]
 thread_local! {
     static SAM_METHOD_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Parent walks [`SymbolTable::walk_parents`] started.
+    static PARENT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Joins [`SymbolTable::lub`] computed rather than remembered.
+    static LUBS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Decl name that marks a refinement as the as-seen-from view of a type
@@ -1475,12 +1479,29 @@ type ByType<V> = crate::check::GenMap<u64, Vec<(Type, std::rc::Rc<V>)>>;
 /// [`SymbolTable::subst_as_seen_from_walk_at`].
 type SeenFromWalk = (Vec<(SymbolId, Vec<Type>)>, rustc_hash::FxHashSet<u32>);
 
+/// No type parameter, type member, unresolved name, path, wildcard or error
+/// anywhere in `t`: what it denotes depends on the class graph alone.
+fn is_ground(t: &Type) -> bool {
+    use scala_rs_parser::TypeFlags as F;
+    let f = t.flags();
+    !(f.contains(F::TYPE_PARAM)
+        || f.contains(F::TYPE_MEMBER)
+        || f.contains(F::NAMED)
+        || f.contains(F::SINGLETON)
+        || f.contains(F::WILDCARD)
+        || f.contains(F::ERROR)
+        || f.contains(F::MODULE_REF))
+}
+
 /// See [`SymbolTable::lub_at`].
 #[derive(Default)]
 struct LubMemo {
     /// Nesting of [`SymbolTable::lub`]; the answers live while it is non-zero.
     active: u32,
     answers: rustc_hash::FxHashMap<u64, Vec<(Type, Type, u32, Type)>>,
+    /// Outermost joins of two ground types, across calls, while `graph_gen`
+    /// is `settled.0`; see [`SymbolTable::lub`].
+    settled: (u64, Vec<(Type, Type, Type)>),
 }
 
 #[derive(Default)]
@@ -6215,6 +6236,24 @@ impl SymbolTable {
     /// varargs element types. Walks the parent chain, so
     /// `lub(Circle, Rect) = Shape` for a sealed `Shape` hierarchy.
     pub fn lub(&self, a: &Type, b: &Type) -> Type {
+        // Two ground types -- no type parameter, member, path or wildcard in
+        // either -- join the same way for as long as the class graph stands
+        // still. `::[B >: A]` asks for `lub(Atom, Elem)` at every child of
+        // every XML literal, and each answer compares two forty-class
+        // hierarchies: 330 us a time, half of such a file's type checking.
+        let settled = self.lub_memo.borrow().active == 0
+            && is_ground(a)
+            && is_ground(b)
+            && !self.has_ambient_type_context();
+        if settled {
+            let memo = self.lub_memo.borrow();
+            if memo.settled.0 == self.graph_gen.get() {
+                if let Some((_, _, l)) = memo.settled.1.iter().find(|(x, y, _)| x == a && y == b) {
+                    return l.clone();
+                }
+            }
+        }
+        let gen = self.graph_gen.get();
         self.lub_memo.borrow_mut().active += 1;
         let out =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.lub_uncached(a, b)));
@@ -6222,6 +6261,17 @@ impl SymbolTable {
         memo.active -= 1;
         if memo.active == 0 {
             memo.answers.clear();
+        }
+        if let (true, Ok(l)) = (settled, &out) {
+            if self.graph_gen.get() == gen {
+                if memo.settled.0 != gen {
+                    memo.settled = (gen, Vec::new());
+                }
+                if memo.settled.1.len() >= 64 {
+                    memo.settled.1.remove(0);
+                }
+                memo.settled.1.push((a.clone(), b.clone(), l.clone()));
+            }
         }
         drop(memo);
         match out {
@@ -6231,6 +6281,8 @@ impl SymbolTable {
     }
 
     fn lub_uncached(&self, a: &Type, b: &Type) -> Type {
+        #[cfg(test)]
+        LUBS_COMPUTED.with(|n| n.set(n.get() + 1));
         let plain = self.lub_at(a, b, 0);
         if self.is_sub_type(a, b) || self.is_sub_type(b, a) {
             return plain;
@@ -6813,6 +6865,8 @@ impl SymbolTable {
     }
 
     fn walk_parents(&self, a: &Type, b: &Type, f: impl FnOnce() -> bool) -> bool {
+        #[cfg(test)]
+        PARENT_WALKS.with(|n| n.set(n.get() + 1));
         let Some(_depth) = enter_depth() else {
             return false;
         };
@@ -6852,7 +6906,62 @@ impl SymbolTable {
         r
     }
 
+    /// A class type is never below a primitive value type, an array or the
+    /// final `String`: only the value classes, `Array` and `String`
+    /// themselves, `Nothing` and `Null` are, when they are spelled as classes.
+    /// Answered without the walk over the class's ancestors the general path
+    /// makes -- which a view search ran for every primitive, array and string
+    /// view in `Predef` against every receiver: 3.1 s of a file of XML
+    /// literals, whose `List[Node]` was checked against `Short`, `Array[T]`,
+    /// `String`, ... 230,000 times.
+    fn class_never_below(&self, a: &Type, b: &Type) -> bool {
+        let Type::Class { sym, .. } = a else {
+            return false;
+        };
+        let primitive = matches!(
+            b,
+            Type::Byte
+                | Type::Short
+                | Type::Char
+                | Type::Int
+                | Type::Long
+                | Type::Float
+                | Type::Double
+                | Type::Boolean
+                | Type::Unit
+        );
+        let array = match b {
+            Type::Array(_) => true,
+            Type::Class { sym: bs, .. } => *bs == self.array_sym && !bs.is_none(),
+            _ => false,
+        };
+        let string = matches!(b, Type::String);
+        if !(primitive || array || string) || *sym == self.array_sym || *sym == self.string_sym {
+            return false;
+        }
+        !matches!(
+            self.get(*sym).jvm_name.as_str(),
+            "scala/Byte"
+                | "scala/Short"
+                | "scala/Char"
+                | "scala/Int"
+                | "scala/Long"
+                | "scala/Float"
+                | "scala/Double"
+                | "scala/Boolean"
+                | "scala/Unit"
+                | "scala/Nothing"
+                | "scala/Null"
+                | "scala/runtime/Nothing$"
+                | "scala/runtime/Null$"
+                | "java/lang/String"
+        )
+    }
+
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
+        if self.class_never_below(a, b) {
+            return false;
+        }
         if let Type::Existential { params, body } = b {
             if a == b || matches!(a, Type::Nothing | Type::Error) {
                 return true;
@@ -7101,6 +7210,14 @@ impl SymbolTable {
                     }
                 }
             }
+        }
+        // ...and only there, for a class: no arm below takes a class to a
+        // type parameter, so the parent walk the `Class` arm would start can
+        // only come back "no" -- after asking every ancestor the same
+        // question. `Text <: B` for an unsolved `B` took 120 us a time. (A
+        // type *member* may still be an alias, and keeps the walk.)
+        if matches!((a, b), (Type::Class { .. }, Type::TypeParam(_))) {
+            return false;
         }
         // One class is under another only if the second one's *symbol* is
         // somewhere in the first one's parent DAG. That question needs no type
@@ -9947,6 +10064,70 @@ type AncMemo = Vec<(u32, u32, bool)>;
 #[cfg(test)]
 mod api_boundary_tests {
     use super::*;
+
+    /// `C extends B extends A`, with `A` and `B` traits.
+    fn chain(st: &mut SymbolTable) -> (SymbolId, SymbolId, SymbolId) {
+        let class_ty = |sym| Type::Class {
+            sym,
+            args: Vec::new().into(),
+        };
+        let a = st.alloc("A", st.root, SymKind::Class, Flags::TRAIT, "A");
+        let b = st.alloc("B", st.root, SymKind::Class, Flags::TRAIT, "B");
+        let c = st.alloc("C", st.root, SymKind::Class, Flags::EMPTY, "C");
+        st.get_mut(b).parents = vec![Type::AnyRef, class_ty(a)];
+        st.get_mut(c).parents = vec![Type::AnyRef, class_ty(b)];
+        (a, b, c)
+    }
+
+    #[test]
+    fn a_class_is_below_no_primitive_array_string_or_bare_parameter_without_a_walk() {
+        let mut st = SymbolTable::new();
+        let (a, _, c) = chain(&mut st);
+        let tp = st.alloc("T", st.root, SymKind::TypeParam, Flags::EMPTY, "T");
+        let c_ty = Type::Class {
+            sym: c,
+            args: Vec::new().into(),
+        };
+        PARENT_WALKS.with(|n| n.set(0));
+        for b in [
+            Type::Int,
+            Type::Double,
+            Type::Array(TyBox::new(Type::Int)),
+            Type::String,
+            Type::TypeParam(tp),
+        ] {
+            assert!(!st.is_sub_type(&c_ty, &b));
+        }
+        assert_eq!(PARENT_WALKS.with(|n| n.get()), 0);
+        // A parameter's lower bound is still what it is read at.
+        st.get_mut(tp).bound_lo = Some(Type::Class {
+            sym: a,
+            args: Vec::new().into(),
+        });
+        assert!(st.is_sub_type(&c_ty, &Type::TypeParam(tp)));
+    }
+
+    #[test]
+    fn a_join_of_ground_types_is_kept_until_the_class_graph_moves() {
+        let mut st = SymbolTable::new();
+        let (a, b, c) = chain(&mut st);
+        let d = st.alloc("D", st.root, SymKind::Class, Flags::EMPTY, "D");
+        let class_ty = |sym| Type::Class {
+            sym,
+            args: Vec::new().into(),
+        };
+        st.get_mut(d).parents = vec![Type::AnyRef, class_ty(b)];
+        LUBS_COMPUTED.with(|n| n.set(0));
+        let first = st.lub(&class_ty(c), &class_ty(d));
+        let computed = LUBS_COMPUTED.with(|n| n.get());
+        assert!(computed > 0);
+        assert_eq!(st.lub(&class_ty(c), &class_ty(d)), first);
+        assert_eq!(LUBS_COMPUTED.with(|n| n.get()), computed);
+        // `D` now extends `A` directly: the join has to be asked again.
+        st.get_mut(d).parents = vec![Type::AnyRef, class_ty(a)];
+        assert_eq!(st.lub(&class_ty(c), &class_ty(d)), class_ty(a));
+        assert!(LUBS_COMPUTED.with(|n| n.get()) > computed);
+    }
 
     #[test]
     fn sam_method_walk_is_reused_until_a_member_is_added() {

@@ -3007,12 +3007,18 @@ impl PickleSupply {
             // asks for one. See `install_nested_module`.
             // Case companions are synthetic but remain source-level API.
             // Their owner and instance/static ABI still come from the pickle.
+            // The pickle names the class as nsc encodes it: the companion of
+            // `case class ~` in `Parsers` is asked about `Parsers.$tilde`.
             let case_companion = m.kind == MemberKind::Module
                 && m.has(pflags::SYNTHETIC)
                 && !m.has(pflags::PRIVATE | pflags::LOCAL)
                 && self
                     .sigs
-                    .class_sig(&mut BinSource(bin), &format!("{}.{name}", hit.owner), false)
+                    .class_sig(
+                        &mut BinSource(bin),
+                        &format!("{}.{jvm_member}", hit.owner),
+                        false,
+                    )
                     .is_ok_and(|sig| sig.flags & pflags::CASE != 0);
             if m.kind == MemberKind::Module && (m.is_public_api() || case_companion) {
                 let owner = hit.owner.clone();
@@ -3603,7 +3609,12 @@ impl PickleSupply {
         if decl_jvm.is_empty() {
             return None;
         }
-        let module_jvm = format!("{decl_jvm}${name}$");
+        // Spelled as the class file is: `object ~` in `Parsers` is
+        // `Parsers$$tilde$`, not `Parsers$~$`.
+        let module_jvm = format!(
+            "{decl_jvm}${}$",
+            scala_rs_pickle::names::encode_method_name(name)
+        );
         // Objects nested in static objects have a real MODULE$ field, while
         // instance member objects have an accessor on their enclosing receiver.
         // Choose from the classfile ABI instead of inventing that accessor.

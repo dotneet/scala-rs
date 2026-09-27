@@ -19,6 +19,7 @@ J[cats]="$C/org/typelevel/cats-core_2.13/2.13.0/cats-core_2.13-2.13.0.jar:$C/org
 J[ce]="$C/org/typelevel/cats-mtl_2.13/1.6.0/cats-mtl_2.13-1.6.0.jar:$C/org/typelevel/cats-effect_2.13/3.7.1/cats-effect_2.13-3.7.1.jar:$C/org/typelevel/cats-effect-kernel_2.13/3.7.1/cats-effect-kernel_2.13-3.7.1.jar:$C/org/typelevel/cats-effect-std_2.13/3.7.1/cats-effect-std_2.13-3.7.1.jar"
 J[fs2]="$C/co/fs2/fs2-core_2.13/3.13.0/fs2-core_2.13-3.13.0.jar:$C/org/scodec/scodec-bits_2.13/1.2.4/scodec-bits_2.13-1.2.4.jar"
 J[circe]="$C/io/circe/circe-core_2.13/0.14.7/circe-core_2.13-0.14.7.jar:$C/io/circe/circe-numbers_2.13/0.14.7/circe-numbers_2.13-0.14.7.jar"
+J[xml]="$C/org/scala-lang/modules/scala-xml_2.13/2.4.0/scala-xml_2.13-2.4.0.jar"
 DIR=$1; shift
 wall() { awk '/^real/ { print $2 }' "$1" }
 printf '| %-12s | %8s | %8s | %5s | %s |\n' kind scalac scala-rs ratio output

@@ -24,6 +24,8 @@ mod parentcheck;
 mod parentimpl;
 #[path = "../parse.rs"]
 mod parse;
+#[path = "../parser_combinators.rs"]
+mod parser_combinators;
 #[path = "../partfactory.rs"]
 mod partfactory;
 #[path = "../patbind.rs"]

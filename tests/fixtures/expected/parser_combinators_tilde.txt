@@ -1,0 +1,6 @@
+3
+-3
+-1
+ok 9
+fail
+abc 42 (x~1) true abc42

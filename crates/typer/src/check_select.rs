@@ -629,11 +629,15 @@ impl Typer {
         // `TypeMember` whose value type is `NoType`: "value apply is not a
         // member of <notype>". The mirror image of `expose_unqualified_type`
         // (`docs/macros.md` §7.6), and just as additive: only a *term*-shaped
-        // member can win here.
+        // member can win here. A nested class is the same case: scala-parser-
+        // combinators' `Parsers` declares `case class ~` and its companion,
+        // and once a signature had entered the class, `P.~(a, b)` selected it
+        // and reached the companion through a static `MODULE$` the member
+        // object does not have (`NoSuchFieldError` at run time).
         if !found.is_empty()
             && found
                 .iter()
-                .all(|&s| self.st.get(s).kind == SymKind::TypeMember)
+                .all(|&s| matches!(self.st.get(s).kind, SymKind::TypeMember | SymKind::Class))
         {
             let more = self.supply_from_pickle(&recv_ty, &name);
             let terms: Vec<SymbolId> = more
