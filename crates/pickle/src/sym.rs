@@ -1177,6 +1177,7 @@ impl std::fmt::Display for LoadError {
 pub struct SigCache {
     cache: HashMap<String, Result<Rc<ClassSig>, LoadError>>,
     linearizations: HashMap<(String, bool), (Vec<LinStep>, Vec<LoadError>)>,
+    member_indexes: HashMap<usize, HashMap<String, Vec<usize>>>,
 }
 
 const RESIDENT_SIGNATURE_LIMIT: usize = 128 * 1024 * 1024;
@@ -1305,7 +1306,7 @@ impl SigCache {
             let Ok(sig) = self.class_sig(src, &step.class_name, step.module) else {
                 continue;
             };
-            for m in sig.members_named(name) {
+            let mut add = |m: &Member| {
                 let mut m = m.clone();
                 m.ty = apply_subst(&m.ty, &step.subst);
                 found.push(MemberHit {
@@ -1313,6 +1314,31 @@ impl SigCache {
                     owner_module: step.module,
                     member: m,
                 });
+            };
+            if sig.members.len() < 128 {
+                for m in sig.members_named(name) {
+                    add(m);
+                }
+                continue;
+            }
+            let index = self
+                .member_indexes
+                .entry(Rc::as_ptr(&sig) as usize)
+                .or_insert_with(|| {
+                    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+                    for (position, member) in sig.members.iter().enumerate() {
+                        index.entry(member.name.clone()).or_default().push(position);
+                    }
+                    index
+                });
+            let encoded = crate::names::encode_method_name(name);
+            let mut positions = index.get(name).cloned().unwrap_or_default();
+            if encoded != name {
+                positions.extend(index.get(&encoded).into_iter().flatten().copied());
+                positions.sort_unstable();
+            }
+            for position in positions {
+                add(&sig.members[position]);
             }
         }
         (found, errs)

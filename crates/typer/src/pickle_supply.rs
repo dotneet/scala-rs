@@ -648,7 +648,16 @@ impl PickleSupply {
         // `Flags::ACCESSOR`, which `ident_is_stable` / `member_is_stable` now
         // read as a val's stability, not a def's absence of it.
         let mut names: Vec<String> = Vec::new();
+        let mut seen_names = rustc_hash::FxHashSet::default();
+        let mut private_accessors = rustc_hash::FxHashSet::default();
         for m in &sig.members {
+            let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
+            if (m.kind == MemberKind::Val || m.has(pflags::STABLE))
+                && m.has(pflags::PRIVATE)
+                && !m.has_private_within
+            {
+                private_accessors.insert(src_name.clone());
+            }
             if m.kind != MemberKind::Def && m.kind != MemberKind::Val {
                 continue;
             }
@@ -664,11 +673,10 @@ impl PickleSupply {
             {
                 continue;
             }
-            let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
             if src_name.is_empty() || src_name == "<init>" || src_name.contains('$') {
                 continue;
             }
-            if !names.contains(&src_name) {
+            if seen_names.insert(src_name.clone()) {
                 names.push(src_name);
             }
         }
@@ -686,6 +694,15 @@ impl PickleSupply {
         {
             names.push("apply".to_string());
         }
+        let mut members_by_name: HashMap<String, Vec<SymbolId>> = HashMap::new();
+        for &member in &st.get(class_sym).members {
+            members_by_name
+                .entry(st.get(member).name.clone())
+                .or_default()
+                .push(member);
+        }
+        let mut stale_batch = HashSet::new();
+        let mut installed_batch = HashSet::new();
         for name in names {
             // The eager, compact ScalaSignature reader installs value accessors
             // before this full pickle is available. It does not carry access
@@ -693,16 +710,11 @@ impl PickleSupply {
             // descriptor completion below cannot replace that eager term.
             // Restore the declaration's private access on the surviving term:
             // a private value is not an inherited override candidate.
-            if sig.members.iter().any(|member| {
-                scala_rs_pickle::names::decode_method_name(&member.name) == name
-                    && (member.kind == MemberKind::Val || member.has(pflags::STABLE))
-                    && member.has(pflags::PRIVATE)
-                    && !member.has_private_within
-            }) {
-                let eager_terms: Vec<_> = st
-                    .get(class_sym)
-                    .members
-                    .iter()
+            if private_accessors.contains(&name) {
+                let eager_terms: Vec<_> = members_by_name
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
                     .copied()
                     .filter(|&id| {
                         let member = st.get(id);
@@ -718,10 +730,10 @@ impl PickleSupply {
             }
             // What the classfile reader put there, so it can be dropped once
             // the pickle has supplied something better.
-            let stale: Vec<SymbolId> = st
-                .get(class_sym)
-                .members
-                .iter()
+            let stale: Vec<SymbolId> = members_by_name
+                .get(&name)
+                .into_iter()
+                .flatten()
                 .copied()
                 .filter(|&m| {
                     let s = st.get(m);
@@ -741,7 +753,7 @@ impl PickleSupply {
                                 && !st.is_source_owner(class_sym)))
                 })
                 .collect();
-            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            let installed = self.complete_named(st, bin, class_sym, &name, false, true);
             if installed.is_empty() {
                 continue;
             }
@@ -764,8 +776,16 @@ impl PickleSupply {
                         st.get(new_id).flags.with(Flags::STATIC).with(Flags::JAVA);
                 }
             }
-            drop_stale_members(st, class_sym, &stale, &installed);
+            stale_batch.extend(stale);
+            installed_batch.extend(installed);
         }
+        let mut kept = HashSet::new();
+        st.get_mut(class_sym).members.retain(|member| {
+            if !installed_batch.contains(member) {
+                return !stale_batch.contains(member);
+            }
+            kept.insert(*member)
+        });
         self.drop_flattened_forwarders(st, bin, class_sym, &sig);
         self.drop_generic_mixin_forwarders(st, bin, class_sym, &sig);
         self.settle_overriding_type_aliases(st, bin, class_sym, &sig, &full, is_module);
@@ -828,7 +848,7 @@ impl PickleSupply {
                     s.kind == SymKind::Method && s.name == name && !s.flags.contains(Flags::STATIC)
                 })
                 .collect();
-            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            let installed = self.complete_named(st, bin, class_sym, &name, false, false);
             if installed.is_empty() || !installed.iter().any(|&m| !st.get(m).tparams.is_empty()) {
                 continue;
             }
@@ -956,7 +976,7 @@ impl PickleSupply {
                 })
                 .map(|m| (m, st.get(m).params.len()))
                 .collect();
-            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            let installed = self.complete_named(st, bin, class_sym, &name, false, false);
             if !installed.iter().any(|&i| st.get(i).paramss.len() > 1) {
                 continue;
             }
@@ -1161,7 +1181,7 @@ impl PickleSupply {
                                 && m.0 < st.source_start))
                 })
                 .collect();
-            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            let installed = self.complete_named(st, bin, class_sym, &name, false, false);
             if installed.is_empty() {
                 continue;
             }
@@ -1346,7 +1366,7 @@ impl PickleSupply {
         }
         let mut supplied = 0;
         for name in names {
-            supplied += self.complete_named(st, bin, class_sym, &name, false).len();
+            supplied += self.complete_named(st, bin, class_sym, &name, false, false).len();
         }
         if supplied != 0 || promoted != 0 {
             trace(format_args!(
@@ -2806,7 +2826,7 @@ impl PickleSupply {
         class_sym: SymbolId,
         name: &str,
     ) -> Vec<SymbolId> {
-        self.complete_named(st, bin, class_sym, name, false)
+        self.complete_named(st, bin, class_sym, name, false, false)
     }
 
     /// The pickled flags of the class (or module class) `full`, or `0` when
@@ -2828,6 +2848,7 @@ impl PickleSupply {
         class_sym: SymbolId,
         name: &str,
         synthetic_ok: bool,
+        defer_stale_cleanup: bool,
     ) -> Vec<SymbolId> {
         // A nested Scala class normally has no ScalaSignature of its own:
         // scalac puts the pickle for it on the enclosing top-level class.
@@ -3212,23 +3233,25 @@ impl PickleSupply {
         // Replace the raw JVM view of each signature that was completed.
         // Return descriptors may be erased value classes or existentials;
         // keeping both views creates a spurious overload.
-        let mut stale = stale;
-        stale.extend(st.get(class_sym).members.iter().copied().filter(|id| {
-            let raw = st.get(*id);
-            raw.flags.contains(Flags::JAVA)
-                && raw.pickled_origin.is_empty()
-                && id.0 >= st.prelude_end
-                && !installed.contains(id)
-                && installed.iter().any(|new| {
-                    st.get(*new).name == raw.name && st.get(*new).jvm_name == raw.jvm_name
-                })
-        }));
-        if !installed.is_empty() && !stale.is_empty() {
-            drop_stale_members(st, class_sym, &stale, &installed);
-            trace(format_args!(
-                "{full}#{name}: replaced {} class-file accessor(s)",
-                stale.len()
-            ));
+        if !defer_stale_cleanup {
+            let mut stale = stale;
+            stale.extend(st.get(class_sym).members.iter().copied().filter(|id| {
+                let raw = st.get(*id);
+                raw.flags.contains(Flags::JAVA)
+                    && raw.pickled_origin.is_empty()
+                    && id.0 >= st.prelude_end
+                    && !installed.contains(id)
+                    && installed.iter().any(|new| {
+                        st.get(*new).name == raw.name && st.get(*new).jvm_name == raw.jvm_name
+                    })
+            }));
+            if !installed.is_empty() && !stale.is_empty() {
+                drop_stale_members(st, class_sym, &stale, &installed);
+                trace(format_args!(
+                    "{full}#{name}: replaced {} class-file accessor(s)",
+                    stale.len()
+                ));
+            }
         }
         trace(format_args!(
             "{full}#{name}: supplied {} overload(s)",
@@ -4533,19 +4556,21 @@ impl PickleSupply {
         // prelude member had always been part of the pickle's own answer,
         // while still installing nothing new and leaving `class_sym.members`
         // untouched.
-        if let Some(&blocker) = st.get(class_sym).members.iter().find(|&&s| {
-            s.0 < st.prelude_end && {
-                let e = st.get(s);
-                e.name == name
-                    && e.pickled_origin.is_empty()
-                    && flat_erased_params(st, &e.ty) == want
+        if class_sym.0 < st.prelude_end {
+            if let Some(&blocker) = st.get(class_sym).members.iter().find(|&&s| {
+                s.0 < st.prelude_end && {
+                    let e = st.get(s);
+                    e.name == name
+                        && e.pickled_origin.is_empty()
+                        && flat_erased_params(st, &e.ty) == want
+                }
+            }) {
+                trace(format_args!(
+                    "{internal}#{name}: a hand-written prelude overload already has these \
+                     erased parameters -- reporting it instead of installing a pickle copy"
+                ));
+                return Some(blocker);
             }
-        }) {
-            trace(format_args!(
-                "{internal}#{name}: a hand-written prelude overload already has these \
-                 erased parameters -- reporting it instead of installing a pickle copy"
-            ));
-            return Some(blocker);
         }
         // Lambda arguments can be pretyped from the common input types of
         // several alternatives. Preserve those alternatives so their result
@@ -4621,7 +4646,7 @@ impl PickleSupply {
         // would otherwise have taken `collect(pf)(Ordering)`'s place).
         let owner_file = scala_rs_pickle::sym::pickle_files_for(pickle_owner, owner_module)
             .into_iter()
-            .find(|file| bin.find_class(file).ok().flatten().is_some());
+            .find(|file| bin.has_class(file).unwrap_or(false));
         let decl_params = self
             .decl_site_want(
                 st,
@@ -4763,7 +4788,7 @@ impl PickleSupply {
         // leaves the class untouched.
         for slot in default_slots {
             let getter = format!("{name}$default${slot}");
-            let ids = self.complete_named(st, bin, class_sym, &getter, true);
+            let ids = self.complete_named(st, bin, class_sym, &getter, true, false);
             let Some(&gid) = ids.first() else {
                 trace(format_args!(
                     "{internal}#{name}: no {getter}, so the default cannot be filled"
