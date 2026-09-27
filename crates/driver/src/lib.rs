@@ -447,17 +447,6 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             for u in units.iter() {
                 add_value_class_companions(&u.tree, &mut st);
             }
-            // Freeze source override identities while method types still
-            // carry receiver and method type parameters. Backend mixin
-            // dispatch runs after erasure and reads this table instead of
-            // inferring a family from erased descriptors.
-            scala_rs_typer::record_method_override_families(&mut st);
-            // nsc `superaccessors`, likewise before `pickler`: which trait
-            // members write `super.m` decides which `T$$super$m` members the
-            // signature declares, and a reader implements exactly those.
-            for u in units.iter() {
-                scala_rs_backend::gen::mark_super_accessors(&u.tree, &mut st);
-            }
             let mut source_classes = Vec::new();
             for u in units.iter() {
                 collect_source_classes(&u.tree, &mut source_classes);
@@ -470,6 +459,17 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                     output_owners.insert(companion);
                     output_owners.insert(st.module_class_of(companion));
                 }
+            }
+            // Freeze source override identities while method types still
+            // carry receiver and method type parameters. Backend mixin
+            // dispatch runs after erasure and reads this table instead of
+            // inferring a family from erased descriptors.
+            scala_rs_typer::record_method_override_families_for(&mut st, &output_owners);
+            // nsc `superaccessors`, likewise before `pickler`: which trait
+            // members write `super.m` decides which `T$$super$m` members the
+            // signature declares, and a reader implements exactly those.
+            for u in units.iter() {
+                scala_rs_backend::gen::mark_super_accessors(&u.tree, &mut st);
             }
             // Lazy classpath loading can allocate after source_start; those
             // classes are not emitted and do not need a new pickle.

@@ -59,7 +59,10 @@ mod overload_ref;
 mod overload_value;
 mod override_check;
 mod rassoc;
-pub use override_check::{method_overloads, method_overrides, record_method_override_families};
+pub use override_check::{
+    method_overloads, method_overrides, record_method_override_families,
+    record_method_override_families_for,
+};
 mod interp_pattern;
 mod pickle_supply;
 mod predef_reimport;

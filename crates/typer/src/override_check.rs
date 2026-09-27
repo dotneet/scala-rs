@@ -1191,10 +1191,23 @@ fn overrides_through_self_type(st: &SymbolTable, cls: SymbolId, child: SymbolId)
 /// `SymbolTable`.  Backend code reads this table after erasure; it never calls
 /// the permissive diagnostic matcher to make a dispatch decision.
 pub fn record_method_override_families(st: &mut SymbolTable) {
+    let classes: std::collections::HashSet<_> = st
+        .symbols
+        .iter()
+        .filter(|s| s.is_class_like())
+        .map(|s| s.id)
+        .collect();
+    record_method_override_families_for(st, &classes);
+}
+
+pub fn record_method_override_families_for(
+    st: &mut SymbolTable,
+    owners: &std::collections::HashSet<SymbolId>,
+) {
     let methods: Vec<SymbolId> = st
         .symbols
         .iter()
-        .filter(|s| s.kind == SymKind::Method)
+        .filter(|s| s.kind == SymKind::Method && owners.contains(&s.owner))
         .map(|s| s.id)
         .collect();
     let mut pairs = Vec::new();
@@ -1237,7 +1250,7 @@ pub fn record_method_override_families(st: &mut SymbolTable) {
     let classes: Vec<_> = st
         .symbols
         .iter()
-        .filter(|s| s.is_class_like() && !is_interface(st, s.id))
+        .filter(|s| owners.contains(&s.id) && s.is_class_like() && !is_interface(st, s.id))
         .map(|s| s.id)
         .collect();
     let mut inherited_pairs = Vec::new();
@@ -1298,6 +1311,40 @@ pub fn method_overrides(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bo
 /// `false` means "not proven", never "these override".
 pub fn method_overloads(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
     child != base && st.methods_are_proven_overloads(child, base)
+}
+
+#[cfg(test)]
+mod selected_override_tests {
+    use super::*;
+    use scala_rs_parser::TyBox;
+
+    #[test]
+    fn only_emitted_owners_record_override_families() {
+        let mut st = SymbolTable::new();
+        let parent = st.alloc("Parent", st.root, SymKind::Class, Flags::TRAIT, "Parent");
+        let base = st.alloc("value", parent, SymKind::Method, Flags::ABSTRACT, "");
+        st.get_mut(base).ty = Type::Method {
+            paramss: vec![].into(),
+            ret: TyBox::new(Type::Int),
+        };
+        let mut children = Vec::new();
+        for name in ["Source", "Binary"] {
+            let child = st.alloc(name, st.root, SymKind::Class, Flags::EMPTY, name);
+            st.get_mut(child).parents.push(Type::Class {
+                sym: parent,
+                args: vec![].into(),
+            });
+            let method = st.alloc("value", child, SymKind::Method, Flags::EMPTY, "");
+            st.get_mut(method).ty = st.get(base).ty.clone();
+            children.push((child, method));
+        }
+        record_method_override_families_for(
+            &mut st,
+            &std::collections::HashSet::from([children[0].0]),
+        );
+        assert!(method_overrides(&st, children[0].1, base));
+        assert!(!method_overrides(&st, children[1].1, base));
+    }
 }
 
 /// Same-named, non-final base members — the "Note:" scalac appends to
