@@ -159,6 +159,7 @@ public final class ScalaRsMacroEngine {
      *  idx text path point)` defines one, `(position src idx path point)`
      *  reuses it. */
     static final java.util.Map<Integer, Object> sourceFiles = new java.util.HashMap<>();
+    static final java.util.Map<String, Sexp> parsedSnippets = new java.util.HashMap<>();
     /** `c.openImplicits` entries by the handle scala-rs gave them. */
     static final java.util.Map<Long, Sexp> openImplicitEntries = new java.util.HashMap<>();
     static List<Object> openMacroContexts = new ArrayList<>();
@@ -454,6 +455,7 @@ public final class ScalaRsMacroEngine {
         mutableSourceSymbols.clear();
         macroContexts.clear();
         sourceFiles.clear();
+        parsedSnippets.clear();
         openImplicitEntries.clear();
         openMacroContexts.clear();
         pendingGap = null;
@@ -3386,9 +3388,13 @@ public final class ScalaRsMacroEngine {
                     (Boolean) a[5]);
             }
             if (n.equals("parse") && arity == 1) {
-                StringBuilder request = new StringBuilder("(q parse ");
-                request.append(Sexp.quote(String.valueOf(a[0])));
-                Sexp answer = query(request.append(')').toString());
+                String source = String.valueOf(a[0]);
+                Sexp answer = parsedSnippets.get(source);
+                if (answer == null) {
+                    StringBuilder request = new StringBuilder("(q parse ");
+                    request.append(Sexp.quote(source));
+                    answer = query(request.append(')').toString());
+                }
                 if (answer.items.size() != 3) throw gap("malformed c.parse answer");
                 if ("fail".equals(answer.items.get(1).text())) {
                     // Context's Java proxy wraps checked ParseException in
@@ -3398,6 +3404,10 @@ public final class ScalaRsMacroEngine {
                         + " (ParseException recovery is not implemented)");
                 }
                 if (!"parsed".equals(answer.items.get(1).text())) throw gap("malformed c.parse answer");
+                if (source.length() <= 4096 && answer.src.length() <= 65536
+                        && parsedSnippets.size() < 256) {
+                    parsedSnippets.putIfAbsent(source, answer);
+                }
                 return buildTree(answer.items.get(2));
             }
             if (n.equals("openMacros") && arity == 0) {

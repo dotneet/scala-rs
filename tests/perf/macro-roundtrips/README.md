@@ -6,7 +6,9 @@ because it defines the Scala 2 macro API; use the jar from the same Scala
 timed client compilations. Both clients expand the same macro 16 times and
 produce `672`. Only `ManyQueries.scala` asks the compiler to parse and typecheck
 400 expressions per expansion. Thus the difference between the clients
-isolates 6,400 macro-to-compiler queries from macro startup and call-site work.
+isolates 6,400 parse and 6,400 typecheck requests from macro startup and
+call-site work. Both clients also perform 32 parses that check that repeated
+parsing creates distinct tree instances.
 
 From the repository root:
 
@@ -35,3 +37,11 @@ done
 Compare the later iterations rather than the first scalac iteration, which
 includes JVM warm-up. To locate the native work, repeat one compilation with
 `SCALA_RS_PHASE_TIMING=1 SCALA_RS_MACRO_TIMING=1`.
+
+The performance regression gate compiles the same source in both resident
+compilers, checks its output, and requires scala-rs to be faster in both run
+orders:
+
+```sh
+python3 tests/perf/macro-roundtrips/check.py "$NATIVE_COMPILER" "$SCALA_DIST" "$JDK_DIR"
+```
