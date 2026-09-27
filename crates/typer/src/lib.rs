@@ -191,6 +191,7 @@ pub use lin::{is_interface, linearize, trait_superclass};
 pub use localobj::{check_local_case_class_captures, check_local_objects, defines_local_classes};
 pub use named_eval_order::restore_named_arg_order;
 pub use rassoc::restore_rassoc_order;
+pub use scala_rs_pickle::sym::enable_resident_signature_cache;
 pub use source_features::{ParsedFeatures, SourceFeature, SourceFeatures};
 pub use specialize::{rewrite_specialized_calls, specialize_method_defs};
 pub use symbol::{

@@ -11,7 +11,8 @@
 //! (`SigType` -> `scala_rs_parser::Type`) lives in
 //! `crates/typer/src/pickle_supply.rs`, which is where the symbol table is.
 
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::read::{pflags, read_pickle, Constant, Entry, Idx, Pickle, ReadError, Tree};
@@ -1178,6 +1179,61 @@ pub struct SigCache {
     linearizations: HashMap<(String, bool), (Vec<LinStep>, Vec<LoadError>)>,
 }
 
+const RESIDENT_SIGNATURE_LIMIT: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct ResidentSignatures {
+    by_pickle: HashMap<Vec<u8>, Rc<Vec<Rc<ClassSig>>>>,
+    insertion_order: VecDeque<Vec<u8>>,
+    estimated_bytes: usize,
+}
+
+thread_local! {
+    static RESIDENT_SIGNATURES_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static RESIDENT_SIGNATURES: RefCell<ResidentSignatures> = RefCell::new(ResidentSignatures::default());
+}
+
+/// Reuse immutable decoded pickles between sequential compilations. The
+/// pickle bytes are the key, so replacing a class file never reuses stale
+/// signatures, including for directory classpaths.
+pub fn enable_resident_signature_cache() {
+    RESIDENT_SIGNATURES_ENABLED.set(true);
+}
+
+fn class_sigs_cached(
+    raw: &[u8],
+    parse: impl FnOnce() -> Result<Vec<ClassSig>, ReadError>,
+) -> Result<Rc<Vec<Rc<ClassSig>>>, ReadError> {
+    let enabled = RESIDENT_SIGNATURES_ENABLED.get();
+    if enabled {
+        if let Some(hit) =
+            RESIDENT_SIGNATURES.with_borrow(|cache| cache.by_pickle.get(raw).cloned())
+        {
+            return Ok(hit);
+        }
+    }
+    let sigs: Rc<Vec<Rc<ClassSig>>> = Rc::new(parse()?.into_iter().map(Rc::new).collect());
+    if enabled {
+        let weight = raw.len().saturating_mul(8);
+        if weight <= RESIDENT_SIGNATURE_LIMIT {
+            RESIDENT_SIGNATURES.with_borrow_mut(|cache| {
+                while cache.estimated_bytes + weight > RESIDENT_SIGNATURE_LIMIT {
+                    let Some(oldest) = cache.insertion_order.pop_front() else {
+                        break;
+                    };
+                    if cache.by_pickle.remove(oldest.as_slice()).is_some() {
+                        cache.estimated_bytes -= oldest.len() * 8;
+                    }
+                }
+                cache.estimated_bytes += weight;
+                cache.insertion_order.push_back(raw.to_vec());
+                cache.by_pickle.insert(raw.to_vec(), sigs.clone());
+            });
+        }
+    }
+    Ok(sigs)
+}
+
 /// One member found by [`SigCache::lookup`].
 #[derive(Clone, Debug)]
 pub struct MemberHit {
@@ -1484,19 +1540,26 @@ fn load<S: ClassSource + ?Sized>(
             last = LoadError::NoSignature(full_name.to_string());
             continue;
         };
-        let p = match read_pickle(&raw) {
-            Ok(p) => p,
+        let found = if RESIDENT_SIGNATURES_ENABLED.get() {
+            class_sigs_cached(&raw, || read_pickle(&raw).map(|p| class_sigs(&p))).map(|sigs| {
+                sigs.iter()
+                    .find(|c| c.full_name == full_name && c.is_module == module)
+                    .cloned()
+            })
+        } else {
+            read_pickle(&raw).map(|p| {
+                class_sigs(&p)
+                    .into_iter()
+                    .find(|c| c.full_name == full_name && c.is_module == module)
+                    .map(Rc::new)
+            })
+        };
+        match found {
+            Ok(Some(sig)) => return Ok(sig),
+            Ok(None) => last = LoadError::NoSuchClass(full_name.to_string()),
             Err(e) => {
                 last = LoadError::BadPickle(full_name.to_string(), e);
-                continue;
             }
-        };
-        match class_sigs(&p)
-            .into_iter()
-            .find(|c| c.full_name == full_name && c.is_module == module)
-        {
-            Some(sig) => return Ok(Rc::new(sig)),
-            None => last = LoadError::NoSuchClass(full_name.to_string()),
         }
     }
     Err(last)
@@ -1840,6 +1903,33 @@ pub fn render(t: &SigType) -> String {
 #[cfg(test)]
 mod tests {
     use super::pickle_files_for;
+
+    #[test]
+    fn resident_signatures_follow_pickle_bytes() {
+        use super::*;
+
+        let signature = |name: &str| ClassSig {
+            full_name: name.into(),
+            is_module: false,
+            declaring_owner_is_module: false,
+            flags: 0,
+            tparams: Vec::new(),
+            parents: Vec::new(),
+            members: Vec::new(),
+            unresolved: Vec::new(),
+            deprecated: None,
+            children: Vec::new(),
+        };
+        enable_resident_signature_cache();
+        let first = class_sigs_cached(b"first", || Ok(vec![signature("First")])).unwrap();
+        let reused = class_sigs_cached(b"first", || panic!("pickle was decoded again")).unwrap();
+        assert!(Rc::ptr_eq(&first, &reused));
+        let replaced = class_sigs_cached(b"second", || Ok(vec![signature("Second")])).unwrap();
+        assert_eq!(replaced[0].full_name, "Second");
+        assert!(!Rc::ptr_eq(&first, &replaced));
+        RESIDENT_SIGNATURES_ENABLED.set(false);
+        RESIDENT_SIGNATURES.with_borrow_mut(|cache| *cache = ResidentSignatures::default());
+    }
 
     #[test]
     fn linearization_reuses_a_cached_walk_and_its_diagnostics() {

@@ -20,10 +20,11 @@ use scala_rs_typer::{
 pub use scala_rs_backend::EmittedClass;
 pub use scala_rs_typer::{ParsedFeatures, SourceFeature, SourceFeatures};
 
-/// Share validated archive indexes between sequential compilations in one
-/// process; source and directory state remains local to each compiler run.
+/// Share validated archive indexes and decoded binary signatures between
+/// sequential compilations. Source state remains local to each run.
 pub fn enable_resident_archive_cache() {
     scala_rs_typer::javaclass::enable_resident_archive_cache();
+    scala_rs_typer::enable_resident_signature_cache();
 }
 
 pub fn enable_resident_direct_macro() {
