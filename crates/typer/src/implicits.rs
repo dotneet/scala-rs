@@ -181,15 +181,16 @@ pub(crate) struct OuterImplicitsKey {
     gen: u64,
 }
 
-/// Top-level implicit searches' answers across implicit operations.
+/// Independent implicit searches' answers across implicit operations.
 ///
 /// [`ImplicitMemo`] lives for one operation, so every statement that asks for
 /// a `Foldable[List]` fitted the whole implicit scope again: cats' instance
 /// scopes hold a few hundred candidates, and a file that writes
 /// `xs.combineAll` sixty times ran sixty identical searches -- 60% of its
-/// type checking. An answer at depth 0, with no type variables of the caller
-/// to solve and nothing open on the divergence stack, is a function of the
-/// wanted type, the candidates in scope and the symbol graph, so it is kept
+/// type checking. An answer at depth zero, or an independent macro query at
+/// depth one, with no type variables of the caller to solve and nothing open
+/// on the divergence stack, is a function of the wanted type, the candidates
+/// in scope and the symbol graph, so it is kept
 /// under a fingerprint of those: the member graph generation, `this_class`,
 /// the lexical candidates, and the declared types of the candidates defined
 /// in source (an `implicit val` typed later changes its answer). Only found,
@@ -3154,7 +3155,13 @@ impl Typer {
         if let Some(hit) = self.memo_lookup(key, pt, undet, depth, open) {
             return hit;
         }
-        let scope_key = (depth == 0
+        // An explicit macro implicit query is a new top-level operation even
+        // though its detached search runs at depth one. Only admit it when
+        // there is no enclosing implicit search to affect the answer.
+        let top_level_macro_query = depth == 1
+            && self.macro_query_depth == 1
+            && self.implicit_search_depth == 0;
+        let scope_key = ((depth == 0 || top_level_macro_query)
             && undet.is_empty()
             && open == 0
             && self.open_implicits.borrow().is_empty()
@@ -6290,6 +6297,39 @@ fn unwrap_byname(t: &Type) -> Type {
 mod memo_tests {
     use super::*;
     use crate::check::TypecheckOptions;
+
+    #[test]
+    fn independent_macro_queries_share_scope_cache_but_not_changed_scopes() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        typer.st.push_scope();
+        let first = typer
+            .st
+            .alloc("first", root, SymKind::Term, Flags::IMPLICIT, "first");
+        typer.st.get_mut(first).ty = Type::Int;
+        typer.st.enter_in_current("first", first);
+        typer.macro_query_depth = 1;
+
+        assert!(matches!(
+            typer.search_implicit_at(&Type::Int, 1),
+            ImplicitSearch::Found(id) if id == first
+        ));
+        assert!(!typer.scope_search_cache.borrow().map.is_empty());
+        assert!(matches!(
+            typer.search_implicit_at(&Type::Int, 1),
+            ImplicitSearch::Found(id) if id == first
+        ));
+
+        let second = typer
+            .st
+            .alloc("second", root, SymKind::Term, Flags::IMPLICIT, "second");
+        typer.st.get_mut(second).ty = Type::Int;
+        typer.st.enter_in_current("second", second);
+        assert!(matches!(
+            typer.search_implicit_at(&Type::Int, 1),
+            ImplicitSearch::Ambiguous(_)
+        ));
+    }
 
     #[test]
     fn specificity_memo_keeps_both_directions_and_expires_with_search() {
