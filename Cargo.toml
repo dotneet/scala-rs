@@ -29,3 +29,7 @@ scala-rs-driver = { path = "crates/driver" }
 # A non-cryptographic hasher for the compiler's internal maps. SipHash in
 # `implicits_in_scope` alone was ~5% of a slick build. See README 速度.
 rustc-hash = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
