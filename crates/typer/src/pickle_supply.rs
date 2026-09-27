@@ -3160,6 +3160,7 @@ impl PickleSupply {
                 &jvm_member,
                 &hit.owner,
                 hit.owner_module,
+                hit.declaration_index,
                 &shape,
                 &class_scope,
                 m.result_prefix.as_ref(),
@@ -4275,6 +4276,7 @@ impl PickleSupply {
         // `internal` whenever the member is inherited.
         pickle_owner: &str,
         owner_module: bool,
+        declaration_index: usize,
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
         result_prefix: Option<&SigType>,
@@ -4760,10 +4762,9 @@ impl PickleSupply {
         // Source overload identity cannot be derived from the JVM descriptor:
         // two Scala parameter types may erase to the same descriptor while
         // remaining distinct alternatives (for example a primitive and a
-        // value-class wrapper around it). Use the pickled declaration shape,
-        // which is also stable when the same inherited member is installed on
-        // more than one receiver.
-        st.get_mut(m).pickled_origin = format!("{pickle_owner}#{jvm_member}{shape:?}");
+        // value-class wrapper around it). The declaration's position in its
+        // owner's signature is unique and stable across receiver lookups.
+        st.get_mut(m).pickled_origin = format!("{pickle_owner}#{jvm_member}@{declaration_index}");
         let mut source = BinSource(bin);
         let mut errors = Vec::new();
         st.get_mut(m).pickled_owner_bases = self

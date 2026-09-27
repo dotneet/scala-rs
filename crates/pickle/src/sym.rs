@@ -1242,6 +1242,8 @@ pub struct MemberHit {
     pub owner: String,
     /// Whether the declaration belongs to the companion module.
     pub owner_module: bool,
+    /// Position of this declaration in its owner's class signature.
+    pub declaration_index: usize,
     /// The member, with its type already substituted into the *queried*
     /// class's type-parameter vocabulary: `List#filter` comes back returning
     /// `List[A]`, not `IterableOps`'s opaque `C`.
@@ -1306,18 +1308,22 @@ impl SigCache {
             let Ok(sig) = self.class_sig(src, &step.class_name, step.module) else {
                 continue;
             };
-            let mut add = |m: &Member| {
+            let mut add = |position: usize, m: &Member| {
                 let mut m = m.clone();
                 m.ty = apply_subst(&m.ty, &step.subst);
                 found.push(MemberHit {
                     owner: step.class_name.clone(),
                     owner_module: step.module,
+                    declaration_index: position,
                     member: m,
                 });
             };
             if sig.members.len() < 128 {
-                for m in sig.members_named(name) {
-                    add(m);
+                let encoded = crate::names::encode_method_name(name);
+                for (position, member) in sig.members.iter().enumerate() {
+                    if member.name == name || member.name == encoded {
+                        add(position, member);
+                    }
                 }
                 continue;
             }
@@ -1338,7 +1344,7 @@ impl SigCache {
                 positions.sort_unstable();
             }
             for position in positions {
-                add(&sig.members[position]);
+                add(position, &sig.members[position]);
             }
         }
         (found, errs)
@@ -1980,6 +1986,54 @@ mod tests {
         let mut module_errors = Vec::new();
         cache.linearization(&mut source, "missing.Example", true, &mut module_errors);
         assert_eq!(cache.linearizations.len(), 2);
+    }
+
+    #[test]
+    fn member_lookup_preserves_declaration_positions_for_overloads() {
+        use super::*;
+
+        let member = |name: &str| Member {
+            name: name.into(),
+            kind: MemberKind::Def,
+            flags: 0,
+            ty: SigType::None,
+            alias_prefix: None,
+            result_prefix: None,
+            macro_impl: None,
+            private_within: None,
+            has_private_within: false,
+            deprecated: None,
+        };
+        for count in [3, 130] {
+            let mut members = vec![member("lift")];
+            members.extend((1..count - 1).map(|_| member("other")));
+            members.push(member("lift"));
+            let sig = ClassSig {
+                full_name: "example.Catalog".into(),
+                is_module: false,
+                declaring_owner_is_module: false,
+                flags: 0,
+                tparams: Vec::new(),
+                parents: Vec::new(),
+                members,
+                unresolved: Vec::new(),
+                deprecated: None,
+                children: Vec::new(),
+            };
+            let mut cache = SigCache::new();
+            cache.cache.insert(sig.full_name.clone(), Ok(Rc::new(sig)));
+            let mut source = |_: &str| None;
+            for _ in 0..2 {
+                let (hits, errors) = cache.lookup(&mut source, "example.Catalog", false, "lift");
+                assert!(errors.is_empty());
+                assert_eq!(
+                    hits.iter()
+                        .map(|hit| hit.declaration_index)
+                        .collect::<Vec<_>>(),
+                    [0, count - 1]
+                );
+            }
+        }
     }
 
     #[test]
