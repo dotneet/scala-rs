@@ -41,6 +41,26 @@ pub fn has_errors(diags: &[Diagnostic]) -> bool {
 mod tests {
     use super::*;
 
+    /// A `}` the top level has no `{` for is reported, as nsc does, and what
+    /// follows it is still read; it had been ignored with the rest.
+    #[test]
+    fn an_unmatched_closing_brace_is_an_error() {
+        for src in [
+            "object A { def f = 1 }}\nobject B",
+            "package p\nobject A }\nobject B",
+            "package p { object A } }\nobject B",
+        ] {
+            let r = parse_str(src);
+            let messages: Vec<_> = r.diags.iter().map(|d| d.message.as_str()).collect();
+            assert!(
+                messages.contains(&"Unmatched closing brace '}' ignored here"),
+                "{src:?}: {messages:?}"
+            );
+            assert!(format!("{:?}", r.tree).contains("\"B\""), "{src:?} lost `B`");
+        }
+        assert!(!has_errors(&parse_str("object A { def f = 1 }\n").diags));
+    }
+
     fn parse_ok(src: &str) -> Tree {
         let r = parse_str(src);
         assert!(

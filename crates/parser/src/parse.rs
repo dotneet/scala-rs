@@ -475,7 +475,8 @@ impl<'a> Parser<'a> {
             if matches!(self.kind(), TokenKind::Object) {
                 let pkg_obj = self.parse_package_object(pkg_span);
                 self.skip_nl_semi();
-                let rest = self.parse_top_stats();
+                let mut rest = self.parse_top_stats();
+                self.drain_unmatched_braces(&mut rest);
                 let mut all = vec![pkg_obj];
                 all.extend(rest);
                 let pid = self.alloc(
@@ -507,6 +508,7 @@ impl<'a> Parser<'a> {
                     },
                 );
                 let mut more = self.parse_top_stats();
+                self.drain_unmatched_braces(&mut more);
                 if more.is_empty() {
                     return inner;
                 }
@@ -532,7 +534,8 @@ impl<'a> Parser<'a> {
             }
             self.accept_separator();
         }
-        let stats = self.parse_top_stats();
+        let mut stats = self.parse_top_stats();
+        self.drain_unmatched_braces(&mut stats);
         let pid = pid.unwrap_or_else(|| {
             self.alloc(
                 lo,
@@ -548,6 +551,21 @@ impl<'a> Parser<'a> {
                 stats,
             },
         )
+    }
+
+    /// A `}` the unit's top level has no `{` for. nsc reports it --
+    /// "Unmatched closing brace '}' ignored here" -- and goes on with what
+    /// follows; it had been dropped silently, with the rest of the file.
+    fn drain_unmatched_braces(&mut self, stats: &mut Vec<Tree>) {
+        loop {
+            self.skip_nl_semi();
+            if !matches!(self.kind(), TokenKind::RBrace) {
+                break;
+            }
+            self.error_here("Unmatched closing brace '}' ignored here");
+            self.bump();
+            stats.extend(self.parse_top_stats());
+        }
     }
 
     fn prev_span(&self) -> Span {
