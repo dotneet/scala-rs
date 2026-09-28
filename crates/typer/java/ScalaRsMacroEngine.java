@@ -921,7 +921,7 @@ public final class ScalaRsMacroEngine {
         }
         java.util.Map<Long, Sexp> previousMetadata = activeSymbolMetadata;
         try {
-            activeSymbolMetadata = sourceSymbolMetadata(requestSymbolIds(req));
+            activeSymbolMetadata = sourceSymbolMetadata(requestSymbolIds(req.field("prefix")));
             return expand(req);
         } finally {
             activeSymbolMetadata = previousMetadata;
@@ -989,6 +989,7 @@ public final class ScalaRsMacroEngine {
         structuralParams.clear();
         asyncMarks.clear();
         Ctx handler = new Ctx();
+        handler.argssWire = argss;
         // `c.prefix`: the receiver of the macro application, or the reason
         // there is none -- which is raised only if the implementation reads it.
         Sexp pfx = req.field("prefix").items.get(1);
@@ -1006,32 +1007,22 @@ public final class ScalaRsMacroEngine {
         if (app.isList() && "no".equals(app.items.get(0).atom)) {
             handler.appWhy = app.items.get(1).text();
         } else {
-            appPrefixTree = handler.prefixTree;
-            try {
-                handler.appTree = buildTree(app);
-            } finally {
-                appPrefixTree = null;
-            }
+            handler.appWire = app;
             for (Sexp field : req.items) {
                 if (field.isList() && field.items.size() == 2
                         && "appSymbol".equals(field.items.get(0).text())) {
-                    Object reference = handler.appTree;
-                    while ("Apply".equals(call(reference, "productPrefix", 0))
-                            || "TypeApply".equals(call(reference, "productPrefix", 0))) {
-                        reference = call(reference, "fun", 0);
-                    }
-                    call(reference, "setSymbol", 1,
-                        sourceSymbol(Long.parseLong(field.items.get(1).text())));
+                    handler.appSymbolId = Long.parseLong(field.items.get(1).text());
                 }
             }
+            // Enter the method before type tags can load its enclosing package.
+            if (handler.appSymbolId != 0) sourceSymbol(handler.appSymbolId);
             Sexp appType = req.field("appType");
-            if (appType.items.size() == 2) call(handler.appTree, "setType", 1, typeFor(appType.items.get(1)));
+            if (appType.items.size() == 2) handler.appTypeWire = appType.items.get(1);
             if (source != null) {
                 Class<?> sourceClass = loadClass("scala.reflect.internal.util.SourceFile");
-                Object pos = loadClass("scala.reflect.internal.util.OffsetPosition")
+                handler.appPosition = loadClass("scala.reflect.internal.util.OffsetPosition")
                     .getConstructor(sourceClass, int.class)
                     .newInstance(source, Integer.parseInt(position.items.get(positionSize - 1).text()));
-                call(handler.appTree, "setPos", 1, pos);
             }
         }
 
@@ -1083,10 +1074,10 @@ public final class ScalaRsMacroEngine {
             for (Sexp a : clause.items.subList(1, clause.items.size())) {
                 if ("repeat".equals(a.items.get(0).atom)) {
                     List<Object> values = new ArrayList<>();
-                    for (Sexp value : a.items.subList(1, a.items.size())) values.add(buildArgument(value));
+                    for (Sexp value : a.items.subList(1, a.items.size())) values.add(buildArgument(value, handler));
                     argv.add(list(values));
                 } else {
-                    argv.add(buildArgument(a));
+                    argv.add(buildArgument(a, handler));
                 }
             }
         }
@@ -1684,9 +1675,28 @@ public final class ScalaRsMacroEngine {
         }
     }
 
-    static Object buildArgument(Sexp a) throws Exception {
+    static Object buildArgument(Sexp a, Ctx context) throws Exception {
         boolean asExpr = "expr".equals(a.items.get(1).atom);
-        Object tree = buildTree(a.items.get(2));
+        if (asExpr) {
+            // An implementation may never inspect an Expr's tree. Keep both
+            // tree construction and its symbol descriptions behind that read.
+            Class<?> exprApi = loadClass("scala.reflect.api.Exprs$Expr");
+            final Object[] realized = new Object[1];
+            return Proxy.newProxyInstance(macroCl, new Class<?>[]{exprApi}, (proxy, method, args) -> {
+                if (realized[0] == null) realized[0] = buildArgumentValue(a, context);
+                try {
+                    return method.invoke(realized[0], args);
+                } catch (InvocationTargetException wrapped) {
+                    throw wrapped.getCause();
+                }
+            });
+        }
+        return buildArgumentValue(a, context);
+    }
+
+    static Object buildArgumentValue(Sexp a, Ctx context) throws Exception {
+        boolean asExpr = "expr".equals(a.items.get(1).atom);
+        Object tree = context.buildArgumentTree(a.items.get(2));
         // Expr's weak tag remains Nothing, but its already-typed argument
         // tree carries the actual source type, including literal constants.
         call(tree, "setType", 1, typeFor(a.items.get(4)));
@@ -2778,8 +2788,8 @@ public final class ScalaRsMacroEngine {
         if (missing.size() < 2) return java.util.Collections.emptyMap();
         List<Long> ordered = new ArrayList<>(missing);
         java.util.Map<Long, Sexp> metadata = new java.util.HashMap<>();
-        for (int from = 0; from < ordered.size(); from += 32) {
-            int until = Math.min(from + 32, ordered.size());
+        for (int from = 0; from < ordered.size(); from += 256) {
+            int until = Math.min(from + 256, ordered.size());
             StringBuilder request = new StringBuilder("(q symbols");
             for (int at = from; at < until; at++) request.append(' ').append(ordered.get(at));
             Sexp answer = query(request.append(')').toString());
@@ -3390,11 +3400,51 @@ public final class ScalaRsMacroEngine {
         String prefixWhy;
         /** `c.macroApplication`: the whole call as written, or null. */
         Object appTree;
+        Sexp appWire;
+        Sexp appTypeWire;
+        long appSymbolId;
+        Object appPosition;
+        Sexp argssWire;
+        java.util.Map<Long, Sexp> argumentMetadata;
         /** Why there is no application tree, when there is none. */
         String appWhy;
         /** Built once: `prefix` is a `val` in nsc and is read more than once. */
         Object prefix;
         Object internalProxy;
+
+        Object buildArgumentTree(Sexp wire) throws Exception {
+            if (argumentMetadata == null) {
+                argumentMetadata = sourceSymbolMetadata(requestSymbolIds(argssWire));
+            }
+            java.util.Map<Long, Sexp> previous = activeSymbolMetadata;
+            activeSymbolMetadata = argumentMetadata;
+            try {
+                return buildTree(wire);
+            } finally {
+                activeSymbolMetadata = previous;
+            }
+        }
+
+        Object applicationTree() throws Exception {
+            if (appTree != null || appWire == null) return appTree;
+            appPrefixTree = prefixTree;
+            try {
+                appTree = buildAnswerTree(appWire);
+            } finally {
+                appPrefixTree = null;
+            }
+            if (appSymbolId != 0) {
+                Object reference = appTree;
+                while ("Apply".equals(call(reference, "productPrefix", 0))
+                        || "TypeApply".equals(call(reference, "productPrefix", 0))) {
+                    reference = call(reference, "fun", 0);
+                }
+                call(reference, "setSymbol", 1, sourceSymbol(appSymbolId));
+            }
+            if (appTypeWire != null) call(appTree, "setType", 1, typeFor(appTypeWire));
+            if (appPosition != null) call(appTree, "setPos", 1, appPosition);
+            return appTree;
+        }
 
         public Object invoke(Object proxy, Method m, Object[] a) throws Throwable {
             String n = m.getName();
@@ -3449,12 +3499,12 @@ public final class ScalaRsMacroEngine {
                 return prefix;
             }
             if (n.equals("macroApplication") && arity == 0) {
-                if (appTree == null) {
+                if (appWire == null) {
                     throw new UnsupportedOperationException(
                         "scala-rs macro engine: c.macroApplication is not available here -- "
                             + appWhy);
                 }
-                return appTree;
+                return applicationTree();
             }
             if ((n.equals("untypecheck") || n.equals("resetLocalAttrs")) && arity == 1) {
                 return untypecheck(a[0]);
@@ -3601,9 +3651,7 @@ public final class ScalaRsMacroEngine {
                 return list(candidates);
             }
             if (n.equals("inferImplicitValue") && arity == 4) {
-                Object enclosing = appTree == null
-                    ? call(universe, "NoPosition", 0)
-                    : call(appTree, "pos", 0);
+                Object enclosing = appPosition == null ? call(universe, "NoPosition", 0) : appPosition;
                 return inferImplicitValue(
                     a[0], (Boolean) a[1], (Boolean) a[2], a[3], enclosing);
             }
@@ -3613,7 +3661,7 @@ public final class ScalaRsMacroEngine {
             }
             // Diagnostics and source inspection use the same call-site point.
             if (n.equals("enclosingPosition") && arity == 0) {
-                return appTree == null ? call(universe, "NoPosition", 0) : call(appTree, "pos", 0);
+                return appPosition == null ? call(universe, "NoPosition", 0) : appPosition;
             }
             if (m.isDefault()) {
                 return invokeDefault(proxy, m, a);

@@ -413,8 +413,8 @@ impl Typer {
     }
 
     fn answer_mirror_symbols(&mut self, items: &[Sexp]) -> String {
-        if items.len() < 3 || items.len() > 34 {
-            return refusal("a symbol batch must contain between 1 and 32 identities");
+        if items.len() < 3 || items.len() > 258 {
+            return refusal("a symbol batch must contain between 1 and 256 identities");
         }
         let mut answer = String::from("(a symbols");
         for item in &items[2..] {
@@ -1736,6 +1736,14 @@ mod tests {
         assert!(typer
             .answer_query(&[atom("q"), atom("symbols"), atom("99999999")])
             .starts_with("(no "));
+        let mut wide = vec![atom("q"), atom("symbols")];
+        wide.extend((0..256).map(|_| atom(&ids[0].to_string())));
+        assert_eq!(
+            typer.answer_query(&wide).matches("(a symbol ").count(),
+            256
+        );
+        wide.push(atom(&ids[0].to_string()));
+        assert!(typer.answer_query(&wide).starts_with("(no "));
     }
 
     fn string(value: &str) -> Sexp {
