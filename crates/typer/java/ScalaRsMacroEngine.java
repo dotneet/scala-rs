@@ -2136,17 +2136,13 @@ public final class ScalaRsMacroEngine {
         }
         Long orig = origTrees.get(t);
         if (orig != null) {
-            // Once a child was spliced, the whole Block cannot also consume
-            // the same typed source tree.
-            if (usedBlockRoots.contains(orig)) {
+            // The first occurrence consumes the typed source tree. Only a
+            // second occurrence needs its shape to rebuild an independent tree.
+            if (usedBlockRoots.contains(orig) || !emittedBlockRoots.add(orig)) {
                 serTreeShape(t, sb);
                 return;
             }
-            emittedBlockRoots.add(orig);
-            // Its shape goes too: scala-rs uses it for a second mention.
-            sb.append("(t \"Orig\" (s0) ").append(orig).append(' ');
-            serTreeShape(t, sb);
-            sb.append(')');
+            sb.append("(t \"Orig\" (s0) ").append(orig).append(')');
             return;
         }
         OrigBlockChild child = origBlockChildren.get(t);
