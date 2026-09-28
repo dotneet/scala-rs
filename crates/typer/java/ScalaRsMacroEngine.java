@@ -7,6 +7,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.invoke.MethodHandle;
 import java.lang.reflect.InvocationTargetException;
@@ -429,8 +430,8 @@ public final class ScalaRsMacroEngine {
 
     static void resetRun(ClassLoader baseCl, List<String> entries) throws Exception {
         boolean sameClasspath = runtimeCl != null && runtimeEntries.equals(entries);
-        boolean changedClasses = runtimeCl != null && runtimeCl.conflicts(entries);
-        if (changedClasses) {
+        boolean changedClasses = sameClasspath && runtimeCl.conflicts(entries);
+        if (runtimeCl != null && (!sameClasspath || changedClasses)) {
             if (macroCl instanceof java.net.URLClassLoader) {
                 ((java.net.URLClassLoader) macroCl).close();
             }
@@ -441,10 +442,18 @@ public final class ScalaRsMacroEngine {
         for (String entry : entries) {
             runtimeCl.addPath(entry);
         }
-        if (!sameClasspath || changedClasses || universe == null) {
+        if (universe == null) {
             Class<?> universeClass = Class.forName("scala.reflect.runtime.JavaUniverse", true, runtimeCl);
             universe = universeClass.getConstructor().newInstance();
+        }
+        if (!sameClasspath || changedClasses || mirror == null) {
             mirror = find(universe.getClass(), "runtimeMirror", 1).invoke(universe, runtimeCl);
+            // The runtime universe's default mirror must resolve libraries on
+            // this run's loader, even though the universe itself is shared.
+            call(universe, "rootMirror", 0);
+            Field rootMirror = universe.getClass().getDeclaredField("rootMirror");
+            rootMirror.setAccessible(true);
+            rootMirror.set(universe, mirror);
         }
         runtimeEntries = new ArrayList<>(entries);
         sourceSymbols.clear();

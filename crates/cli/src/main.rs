@@ -328,10 +328,12 @@ fn macro_daemon_endpoint(engine_dir: &str, classpath: &str) -> Result<PathBuf, S
         .map_err(|e| e.to_string())?;
     let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
     let mut daemon = Command::new(macro_java());
+    // Keep Scala reflection on the daemon loader while each compile gets a
+    // replaceable child loader for its changing project classpath.
     daemon
         .arg("-Xmx2g")
         .arg("-cp")
-        .arg(engine_dir)
+        .arg(format!("{engine_dir}:{runtime_cp}"))
         .arg("ScalaRsMacroEngine")
         .arg("--daemon")
         .arg(&endpoint)

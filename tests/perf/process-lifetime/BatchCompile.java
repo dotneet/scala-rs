@@ -20,7 +20,7 @@ public final class BatchCompile {
                     + "[--warmup] [--batch-native]");
         }
         Path source = Path.of(args[0]);
-        String classpath = args[1];
+        String[] classpaths = args[1].split("\\|", -1);
         int repeats = Integer.parseInt(args[2]);
         Path root = Files.createTempDirectory("compiler-batch-");
         long total = 0;
@@ -29,6 +29,7 @@ public final class BatchCompile {
         try {
             for (int i = warmup ? -1 : 0; i < repeats; i++) {
                 String label = i < 0 ? "warmup" : String.valueOf(i);
+                String classpath = classpaths[Math.floorMod(i, classpaths.length)];
                 Path input = Files.copy(source, root.resolve("input-" + label + ".scala"));
                 Path output = Files.createDirectory(root.resolve("out-" + label));
                 long start = System.nanoTime();

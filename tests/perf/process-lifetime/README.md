@@ -176,3 +176,31 @@ It verifies the program output and first/last output class hashes for scalac
 and the required native macro daemon. A daemon that keeps a previously loaded
 provider class incorrectly prints A's value during the B compilation. This
 check must pass before resident macro performance results are meaningful.
+
+The same two providers also reproduce the cost of switching classpaths between
+small modules. Each compiler stays resident; the provider changes on every
+compilation, and the output is checked at both ends of each run:
+
+```sh
+python3 tests/perf/process-lifetime/classpath_switch_check.py \
+  /path/to/scala-rs /path/to/scala-2.13.16 /path/to/jdk
+```
+
+The default maximum native/scalac ratio is 0.8. On JDK 21.0.2, the earlier
+macro daemon took 4.84-5.06 seconds for 16 compilations versus 0.85-0.89
+seconds for resident scalac. Reusing the Scala runtime universe while replacing
+the project class loader and mirror took 0.19-0.27 seconds versus 0.83-0.85
+seconds for scalac. The only dependencies are the Scala distribution's library
+and reflect jars; the provider compilation is outside the timed interval.
+
+An additional correctness check first asks a macro mirror for an absent class,
+then adds that class's output directory to the next compilation's classpath:
+
+```sh
+python3 tests/perf/process-lifetime/classpath_addition_check.py \
+  /path/to/scala-rs /path/to/scala-2.13.16 /path/to/jdk
+```
+
+Both resident compilers must print `false` and then `true`. A new child class
+loader and mirror are needed when the classpath grows, even when no previously
+loaded class file changed.
