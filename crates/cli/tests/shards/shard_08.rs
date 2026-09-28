@@ -96,6 +96,8 @@ mod vcself;
 mod verify_sql;
 #[path = "../verifyfail.rs"]
 mod verifyfail;
+#[path = "../view_with_args.rs"]
+mod view_with_args;
 #[path = "../wacc.rs"]
 mod wacc;
 #[path = "../warn.rs"]

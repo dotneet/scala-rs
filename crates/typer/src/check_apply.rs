@@ -1123,6 +1123,11 @@ impl Typer {
                 this.type_expr(fun, &dummy_method);
             });
         });
+        if let Some((span, mark)) = self.view_retry.take() {
+            if fun.ty.is_error() && span == fun.span {
+                self.retry_view_with_args(fun, args, mark);
+            }
+        }
 
         // The parser keeps `recv op (a, b)` as an infix application with one
         // tuple-valued argument.  nsc's `adaptToArguments` expands that tuple

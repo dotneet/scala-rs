@@ -907,6 +907,9 @@ impl Typer {
                 // nsc names the *reduced* type: `value _4 is not a member of
                 // (A0, Any, Any)`, not of the application that produced it.
                 let shown = self.st.expand_applied_hk_alias(qual.ty.clone());
+                self.view_retry = self
+                    .view_ambiguous
+                    .then(|| (tree.span, self.diags.len()));
                 self.error(
                     tree.span,
                     format!(
@@ -3301,6 +3304,45 @@ impl Typer {
         tree.ty = Type::NoType;
         tree.sym = SymbolId::NONE;
         self.type_expr(tree, pt);
+        true
+    }
+
+    /// nsc's `adaptToMemberWithArgs`: a selection whose views could not be
+    /// told apart by the member's name is searched again with the types of
+    /// the arguments it is applied to, typed on copies. `a + b` on `a, b: T`
+    /// under `Numeric.Implicits._` has `infixNumericOps` and `any2stringadd`
+    /// in scope; only the arguments rule the string view out. On success the
+    /// selection's error, at `mark`, is withdrawn.
+    pub(crate) fn retry_view_with_args(&mut self, fun: &mut Tree, args: &[Tree], mark: usize) -> bool {
+        let TreeKind::Select { qual, .. } = &fun.kind else {
+            return false;
+        };
+        if qual.ty.is_error() || qual.ty.is_no_type() {
+            return false;
+        }
+        let probe_mark = self.diags.len();
+        let mut probe = args.to_vec();
+        for arg in probe.iter_mut() {
+            self.type_expr(arg, &Type::NoType);
+        }
+        let typed = probe
+            .iter()
+            .all(|a| !a.ty.is_error() && !a.ty.is_no_type());
+        self.diags.truncate(probe_mark);
+        if !typed {
+            return false;
+        }
+        let arg_tys: Vec<Type> = probe.iter().map(Tree::argument_type).collect();
+        if !self.rewrite_apply_extension(fun, &arg_tys) {
+            return false;
+        }
+        if self
+            .diags
+            .get(mark)
+            .is_some_and(|d| d.message.contains("is not a member of"))
+        {
+            self.diags.remove(mark);
+        }
         true
     }
 

@@ -946,6 +946,12 @@ pub struct Typer {
     /// The view result classes found to have no member of a name
     /// ([`Typer::view_class_may_have_member`]), by `member_graph_gen`.
     pub(crate) view_member_misses: (u64, rustc_hash::FxHashSet<(SymbolId, String)>),
+    /// The last extension search had views it could not choose between
+    /// without the member's arguments.
+    pub(crate) view_ambiguous: bool,
+    /// A selection that failed that way, by its span, and where its error
+    /// went: the application around it retries with the arguments.
+    pub(crate) view_retry: Option<(scala_rs_span::Span, usize)>,
     /// The complete candidate fit produced by the most recent implicit
     /// search. Materialization consumes it before entering its recursion
     /// guard, so associated type arguments inferred from the candidate's own
@@ -1493,6 +1499,8 @@ impl Typer {
             implicit_instances: Default::default(),
             implicit_instance_origins: Default::default(),
             view_member_misses: Default::default(),
+            view_ambiguous: false,
+            view_retry: None,
             selected_implicit_fit: std::cell::RefCell::new(None),
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_memo: std::cell::RefCell::new(Default::default()),

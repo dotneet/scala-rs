@@ -14,6 +14,8 @@ use zip::ZipArchive;
 #[cfg(test)]
 thread_local! {
     static CLASS_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Archives [`BinaryIndex::has_package_prefix`] searched.
+    static ARCHIVE_PACKAGE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 const ACC_PUBLIC: u16 = 0x0001;
@@ -259,6 +261,12 @@ pub struct BinaryIndex {
     /// Package probes are frequent during implicit search. Directory entries
     /// need filesystem checks, so remember stable answers just like classes.
     package_cache: HashMap<String, bool>,
+    /// The archives' share of [`Self::has_package_prefix`], which is always
+    /// kept: an archive does not change during a run. The whole answer is
+    /// kept only once no path is unclassified, and gitbucket's classpath has
+    /// a Java output directory that does not exist yet -- every miss then
+    /// searched every jar again, a quarter of its type checking.
+    archive_package_cache: HashMap<String, bool>,
     /// The entry each class found so far was read from, for
     /// [`Self::from_scala_distribution`].
     class_origin: HashMap<String, usize>,
@@ -398,6 +406,7 @@ impl BinaryIndex {
             package_paths: HashMap::default(),
             class_cache: HashMap::default(),
             package_cache: HashMap::default(),
+            archive_package_cache: HashMap::default(),
             class_origin: HashMap::default(),
         }
     }
@@ -590,17 +599,35 @@ impl BinaryIndex {
         } else {
             self.paths.len()
         };
-        for i in 0..limit {
-            match self.paths[i].kind {
-                PathKind::Zip => {
+        let in_archives = match self.archive_package_cache.get(prefix) {
+            Some(&found) => found,
+            None => {
+                let mut found = false;
+                for i in 0..limit {
+                    if !matches!(self.paths[i].kind, PathKind::Zip) {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    ARCHIVE_PACKAGE_SCANS.with(|count| count.set(count.get() + 1));
                     let Ok(e) = load_zip(&mut self.paths[i]) else {
                         continue;
                     };
                     let names = &e.zip.as_ref().expect("zip loaded").sorted_names;
                     if has_sorted_prefix(names, prefix) || has_sorted_prefix(names, &alt) {
-                        return true;
+                        found = true;
+                        break;
                     }
                 }
+                self.archive_package_cache.insert(prefix.to_string(), found);
+                found
+            }
+        };
+        if in_archives {
+            return true;
+        }
+        for i in 0..limit {
+            match self.paths[i].kind {
+                PathKind::Zip => {}
                 PathKind::Dir => {
                     if self.paths[i].has_directory_package(dir_rel) {
                         return true;
@@ -1155,6 +1182,29 @@ fn nested_is_static(this: &str, inners: &[JavaInnerClass]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A directory on the class path that does not exist yet keeps package
+    /// misses from being remembered whole, but the archives' part of the
+    /// answer is: asking twice searches them once.
+    #[test]
+    fn a_missing_directory_does_not_make_archives_searched_again() {
+        let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if !jar.is_file() {
+            return;
+        }
+        let missing = std::env::temp_dir().join(format!(
+            "scala-rs-missing-classes-{}",
+            std::process::id()
+        ));
+        let mut index = BinaryIndex::from_user_paths(vec![missing, jar]);
+        ARCHIVE_PACKAGE_SCANS.with(|count| count.set(0));
+        assert!(!index.has_package_prefix("no/such/pkg/"));
+        let first = ARCHIVE_PACKAGE_SCANS.with(|count| count.get());
+        assert!(first > 0);
+        assert!(!index.has_package_prefix("no/such/pkg/"));
+        assert_eq!(ARCHIVE_PACKAGE_SCANS.with(|count| count.get()), first);
+        assert!(index.has_package_prefix("scala/collection/"));
+    }
+
     use super::*;
 
     fn test_archive(path: &Path, entries: &[(&str, &[u8])]) {

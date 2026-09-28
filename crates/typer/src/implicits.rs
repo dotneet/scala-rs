@@ -4496,8 +4496,17 @@ impl Typer {
                 }
                 params.iter().zip(args).any(|(p, a)| {
                     let p = self.st.subst_as_seen_from(to, p);
-                    self.st.class_sym_of(&p).is_some()
-                        && self.st.class_sym_of(a).is_some()
+                    // A type parameter of an enclosing definition is a fixed
+                    // type here, as `T` is in `def add[T: Numeric](a: T, b:
+                    // T) = a + b`: it conforms to `any2stringadd`'s `String`
+                    // only through its bound. A variable still being solved
+                    // could become anything, and is left alone.
+                    let settled = |t: &Type| {
+                        self.st.class_sym_of(t).is_some()
+                            || matches!(t, Type::TypeParam(id) if !self.undet_tvars.contains(id))
+                    };
+                    settled(&p)
+                        && settled(a)
                         && !matches!(p, Type::ByName(_) | Type::Repeated(_))
                         && !self.weak_conforms(a, &p)
                 })
@@ -4518,6 +4527,7 @@ impl Typer {
         span: Span,
         args: &[Type],
     ) -> Option<(SymbolId, SymbolId, Type)> {
+        self.view_ambiguous = false;
         // A conversion is applicable only if its own implicit clauses have
         // witnesses ([`Self::drop_witnessless_conversions`], below). The
         // witness for `FlatMap[Box]` lives on `Box`'s companion, which is a
@@ -4724,6 +4734,16 @@ impl Typer {
                 hits = wider;
             }
         }
+        // A view whose member cannot take the arguments is no view to
+        // `?{def name(x: ? >: A): ?}` at all, whichever pool it came from:
+        // `any2stringadd`'s `+(String)` beside `Numeric.Implicits`'
+        // `infixNumericOps` for `a + b` with `a, b: T`.
+        if hits.len() > 1 && !args.is_empty() {
+            let (fit, unfit): (Vec<_>, Vec<_>) = hits
+                .into_iter()
+                .partition(|(_, _, to)| !self.view_member_rejects(to, name, args));
+            hits = if fit.is_empty() { unfit } else { fit };
+        }
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
             0 => None,
@@ -4808,6 +4828,9 @@ impl Typer {
                     if let Some(hit) = self.pick_array_ops_conv(from, &pool) {
                         return Some(hit);
                     }
+                    // Undecided without the arguments: an application may
+                    // still decide it with them ([`Self::retry_view_with_args`]).
+                    self.view_ambiguous = args.is_empty();
                     return None;
                 }
                 pool.into_iter().find(|(c, _, _)| *c == winners[0])
