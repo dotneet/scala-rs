@@ -128,7 +128,7 @@ pub struct PickleSupply {
     /// again can only repeat them; every selection of a member a library
     /// class lacks (`x % 2` on an `Integer`, through each view in scope)
     /// asked, and each time walked the ancestors' pickles again.
-    idle_completions: (u64, HashMap<(u32, String), Vec<SymbolId>>),
+    idle_completions: (u64, rustc_hash::FxHashMap<(u32, String), Vec<SymbolId>>),
     /// Classes whose pickled parents have already been attached.
     parented: HashSet<u32>,
     /// Dotted names `conv` needed and could not turn into a symbol, since the
@@ -292,7 +292,7 @@ impl PickleSupply {
         let out = self.complete_uncached(st, bin, class_sym, name);
         if st.mutation_gen.get() == before {
             if self.idle_completions.0 != gen {
-                self.idle_completions = (gen, HashMap::new());
+                self.idle_completions = (gen, Default::default());
             }
             self.idle_completions.1.insert(key, out.clone());
         }
@@ -4939,6 +4939,11 @@ impl PickleSupply {
         }
         let is_module = sym.kind == SymKind::ModuleClass;
         let Some(full) = self.pickled_full_name(bin, &internal, is_module) else {
+            // Whether a pickle exists is a property of the class path: a
+            // class without one (`scala.AnyVal`) is done with. Asked again it
+            // rebuilt its names and probed the class path at every step of
+            // every ancestor walk through it.
+            self.parented.insert(cls.0);
             return;
         };
         self.attach_parents(st, bin, cls, &full, is_module);
@@ -8959,6 +8964,24 @@ fn ensure_value_class_field(
 mod tests {
     use super::*;
     use crate::TypecheckOptions;
+
+    /// A class the class path has no pickle for is done with after the first
+    /// ask; every ancestor walk through `scala.AnyVal` asked again.
+    #[test]
+    fn a_class_without_a_pickle_is_parented_once() {
+        let mut st = SymbolTable::new();
+        let mut binary = BinaryIndex::from_user_paths(Vec::new());
+        let mut supply = PickleSupply::new();
+        let cls = st.alloc(
+            "NoPickle",
+            st.root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "scala/NoPickleHere",
+        );
+        supply.ensure_parents(&mut st, &mut binary, cls);
+        assert!(supply.parents_loaded(cls));
+    }
 
     #[test]
     fn scala_signature_source_skips_java_classfiles() {

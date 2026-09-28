@@ -156,6 +156,9 @@ pub(crate) struct MacroTiming {
     pub(crate) expansions: Vec<ExpansionTiming>,
     active: Vec<ActiveExpansion>,
     implicit_queries: ImplicitQueryStats,
+    /// Trees answered to the engine that came back in an expansion unchanged
+    /// and were spliced in typed, not typed again.
+    pub(crate) answers_spliced: usize,
 }
 
 struct ActiveExpansion {
@@ -323,6 +326,10 @@ impl MacroTiming {
                 secs(*d)
             );
         }
+        eprintln!(
+            "[macro timing] answer trees spliced back typed: {}",
+            self.answers_spliced
+        );
         eprintln!(
             "[macro timing] measured exclusive stages {:.3} s (with engine start-up: {:.3} s)",
             secs(sum(ExpansionTiming::total)),

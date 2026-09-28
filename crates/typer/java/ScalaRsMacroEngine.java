@@ -1332,6 +1332,7 @@ public final class ScalaRsMacroEngine {
         }
         Object tpe = typeFor(ans.items.get(2));
         Object built = buildAnswerTree(ans.items.get(3));
+        rememberAnswer(built, ans);
         Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
         // Attachments belong to the original JVM tree. A typer adaptation may
         // change its shape (Ident to Select), but must retain those attachments.
@@ -1366,7 +1367,7 @@ public final class ScalaRsMacroEngine {
             }
             return verdict;
         }
-        if (!"ok".equals(verdict) || ans.items.size() != 4
+        if (!"ok".equals(verdict) || ans.items.size() < 4 || ans.items.size() > 5
                 || !ans.items.get(2).isList() || !ans.items.get(3).isList()) {
             throw gap("scala-rs returned a malformed c.typecheck `ok` answer");
         }
@@ -1396,7 +1397,7 @@ public final class ScalaRsMacroEngine {
             }
             return call(universe, "EmptyTree", 0);
         }
-        if (!"ok".equals(verdict) || ans.items.size() != 4) {
+        if (!"ok".equals(verdict) || ans.items.size() < 4 || ans.items.size() > 5) {
             throw gap("scala-rs returned a malformed c.inferImplicitValue answer");
         }
         Sexp typeAnswer = ans.items.get(2);
@@ -1417,8 +1418,17 @@ public final class ScalaRsMacroEngine {
         }
         Object tpe = same ? pt : typeFor(typeAnswer);
         Object built = buildAnswerTree(ans.items.get(3));
+        rememberAnswer(built, ans);
         Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
         return call(support, "setType", 2, built, tpe);
+    }
+
+    /** A typed tree scala-rs answered with carries the splice it keeps for
+     * it: returned unchanged, it goes back as `Orig`, like an argument. */
+    static void rememberAnswer(Object built, Sexp ans) {
+        if (ans.items.size() == 5 && !ans.items.get(4).isList()) {
+            origTrees.put(built, Long.parseLong(ans.items.get(4).text()));
+        }
     }
 
     /** `scala.reflect.macros.TypecheckException(NoPosition, msg)`. */

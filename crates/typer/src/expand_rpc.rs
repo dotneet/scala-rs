@@ -752,8 +752,12 @@ impl Typer {
                         function_symbols: Some((&self.macro_function_symbols, self.file_index)),
                         prefix_ref: None,
                     };
-                    return match answer_tree_to_wire(&cx, &tree, &mut built) {
-                        Ok(()) => format!("(a ok {ty} {built})"),
+                    let written = answer_tree_to_wire(&cx, &tree, &mut built);
+                    return match written {
+                        Ok(()) => {
+                            let splice = self.answer_splice(&tree);
+                            format!("(a ok {ty} {built}{splice})")
+                        }
                         Err(why) => refusal(&format!("`c.inferImplicitValue` produced {why}")),
                     };
                 }
@@ -1077,10 +1081,43 @@ impl Typer {
             function_symbols: Some((&self.macro_function_symbols, self.file_index)),
             prefix_ref: None,
         };
-        match answer_tree_to_wire(&cx, tree, &mut built) {
-            Ok(()) => format!("(a ok {ty} {built})"),
+        let written = answer_tree_to_wire(&cx, tree, &mut built);
+        match written {
+            Ok(()) => {
+                let splice = self.answer_splice(tree);
+                format!("(a ok {ty} {built}{splice})")
+            }
             Err(why) => refusal(&format!("`c.typecheck` produced {why}")),
         }
+    }
+
+    /// Keep a typed tree just answered, and name it for the engine: if the
+    /// implementation returns that very tree in its expansion, it comes back
+    /// as the typed tree (`Orig`), not typed again -- nsc's typer leaves an
+    /// attributed tree alone. A shapeless `Lazy` derivation returns the
+    /// instances it asked for, and every one was typed twice.
+    ///
+    /// A tree that still holds a macro application is not kept: the witness
+    /// an implicit query hands back unexpanded is expanded only if the
+    /// implementation uses it, by typing it again at the call site.
+    fn answer_splice(&mut self, tree: &Tree) -> String {
+        fn holds_macro(st: &crate::symbol::SymbolTable, t: &Tree) -> bool {
+            if !t.sym.is_none()
+                && (t.sym.0 as usize) < st.symbols.len()
+                && st.get(t.sym).macro_impl.is_some()
+            {
+                return true;
+            }
+            let mut found = false;
+            crate::erasure::for_each_child(t, &mut |c| found = found || holds_macro(st, c));
+            found
+        }
+        if holds_macro(&self.st, tree) {
+            return String::new();
+        }
+        let index = self.macro_answer_base + self.macro_answer_splices.len();
+        self.macro_answer_splices.push(tree.clone());
+        format!(" {index}")
     }
 
     /// TYPEmode: read the tree as a type and hand back a `TypeTree` carrying

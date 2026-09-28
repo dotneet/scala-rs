@@ -752,8 +752,9 @@ impl Drop for PendingEngine {
 
 impl Typer {
     /// Start the engine in the background when this run could expand a
-    /// macro at all, which its own classpath naming scala-reflect.jar says
-    /// (the compiler's copy is added for every run, so it says nothing). A
+    /// macro at all, which its own classpath says
+    /// ([`classpath_expands_macros`]; the compiler's copy of scala-reflect
+    /// is added for every run, so that one says nothing). A
     /// run that never expands one cancels and reaps its unused startup when
     /// the typer drops; one that expands a macro without having named the
     /// jar starts the engine at its first expansion instead.
@@ -1744,6 +1745,36 @@ pub(crate) fn is_scala_reflect(p: &Path) -> bool {
     jar_kind(p) == Some("scala-reflect")
 }
 
+/// Whether a run on `binary_path` is one that expands macros, so that the
+/// engine is worth starting before the first expansion needs it: the path
+/// names scala-reflect itself, or holds a library whose Maven descriptor
+/// beside its jar depends on scala-reflect at compile scope. A macro
+/// library's users -- ScalaTest's `Position`, shapeless, circe-generic --
+/// list the library, not scala-reflect, and each run then waited for the
+/// engine's JVM at its first expansion. A `provided` dependency (cats-core's)
+/// is the library's own build using macros, not its users.
+pub(crate) fn classpath_expands_macros(binary_path: &[PathBuf]) -> bool {
+    binary_path
+        .iter()
+        .any(|p| is_scala_reflect(p) || pom_needs_scala_reflect(&p.with_extension("pom")))
+}
+
+fn pom_needs_scala_reflect(pom: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(pom) else {
+        return false;
+    };
+    text.split("<dependency>").skip(1).any(|dependency| {
+        let dependency = dependency.split("</dependency>").next().unwrap_or("");
+        let scope = dependency
+            .split("<scope>")
+            .nth(1)
+            .and_then(|rest| rest.split("</scope>").next())
+            .map(str::trim);
+        dependency.contains("<artifactId>scala-reflect</artifactId>")
+            && matches!(scope, None | Some("compile"))
+    })
+}
+
 /// `scala-reflect` or `scala-compiler`, for a jar of either.
 fn jar_kind(p: &Path) -> Option<&'static str> {
     let name = p.file_name()?.to_str()?;
@@ -2042,8 +2073,12 @@ impl Typer {
         let saved_span = self.macro_rpc_span;
         self.macro_rpc_span = tree.span;
         let request = self.fill_source_text(request, text_slot);
+        let saved_answers = std::mem::take(&mut self.macro_answer_splices);
+        let saved_answer_base = std::mem::replace(&mut self.macro_answer_base, splices.len());
         let reply =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.converse(&request)));
+        let answers = std::mem::replace(&mut self.macro_answer_splices, saved_answers);
+        self.macro_answer_base = saved_answer_base;
         self.macro_rpc_span = saved_span;
         let reply = match reply {
             Ok(reply) => reply,
@@ -2063,12 +2098,24 @@ impl Typer {
         let items = reply.list()?;
         match items.first().and_then(|s| s.atom()) {
             Some("ok") => {
-                self.with_macro_splices(splices.into_iter().map(Some).collect(), |this| {
+                let own_splices = splices.len();
+                let splices = splices
+                    .into_iter()
+                    .map(Some)
+                    .chain(answers.into_iter().map(Some))
+                    .collect();
+                self.with_macro_splices(splices, |this| {
                     let rebuild_started = this.macro_timing.start_stage();
                     let built = (|| {
                         let expansion = at(items, 1)?;
                         this.tree_from_reply(expansion, tree.span)
                     })();
+                    if this.macro_timing.enabled {
+                        this.macro_timing.answers_spliced += this.macro_splices[own_splices..]
+                            .iter()
+                            .filter(|s| s.is_none())
+                            .count();
+                    }
                     if let Some(t) = rebuild_started {
                         let slot = t.slot;
                         let elapsed = this.macro_timing.stop_stage(t);
@@ -6256,6 +6303,37 @@ mod tests {
         typer.file_index = 1;
         assert_eq!(typer.fill_source_text(request(""), slot), request("\"c\" "));
         assert_eq!(typer.fill_source_text(request(""), None), request(""));
+    }
+
+    /// A library whose descriptor depends on scala-reflect at compile scope
+    /// makes the run one that expands macros; a `provided` one does not.
+    #[test]
+    fn a_library_depending_on_scala_reflect_prestarts_the_engine() {
+        let dir = std::env::temp_dir().join(format!("scala-rs-pom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dependency = |scope: &str| {
+            format!(
+                "<project><dependencies><dependency>\n\
+                 <groupId>org.scala-lang</groupId>\n\
+                 <artifactId>scala-reflect</artifactId>{scope}\n\
+                 </dependency></dependencies></project>"
+            )
+        };
+        let jar = |name: &str, pom: Option<String>| {
+            let jar = dir.join(format!("{name}.jar"));
+            if let Some(pom) = pom {
+                std::fs::write(jar.with_extension("pom"), pom).unwrap();
+            }
+            jar
+        };
+        let macros = jar("macros-1.0", Some(dependency("")));
+        let compile = jar("compile-1.0", Some(dependency("<scope>compile</scope>")));
+        let provided = jar("provided-1.0", Some(dependency("<scope>provided</scope>")));
+        let bare = jar("bare-1.0", None);
+        assert!(classpath_expands_macros(&[bare.clone(), macros]));
+        assert!(classpath_expands_macros(&[compile]));
+        assert!(!classpath_expands_macros(&[bare, provided]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

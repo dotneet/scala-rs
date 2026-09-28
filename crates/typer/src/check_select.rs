@@ -1624,6 +1624,28 @@ impl Typer {
         kept
     }
 
+    /// Every class `cls` inherits from through class parents, or `None` when
+    /// a parent is anything else (a refinement, a function type, a type
+    /// parameter): then only `is_sub_type` can say.
+    fn nominal_ancestors(&self, cls: SymbolId) -> Option<rustc_hash::FxHashSet<SymbolId>> {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut work = vec![cls];
+        while let Some(c) = work.pop() {
+            for p in &self.st.get(c).parents {
+                match p {
+                    Type::Class { sym, .. } => {
+                        if seen.insert(*sym) {
+                            work.push(*sym);
+                        }
+                    }
+                    Type::AnyRef | Type::Any | Type::AnyVal => {}
+                    _ => return None,
+                }
+            }
+        }
+        Some(seen)
+    }
+
     fn drop_overridden_uncached(&self, recv: SymbolId, found: Vec<SymbolId>) -> Vec<SymbolId> {
         let found = self.collapse_pickled_copies(found);
         let found = self.drop_classfile_forwarders(found);
@@ -1633,6 +1655,13 @@ impl Typer {
         // builder's `append` has some thirty alternatives from three owners.
         let below: std::cell::RefCell<rustc_hash::FxHashMap<(SymbolId, SymbolId), bool>> =
             Default::default();
+        // Each owner's ancestors, walked once for the whole set: a member
+        // defined along a chain of 150 traits has 150 owners, and asking each
+        // pair separately walked the chain again for every pair whenever the
+        // class graph had moved since the last selection.
+        let ancestors: std::cell::RefCell<
+            rustc_hash::FxHashMap<SymbolId, Option<rustc_hash::FxHashSet<SymbolId>>>,
+        > = Default::default();
         let owner_below = |child: SymbolId, parent: SymbolId| -> bool {
             if let Some(&known) = below.borrow().get(&(child, parent)) {
                 return known;
@@ -1641,7 +1670,31 @@ impl Typer {
                 sym: child,
                 args: vec![].into(),
             };
-            let answer = self.st.is_sub_type(&child_ty, &self.owner_as_type(parent));
+            let parent_ty = self.owner_as_type(parent);
+            let nominal = match &parent_ty {
+                Type::Class { sym, args } if *sym == parent => Some(args.is_empty()),
+                _ => None,
+            };
+            let reached = nominal.and_then(|_| {
+                ancestors
+                    .borrow_mut()
+                    .entry(child)
+                    .or_insert_with(|| self.nominal_ancestors(child))
+                    .as_ref()
+                    .map(|set| set.contains(&parent))
+            });
+            let answer = match (reached, nominal) {
+                // Not an ancestor: no subtype either, which is the
+                // symbol-level answer `is_sub_type` starts from itself.
+                (Some(false), _) => false,
+                // An ancestor applied to no arguments: nothing left to check.
+                (Some(true), Some(true)) => true,
+                _ => {
+                    #[cfg(test)]
+                    OWNER_SUBTYPE_QUESTIONS.with(|n| n.set(n.get() + 1));
+                    self.st.is_sub_type(&child_ty, &parent_ty)
+                }
+            };
             below.borrow_mut().insert((child, parent), answer);
             answer
         };
@@ -1985,6 +2038,21 @@ impl Typer {
             return found;
         }
         let mut seen: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+        // The pickled candidates by name: a source declaration is compared
+        // with its namesakes only. Scanning every candidate for each was
+        // quadratic in an extension search with a thousand implicit classes
+        // in scope.
+        let mut pickled_by_name: rustc_hash::FxHashMap<&str, Vec<SymbolId>> =
+            rustc_hash::FxHashMap::default();
+        for &other in &found {
+            let other_symbol = self.st.get(other);
+            if !other_symbol.pickled_origin.is_empty() {
+                pickled_by_name
+                    .entry(other_symbol.name.as_str())
+                    .or_default()
+                    .push(other);
+            }
+        }
         found
             .iter()
             .copied()
@@ -2011,6 +2079,9 @@ impl Typer {
                 if symbol.kind != SymKind::Method {
                     return true;
                 }
+                let Some(namesakes) = pickled_by_name.get(symbol.name.as_str()) else {
+                    return true;
+                };
                 let Some((param_clause_shape, tparam_count)) = (match &symbol.ty {
                     Type::Method { paramss, .. } => Some((
                         paramss.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -2029,7 +2100,9 @@ impl Typer {
                 // arity and all their unresolved slots, this source symbol
                 // cannot prove which one it represents and must stay.
                 let mut matching_origins = HashSet::new();
-                for &other in found.iter() {
+                for &other in namesakes {
+                    #[cfg(test)]
+                    PICKLED_COPY_COMPARISONS.with(|n| n.set(n.get() + 1));
                     let other_symbol = self.st.get(other);
                     if !other_symbol.pickled_origin.is_empty()
                         && other_symbol.name == symbol.name
@@ -3844,16 +3917,16 @@ impl Typer {
     }
 
     pub(crate) fn try_rewrite_dynamic_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
-        let TreeKind::Apply { fun, args } = &tree.kind else {
+        let TreeKind::Apply { fun, .. } = &tree.kind else {
             return false;
         };
-        let (base, mut targs) = match &fun.kind {
+        let (base, targs) = match &fun.kind {
             TreeKind::TypeApply { fun, args } => (fun.as_ref(), args.clone()),
             _ => (fun.as_ref(), Vec::new()),
         };
-        let (mut qual, dyn_name) = match &base.kind {
-            TreeKind::Select { qual, name } => ((**qual).clone(), name.clone()),
-            _ if !targs.is_empty() => (base.clone(), "apply".into()),
+        let (dyn_name, selected) = match &base.kind {
+            TreeKind::Select { name, .. } => (name.clone(), true),
+            _ if !targs.is_empty() => ("apply".to_string(), false),
             _ => return false,
         };
         if matches!(
@@ -3862,6 +3935,43 @@ impl Typer {
         ) {
             return false;
         }
+        let peels = dyn_name == "apply"
+            && targs.is_empty()
+            && matches!(&base.kind, TreeKind::Select { qual, .. }
+                if matches!(qual.kind, TreeKind::TypeApply { .. }));
+        // The qualifier of `qual.m(args)` is probed where it stands: taken
+        // out, typed, and put back below. Cloning it for the probe made a
+        // chain `a + b + c + ...` quadratic, each application copying the
+        // whole application before it. A probe that may peel the receiver's
+        // type arguments, or whose callee is no selection, keeps a copy.
+        let mut qual = match &mut tree.kind {
+            TreeKind::Apply { fun, .. } => {
+                let base = match &mut fun.kind {
+                    TreeKind::TypeApply { fun, .. } => fun.as_mut(),
+                    _ => fun.as_mut(),
+                };
+                match &mut base.kind {
+                    TreeKind::Select { qual, .. } if selected && !peels => {
+                        std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty))
+                    }
+                    TreeKind::Select { qual, .. } => {
+                        #[cfg(test)]
+                        DYNAMIC_PROBE_COPIES.with(|n| n.set(n.get() + 1));
+                        (**qual).clone()
+                    }
+                    _ => {
+                        #[cfg(test)]
+                        DYNAMIC_PROBE_COPIES.with(|n| n.set(n.get() + 1));
+                        base.clone()
+                    }
+                }
+            }
+            _ => return false,
+        };
+        let mut targs = targs;
+        let TreeKind::Apply { fun, args } = &tree.kind else {
+            return false;
+        };
         // A retry may already have inserted `.apply` around `x[T]`.
         // Those type arguments belong to the dynamic method, not to x.
         let mut receiver_type_args = false;
@@ -3872,7 +3982,7 @@ impl Typer {
                 qual = (**fun).clone();
             }
         }
-        let direct_type_apply = !targs.is_empty() && !matches!(base.kind, TreeKind::Select { .. });
+        let direct_type_apply = !targs.is_empty() && !selected;
         // This is a receiver-classification probe. Reuse a completed
         // qualifier, including its error, rather than recursively typechecking
         // the same application chain twice at every selection. The ordinary
@@ -5092,5 +5202,105 @@ fn expand_rebound_result_alias(st: &SymbolTable, declared: &Type, seen: Type) ->
             ),
         },
         other => st.expand_applied_hk_alias(other),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Qualifiers [`Typer::try_rewrite_dynamic_apply`] copied to probe.
+    static DYNAMIC_PROBE_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Candidates [`Typer::collapse_pickled_copies`] compared a source
+    /// declaration with.
+    static PICKLED_COPY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Owner pairs [`Typer::drop_overridden_at`] left to `is_sub_type`.
+    static OWNER_SUBTYPE_QUESTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod owner_order_tests {
+    use super::OWNER_SUBTYPE_QUESTIONS;
+
+    /// `super.v` in a class mixing in a chain of traits sees a `v` from each
+    /// of them. Which owner is below which is read off each owner's
+    /// ancestors, walked once; asked pair by pair, it walked the chain again
+    /// for every pair.
+    #[test]
+    fn overriding_owners_are_ordered_from_their_ancestors() {
+        let mut src = String::from("trait T0 { def v: Int = 0 }\n");
+        for i in 1..40 {
+            src.push_str(&format!(
+                "trait T{i} extends T{} {{ override def v: Int = super.v + {i} }}\n",
+                i - 1
+            ));
+        }
+        src.push_str("class C extends T0 with T39 { override def v: Int = super.v + 1 }\n");
+        OWNER_SUBTYPE_QUESTIONS.with(|n| n.set(0));
+        let (_, _, diags) = crate::typecheck_str(&src);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(OWNER_SUBTYPE_QUESTIONS.with(|n| n.get()), 0);
+    }
+}
+
+#[cfg(test)]
+mod namesake_tests {
+    use super::PICKLED_COPY_COMPARISONS;
+    use crate::check::{TypecheckOptions, Typer};
+    use crate::symbol::SymKind;
+    use scala_rs_parser::{Flags, TyBox, Type};
+
+    /// A source declaration is compared with the pickled candidates of its
+    /// own name only. It was compared with every candidate, which in an
+    /// extension search with a thousand implicit classes in scope is a
+    /// million comparisons per selection.
+    #[test]
+    fn a_source_declaration_is_compared_with_its_namesakes_only() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let owner = typer.st.alloc("S", root, SymKind::Class, Flags::EMPTY, "S");
+        let method = |typer: &mut Typer, name: &str| {
+            let m = typer.st.alloc(name, owner, SymKind::Method, Flags::EMPTY, "");
+            typer.st.get_mut(m).ty = Type::Method {
+                paramss: vec![vec![Type::Int]].into(),
+                ret: TyBox::new(Type::Int),
+            };
+            m
+        };
+        let pickled = method(&mut typer, "p");
+        typer.st.get_mut(pickled).pickled_origin = "lib.P#p".to_string();
+        let mut found = vec![pickled];
+        for i in 0..50 {
+            found.push(method(&mut typer, &format!("s{i}")));
+        }
+        PICKLED_COPY_COMPARISONS.with(|n| n.set(0));
+        let kept = typer.collapse_pickled_copies(found.clone());
+        assert_eq!(kept, found);
+        assert_eq!(PICKLED_COPY_COMPARISONS.with(|n| n.get()), 0);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_probe_tests {
+    use super::DYNAMIC_PROBE_COPIES;
+
+    /// Every application asks whether its receiver is `Dynamic`. The
+    /// receiver of each `+` in `x + 1 + 2 + ...` is the whole chain before
+    /// it, and copying it for the question made the chain quadratic.
+    #[test]
+    fn a_long_application_chain_probes_its_receivers_in_place() {
+        let chain = (0..100).map(|i| i.to_string()).collect::<Vec<_>>().join(" + ");
+        let src = format!("object A {{ def f(x: Int): Int = x + {chain} }}\n");
+        // The typer recurses once per link; the default test stack is small.
+        let copies = std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(move || {
+                DYNAMIC_PROBE_COPIES.with(|n| n.set(0));
+                let (_, _, diags) = crate::typecheck_str(&src);
+                assert!(diags.is_empty(), "{diags:?}");
+                DYNAMIC_PROBE_COPIES.with(|n| n.get())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(copies, 0);
     }
 }

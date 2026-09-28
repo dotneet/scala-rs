@@ -4901,13 +4901,31 @@ impl Typer {
             ms.into_iter()
                 .any(|m| !this.st.get(m).flags.contains(Flags::STATIC))
         };
+        // A miss stands while no class or member is entered: an extension
+        // search asks it of every view in scope, and a thousand source
+        // implicit classes each went to their parents' pickles for every
+        // selection in the file.
+        let generation = self.st.member_graph_gen();
+        if self.view_member_misses.0 != generation {
+            self.view_member_misses = (generation, Default::default());
+        }
+        let key = (cls, name.to_string());
+        if self.view_member_misses.1.contains(&key) {
+            #[cfg(test)]
+            VIEW_MEMBER_MISS_HITS.with(|n| n.set(n.get() + 1));
+            return false;
+        }
         self.ensure_java_loaded(cls, span);
         let declared = self.st.lookup_member(cls, name);
         if non_static(self, declared) {
             return true;
         }
         let supplied = self.supply_from_pickle(ret, name);
-        non_static(self, supplied)
+        let found = non_static(self, supplied);
+        if !found && self.st.member_graph_gen() == generation {
+            self.view_member_misses.1.insert(key);
+        }
+        found
     }
 
     pub(crate) fn class_sym_for_bounded_member_lookup(
@@ -7816,5 +7834,35 @@ mod memo_tests {
                 args: vec![Type::Int].into(),
             })
         );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Misses [`Typer::view_class_may_have_member`] answered from memory.
+    static VIEW_MEMBER_MISS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod view_member_miss_tests {
+    use super::VIEW_MEMBER_MISS_HITS;
+
+    /// An extension search asks each view in scope whether its result has
+    /// the selected member. That a source implicit class has no `b` is asked
+    /// once, not again at the next selection of `b`.
+    #[test]
+    fn a_view_without_the_member_is_asked_once() {
+        let src = "object S {\n\
+                     implicit class A(val i: Int) { def a: Int = i }\n\
+                     implicit class B(val i: Int) { def b: Int = i }\n\
+                   }\n\
+                   object U {\n\
+                     import S._\n\
+                     def f(x: Int): Int = x.b + x.b\n\
+                   }\n";
+        VIEW_MEMBER_MISS_HITS.with(|n| n.set(0));
+        let (_, _, diags) = crate::typecheck_str(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(VIEW_MEMBER_MISS_HITS.with(|n| n.get()) > 0);
     }
 }

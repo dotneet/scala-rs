@@ -352,6 +352,96 @@ fn implicit_answers_batch_source_symbol_descriptions() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+/// A tree scala-rs answered `c.inferImplicitValue` or `c.typecheck` with,
+/// returned by the implementation unchanged, is spliced into the expansion
+/// typed -- nsc's typer leaves an attributed tree alone -- rather than typed a
+/// second time. A shapeless `Lazy` derivation returns the instances it asked
+/// for, and each was typed twice.
+#[test]
+fn answered_trees_returned_unchanged_are_not_typed_again() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base = format!("{JAR}:{REFLECT}");
+    fs::create_dir(&implementation).unwrap();
+    let provider = root.join("Provider.scala");
+    fs::write(
+        &provider,
+        "import scala.language.experimental.macros\n\
+         import scala.reflect.macros.blackbox\n\
+         object Answers {\n\
+           def find[T]: T = macro AnswersImpl.find[T]\n\
+           def typed(n: Int): Int = macro AnswersImpl.typed\n\
+         }\n\
+         object AnswersImpl {\n\
+           def find[T: c.WeakTypeTag](c: blackbox.Context): c.Expr[T] =\n\
+             c.Expr[T](c.inferImplicitValue(c.weakTypeOf[T]))\n\
+           def typed(c: blackbox.Context)(n: c.Expr[Int]): c.Expr[Int] = {\n\
+             import c.universe._\n\
+             c.Expr[Int](c.typecheck(q\"Values.base + 1\"))\n\
+           }\n\
+         }\n",
+    )
+    .unwrap();
+    let compiled_provider = Command::new(NSC)
+        .args(["-nowarn", "-cp", &base, "-d"])
+        .arg(&implementation)
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert!(
+        compiled_provider.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled_provider.stderr)
+    );
+    let mut client = String::from(
+        "object Values {\n  val base = 41\n  implicit val given: Int = 1\n}\nimport Values._\n\
+         object Main {\n",
+    );
+    for call in 0..10 {
+        client.push_str(&format!(
+            "  def f{call}: Int = Answers.find[Int] + Answers.typed({call})\n"
+        ));
+    }
+    let calls = (0..10)
+        .map(|call| format!("f{call}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    client.push_str(&format!(
+        "  def main(args: Array[String]): Unit = println({calls})\n}}\n"
+    ));
+    let consumer = root.join("Consumer.scala");
+    fs::write(&consumer, client).unwrap();
+    let cp = format!("{}:{base}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        fs::create_dir(&out).unwrap();
+        let mut command = Command::new(if nsc {
+            NSC
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            command.args(["compile", "--scala-library", JAR, "-nowarn"]);
+            command.env("SCALA_RS_MACRO_TIMING", "1");
+        }
+        let result = command
+            .arg(&consumer)
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "nsc={nsc}: {stderr}");
+        assert_eq!(run(&out, &cp), b"430\n");
+        if !nsc {
+            assert!(
+                stderr.contains("answer trees spliced back typed: 20"),
+                "{stderr}"
+            );
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn bidirectional_macro_transport_and_access() {
     let root = root();

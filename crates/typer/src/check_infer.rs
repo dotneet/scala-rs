@@ -4246,7 +4246,11 @@ impl Typer {
         if matches!(tree.ty, Type::Overload(_)) {
             self.pick_overload_for_function(tree, pt);
         }
-        if is_function_pt(pt) || self.sam_sig_here(pt).is_some() {
+        // Eta-expansion is for a method-typed tree; the SAM question about
+        // `pt` is asked only of one.
+        if matches!(tree.ty, Type::Method { .. })
+            && (is_function_pt(pt) || self.sam_sig_here(pt).is_some())
+        {
             if let Some(Type::Function { params, ret }) = self.implicit_eta_shape(tree) {
                 // Type the generated application normally: that infers method
                 // variables and supplies real evidence in the lexical scope.
@@ -4820,6 +4824,8 @@ impl Typer {
     /// with holes in it, and `PickleSupply::concrete_method_names` for why
     /// the holes are *read* rather than filled.
     pub(crate) fn sam_sig_here(&mut self, pt: &Type) -> Option<crate::symbol::SamSig> {
+        #[cfg(test)]
+        SAM_SIG_QUESTIONS.with(|n| n.set(n.get() + 1));
         // The backend's anonymous SAM class must see every Scala default that
         // can conflict with an abstract parent method.  The ordinary
         // on-demand member policy leaves those defaults out when no source
@@ -4880,6 +4886,11 @@ impl Typer {
     }
 
     fn adapt_to_sam(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        // Only a function value converts; the SAM question -- and the pickle
+        // reading it can start -- is for nothing on any other tree.
+        if !matches!(tree.ty, Type::Function { .. }) {
+            return false;
+        }
         let Some(sam) = self.sam_sig_here(pt) else {
             return false;
         };
@@ -5571,6 +5582,37 @@ enum SingletonRecv<'t> {
 thread_local! {
     /// Joins [`Typer::unify_tparam_all`] performed, for the tests.
     static ARG_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// SAM questions [`Typer::sam_sig_here`] was asked, for the tests.
+    static SAM_SIG_QUESTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod sam_question_tests {
+    use super::SAM_SIG_QUESTIONS;
+
+    /// Whether a SAM type is expected matters only to a function value or a
+    /// method being eta-expanded; `adapt` asked it of every tree, and each
+    /// answer walks the expected class's members.
+    #[test]
+    fn a_value_is_not_asked_whether_it_converts_to_a_sam() {
+        // `1` has to be converted to an `F`: `adapt` gets to the question
+        // with a tree that is neither a function nor a method.
+        let src = "trait F { def apply(x: Int): Int }\n\
+                   object A {\n\
+                     implicit def toF(i: Int): F = null\n\
+                     def take(f: F, n: Int): Int = n\n\
+                     val r = take(1, 1)\n\
+                   }\n";
+        SAM_SIG_QUESTIONS.with(|n| n.set(0));
+        let (_, _, diags) = crate::typecheck_str(src);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.level != scala_rs_span::Level::Error),
+            "{diags:?}"
+        );
+        assert_eq!(SAM_SIG_QUESTIONS.with(|n| n.get()), 0);
+    }
 }
 
 #[cfg(test)]

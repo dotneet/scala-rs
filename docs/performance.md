@@ -793,6 +793,48 @@ for inferred type arguments, `_root_.scala.List` for
 (`macro_tree_shape.rs`), explicit type arguments aside: nsc prints those
 fully qualified, through aliases scala-rs does not keep (`scala.Predef.String`).
 
+### Four slower-than-expected shapes, and macros again (2026-09-28)
+
+Measured again against scalac, four non-macro shapes were well behind:
+
+| kind | scalac | before | after |
+|---|---:|---:|---:|
+| `xmllits` (XML literals) | 4.7 s | 14.5 s | 2.5 s |
+| `bigexpr` (a 1000-term `+` chain per method) | fails | 4.1 s | 0.5 s |
+| `srcsyntax` (600 source implicit classes) | 6.0 s | 5.5 s | 2.0 s |
+| `deepinherit` (`super.v` along 150 traits) | 6.4 s | 4.7 s | 1.6 s |
+
+* `xmllits` had regressed: `Predef`'s tuple views made every view search ask
+  whether the receiver is below a tuple, walking its ancestors. `Tuple1` to
+  `Tuple22` are final, so only the tuple class itself is. `adapt` also asked
+  the SAM question of trees that are neither functions nor methods.
+* Each application of a `+` chain copied the whole chain before it to ask
+  whether its receiver is `Dynamic`; the receiver is now probed in place.
+* An extension search compared each source implicit class with every
+  pickled candidate, and re-read `scala.AnyVal`'s (absent) pickle at every
+  ancestor walk; comparisons are by name and a class without a pickle is
+  recorded once.
+* `drop_overridden` ordered 150 owners pairwise, each pair a walk up the
+  chain; each owner's ancestors are now walked once per selection.
+
+**Macros.** A simple macro's expansion costs about 50 µs of round trip,
+which fewer round trips could save: sending the infos of settled symbols
+with their descriptions cut circe's round trips from 57,000 to 31,000 and
+saved no time, and batching symbol descriptions (the earlier pass) saved
+0.6 s. The engine's JVM computes about half of the time it is asked and
+waits for scala-rs the other half; JFR's samples under-count its compute
+several times over (`sample` on the process shows it). What saved time:
+
+* A tree scala-rs answered `c.typecheck` or `c.inferImplicitValue` with,
+  returned by the implementation unchanged, is spliced back typed instead of
+  typed again, as nsc leaves an attributed tree alone (circe `generic.auto`
+  17.5 s -> 15.6 s; every one of a `c.typecheck` macro's 11,000 answers).
+  A tree that still holds an unexpanded implicit macro is typed again, so
+  the macro is expanded only if it is used.
+* The engine is prestarted for a library that depends on scala-reflect, not
+  only when scala-reflect is named; the first expansion then waits 0.35 s
+  instead of 0.41 s. The JVM's own start-up is the rest.
+
 ### What is left
 
 From the profiles of 2026-09-24:

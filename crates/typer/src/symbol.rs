@@ -6934,10 +6934,22 @@ impl SymbolTable {
     /// view in `Predef` against every receiver: 3.1 s of a file of XML
     /// literals, whose `List[Node]` was checked against `Short`, `Array[T]`,
     /// `String`, ... 230,000 times.
+    ///
+    /// A tuple type is the same: `Tuple1` ... `Tuple22` are final, so only the
+    /// tuple class of that arity is below one. `Predef`'s `tuple2ToZippedOps`
+    /// and `tuple3ToZippedOps` made every view search ask it of every
+    /// receiver, and each question walked the receiver's ancestors.
     fn class_never_below(&self, a: &Type, b: &Type) -> bool {
         let Type::Class { sym, .. } = a else {
             return false;
         };
+        if let Type::Tuple(ts) = b {
+            return !self.is_tuple_arity(*sym, ts.len())
+                && !matches!(
+                    self.get(*sym).jvm_name.as_str(),
+                    "scala/Nothing" | "scala/Null" | "scala/runtime/Nothing$" | "scala/runtime/Null$"
+                );
+        }
         let primitive = matches!(
             b,
             Type::Byte
@@ -7896,17 +7908,15 @@ impl SymbolTable {
     }
 
     fn is_tuple_arity(&self, sym: SymbolId, n: usize) -> bool {
-        let s = self.get(sym);
-        let name = s.name.trim_end_matches('$');
-        if name == format!("Tuple{n}") {
-            return true;
-        }
-        let jvm = if s.jvm_name.is_empty() {
-            String::new()
-        } else {
-            s.jvm_name.clone()
+        // Asked at each step of a subtype walk against a tuple: compared in
+        // place rather than by formatting the two names to compare with.
+        let arity = |text: &str, prefix: &str| {
+            text.strip_prefix(prefix)
+                .and_then(|digits| digits.parse::<usize>().ok())
+                == Some(n)
         };
-        jvm == format!("scala/Tuple{n}")
+        let s = self.get(sym);
+        arity(s.name.trim_end_matches('$'), "Tuple") || arity(&s.jvm_name, "scala/Tuple")
     }
 
     /// One refinement declaration, with the symbol table to hand.
@@ -10212,6 +10222,35 @@ mod api_boundary_tests {
         st.get_mut(d).parents = vec![Type::AnyRef, class_ty(a)];
         assert_eq!(st.lub(&class_ty(c), &class_ty(d)), class_ty(a));
         assert!(LUBS_COMPUTED.with(|n| n.get()) > computed);
+    }
+
+    /// `Tuple1` ... `Tuple22` are final: a class below a tuple type is the
+    /// tuple class of that arity, and any other is answered no without the
+    /// walk over its ancestors `Predef`'s tuple views made every view search
+    /// pay for every receiver.
+    #[test]
+    fn a_class_is_below_a_tuple_only_as_that_tuple() {
+        let mut st = SymbolTable::new();
+        let class_ty = |sym| Type::Class {
+            sym,
+            args: Vec::new().into(),
+        };
+        let mut deep = st.alloc("Base", st.root, SymKind::Class, Flags::TRAIT, "Base");
+        for i in 0..40 {
+            let next = st.alloc(&format!("C{i}"), st.root, SymKind::Class, Flags::EMPTY, "");
+            st.get_mut(next).parents = vec![Type::AnyRef, class_ty(deep)];
+            deep = next;
+        }
+        let tuple2 = st.alloc("Tuple2", st.root, SymKind::Class, Flags::FINAL, "scala/Tuple2");
+        let pair = Type::Tuple(vec![Type::Int, Type::Int].into());
+        PARENT_WALKS.with(|n| n.set(0));
+        assert!(!st.is_sub_type(&class_ty(deep), &pair));
+        assert_eq!(PARENT_WALKS.with(|n| n.get()), 0);
+        let tuple_class = Type::Class {
+            sym: tuple2,
+            args: vec![Type::Int, Type::Int].into(),
+        };
+        assert!(st.is_sub_type(&tuple_class, &pair));
     }
 
     #[test]

@@ -401,6 +401,12 @@ pub struct Typer {
     /// returns one of them unchanged (`(t "Orig" … K …)`) gets it back typed,
     /// once; see `NodeId::PRETYPED_SPLICE`.
     pub(crate) macro_splices: Vec<Option<Tree>>,
+    /// The trees answered to `c.typecheck` and `c.inferImplicitValue` during
+    /// the expansion being conversed, after its own splices
+    /// ([`Typer::macro_answer_base`] of them): an expansion that returns one
+    /// unchanged gets the typed tree back instead of typing it again.
+    pub(crate) macro_answer_splices: Vec<Tree>,
+    pub(crate) macro_answer_base: usize,
     /// Counter for synthetic names.
     pub(crate) gensym: u32,
     /// Where the argument in each parameter slot was written, as the last call
@@ -937,6 +943,9 @@ pub struct Typer {
     pub(crate) open_implicits: std::cell::RefCell<Vec<(SymbolId, Type)>>,
     pub(crate) implicit_instances: rustc_hash::FxHashMap<SymbolId, (Type, Vec<SymbolId>)>,
     pub(crate) implicit_instance_origins: rustc_hash::FxHashMap<SymbolId, SymbolId>,
+    /// The view result classes found to have no member of a name
+    /// ([`Typer::view_class_may_have_member`]), by `member_graph_gen`.
+    pub(crate) view_member_misses: (u64, rustc_hash::FxHashSet<(SymbolId, String)>),
     /// The complete candidate fit produced by the most recent implicit
     /// search. Materialization consumes it before entering its recursion
     /// guard, so associated type arguments inferred from the candidate's own
@@ -1339,6 +1348,8 @@ impl Typer {
             async_return_keys: HashMap::new(),
             macro_reply_pattern: false,
             macro_splices: Vec::new(),
+            macro_answer_splices: Vec::new(),
+            macro_answer_base: 0,
             gensym: 0,
             slot_source: Vec::new(),
             last_named_order: None,
@@ -1387,10 +1398,7 @@ impl Typer {
                 &opts.binary_path,
                 &opts.macro_runtime,
             ),
-            macro_prestart: opts
-                .binary_path
-                .iter()
-                .any(|p| crate::expand::is_scala_reflect(p)),
+            macro_prestart: crate::expand::classpath_expands_macros(&opts.binary_path),
             macro_failures: HashMap::new(),
             macro_depth: 0,
             macro_context_stack: Vec::new(),
@@ -1484,6 +1492,7 @@ impl Typer {
             open_implicits: std::cell::RefCell::new(Vec::new()),
             implicit_instances: Default::default(),
             implicit_instance_origins: Default::default(),
+            view_member_misses: Default::default(),
             selected_implicit_fit: std::cell::RefCell::new(None),
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_memo: std::cell::RefCell::new(Default::default()),

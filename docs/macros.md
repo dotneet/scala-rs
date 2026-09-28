@@ -359,8 +359,10 @@ Operational notes this probe turned up:
   never on the *compilation* classpath: the program is not typed against them. shapeless's
   `Generic` and `Lazy` need scala-compiler (`Global`); with only shapeless listed, a derivation
   was "could not find implicit value". When no jar is found, that message now says why
-  (`crates/cli/tests/macro_runtime.rs`). The engine is prestarted only when the run's own
-  classpath names scala-reflect; otherwise it starts at the first expansion.
+  (`crates/cli/tests/macro_runtime.rs`). The engine is prestarted when the run's own
+  classpath names scala-reflect, or holds a library whose Maven descriptor beside its jar depends
+  on scala-reflect at compile scope (ScalaTest, shapeless, circe-generic; cats-core's `provided`
+  dependency does not count); otherwise it starts at the first expansion.
 - The engine has to be written in **Java**, not Rust (implementing Scala traits from Java). The build
   then needs `javac`. Whether to ship a prebuilt engine or run `javac` on first use is a separate
   decision.
