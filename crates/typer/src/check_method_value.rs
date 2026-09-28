@@ -90,6 +90,33 @@ impl Typer {
         self.st.is_sam_type(&pt)
     }
 
+    /// Whether [`Self::adapt_method_value`] could apply to `tree` at all: an
+    /// overloaded reference, a method with a parameter list still to apply,
+    /// or a branch ending in one. Cheap, and asked first -- whether `pt`
+    /// expects a function is a SAM question about its class, and `adapt`
+    /// sees every tree.
+    pub(crate) fn may_be_method_value(tree: &Tree) -> bool {
+        match &tree.ty {
+            Type::Overload(_) => return true,
+            Type::Method { paramss, .. } if paramss.first().is_some_and(|c| !c.is_empty()) => {
+                return true
+            }
+            _ => {}
+        }
+        match &tree.kind {
+            TreeKind::If { thenp, elsep, .. } if !elsep.is_empty() => {
+                Self::may_be_method_value(thenp) || Self::may_be_method_value(elsep)
+            }
+            TreeKind::Match { cases, .. } => cases.iter().any(|c| Self::may_be_method_value(&c.body)),
+            TreeKind::Try { block, catches, .. } => {
+                Self::may_be_method_value(block)
+                    || catches.iter().any(|c| Self::may_be_method_value(&c.body))
+            }
+            TreeKind::Block { expr, .. } => Self::may_be_method_value(expr),
+            _ => false,
+        }
+    }
+
     /// Apply the rule to `tree`, which is in value position with no function
     /// type expected. Returns whether it applied: in 2.13 mode `tree` is then
     /// an error, under `-Xsource:3` it is the eta-expansion.

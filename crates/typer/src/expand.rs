@@ -5712,10 +5712,14 @@ impl Sexp {
                 "the macro engine sent a reply larger than {max_bytes} bytes"
             ));
         }
-        let bytes: Vec<char> = s.chars().collect();
+        // Bytes, not chars: every delimiter is ASCII, so a slice between two
+        // of them is whole UTF-8. A reply is parsed at every round trip, and
+        // collecting it into `char`s and pushing each one was most of that.
+        let bytes = s.as_bytes();
         let mut i = 0;
-        let v = Sexp::parse_at(&bytes, &mut i, 0, max_depth)?;
-        while i < bytes.len() && bytes[i] == ' ' {
+        let mut scratch = Vec::new();
+        let v = Sexp::parse_at(s, &mut i, 0, max_depth, &mut scratch)?;
+        while i < bytes.len() && bytes[i] == b' ' {
             i += 1;
         }
         if i != bytes.len() {
@@ -5724,84 +5728,101 @@ impl Sexp {
         Ok(v)
     }
 
-    fn parse_at(s: &[char], i: &mut usize, depth: usize, max_depth: usize) -> Result<Sexp, String> {
-        while *i < s.len() && s[*i] == ' ' {
+    /// `scratch` holds the items of the lists being parsed, innermost last;
+    /// each list takes its own off the end once it is closed, so it is
+    /// allocated once at its final length.
+    fn parse_at(
+        text: &str,
+        i: &mut usize,
+        depth: usize,
+        max_depth: usize,
+        scratch: &mut Vec<Sexp>,
+    ) -> Result<Sexp, String> {
+        let s = text.as_bytes();
+        while *i < s.len() && s[*i] == b' ' {
             *i += 1;
         }
         if *i >= s.len() {
             return Err("the macro engine sent an empty reply".to_string());
         }
         match s[*i] {
-            '(' => {
+            b'(' => {
                 if depth >= max_depth {
                     return Err(format!(
                         "the macro engine sent a reply nested more than {max_depth} deep"
                     ));
                 }
                 *i += 1;
-                let mut items = Vec::new();
+                let start = scratch.len();
                 loop {
-                    while *i < s.len() && s[*i] == ' ' {
+                    while *i < s.len() && s[*i] == b' ' {
                         *i += 1;
                     }
                     if *i >= s.len() {
+                        scratch.truncate(start);
                         return Err("the macro engine sent an unterminated reply".to_string());
                     }
-                    if s[*i] == ')' {
+                    if s[*i] == b')' {
                         *i += 1;
                         break;
                     }
-                    items.push(Sexp::parse_at(s, i, depth + 1, max_depth)?);
+                    match Sexp::parse_at(text, i, depth + 1, max_depth, scratch) {
+                        Ok(item) => scratch.push(item),
+                        Err(e) => {
+                            scratch.truncate(start);
+                            return Err(e);
+                        }
+                    }
                 }
-                Ok(Sexp::List(items))
+                Ok(Sexp::List(scratch.drain(start..).collect()))
             }
-            '"' => {
+            b'"' => {
                 *i += 1;
                 let mut out = String::new();
-                while *i < s.len() && s[*i] != '"' {
-                    let c = s[*i];
-                    *i += 1;
-                    if c == '\\' {
-                        if *i >= s.len() {
-                            return Err(
-                                "the macro engine sent an unterminated string escape".to_string()
-                            );
-                        }
-                        let e = s[*i];
+                let mut run = *i;
+                while *i < s.len() && s[*i] != b'"' {
+                    if s[*i] != b'\\' {
                         *i += 1;
-                        out.push(match e {
-                            'n' => '\n',
-                            't' => '\t',
-                            'r' => '\r',
-                            '"' => '"',
-                            '\\' => '\\',
-                            other => {
-                                return Err(format!(
-                                    "the macro engine sent the unknown string escape `\\{other}`"
-                                ))
-                            }
-                        });
-                    } else {
-                        out.push(c);
+                        continue;
                     }
+                    out.push_str(&text[run..*i]);
+                    *i += 1;
+                    if *i >= s.len() {
+                        return Err("the macro engine sent an unterminated string escape".to_string());
+                    }
+                    out.push(match s[*i] {
+                        b'n' => '\n',
+                        b't' => '\t',
+                        b'r' => '\r',
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        _ => {
+                            let other = text[*i..].chars().next().unwrap_or('?');
+                            return Err(format!(
+                                "the macro engine sent the unknown string escape `\\{other}`"
+                            ));
+                        }
+                    });
+                    *i += 1;
+                    run = *i;
                 }
                 if *i >= s.len() {
                     return Err("the macro engine sent an unterminated string".to_string());
                 }
+                out.push_str(&text[run..*i]);
                 *i += 1;
                 Ok(Sexp::Str(out))
             }
-            ')' => Err("the macro engine sent an unexpected `)`".to_string()),
+            b')' => Err("the macro engine sent an unexpected `)`".to_string()),
             _ => {
-                let mut out = String::new();
-                while *i < s.len() && !matches!(s[*i], ' ' | '(' | ')') {
-                    out.push(s[*i]);
+                let start = *i;
+                while *i < s.len() && !matches!(s[*i], b' ' | b'(' | b')') {
                     *i += 1;
                 }
-                if out.is_empty() {
+                if *i == start {
                     return Err("the macro engine sent an empty atom".to_string());
                 }
-                Ok(Sexp::Atom(out))
+                Ok(Sexp::Atom(text[start..*i].to_string()))
             }
         }
     }
@@ -5933,6 +5954,14 @@ mod tests {
         let mut out = String::new();
         quote_into(&mut out, "a\"b\\c\n");
         assert_eq!(Sexp::parse(&out).unwrap().text(), "a\"b\\c\n");
+        // Multi-byte characters around escapes and in atoms stay whole.
+        let mut out = String::from("(é ");
+        quote_into(&mut out, "日\"本\\語");
+        out.push(')');
+        let parsed = Sexp::parse(&out).unwrap();
+        let items = parsed.list().unwrap();
+        assert_eq!(items[0].atom(), Some("é"));
+        assert_eq!(items[1].text(), "日\"本\\語");
     }
 
     #[test]

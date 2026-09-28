@@ -4159,19 +4159,18 @@ impl Typer {
         if !conforms {
             return false;
         }
-        // A view does not beat a value-shaped implicit on type alone. Keep the
-        // long-standing raw-clause distinction here: several reflection API
-        // candidates depend on it. The exception is the low-priority pattern
-        // this comparison's owner term exists to order: a candidate declared
-        // on the derived owner and carrying only implicit clauses is not a
-        // conversion merely because that clause has one parameter
-        // (`Shrink.shrinkIntegral` versus inherited `shrinkAny`).
-        !matches!(
-            (self.conversion_arg_ty(a), self.conversion_arg_ty(b)),
-            (Some(_), None)
-        ) || (self.only_implicit_clauses(a)
-            && self.is_named_low_priority_origin(b)
-            && self.owner_is_proper_subclass(a, b))
+        // A view does not beat a value-shaped implicit on type alone. A
+        // candidate with only implicit clauses is not a view, though: nsc
+        // drops an implicit clause before comparing (`case mt: MethodType if
+        // mt.isImplicit => isAsSpecific(mt.resultType, ftpe2)`), so
+        // `opt[T](implicit s: Show[T]): Show[Option[T]]` is value-shaped and
+        // beats `derive[T]: Show[T]` for a `Show[Option[Int]]`, which was
+        // "ambiguous implicit: opt, derive". The same holds on a derived
+        // owner (`Shrink.shrinkIntegral` versus inherited `shrinkAny`).
+        let is_view = |id: SymbolId| {
+            self.conversion_arg_ty(id).is_some() && !self.only_implicit_clauses(id)
+        };
+        !(is_view(a) && self.conversion_arg_ty(b).is_none())
     }
 
     /// Direct owner must be class-like (nsc `owner.isSubClass`). A method-local

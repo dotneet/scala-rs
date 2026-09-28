@@ -1331,7 +1331,7 @@ public final class ScalaRsMacroEngine {
             sneakyThrow(newTypecheckException(msg));
         }
         Object tpe = typeFor(ans.items.get(2));
-        Object built = buildTree(ans.items.get(3));
+        Object built = buildAnswerTree(ans.items.get(3));
         Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
         // Attachments belong to the original JVM tree. A typer adaptation may
         // change its shape (Ident to Select), but must retain those attachments.
@@ -1416,7 +1416,7 @@ public final class ScalaRsMacroEngine {
                 + typeTag + "`");
         }
         Object tpe = same ? pt : typeFor(typeAnswer);
-        Object built = buildTree(ans.items.get(3));
+        Object built = buildAnswerTree(ans.items.get(3));
         Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
         return call(support, "setType", 2, built, tpe);
     }
@@ -2785,6 +2785,26 @@ public final class ScalaRsMacroEngine {
             }
         }
         return metadata;
+    }
+
+    /** A tree scala-rs answered with -- a typechecked tree, an implicit it
+     * found -- built with the descriptions of its source symbols fetched
+     * together, as a request's are. Such a tree is the expansion of an
+     * earlier macro more often than not, and every local of it is a symbol
+     * the mirror has not seen: circe's derivations asked for 80000 of them
+     * one round trip each. */
+    static Object buildAnswerTree(Sexp tree) throws Exception {
+        java.util.Map<Long, Sexp> previous = activeSymbolMetadata;
+        java.util.Map<Long, Sexp> fetched = sourceSymbolMetadata(requestSymbolIds(tree));
+        if (fetched.isEmpty()) return buildTree(tree);
+        java.util.Map<Long, Sexp> merged = new java.util.HashMap<>(previous);
+        merged.putAll(fetched);
+        activeSymbolMetadata = merged;
+        try {
+            return buildTree(tree);
+        } finally {
+            activeSymbolMetadata = previous;
+        }
     }
 
     static Object sourceSymbol(long id, java.util.Map<Long, Sexp> metadata) throws Exception {

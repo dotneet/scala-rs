@@ -740,6 +740,57 @@ implicit member of an enclosing class was selected through a companion
 object that inherits it, whose `MODULE$` is still null while its parent's
 constructor runs (`outer_this_implicit.rs`).
 
+### Macros against scalac (2026-09-28)
+
+Macro-heavy code is where scala-rs stays closest to scalac. Every expansion
+runs on the JVM engine and every question it asks is a round trip, so the
+ratios sit at 0.2--0.6 where plain code reaches 0.05:
+
+| workload | scalac | scala-rs | ratio |
+|---|---:|---:|---:|
+| circe `generic.auto`, 20 files | 17.8 s | 16.9 s | 0.95 |
+| circe semi-automatic derivation | 11.1 s | 6.9 s | 0.62 |
+| ScalaTest `FunSuite` (`Position`, `assert`) | 4.9 s | 2.7 s | 0.55 |
+| shapeless `Generic` derivation | 7.3 s | 3.2 s | 0.44 |
+| user macro calling `c.typecheck` | 2.3 s | 1.3 s | 0.59 |
+| user blackbox macro, 4800 calls | 2.8 s | 1.1 s | 0.38 |
+| user implicit materializer (`Show[T]`) | 7.3 s | 2.7 s | 0.36 |
+| user whitebox macro | 5.3 s | 1.2 s | 0.22 |
+
+The automatic derivation is the slow one. scalac expands 56520 macros in
+10.5 s; scala-rs reuses context-free expansions and runs 17171, but each
+costs more: 5.3 s of the type checking waited for the engine and about 9 s
+was our own work -- typing the expansions (4.3 s), answering the engine's
+implicit searches (3.3 s) and rebuilding its replies. Measured changes:
+
+* **Symbol descriptions in answers are fetched together.** The trees the
+  engine gets back from `c.typecheck` and `c.inferImplicitValue` are mostly
+  earlier expansions, full of locals the mirror has not seen, and each was
+  described in a round trip of its own: 79648 of 131114 round trips. They
+  are now batched as a request's are (57089 round trips).
+* **`adapt` asks whether a function is expected only of a method value.**
+  The question is a SAM walk over the expected type's class, and its cache
+  is dropped whenever an expansion enters a class; it was asked of every
+  tree.
+* **Replies are parsed as bytes**, sliced rather than pushed character by
+  character, and each list allocated once.
+* **The implicit instance maps hash with Fx** instead of SipHash.
+
+Together: 17.1 s → 15.9 s of type checking. JVM options for the engine
+(C1 only, other collectors, a larger young generation) changed nothing or
+made it slower; the engine process spends about 13 s of CPU, much of it
+compiling scala-reflect and the macro implementations.
+
+The user-defined macros found two correctness gaps on the way. A type class
+with a derivation macro (`implicit def derive[T]: Show[T]` beside
+`implicit def opt[T](implicit s: Show[T]): Show[Option[T]]`) was
+"ambiguous implicit": a candidate whose only clause is implicit counted as
+a view, and a view never beats a value on type alone
+(`implicit_clause_specificity.rs`). The typed trees sent to a macro also
+differ from nsc's in shape (`s.length` for `s.length()`, no `TypeApply` for
+inferred type arguments), which `showCode` makes visible; that is not fixed
+yet.
+
 ### What is left
 
 From the profiles of 2026-09-24:

@@ -246,6 +246,112 @@ fn macro_request_batches_source_symbol_descriptions() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+/// The tree scala-rs answers `c.inferImplicitValue` with is built by the
+/// engine at once, and each source symbol in it is described to the mirror.
+/// Those descriptions are fetched together, as a request's are, rather than
+/// one round trip per symbol: circe's derivations, whose answers are earlier
+/// expansions full of fresh locals, asked 80000 such questions one by one.
+#[test]
+fn implicit_answers_batch_source_symbol_descriptions() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base = format!("{JAR}:{REFLECT}");
+    fs::create_dir(&implementation).unwrap();
+    let provider = root.join("Provider.scala");
+    fs::write(
+        &provider,
+        "import scala.language.experimental.macros\n\
+         import scala.reflect.macros.blackbox\n\
+         object Find { def apply[T]: Int = macro FindImpl.find[T] }\n\
+         object FindImpl {\n\
+           def find[T: c.WeakTypeTag](c: blackbox.Context): c.Expr[Int] = {\n\
+             import c.universe._\n\
+             val found = c.inferImplicitValue(weakTypeOf[T])\n\
+             c.Expr[Int](q\"${if (found.isEmpty) 0 else 1}\")\n\
+           }\n\
+         }\n",
+    )
+    .unwrap();
+    let compiled_provider = Command::new(NSC)
+        .args(["-nowarn", "-cp", &base, "-d"])
+        .arg(&implementation)
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert!(
+        compiled_provider.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled_provider.stderr)
+    );
+    // Each `Find[W{call}]` is answered with `pick{call}(a{call}_0, ...)`:
+    // eleven source symbols the engine has not seen before.
+    let mut client = String::from("object Imps {\n");
+    for call in 0..20 {
+        client.push_str(&format!("  class W{call}\n"));
+        let mut params = Vec::new();
+        for arg in 0..10 {
+            client.push_str(&format!(
+                "  class A{call}_{arg}\n  implicit val a{call}_{arg}: A{call}_{arg} = new A{call}_{arg}\n"
+            ));
+            params.push(format!("x{arg}: A{call}_{arg}"));
+        }
+        client.push_str(&format!(
+            "  implicit def pick{call}(implicit {}): W{call} = new W{call}\n",
+            params.join(", ")
+        ));
+    }
+    client.push_str("}\nimport Imps._\nobject Main {\n");
+    let calls = (0..20)
+        .map(|call| format!("Find[W{call}]"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    client.push_str(&format!(
+        "  def main(args: Array[String]): Unit = println({calls})\n}}\n"
+    ));
+    let consumer = root.join("Consumer.scala");
+    fs::write(&consumer, client).unwrap();
+    let cp = format!("{}:{base}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        fs::create_dir(&out).unwrap();
+        let mut command = Command::new(if nsc {
+            NSC
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            command.args(["compile", "--scala-library", JAR, "-nowarn"]);
+            command.env("SCALA_RS_MACRO_TIMING", "1");
+        }
+        let result = command
+            .arg(&consumer)
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(result.status.success(), "nsc={nsc}: {stderr}");
+        assert_eq!(run(&out, &cp), b"20\n");
+        if !nsc {
+            let question_count = |name| {
+                stderr
+                    .lines()
+                    .filter_map(|line| {
+                        let fields = line.split_whitespace().collect::<Vec<_>>();
+                        (fields.get(3) == Some(&name))
+                            .then(|| fields.get(4).and_then(|n| n.parse::<usize>().ok()))
+                            .flatten()
+                    })
+                    .sum::<usize>()
+            };
+            assert!(question_count("symbols") >= 20, "{stderr}");
+            // 244 before; what remains are the classes the answers' types
+            // name, described when a type is read.
+            assert!(question_count("symbol") <= 40, "{stderr}");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn bidirectional_macro_transport_and_access() {
     let root = root();

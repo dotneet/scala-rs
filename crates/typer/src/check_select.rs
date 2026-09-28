@@ -3284,7 +3284,7 @@ impl Typer {
         if let Some(c) = self.st.class_sym_of(ty) {
             work.push(c);
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         while let Some(id) = work.pop() {
             if !seen.insert(id.0) {
                 continue;

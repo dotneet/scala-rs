@@ -64,6 +64,8 @@ mod implfilter;
 mod implfind;
 #[path = "../implguard.rs"]
 mod implguard;
+#[path = "../implicit_clause_specificity.rs"]
+mod implicit_clause_specificity;
 #[path = "../implicit_derived_tag_undet.rs"]
 mod implicit_derived_tag_undet;
 #[path = "../implicit_misc.rs"]

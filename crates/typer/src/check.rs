@@ -935,8 +935,8 @@ pub struct Typer {
     /// diverging expansions (`crate::implicits`).
     pub(crate) building_implicits: Vec<(SymbolId, Type)>,
     pub(crate) open_implicits: std::cell::RefCell<Vec<(SymbolId, Type)>>,
-    pub(crate) implicit_instances: HashMap<SymbolId, (Type, Vec<SymbolId>)>,
-    pub(crate) implicit_instance_origins: HashMap<SymbolId, SymbolId>,
+    pub(crate) implicit_instances: rustc_hash::FxHashMap<SymbolId, (Type, Vec<SymbolId>)>,
+    pub(crate) implicit_instance_origins: rustc_hash::FxHashMap<SymbolId, SymbolId>,
     /// The complete candidate fit produced by the most recent implicit
     /// search. Materialization consumes it before entering its recursion
     /// guard, so associated type arguments inferred from the candidate's own
@@ -1482,8 +1482,8 @@ impl Typer {
             pending_defaults: Vec::new(),
             building_implicits: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
-            implicit_instances: HashMap::new(),
-            implicit_instance_origins: HashMap::new(),
+            implicit_instances: Default::default(),
+            implicit_instance_origins: Default::default(),
             selected_implicit_fit: std::cell::RefCell::new(None),
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_memo: std::cell::RefCell::new(Default::default()),
