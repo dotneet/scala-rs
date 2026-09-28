@@ -472,6 +472,9 @@ public final class ScalaRsMacroEngine {
         emittedBlockRoots.clear();
         usedBlockRoots.clear();
         appPrefixTree = null;
+        cachedPrefixId = -1;
+        cachedPrefixTree = null;
+        compactOriginalSplices = false;
         transportedTermSymbols.clear();
         ambiguousTransportedTerms.clear();
         typeCache.clear();
@@ -1143,7 +1146,13 @@ public final class ScalaRsMacroEngine {
             tree = find(result.getClass(), "tree", 0).invoke(result);
         }
         StringBuilder sb = new StringBuilder("(ok ");
-        ser(tree, sb);
+        boolean previousCompact = compactOriginalSplices;
+        compactOriginalSplices = true;
+        try {
+            ser(tree, sb);
+        } finally {
+            compactOriginalSplices = previousCompact;
+        }
         sb.append(')');
         return sb.toString();
     }
@@ -1459,11 +1468,27 @@ public final class ScalaRsMacroEngine {
     static final java.util.Set<Long> usedBlockRoots = new java.util.HashSet<>();
     // Valid only while rebuilding the current macro application's tree.
     static Object appPrefixTree;
+    static long cachedPrefixId = -1;
+    static Object cachedPrefixTree;
+    static boolean compactOriginalSplices;
     static final java.util.Map<String, Object> transportedTermSymbols = new java.util.HashMap<>();
     static final java.util.Set<String> ambiguousTransportedTerms = new java.util.HashSet<>();
 
     /** A tree the request describes, built in the runtime universe. */
     static Object buildTree(Sexp s) throws Exception {
+        if (s.isList() && s.items.size() == 3 && "cachedPrefix".equals(s.items.get(0).atom)) {
+            Object tree = buildTree(s.items.get(2));
+            cachedPrefixId = Long.parseLong(s.items.get(1).text());
+            cachedPrefixTree = tree;
+            return tree;
+        }
+        if (s.isList() && s.items.size() == 2 && "cachedPrefixRef".equals(s.items.get(0).atom)) {
+            long id = Long.parseLong(s.items.get(1).text());
+            if (cachedPrefixTree == null || cachedPrefixId != id) {
+                throw new IllegalArgumentException("unknown cached macro prefix " + id);
+            }
+            return cachedPrefixTree;
+        }
         if (s.isList() && s.items.size() == 3 && "typed".equals(s.items.get(0).atom)) {
             Object tree = buildTree(s.items.get(1));
             call(tree, "setType", 1, typeFor(s.items.get(2)));
@@ -2136,13 +2161,21 @@ public final class ScalaRsMacroEngine {
         }
         Long orig = origTrees.get(t);
         if (orig != null) {
-            // The first occurrence consumes the typed source tree. Only a
-            // second occurrence needs its shape to rebuild an independent tree.
-            if (usedBlockRoots.contains(orig) || !emittedBlockRoots.add(orig)) {
+            // Final replies consume the typed tree on first use. Reverse
+            // queries still need a shape: they are rebuilt before that splice
+            // vector is installed on the Rust side.
+            if (usedBlockRoots.contains(orig)
+                    || (compactOriginalSplices && !emittedBlockRoots.add(orig))) {
                 serTreeShape(t, sb);
                 return;
             }
-            sb.append("(t \"Orig\" (s0) ").append(orig).append(')');
+            emittedBlockRoots.add(orig);
+            sb.append("(t \"Orig\" (s0) ").append(orig);
+            if (!compactOriginalSplices) {
+                sb.append(' ');
+                serTreeShape(t, sb);
+            }
+            sb.append(')');
             return;
         }
         OrigBlockChild child = origBlockChildren.get(t);

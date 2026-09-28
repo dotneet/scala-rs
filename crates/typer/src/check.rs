@@ -618,6 +618,10 @@ pub struct Typer {
     /// The files whose text the engine already holds (`fill_source_text` in
     /// `expand.rs`). There is one engine per typer.
     pub(crate) macro_sources_sent: rustc_hash::FxHashSet<usize>,
+    /// The previous successful top-level macro prefix, for a compact reference
+    /// when the next call contains the same typed subtree.
+    pub(crate) macro_cached_prefix: Option<(u64, String)>,
+    pub(crate) macro_next_prefix_id: u64,
     /// Entries of `c.openImplicits` answers the engine already holds, by
     /// their wire text (`answer_open_implicits`).
     pub(crate) open_implicit_handles: rustc_hash::FxHashMap<String, u64>,
@@ -1397,6 +1401,8 @@ impl Typer {
             macro_engine: None,
             macro_engine_pending: None,
             macro_sources_sent: Default::default(),
+            macro_cached_prefix: None,
+            macro_next_prefix_id: 0,
             open_implicit_handles: Default::default(),
             type_wire_cache: Default::default(),
             macro_engine_error: None,

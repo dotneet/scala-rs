@@ -20,7 +20,7 @@ def main() -> None:
     parser.add_argument("--chains", type=int, default=4)
     parser.add_argument("--depth", type=int, default=32)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--maximum-ratio", type=float, default=2.0)
+    parser.add_argument("--maximum-ratio", type=float, default=1.2)
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="compact-original-tree-") as directory:

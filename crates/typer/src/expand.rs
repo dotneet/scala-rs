@@ -2040,7 +2040,8 @@ impl Typer {
             }
         }
         let timing_start = self.macro_timing.start_stage();
-        let (request, splices, text_slot) =
+        let cache_top_level = self.macro_depth == 0 && !self.macro_engine_busy;
+        let (request, splices, text_slot, cached_prefix) =
             self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
         if let Some(t) = timing_start {
             let slot = t.slot;
@@ -2094,8 +2095,23 @@ impl Typer {
             row.engine_wait += engine.1;
             row.engine_handle += engine.2;
         }
-        let reply = reply?;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(why) => {
+                if cache_top_level {
+                    self.macro_cached_prefix = None;
+                }
+                return Err(why);
+            }
+        };
         let items = reply.list()?;
+        if cache_top_level {
+            self.macro_cached_prefix = if items.first().and_then(|s| s.atom()) == Some("ok") {
+                cached_prefix
+            } else {
+                None
+            };
+        }
         match items.first().and_then(|s| s.atom()) {
             Some("ok") => {
                 let own_splices = splices.len();
@@ -2340,7 +2356,7 @@ impl Typer {
         targs: &[Type],
         prefix: Option<&Tree>,
         application: &Tree,
-    ) -> Result<(String, Vec<Tree>, Option<usize>), String> {
+    ) -> Result<(String, Vec<Tree>, Option<usize>, Option<(u64, String)>), String> {
         let sym = self
             .macro_symbol_of(application)
             .ok_or("macro application lost its symbol")?;
@@ -2480,6 +2496,7 @@ impl Typer {
         // touches.
         out.push_str(" (prefix ");
         let mut prefix_written = false;
+        let mut cached_prefix = None;
         match prefix {
             None => {
                 out.push_str("(no ");
@@ -2499,9 +2516,30 @@ impl Typer {
                         out.push(')');
                     }
                     Ok(()) => {
-                        out.push_str(&format!("(orig {} ", splices.len()));
-                        out.push_str(&built);
-                        out.push(')');
+                        if built.len() >= 4096
+                            && self.macro_depth == 0
+                            && !self.macro_engine_busy
+                        {
+                            let id = self.macro_next_prefix_id;
+                            self.macro_next_prefix_id += 1;
+                            let mut compact = built.clone();
+                            if let Some((previous_id, previous)) = &self.macro_cached_prefix {
+                                if let Some(at) = compact.find(previous) {
+                                    compact.replace_range(
+                                        at..at + previous.len(),
+                                        &format!("(cachedPrefixRef {previous_id})"),
+                                    );
+                                }
+                            }
+                            out.push_str(&format!("(orig {} (cachedPrefix {id} ", splices.len()));
+                            out.push_str(&compact);
+                            out.push_str("))");
+                            cached_prefix = Some((id, built));
+                        } else {
+                            out.push_str(&format!("(orig {} ", splices.len()));
+                            out.push_str(&built);
+                            out.push(')');
+                        }
                         splices.push(p.clone());
                         prefix_written = true;
                     }
@@ -2596,7 +2634,7 @@ impl Typer {
             quote_into(&mut out, setting);
         }
         out.push_str("))");
-        Ok((out, splices, text_slot))
+        Ok((out, splices, text_slot, cached_prefix))
     }
 
     /// The type descriptor of every *typed leaf* in `t` that has no source
