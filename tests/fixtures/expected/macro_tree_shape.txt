@@ -7,4 +7,5 @@ scala.`package`.Nil.isEmpty
 scala.`package`.List.apply[Int](x, 3).map[Int](((x$1: Int) => x$1.+(1)))
 12
 12
+typed
 777shadow

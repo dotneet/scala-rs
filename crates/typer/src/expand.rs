@@ -2613,6 +2613,13 @@ impl Typer {
     /// `explicit_targs`: `t` is the function of a `TypeApply` the source
     /// wrote, whose type arguments are already spelled out.
     fn collect_wire_types_at(&mut self, t: &Tree, types: &mut WireTypes, explicit_targs: bool) {
+        if let TreeKind::InterpolatedString { args, .. } = &t.kind {
+            for arg in args {
+                if let Ok(wire) = self.tag_wire(&arg.ty) {
+                    types.interpolation_types.insert(std::ptr::from_ref(arg), wire);
+                }
+            }
+        }
         if !explicit_targs {
             self.record_inferred_targs(t, None, types);
         }
@@ -4799,6 +4806,7 @@ fn application_receiver(mut tree: &Tree) -> Option<&Tree> {
 #[derive(Default)]
 pub(crate) struct WireTypes {
     leaves: std::collections::HashMap<*const Tree, Result<String, String>>,
+    interpolation_types: std::collections::HashMap<*const Tree, String>,
     /// The type arguments the typer inferred for a reference to a
     /// polymorphic method, as the wire list of their `TypeTree`s. nsc's
     /// typed tree spells them out (`List.apply[Int](x, 3)`); ours keeps them
@@ -5327,7 +5335,15 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str(") ) (l");
             for arg in args {
                 out.push(' ');
-                tree_to_wire(cx, arg, out)?;
+                if let Some(ty) = cx.types.interpolation_types.get(&std::ptr::from_ref(arg)) {
+                    out.push_str("(typed ");
+                    tree_to_wire(cx, arg, out)?;
+                    out.push(' ');
+                    out.push_str(ty);
+                    out.push(')');
+                } else {
+                    tree_to_wire(cx, arg, out)?;
+                }
             }
             out.push_str("))");
             Ok(())

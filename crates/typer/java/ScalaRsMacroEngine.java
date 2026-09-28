@@ -1473,6 +1473,11 @@ public final class ScalaRsMacroEngine {
 
     /** A tree the request describes, built in the runtime universe. */
     static Object buildTree(Sexp s) throws Exception {
+        if (s.isList() && s.items.size() == 3 && "typed".equals(s.items.get(0).atom)) {
+            Object tree = buildTree(s.items.get(1));
+            call(tree, "setType", 1, typeFor(s.items.get(2)));
+            return tree;
+        }
         if (s.isList() && s.items.size() >= 2 && "t".equals(s.items.get(0).atom)
                 && "PrefixRef".equals(s.items.get(1).text())) {
             if (appPrefixTree == null) throw new IllegalArgumentException("missing macro prefix tree");

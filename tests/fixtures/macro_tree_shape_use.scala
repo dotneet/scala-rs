@@ -15,6 +15,7 @@ object Main {
     println(Code.show(List(x, 3).map(_ + 1)))
     println(Code.rebuild(List(x, 3).sum + s.length))
     println(Code.retyped(List(x, 3).map(_ + 1).sum + s.trim.length))
+    println(Code.inspectInterpolated(s"value=$x, text=$s"))
   }
 
   def shadowed(x: Int): String = {

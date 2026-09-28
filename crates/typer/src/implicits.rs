@@ -4250,8 +4250,22 @@ impl Typer {
     fn specificity_score(&self, a: SymbolId, b: SymbolId) -> i32 {
         let spec =
             i32::from(self.is_as_specific_type(a, b)) - i32::from(self.is_as_specific_type(b, a));
-        let sub = i32::from(self.is_as_specific_origin(a, b))
-            - i32::from(self.is_as_specific_origin(b, a));
+        let shared_declaration_owner = match (
+            self.st.get(a).pickled_origin.split_once('#'),
+            self.st.get(b).pickled_origin.split_once('#'),
+        ) {
+            (Some((ao, _)), Some((bo, _))) => ao == bo,
+            _ => false,
+        };
+        // A binary member may be attached to a module mirror while another
+        // member of the same declaration is attached to its trait. That
+        // synthetic owner relation must not cancel a strict type preference.
+        let sub = if spec != 0 && shared_declaration_owner {
+            0
+        } else {
+            i32::from(self.is_as_specific_origin(a, b))
+                - i32::from(self.is_as_specific_origin(b, a))
+        };
         spec + sub
     }
 
@@ -6612,6 +6626,39 @@ fn unwrap_byname(t: &Type) -> Type {
 mod memo_tests {
     use super::*;
     use crate::check::TypecheckOptions;
+
+    #[test]
+    fn shared_pickled_owner_does_not_override_type_specificity() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let base = typer
+            .st
+            .alloc("Base", root, SymKind::Class, Flags::EMPTY, "priority/Base");
+        let derived = typer
+            .st
+            .alloc("Derived", root, SymKind::Class, Flags::EMPTY, "priority/Derived");
+        typer.st.get_mut(derived).parents = vec![Type::Class {
+            sym: base,
+            args: vec![].into(),
+        }];
+        let concrete = typer
+            .st
+            .alloc("concrete", base, SymKind::Term, Flags::IMPLICIT, "concrete");
+        let generic = typer
+            .st
+            .alloc("generic", derived, SymKind::Term, Flags::IMPLICIT, "generic");
+        typer.st.get_mut(concrete).ty = Type::Int;
+        typer.st.get_mut(generic).ty = Type::Any;
+        typer.st.get_mut(concrete).pickled_origin = "priority.Base#concrete@1".into();
+        typer.st.get_mut(generic).pickled_origin = "priority.Base#generic@2".into();
+
+        assert!(typer.is_as_specific_origin(generic, concrete));
+        assert!(typer.strictly_more_specific(concrete, generic));
+        assert!(matches!(
+            typer.most_specific(vec![concrete, generic]),
+            ImplicitSearch::Found(id) if id == concrete
+        ));
+    }
 
     #[test]
     fn independent_macro_queries_share_scope_cache_but_not_changed_scopes() {

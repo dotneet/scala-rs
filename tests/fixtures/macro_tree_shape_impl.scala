@@ -7,6 +7,7 @@ object Code {
   def show[A](x: A): String = macro Impl.show[A]
   def rebuild[A](x: A): A = macro Impl.rebuild[A]
   def retyped[A](x: A): A = macro Impl.retyped[A]
+  def inspectInterpolated(x: String): String = macro Impl.inspectInterpolated
 }
 
 object Impl {
@@ -30,4 +31,17 @@ object Impl {
 
   def retyped[A](c: blackbox.Context)(x: c.Expr[A]): c.Expr[A] =
     c.Expr[A](c.untypecheck(x.tree.duplicate))
+
+  def inspectInterpolated(c: blackbox.Context)(x: c.Expr[String]): c.Expr[String] = {
+    import c.universe._
+    x.tree match {
+      case Apply(_, args) if args.nonEmpty =>
+        args.foreach(arg => {
+          if (arg.tpe == null) c.abort(c.enclosingPosition, "interpolation argument has no type")
+          arg.tpe <:< typeOf[AnyRef]
+        })
+        c.Expr[String](Literal(Constant("typed")))
+      case other => c.abort(c.enclosingPosition, "expected interpolation: " + showRaw(other))
+    }
+  }
 }
