@@ -94,6 +94,8 @@ mod lzorigin;
 mod macromirror;
 #[path = "../macro_runtime.rs"]
 mod macro_runtime;
+#[path = "../macro_tree_shape.rs"]
+mod macro_tree_shape;
 #[path = "../macros.rs"]
 mod macros;
 #[path = "../macrotag.rs"]

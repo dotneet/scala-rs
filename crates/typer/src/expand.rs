@@ -2560,9 +2560,54 @@ impl Typer {
     /// ([`WireCx::types`]); a type that cannot be described is recorded as
     /// the reason, which the serialiser raises only if it reaches the node.
     pub(crate) fn collect_wire_types(&mut self, t: &Tree, types: &mut WireTypes) {
-        if let TreeKind::Function { body, .. } = &t.kind {
+        self.collect_wire_types_at(t, types, false);
+    }
+
+    /// `explicit_targs`: `t` is the function of a `TypeApply` the source
+    /// wrote, whose type arguments are already spelled out.
+    fn collect_wire_types_at(&mut self, t: &Tree, types: &mut WireTypes, explicit_targs: bool) {
+        if !explicit_targs {
+            self.record_inferred_targs(t, None, types);
+        }
+        // The application whose function is a polymorphic method reference:
+        // the reference's own type can leave a variable the arguments only
+        // settled in the application's result (`List(x).map(_ + 1)` keeps
+        // `B` in `map`'s type), so the outermost application is read too.
+        if let TreeKind::Apply { .. } = &t.kind {
+            let mut head = t;
+            let mut layers = 0usize;
+            while let TreeKind::Apply { fun, .. } = &head.kind {
+                head = fun;
+                layers += 1;
+            }
+            if !types.targs.contains_key(&std::ptr::from_ref(head)) {
+                self.record_inferred_targs(head, Some((layers, &t.ty)), types);
+            }
+        }
+        if let TreeKind::TypeApply { fun, args } = &t.kind {
+            self.collect_wire_types_at(fun, types, true);
+            for arg in args {
+                self.collect_wire_types(arg, types);
+            }
+            return;
+        }
+        if let TreeKind::Function { body, vparams } = &t.kind {
             if !t.byname_thunk && !is_source_run_symbol(&self.st, t.sym) {
                 self.macro_function_symbol(body.id);
+            }
+            for vparam in vparams {
+                if let TreeKind::ValDef { tpt, .. } = &vparam.kind {
+                    if tpt.is_empty() && !vparam.sym.is_none() {
+                        let ty = self.st.get(vparam.sym).ty.clone();
+                        if !crate::check::type_is_erroneous(&ty) && !ty.is_no_type() {
+                            if let Ok(desc) = self.tag_wire(&ty) {
+                                types
+                                    .param_types
+                                    .insert(std::ptr::from_ref(vparam), desc);
+                            }
+                        }
+                    }
+                }
             }
         }
         let leaf = match &t.kind {
@@ -2600,6 +2645,71 @@ impl Typer {
             _ => {}
         }
         crate::erasure::for_each_child(t, &mut |c| self.collect_wire_types(c, types));
+    }
+
+    /// The type arguments of a reference to a polymorphic method, read back
+    /// off its instantiated type the way nsc's typed tree states them. Left
+    /// out -- the reference goes over as before -- when one of them is not
+    /// determined by the type or has no descriptor the call site can rebuild.
+    /// `applied`: the number of argument clauses applied to `t` and the
+    /// type of that application.
+    fn record_inferred_targs(
+        &mut self,
+        t: &Tree,
+        applied: Option<(usize, &Type)>,
+        types: &mut WireTypes,
+    ) {
+        if !matches!(t.kind, TreeKind::Select { .. } | TreeKind::Ident { .. })
+            || t.sym.is_none()
+            || t.sym.0 as usize >= self.st.symbols.len()
+        {
+            return;
+        }
+        let s = self.st.get(t.sym);
+        if s.kind != SymKind::Method
+            || s.tparams.is_empty()
+            || s.name == "<init>"
+            || s.flags.contains(Flags::CONSTRUCTOR)
+            || s.macro_impl.is_some()
+        {
+            return;
+        }
+        let tparams = s.tparams.clone();
+        let declared = s.ty.clone();
+        let shapes = targ_shapes(&declared, &t.ty);
+        // The declared result against the application's type, when every
+        // clause is applied.
+        let result = match (&declared, applied) {
+            (Type::Method { paramss, ret }, Some((layers, ty))) if paramss.len() == layers => {
+                Some(((**ret).clone(), ty.clone()))
+            }
+            _ => None,
+        };
+        let clean = |targ: &Type| {
+            !crate::check::type_is_erroneous(targ)
+                && !matches!(targ, Type::NoType | Type::Wildcard)
+                && !tparams
+                    .iter()
+                    .any(|own| crate::check::type_mentions_tparam_deep(targ, *own))
+        };
+        let mut wire = String::from("(l");
+        for &tp in &tparams {
+            let solve = |(pattern, actual): &(Type, Type)| {
+                crate::check::unify_one(&self.st, tp, pattern, actual).filter(|t| clean(t))
+            };
+            let Some(targ) = shapes.as_ref().and_then(solve).or_else(|| result.as_ref().and_then(solve))
+            else {
+                return;
+            };
+            let Ok(desc) = self.tag_wire(&targ) else {
+                return;
+            };
+            wire.push_str(" (t \"TypeTree\" (s0) ");
+            wire.push_str(&desc);
+            wire.push(')');
+        }
+        wire.push(')');
+        types.targs.insert(t as *const Tree, wire);
     }
 
     /// The type each `WeakTypeTag` the implementation asks for stands for, at
@@ -2987,6 +3097,30 @@ impl Typer {
                 let name = decode_method_name(&name_from(at(kids, 0)?)?);
                 if self.macro_reply_pattern && name == "_" {
                     return Ok(node(TreeKind::Wildcard));
+                }
+                // A package the engine knows by the identity
+                // [`anchored_path_to_wire`] gave it -- the head of a path
+                // this side sent -- is resolved from the root, where no local
+                // of the call site can shadow it. A package reference the
+                // implementation built itself (`tq"scala.AnyRef"`) keeps its
+                // spelling.
+                if sym.first().and_then(|s| s.atom()) == Some("sr")
+                    && !source_sym.is_none()
+                    && self.st.get(source_sym).kind == SymKind::Package
+                {
+                    let full = self.st.jvm_internal(source_sym).replace('/', ".");
+                    if full.contains('.') {
+                        return Ok(path_tree(&full, span));
+                    }
+                    let mut anchored = path_tree("_root_", span);
+                    anchored = Tree {
+                        kind: TreeKind::Select {
+                            qual: Box::new(anchored.clone()),
+                            name: full,
+                        },
+                        ..anchored
+                    };
+                    return Ok(anchored);
                 }
                 // A *static* symbol is rebuilt from its full name: the
                 // expansion is typed in the call site's scope, where the
@@ -4512,7 +4646,7 @@ fn filled_application_to_wire(
         out.push_str("(t \"Apply\" (s0) ");
         if index == 0 {
             if typed_fun && !matches!(fun.kind, TreeKind::New { .. }) {
-                typed_tree_to_wire(cx, fun, out)?;
+                typed_tree_to_wire_in(cx, fun, false, out)?;
             } else {
                 application_fun_to_wire(cx, fun, out)?;
             }
@@ -4615,7 +4749,28 @@ fn application_receiver(mut tree: &Tree) -> Option<&Tree> {
 
 /// A type descriptor for each typed leaf of the trees being sent, by node
 /// address ([`Typer::collect_wire_types`]).
-pub(crate) type WireTypes = std::collections::HashMap<*const Tree, Result<String, String>>;
+#[derive(Default)]
+pub(crate) struct WireTypes {
+    leaves: std::collections::HashMap<*const Tree, Result<String, String>>,
+    /// The type arguments the typer inferred for a reference to a
+    /// polymorphic method, as the wire list of their `TypeTree`s. nsc's
+    /// typed tree spells them out (`List.apply[Int](x, 3)`); ours keeps them
+    /// in the reference's instantiated type only.
+    targs: std::collections::HashMap<*const Tree, String>,
+    /// The type of a function literal's parameter written without one:
+    /// nsc's typed `Function` carries it (`(x$1: Int) => x$1.+(1)`).
+    param_types: std::collections::HashMap<*const Tree, String>,
+}
+
+impl WireTypes {
+    pub(crate) fn insert(&mut self, t: *const Tree, wire: Result<String, String>) {
+        self.leaves.insert(t, wire);
+    }
+
+    fn get(&self, t: &*const Tree) -> Option<&Result<String, String>> {
+        self.leaves.get(t)
+    }
+}
 
 /// What the outbound serialiser reads besides the tree itself: the symbol
 /// table, to tell a static object from a local, and the descriptors of the
@@ -4699,6 +4854,20 @@ fn static_module_class_path(st: &SymbolTable, module_class: SymbolId) -> Option<
     let module = st.get(module_class).name.trim_end_matches('$').to_string();
     let owner = st.get(module_class).owner;
     if let Some(path) = owner_chain_path(st, module.clone(), owner) {
+        // An object a package object aliases: `scala.List` is `val List =
+        // scala.collection.immutable.List` in `scala/package.scala`, and
+        // nsc's typed tree selects it through that object --
+        // `scala.package.List`. Its class lives elsewhere, which is how it
+        // is told from an object the package declares.
+        let jvm = &st.get(module_class).jvm_name;
+        if st.get(owner).kind == SymKind::Package
+            && jvm.ends_with('$')
+            && *jvm != format!("{}/{}$", st.jvm_internal(owner), encode_method_name(&module))
+        {
+            if let Some((pkg, last)) = path.rsplit_once('.') {
+                return Some(format!("{pkg}.package.{last}"));
+            }
+        }
         return Some(path);
     }
     if !st.get(module_class).flags.contains(Flags::STATIC)
@@ -4764,6 +4933,70 @@ fn class_path_member(cx: &WireCx, t: &Tree, qual: &Tree, name: &str, out: &mut S
     true
 }
 
+/// The declared and the instantiated type of a method reference, as two
+/// types of one shape whose type parameters can be matched up: every
+/// parameter type and the result, when the reference is the function of an
+/// application; the result alone for a parameterless method used as a value.
+fn targ_shapes(declared: &Type, actual: &Type) -> Option<(Type, Type)> {
+    let flatten = |paramss: &[Vec<Type>], ret: &Type| {
+        let mut parts: Vec<Type> = paramss.iter().flat_map(|c| c.iter().cloned()).collect();
+        parts.push(ret.clone());
+        Type::Tuple(parts.into())
+    };
+    match (declared, actual) {
+        (
+            Type::Method {
+                paramss: dp,
+                ret: dr,
+            },
+            Type::Method {
+                paramss: ap,
+                ret: ar,
+            },
+        ) if dp.len() == ap.len() && dp.iter().zip(ap.iter()).all(|(d, a)| d.len() == a.len()) => {
+            Some((flatten(dp, dr), flatten(ap, ar)))
+        }
+        (Type::Method { .. } | Type::Overload(_), Type::Method { .. }) => None,
+        (Type::Method { paramss, ret }, actual) if paramss.iter().all(|c| c.is_empty()) => {
+            Some(((**ret).clone(), actual.clone()))
+        }
+        (Type::Method { .. }, _) => None,
+        (declared, actual) => Some((declared.clone(), actual.clone())),
+    }
+}
+
+/// `a.b.c` as nsc's typer writes a static path: its head package is an
+/// `Ident` -- `scala.math.Numeric`, not `_root_.scala.math.Numeric` -- that
+/// carries the package's identity. The engine makes that package the
+/// `Ident`'s symbol and hands it back with it, and the call site then starts
+/// the path at the root again ([`Typer::tree_from_reply`]), so no local named
+/// `scala` can capture it. A path whose head is no package keeps `_root_`.
+pub(crate) fn anchored_path_to_wire(st: &SymbolTable, path: &str, out: &mut String) {
+    let mut segs = path.split('.');
+    let head = segs.next().unwrap_or("");
+    let package = st
+        .lookup_member(st.root, head)
+        .into_iter()
+        .chain(st.lookup(head))
+        .find(|&s| st.get(s).kind == SymKind::Package && st.get(s).owner == st.root);
+    let Some(package) = package else {
+        root_path_to_wire(path, out);
+        return;
+    };
+    let mut built = format!("(t \"Ident\" (sr {}) (n term ", package.0);
+    quote_into(&mut built, &encode_method_name(head));
+    built.push_str("))");
+    for seg in segs {
+        let mut next = String::from("(t \"Select\" (s0) ");
+        next.push_str(&built);
+        next.push_str(" (n term ");
+        quote_into(&mut next, &encode_method_name(seg));
+        next.push_str("))");
+        built = next;
+    }
+    out.push_str(&built);
+}
+
 /// `_root_.a.b.c` as a chain of term selections.
 pub(crate) fn root_path_to_wire(path: &str, out: &mut String) {
     let mut built = String::from("(t \"Ident\" (s0) (n term \"_root_\"))");
@@ -4827,6 +5060,16 @@ pub(crate) fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<Strin
 /// type-checked again at the call site -- where an unqualified name still
 /// means what the source meant, and a `This` we did not resolve would not.
 fn typed_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
+    typed_tree_to_wire_in(cx, t, true, out)
+}
+
+/// `value`: `t` is used as a value, not as the function of an application.
+fn typed_tree_to_wire_in(
+    cx: &WireCx,
+    t: &Tree,
+    value: bool,
+    out: &mut String,
+) -> Result<(), String> {
     if cx.prefix_ref == Some(std::ptr::from_ref(t)) {
         out.push_str("(t \"PrefixRef\" (s0))");
         return Ok(());
@@ -4835,10 +5078,77 @@ fn typed_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), Str
         // Written as the thunk's body always was; only the wrapper goes.
         return tree_to_wire(cx, body, out);
     }
-    let start = out.len();
-    typed_tree_to_wire_body(cx, t, out)?;
-    mirror_tree_identity(cx, t, start, out);
+    with_reference_layers(cx, t, value, out, |out| {
+        let start = out.len();
+        typed_tree_to_wire_body(cx, t, out)?;
+        mirror_tree_identity(cx, t, start, out);
+        Ok(())
+    })
+}
+
+/// The layers nsc's typer puts around a method reference and ours leaves
+/// implicit: the inferred type arguments (`List.apply[Int]`) and, for a
+/// method declared with an empty parameter list and used without one, the
+/// application (`s.length()`). The function of an application gets the
+/// first only.
+fn with_reference_layers(
+    cx: &WireCx,
+    t: &Tree,
+    value: bool,
+    out: &mut String,
+    body: impl FnOnce(&mut String) -> Result<(), String>,
+) -> Result<(), String> {
+    let applied = value && auto_applied(cx.st, t);
+    let targs = cx.types.targs.get(&std::ptr::from_ref(t));
+    if applied {
+        out.push_str("(t \"Apply\" (s0) ");
+    }
+    if targs.is_some() {
+        out.push_str("(t \"TypeApply\" (s0) ");
+    }
+    body(out)?;
+    if let Some(targs) = targs {
+        out.push(' ');
+        out.push_str(targs);
+        out.push(')');
+    }
+    if applied {
+        out.push_str(" (l))");
+    }
     Ok(())
+}
+
+/// Whether `t` names a method declared with an empty parameter list and is
+/// used without one -- `s.length` for `String.length()`. nsc's typer applies
+/// it (`adapt`), so its typed tree is `s.length()`; ours keeps the reference.
+/// A Java method always has a parameter list, but a class file's (and the
+/// prelude's) parameterless one is entered here with none. A Scala object's
+/// class file carries no pickle of its own and reads as Java too; its name
+/// (`Decoder$`) and its members' pickled origin tell it apart. The
+/// hand-written prelude does not keep a Scala member's empty parameter list
+/// faithfully (`<:<.refl` is parameterless in the library), so only a
+/// declaration read from source or from a pickle is taken at its word.
+fn auto_applied(st: &SymbolTable, t: &Tree) -> bool {
+    let sym = match &t.kind {
+        TreeKind::Select { .. } | TreeKind::Ident { .. } => t.sym,
+        TreeKind::TypeApply { fun, .. } => fun.sym,
+        _ => return false,
+    };
+    if sym.is_none() || sym.0 as usize >= st.symbols.len() {
+        return false;
+    }
+    let s = st.get(sym);
+    let java = !s.owner.is_none()
+        && st.get(s.owner).flags.contains(Flags::JAVA)
+        && !st.get(s.owner).jvm_name.ends_with('$')
+        && s.pickled_origin.is_empty();
+    let faithful = sym.0 >= st.prelude_end || !s.pickled_origin.is_empty();
+    s.kind == SymKind::Method
+        && s.name != "<init>"
+        && matches!(&s.ty, Type::Method { paramss, .. }
+            if (faithful && paramss.first().is_some_and(|c| c.is_empty()))
+                || (java && paramss.is_empty()))
+        && !matches!(t.ty, Type::Method { .. } | Type::Overload(_) | Type::NoType)
 }
 
 fn typed_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
@@ -4873,7 +5183,7 @@ fn typed_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<()
             if matches!(fun.kind, TreeKind::New { .. }) {
                 application_fun_to_wire(cx, fun, out)?;
             } else {
-                typed_tree_to_wire(cx, fun, out)?;
+                typed_tree_to_wire_in(cx, fun, false, out)?;
             }
             out.push_str(" (l");
             for a in args {
@@ -4911,6 +5221,12 @@ pub(crate) fn byname_thunk_body(t: &Tree) -> Option<&Tree> {
 /// refusing those by name is the honest answer until the bridge carries typed
 /// trees (`docs/macros.md` §4.3).
 pub(crate) fn tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
+    tree_to_wire_in(cx, t, true, out)
+}
+
+/// `value`: `t` is used as a value, not as the function of an application
+/// ([`with_reference_layers`]).
+fn tree_to_wire_in(cx: &WireCx, t: &Tree, value: bool, out: &mut String) -> Result<(), String> {
     if cx.prefix_ref == Some(std::ptr::from_ref(t)) {
         out.push_str("(t \"PrefixRef\" (s0))");
         return Ok(());
@@ -4918,10 +5234,12 @@ pub(crate) fn tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<()
     if let Some(body) = byname_thunk_body(t) {
         return tree_to_wire(cx, body, out);
     }
-    let start = out.len();
-    tree_to_wire_body(cx, t, out)?;
-    mirror_tree_identity(cx, t, start, out);
-    Ok(())
+    with_reference_layers(cx, t, value, out, |out| {
+        let start = out.len();
+        tree_to_wire_body(cx, t, out)?;
+        mirror_tree_identity(cx, t, start, out);
+        Ok(())
+    })
 }
 
 pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
@@ -4950,7 +5268,7 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str(
                 "(t \"Apply\" (s0) (t \"Select\" (s0) (t \"Apply\" (s0) (t \"Select\" (s0) ",
             );
-            root_path_to_wire("scala.StringContext", out);
+            anchored_path_to_wire(cx.st, "scala.StringContext", out);
             out.push_str(" (n term \"apply\")) (l");
             for part in parts {
                 out.push_str(" (t \"Literal\" (s0) ");
@@ -4976,7 +5294,7 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
         TreeKind::Ident { name } if name == "$classOf" => {
             let ty = cx.leaf_type(t)?;
             out.push_str("(t \"TypeApply\" (s0) ");
-            root_path_to_wire("scala.Predef.classOf", out);
+            anchored_path_to_wire(cx.st, "scala.Predef.classOf", out);
             out.push_str(" (l (t \"TypeTree\" (s0) ");
             out.push_str(ty);
             out.push_str(")))");
@@ -4989,7 +5307,7 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             if let Some(path) =
                 static_module_path(cx.st, t.sym).or_else(|| static_member_path(cx.st, t.sym))
             {
-                root_path_to_wire(&path, out);
+                anchored_path_to_wire(cx.st, &path, out);
                 return Ok(());
             }
             out.push_str("(t \"Ident\" (s0) (n term ");
@@ -5006,7 +5324,7 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             // same anchor as an absolute package path on the next hop.
             if !t.sym.is_none() && cx.st.get(t.sym).kind == SymKind::Package {
                 let full = cx.st.jvm_internal(t.sym).replace('/', ".");
-                root_path_to_wire(&full, out);
+                anchored_path_to_wire(cx.st, &full, out);
                 return Ok(());
             }
             out.push_str("(t \"This\" (s0) (n type ");
@@ -5295,7 +5613,7 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
         }
         TreeKind::TypeApply { fun, args } => {
             out.push_str("(t \"TypeApply\" (s0) ");
-            tree_to_wire(cx, fun, out)?;
+            tree_to_wire_in(cx, fun, false, out)?;
             out.push_str(" (l");
             for arg in args {
                 out.push(' ');
@@ -5319,7 +5637,14 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str(" (n term ");
             quote_into(out, &encode_method_name(name));
             out.push_str(") ");
-            type_tree_to_wire(cx, tpt, out)?;
+            match cx.types.param_types.get(&std::ptr::from_ref(t)) {
+                Some(desc) if tpt.is_empty() => {
+                    out.push_str("(t \"TypeTree\" (s0) ");
+                    out.push_str(desc);
+                    out.push(')');
+                }
+                _ => type_tree_to_wire(cx, tpt, out)?,
+            }
             out.push(' ');
             tree_to_wire(cx, rhs, out)?;
             out.push(')');
@@ -5481,7 +5806,7 @@ pub(crate) fn application_fun_to_wire(
         out.push_str(" (n term \"<init>\"))");
         Ok(())
     } else {
-        tree_to_wire(cx, fun, out)
+        tree_to_wire_in(cx, fun, false, out)
     }
 }
 

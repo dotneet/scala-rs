@@ -1576,7 +1576,7 @@ fn answer_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(
                 return Ok(());
             }
             if let Some(path) = super::expand::static_module_path(cx.st, t.sym) {
-                super::expand::root_path_to_wire(&path, out);
+                super::expand::anchored_path_to_wire(cx.st, &path, out);
                 return Ok(());
             }
             // A name that resolved to a member of an enclosing class means

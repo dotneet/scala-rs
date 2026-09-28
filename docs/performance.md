@@ -787,9 +787,11 @@ with a derivation macro (`implicit def derive[T]: Show[T]` beside
 "ambiguous implicit": a candidate whose only clause is implicit counted as
 a view, and a view never beats a value on type alone
 (`implicit_clause_specificity.rs`). The typed trees sent to a macro also
-differ from nsc's in shape (`s.length` for `s.length()`, no `TypeApply` for
-inferred type arguments), which `showCode` makes visible; that is not fixed
-yet.
+differed from nsc's in shape (`s.length` for `s.length()`, no `TypeApply`
+for inferred type arguments, `_root_.scala.List` for
+``scala.`package`.List``), which `showCode` makes visible; they now match
+(`macro_tree_shape.rs`), explicit type arguments aside: nsc prints those
+fully qualified, through aliases scala-rs does not keep (`scala.Predef.String`).
 
 ### What is left
 
