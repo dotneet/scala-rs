@@ -2958,7 +2958,13 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         let (params, ret, mtparams) = if let Some(ms) = parsed {
             let mut tp_ids = Vec::new();
             for p in &ms.tparams {
-                let tid = st.alloc(&p.name, owner, SymKind::TypeParam, Flags::EMPTY, "");
+                let tid = st.alloc(
+                    &p.name,
+                    SymbolId::NONE,
+                    SymKind::TypeParam,
+                    Flags::EMPTY,
+                    "",
+                );
                 st.get_mut(tid).ty = Type::TypeParam(tid);
                 env.insert(p.name.clone(), tid);
                 tp_ids.push(tid);
@@ -3018,12 +3024,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         st.set_jvm_name(id, m.desc.clone());
         if !mtparams.is_empty() {
             for tid in &mtparams {
-                // Method type parameters had to be allocated before the
-                // method symbol existed, so `alloc` temporarily entered them
-                // as class members. Move them with their owner: leaving them
-                // on the class makes inherited lookup and wildcard imports
-                // expose names that exist only inside this method.
-                st.get_mut(owner).members.retain(|member| member != tid);
+                // The method did not exist when its type parameters were
+                // allocated. Attach them only after it is available so they
+                // never enter the enclosing class's member list.
                 st.get_mut(*tid).owner = id;
                 if !st.get(id).members.contains(tid) {
                     st.get_mut(id).members.push(*tid);
@@ -3429,7 +3432,13 @@ mod method_type_param_tests {
             sole_instance_field: None,
         };
 
+        let before_members = st.member_graph_gen();
         fill_java_members(&mut st, owner, &class);
+        assert_eq!(
+            st.member_graph_gen() - before_members,
+            2,
+            "method type parameters must not invalidate class member lookups"
+        );
 
         let method = st
             .lookup_member(owner, "id")
