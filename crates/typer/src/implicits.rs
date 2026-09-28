@@ -4367,7 +4367,17 @@ impl Typer {
             if !self.only_implicit_clauses(c) {
                 continue;
             }
-            if let Type::Method { paramss, .. } = &*self.implicit_candidate_ty(c) {
+            if let Type::Method { paramss, ret } = &*self.implicit_candidate_ty(c) {
+                // A witness can only need its clauses when its result fits the
+                // requested type. Large companions contain many unrelated
+                // derivations; warming all their clauses repeats the full
+                // candidate scan for each one. A macro can refine its result
+                // during expansion, so keep warming its declared clauses.
+                if self.st.get(c).macro_impl.is_none()
+                    && self.implicit_solve(c, ret, want, &[]).is_none()
+                {
+                    continue;
+                }
                 for p in paramss.iter().flatten() {
                     if !nested.contains(p) {
                         nested.push(p.clone());
@@ -4376,6 +4386,8 @@ impl Typer {
             }
         }
         for n in nested {
+            #[cfg(test)]
+            WITNESS_CHAIN_NESTED_VISITS.with(|count| count.set(count.get() + 1));
             self.warm_witness_chain(&n, depth - 1);
         }
     }
@@ -6623,9 +6635,109 @@ fn unwrap_byname(t: &Type) -> Type {
 }
 
 #[cfg(test)]
+thread_local! {
+    static WITNESS_CHAIN_NESTED_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod memo_tests {
     use super::*;
     use crate::check::TypecheckOptions;
+
+    #[test]
+    fn witness_chain_warms_only_fitting_derivations() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let derive = typer
+            .st
+            .alloc("Derive", root, SymKind::Class, Flags::EMPTY, "Derive");
+        let module = typer
+            .st
+            .alloc("Derive", root, SymKind::Module, Flags::MODULE, "Derive$");
+        let module_class = typer.st.alloc(
+            "Derive$",
+            root,
+            SymKind::ModuleClass,
+            Flags::MODULE,
+            "Derive$",
+        );
+        typer.st.get_mut(module).ty = Type::ModuleRef(module_class);
+        let atomic = typer
+            .st
+            .alloc("Atomic", root, SymKind::Class, Flags::EMPTY, "Atomic");
+        let pair = typer
+            .st
+            .alloc("Pair", root, SymKind::Class, Flags::EMPTY, "Pair");
+        let evidence = typer
+            .st
+            .alloc("Evidence", root, SymKind::Class, Flags::EMPTY, "Evidence");
+        let atomic_ty = Type::Class {
+            sym: atomic,
+            args: vec![].into(),
+        };
+        let wanted = Type::Class {
+            sym: derive,
+            args: vec![atomic_ty.clone(), Type::Int].into(),
+        };
+        for index in 0..40 {
+            let method = typer.st.alloc(
+                format!("derivePair{index}"),
+                module_class,
+                SymKind::Method,
+                Flags::IMPLICIT,
+                "",
+            );
+            let tp = typer
+                .st
+                .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "");
+            typer.st.get_mut(method).tparams = vec![tp];
+            let param = typer
+                .st
+                .alloc("evidence", method, SymKind::Term, Flags::IMPLICIT, "");
+            typer.st.get_mut(method).paramss = vec![vec![param]];
+            typer.st.get_mut(method).ty = Type::Method {
+                paramss: vec![vec![Type::Class {
+                    sym: evidence,
+                    args: vec![Type::TypeParam(tp)].into(),
+                }]]
+                .into(),
+                ret: TyBox::new(Type::Class {
+                    sym: derive,
+                    args: vec![
+                        Type::Class {
+                            sym: pair,
+                            args: vec![Type::TypeParam(tp)].into(),
+                        },
+                        Type::Int,
+                    ]
+                    .into(),
+                }),
+            };
+        }
+        let matching = typer.st.alloc(
+            "deriveAtomic",
+            module_class,
+            SymKind::Method,
+            Flags::IMPLICIT,
+            "",
+        );
+        let param = typer
+            .st
+            .alloc("evidence", matching, SymKind::Term, Flags::IMPLICIT, "");
+        typer.st.get_mut(matching).paramss = vec![vec![param]];
+        typer.st.get_mut(matching).ty = Type::Method {
+            paramss: vec![vec![Type::Class {
+                sym: evidence,
+                args: vec![atomic_ty].into(),
+            }]]
+            .into(),
+            ret: TyBox::new(wanted.clone()),
+        };
+        assert_eq!(typer.companion_implicits(&wanted).len(), 41);
+        WITNESS_CHAIN_NESTED_VISITS.with(|count| count.set(0));
+        typer.warm_witness_chain(&wanted, 1);
+        assert_eq!(WITNESS_CHAIN_NESTED_VISITS.with(|count| count.get()), 1);
+    }
 
     #[test]
     fn shared_pickled_owner_does_not_override_type_specificity() {
