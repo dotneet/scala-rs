@@ -27,6 +27,5 @@ to machine load:
 
 ```sh
 python3 tests/perf/large-signature/check.py \
-  target/release/scala-rs /tmp/scala-2.13.16 /path/to/jdk \
-  --members 6000 --repeats 8 --maximum-ratio 8.5
+  target/release/scala-rs /tmp/scala-2.13.16 /path/to/jdk --wide
 ```

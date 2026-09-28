@@ -2669,17 +2669,18 @@ fn existing_java_method(
     st: &SymbolTable,
     owner: SymbolId,
     m: &crate::javaclass::JavaMethod,
+    members: &[SymbolId],
 ) -> Option<SymbolId> {
-    if let Some(id) = st.lookup_member(owner, &m.name).into_iter().find(|&id| {
+    if let Some(id) = members.iter().copied().find(|&id| {
         let s = st.get(id);
         s.kind == SymKind::Method && s.owner == owner && s.jvm_name == m.desc
     }) {
         return Some(id);
     }
     let arity = desc_param_count(&m.desc);
-    let candidates: Vec<SymbolId> = st
-        .lookup_member(owner, &m.name)
-        .into_iter()
+    let candidates: Vec<SymbolId> = members
+        .iter()
+        .copied()
         .filter(|&id| {
             let s = st.get(id);
             s.kind == SymKind::Method
@@ -2886,11 +2887,29 @@ fn module_desc_head(internal: &str) -> String {
 
 fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
     let trait_defined = scala_trait_defined_members(c);
+    let mut methods_by_name: rustc_hash::FxHashMap<String, Vec<SymbolId>> =
+        rustc_hash::FxHashMap::default();
+    for &id in &st.get(owner).members {
+        if st.get(id).kind == SymKind::Method && st.get(id).owner == owner {
+            methods_by_name
+                .entry(st.get(id).name.clone())
+                .or_default()
+                .push(id);
+        }
+    }
     for m in &c.methods {
         if is_erased_scala_forwarder(st, owner, c, m) {
             continue;
         }
-        if let Some(id) = existing_java_method(st, owner, m) {
+        if let Some(id) = existing_java_method(
+            st,
+            owner,
+            m,
+            methods_by_name
+                .get(&m.name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ) {
             // The class file's flags, *plus* the two a class file cannot
             // record and only a pickle knows: `implicit` and "this is a val's
             // accessor". Overwriting wholesale made the whole thing
@@ -2993,6 +3012,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             flags.set(Flags::ABSTRACT, false);
         }
         let id = add_method_types(st, owner, &m.name, names, params, ret);
+        methods_by_name.entry(m.name.clone()).or_default().push(id);
         st.get_mut(id).flags = flags;
         mark_java_package_private(st, id, owner, m.access);
         st.set_jvm_name(id, m.desc.clone());

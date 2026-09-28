@@ -538,6 +538,13 @@ fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {
     if ret_is_value_class {
         return erased;
     }
+    let our_ret = match &erased {
+        Type::Method { ret, .. } | Type::Function { ret, .. } => ret.as_ref(),
+        t => t,
+    };
+    if !is_primitive(our_ret) {
+        return erased;
+    }
     let Some(ov) = find_overridden_method(st, id) else {
         return erased;
     };
@@ -545,11 +552,7 @@ fn erase_overriding_method(st: &SymbolTable, id: SymbolId, ty: &Type) -> Type {
         Type::Method { ret, .. } | Type::Function { ret, .. } => erase_ty(ret, st),
         t => erase_ty(t, st),
     };
-    let our_ret = match &erased {
-        Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
-        t => t.clone(),
-    };
-    if is_ref_erased(&ov_ret) && is_primitive(&our_ret) {
+    if is_ref_erased(&ov_ret) {
         match erased {
             Type::Method { paramss, .. } => Type::Method {
                 paramss,

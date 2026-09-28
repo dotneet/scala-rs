@@ -35,10 +35,16 @@ def main() -> None:
     parser.add_argument("native", type=Path)
     parser.add_argument("scala_dist", type=Path)
     parser.add_argument("jdk", type=Path)
-    parser.add_argument("--members", type=int, default=1000)
-    parser.add_argument("--repeats", type=int, default=20)
-    parser.add_argument("--maximum-ratio", type=float, default=2.0)
+    parser.add_argument("--wide", action="store_true", help="exercise wide inherited imports and erasure")
+    parser.add_argument("--members", type=int)
+    parser.add_argument("--repeats", type=int)
+    parser.add_argument("--maximum-ratio", type=float)
     args = parser.parse_args()
+    args.members = args.members if args.members is not None else (6000 if args.wide else 1000)
+    args.repeats = args.repeats if args.repeats is not None else (8 if args.wide else 20)
+    args.maximum_ratio = (
+        args.maximum_ratio if args.maximum_ratio is not None else (4.4 if args.wide else 2.0)
+    )
     if args.members < 128:
         parser.error("--members must be at least 128")
     with tempfile.TemporaryDirectory(prefix="large-signature-") as scratch:
