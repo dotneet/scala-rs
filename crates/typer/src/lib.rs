@@ -187,7 +187,6 @@ pub use erasure::{
     note_source_value_classes,
     tree_mentions_symbol,
 };
-pub use expand::enable_resident_direct_macro;
 pub use expand_private::{expand_private_names, expand_trait_private_vals};
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;

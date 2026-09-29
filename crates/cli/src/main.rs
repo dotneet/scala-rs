@@ -12,8 +12,8 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scala_rs_driver::{
-    compile_paths, enable_resident_archive_cache, enable_resident_direct_macro, find_scala_library,
-    find_scala_xml, run_main_with_cp, CompileOptions, CompileResult, SourceFeatures,
+    compile_paths, enable_resident_archive_cache, find_scala_library, find_scala_xml,
+    run_main_with_cp, CompileOptions, CompileResult, SourceFeatures,
 };
 use scala_rs_span::{render_all, render_scalac};
 
@@ -500,7 +500,6 @@ fn compile_batch(options: &[String]) -> ExitCode {
     if cache_enabled {
         enable_resident_archive_cache();
     }
-    enable_resident_direct_macro();
     let mut args = Vec::new();
     loop {
         let mut bytes = Vec::new();

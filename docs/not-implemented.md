@@ -81,6 +81,17 @@ diagnostic or, where marked, is a known divergence. What is supported is in
   SAM type (and `PartialFunction`) becomes an anonymous class, where scalac
   uses `invokedynamic` for SAM types it considers functional interfaces.
   Behaviour is the same; class count and call-site shape differ.
+- **Java annotations on classes, fields and parameters are not written to
+  the class file**, and a method's only when they take no arguments. A class
+  annotated `@Marker` (a Java annotation with `RetentionPolicy.RUNTIME`) or
+  `@Schema(description = "…")` is compiled, but reflection finds neither on
+  it at run time, where scalac's class carries both.
+- **Java sources are compiled by javac, not read.** A `.java` source given
+  with the Scala ones is compiled with `javac` against the classpath before
+  the Scala sources are typed, and its class files are not written to the
+  output directory (as with scalac, a build tool's javac writes them). A Java
+  source that refers to a Scala source of the same compilation cannot be
+  compiled this way and is reported.
 - **Repeated parameters forwarded to a Java varargs method.**
   `def fmt(s: String, args: Any*) = s.format(args: _*)` passes the `Seq`
   without nsc's `Object[]` conversion and throws

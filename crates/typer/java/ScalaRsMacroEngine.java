@@ -282,6 +282,7 @@ public final class ScalaRsMacroEngine {
     static void runDaemon(String endpointPath, String token, String unixPath) throws Exception {
         ClassLoader baseCl = ScalaRsMacroEngine.class.getClassLoader();
         final java.util.concurrent.Semaphore session = new java.util.concurrent.Semaphore(1);
+        startEngineWatchdog();
         try (ServerSocket server = new ServerSocket(0, 32,
                 InetAddress.getByName("127.0.0.1"))) {
             server.setSoTimeout(1000);
@@ -359,6 +360,41 @@ public final class ScalaRsMacroEngine {
         }
     }
 
+    /**
+     * When the engine last took the ball from scala-rs, or 0 while it is
+     * waiting for scala-rs. A daemon session whose compiler was killed while
+     * a macro loops would otherwise hold the session, and run, for ever.
+     */
+    static volatile long engineSince = 0;
+
+    /** How long a daemon's macro may compute without a word to scala-rs. */
+    static final long ENGINE_WATCHDOG_NANOS = java.util.concurrent.TimeUnit.MINUTES.toNanos(10);
+
+    static String awaitScalaRs() throws Exception {
+        engineSince = 0;
+        String line = readWireLine(in);
+        engineSince = System.nanoTime();
+        return line;
+    }
+
+    static void startEngineWatchdog() {
+        Thread watchdog = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(10_000);
+                } catch (InterruptedException stop) {
+                    return;
+                }
+                long since = engineSince;
+                if (since != 0 && System.nanoTime() - since > ENGINE_WATCHDOG_NANOS) {
+                    System.exit(3);
+                }
+            }
+        }, "macro-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
     static void startDaemonSession(AutoCloseable client, java.io.InputStream input,
                                    java.io.OutputStream output, String token, ClassLoader baseCl,
                                    java.util.concurrent.Semaphore session) throws Exception {
@@ -394,8 +430,16 @@ public final class ScalaRsMacroEngine {
                                  java.util.concurrent.Semaphore session) {
         boolean acquired = false;
         try {
-            session.acquire();
-            acquired = true;
+            // One session runs at a time: the runtime universe and the run's
+            // mirror are shared state. A compiler that finds the daemon busy
+            // -- a parallel build, or a session still closing -- is told so,
+            // and starts an engine of its own rather than waiting its turn.
+            acquired = session.tryAcquire(1, java.util.concurrent.TimeUnit.SECONDS);
+            if (!acquired) {
+                output.write("(busy)\n".getBytes(StandardCharsets.UTF_8));
+                output.flush();
+                return;
+            }
             if (client instanceof Socket) ((Socket) client).setSoTimeout(0);
             in = reader;
             out = new PrintStream(output, true, "UTF-8");
@@ -408,7 +452,7 @@ public final class ScalaRsMacroEngine {
             resetRun(baseCl, entries);
             out.println("(ready)");
             String line;
-            while ((line = readWireLine(in)) != null) {
+            while ((line = awaitScalaRs()) != null) {
                 if (line.isEmpty()) continue;
                 String reply;
                 long handleStarted = System.nanoTime();
@@ -423,6 +467,7 @@ public final class ScalaRsMacroEngine {
         } catch (Throwable failure) {
             if (out != null) out.println(err(describe(failure)));
         } finally {
+            engineSince = 0;
             try { client.close(); } catch (Exception ignored) { }
             if (acquired) session.release();
         }
@@ -1269,7 +1314,7 @@ public final class ScalaRsMacroEngine {
         out.println(q);
         for (;;) {
             long waitStarted = System.nanoTime();
-            String line = readWireLine(in);
+            String line = awaitScalaRs();
             waitNanos += System.nanoTime() - waitStarted;
             if (line == null) {
                 throw new Gap("scala-rs closed the pipe while the macro was asking it a question");

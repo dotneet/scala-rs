@@ -3666,6 +3666,47 @@ impl Typer {
         Some(result)
     }
 
+    /// One implicit declaration read twice: from its declaring trait, and as
+    /// the member a module inherits, completed onto the module under the same
+    /// `pickled_origin`. Only the declaring class's copy stands.
+    ///
+    /// The owner is what ranks an implicit against the others (nsc's
+    /// "defined in a subclass" rule), and the module's copy claims the
+    /// module itself: pureconfig's `ExportedReaders#exportedReader` then tied
+    /// with `PrimitiveReaders#stringConfigReader` once a derivation had named
+    /// `ConfigReader.exportedReader`, and every later `ConfigReader[String]`
+    /// was ambiguous.
+    fn collapse_inherited_implicit_copies(&self, fits: &mut Vec<(SymbolId, ImplicitFit)>) {
+        if fits.len() < 2 {
+            return;
+        }
+        let declares = |id: SymbolId| {
+            let s = self.st.get(id);
+            let owner = self.st.jvm_internal(s.owner).replace('/', ".");
+            s.pickled_origin
+                .split('#')
+                .next()
+                .is_some_and(|declaring| declaring == owner.trim_end_matches('$'))
+        };
+        let copies: Vec<SymbolId> = fits
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|&id| {
+                let origin = &self.st.get(id).pickled_origin;
+                !origin.is_empty()
+                    && !declares(id)
+                    && fits.iter().any(|(other, _)| {
+                        *other != id
+                            && self.st.get(*other).pickled_origin == *origin
+                            && declares(*other)
+                    })
+            })
+            .collect();
+        if !copies.is_empty() {
+            fits.retain(|(id, _)| !copies.contains(id));
+        }
+    }
+
     fn search_implicit_uncached(
         &self,
         pt: &Type,
@@ -3698,6 +3739,7 @@ impl Typer {
                     .unwrap_or_default();
             }
         }
+        self.collapse_inherited_implicit_copies(&mut fits);
         let cands: Vec<SymbolId> = fits.iter().map(|(id, _)| *id).collect();
         let found = self.most_specific(cands);
         let bindings = match &found {

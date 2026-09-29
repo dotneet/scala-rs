@@ -62,7 +62,9 @@ rather than an absolute benchmark:
   0.3--0.5 of scalac's time.
 * **A private 97-module application, 2026-09-29** (below): 175 s -> 121 s for
   every module in turn; its largest module 22.1 s -> 15.3 s against scalac's
-  27.2 s, with identical class files.
+  27.2 s, with identical class files. With the macro daemon by default and
+  the compatibility fixes that let every module compile: 92.5 s against
+  scalac's 339.5 s.
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -893,11 +895,43 @@ flags for the engine (C1 only is 7% faster on small modules, 13% slower on
 the largest; a dynamic CDS archive is slower, since the classpath differs per
 module).
 
-What remains on these modules: about 28% of the largest one's wall time is
-the engine's JVM computing (a cold JIT; with `SCALA_RS_MACRO_DAEMON=1` the
-whole build takes 99 s), and 4--5% is `stat` on classpath directories that
-do not exist, which `BinaryIndex` re-checks at every new name so that a
-directory created during the run is found.
+**Later the same day**, two behaviours changed for these modules, and every
+module now compiles:
+
+* `compile` uses the macro daemon by default, as the resident batch
+  compiler already did. Small modules had paid a cold JVM each -- its start
+  and its first, interpreted, expansions. A daemon serves one compiler at a
+  time (a busy one sends `(busy)` and the compiler starts an engine of its
+  own, so parallel builds are not serialised), a poisoned session shuts the
+  daemon down so a looping macro cannot hold it, and a watchdog ends a daemon
+  whose macro has computed for ten minutes without a word to scala-rs.
+  `SCALA_RS_MACRO_DAEMON=0` restores a JVM per compilation.
+* A classpath directory that does not exist when the run starts is nothing
+  for the run; it had been probed again for every new class name, 1--5% of
+  each module (their build tool lists the output directories of modules not
+  built yet).
+
+With five compatibility fixes (an `Option` view reached through `Some` and
+`None`, one inherited implicit named through its module, a module entered
+from its header alone, a type projection through an alias parameter, named
+then positional arguments choosing an overload) and Java sources compiled by
+javac, all 97 modules compile. The four modules that did not compile before
+are included from here on:
+
+| | scalac | scala-rs |
+|---|---:|---:|
+| all 97 modules | 339.5 s | 92.5 s |
+| the 64 of 12 files or fewer | 148.5 s | 32.5 s |
+| largest module | 27.5 s | 13.6 s |
+
+scalac runs with the application's own 67 options, lints included; scala-rs
+with the five of them it accepts. No module is slower than with scalac. The
+fixes changed 176 class files of seven modules that already compiled; in
+every one the methods called and fields read are now closer to scalac's
+(counted over the `javap` references), and none moved further away.
+
+What remains is about a quarter of the largest module's time in the engine's
+JVM, even warm.
 
 ### What is left
 

@@ -93,8 +93,30 @@ impl Typer {
             // forwarder is not a class declaration, whereas a case class or
             // trait must still be loaded into the type namespace.
             if self.st.get(owner).kind == SymKind::Package && has_module {
+                // A source object keeps its own members, whatever a jar of
+                // the same name holds (scalapb's generated `WrappersProto`
+                // is both).
+                // Only a module read from its class file's header can be
+                // missing its terms; a source object has all of its own,
+                // whatever a jar of the same name holds (scalapb's generated
+                // `WrappersProto` is both).
+                let header_only_module = found.iter().any(|&id| {
+                    self.st.get(id).kind == SymKind::Module
+                        && self.st.binary_read.contains(&self.st.module_class_of(id).0)
+                });
                 for internal in self.binary_member_candidates(owner, name) {
                     if internal.ends_with('$') {
+                        if !header_only_module {
+                            continue;
+                        }
+                        // The module may have been entered from its header
+                        // alone, because a signature read elsewhere named one
+                        // of its type members (`def add(f: A.Fetch)` reached
+                        // `A`). Loading its class file is what enters its
+                        // terms -- `A.fetch`; do it unless it has been done.
+                        if !self.completed_java.contains(&internal) {
+                            self.load_binary_into(&internal, owner, span, true);
+                        }
                         continue;
                     }
                     let is_class = self
@@ -1458,8 +1480,14 @@ impl Typer {
     /// pickled `IterableFactory.Delegate` parent, whose `apply[A](A*): CC[A]`
     /// then stood next to the prelude's own — and `mutable.Set[TypeSymbol]()`
     /// came back as `Set[A]`. The conversions this is here to find
-    /// (`Option.option2Iterable`) live on the companion of the type itself, so
-    /// nothing is lost by stopping there.
+    /// (`Option.option2Iterable`) live on the companion of the type itself --
+    /// or of a base class of it outside the collections: an argument written
+    /// `Some(x)` or `None` has type `Some[A]` or `None.type`, whose implicit
+    /// scope reaches `Option`'s companion only through that base class, and
+    /// `f(None)` for a parameter `Iterable[C]` found no view (nsc applies
+    /// `option2Iterable`). So the base classes are warmed as well, except the
+    /// standard collections the hazard above is about and the universal
+    /// traits no companion of which declares a view.
     /// Read the classfile behind each argument's class, so `is_sub_type` can
     /// see its parents. Answers whether any of them had not been read yet.
     ///
@@ -1518,10 +1546,35 @@ impl Typer {
     }
 
     pub(crate) fn warm_own_scope_once(&mut self, ty: &Type) -> bool {
-        match self.st.class_sym_of(ty) {
-            Some(c) => self.warm_one_scope(c),
-            None => false,
+        let Some(c) = self.st.class_sym_of(ty) else {
+            return false;
+        };
+        let mut fresh = self.warm_one_scope(c);
+        for base in crate::lin::linearize(&self.st, c) {
+            if base == c || !self.warms_as_base_class(base) {
+                continue;
+            }
+            fresh |= self.warm_one_scope(base);
         }
+        fresh
+    }
+
+    /// Whether [`Self::warm_own_scope_once`] warms `base`'s companion when it
+    /// is a base class of the argument's class.
+    fn warms_as_base_class(&self, base: SymbolId) -> bool {
+        let jvm = &self.st.get(base).jvm_name;
+        !(base == self.st.any_sym
+            || base == self.st.anyref_sym
+            || base == self.st.anyval_sym
+            || jvm.starts_with("scala/collection/")
+            || matches!(
+                jvm.as_str(),
+                "java/lang/Object"
+                    | "scala/Product"
+                    | "scala/Equals"
+                    | "scala/Serializable"
+                    | "java/io/Serializable"
+            ))
     }
 
     /// The classes of every parameter of every alternative of an overloaded

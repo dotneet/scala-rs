@@ -62,6 +62,8 @@ mod libov;
 mod liboverload;
 #[path = "../libprelude.rs"]
 mod libprelude;
+#[path = "../library_client_compat.rs"]
+mod library_client_compat;
 #[path = "../library_trait_bridges.rs"]
 mod library_trait_bridges;
 #[path = "../linearization.rs"]

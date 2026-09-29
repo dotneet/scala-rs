@@ -589,6 +589,9 @@ fn startup_failure_keeps_bounded_stderr_diagnostic() {
     );
 
     let mut command = compile_with_tmpdir("eg_use", &failed, &[&impls], &cache);
+    // A JVM of its own: the warm compile above left a macro daemon that
+    // would serve this one without starting anything.
+    command.env("SCALA_RS_MACRO_DAEMON", "0");
     command.env("JAVA_TOOL_OPTIONS", "-XscalaRsStartupFailure");
     let output = command.output().expect("compile with startup failure");
     let err = diagnostics(&output);

@@ -309,8 +309,21 @@ impl Typer {
         &self,
         alts: &[SymbolId],
         named: &[(String, Type)],
-        nargs: usize,
+        args: &[Tree],
     ) -> Option<(Vec<SymbolId>, bool)> {
+        let nargs = args.len();
+        // Each argument's name, in the order written; `None` for a
+        // positional one.
+        let layout: Vec<Option<&str>> = args
+            .iter()
+            .map(|a| match &a.kind {
+                TreeKind::Assign { lhs, .. } => match &lhs.kind {
+                    TreeKind::Ident { name } => Some(name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
         let cands: Vec<(Vec<SymbolId>, bool)> = alts
             .iter()
             .filter(|&&m| self.st.get(m).kind == SymKind::Method)
@@ -343,23 +356,55 @@ impl Typer {
         // Int) = … }` called as `new C(a = 3)` has two alternatives that both
         // declare `a`, and the primary one came first, so `b` was reported
         // missing for a call that names the one-parameter constructor
-        // exactly. Positional arguments fill the leading slots (a named
-        // argument that moves an argument makes every later positional one an
-        // error, so the leading run is all there can be), a named one fills
-        // its own, and what is left must carry a default, be implicit, or be
-        // the repeated tail.
-        let leading = nargs.saturating_sub(named.len());
+        // exactly. What is left must carry a default, be implicit, or be the
+        // repeated tail.
+        //
+        // The arguments are placed as `named_arg_slots` places them: a
+        // positional argument takes its own position, and one after a named
+        // argument that moved is no argument of this alternative at all.
+        // `g(roles = 2, "s")` against `g(x: Int, roles: Int)` and
+        // `g(roles: Int, s: String)` is the second; taking the positional
+        // arguments for a leading run chose the first and reported
+        // "positional after named argument".
         let applicable = |ids: &[SymbolId], repeated_last: bool| -> bool {
             if ids.len() < nargs && !repeated_last {
                 return false;
             }
             let last = ids.len().saturating_sub(1);
+            let mut filled = vec![false; ids.len()];
+            let mut positional_ok = true;
+            for (i, name) in layout.iter().enumerate() {
+                let slot = match name {
+                    None => {
+                        if !positional_ok {
+                            return false;
+                        }
+                        if i < ids.len() {
+                            i
+                        } else if repeated_last && !ids.is_empty() {
+                            last
+                        } else {
+                            return false;
+                        }
+                    }
+                    Some(n) => {
+                        let Some(pos) = ids.iter().position(|p| self.st.get(*p).name == *n) else {
+                            return false;
+                        };
+                        if pos != i {
+                            positional_ok = false;
+                        }
+                        if filled[pos] {
+                            return false;
+                        }
+                        pos
+                    }
+                };
+                filled[slot] = true;
+            }
             ids.iter().enumerate().all(|(i, p)| {
-                if i < leading {
-                    return true;
-                }
                 let s = self.st.get(*p);
-                named.iter().any(|(n, _)| n.as_str() == s.name.as_str())
+                filled[i]
                     || s.flags.contains(Flags::DEFAULTPARAM)
                     || s.flags.contains(Flags::IMPLICIT)
                     || (repeated_last && i == last)
@@ -695,7 +740,7 @@ impl Typer {
             }
         };
         let (ids, repeated_last) = flat
-            .or_else(|| self.alt_for_named_args(&alts, &named, args.len()))
+            .or_else(|| self.alt_for_named_args(&alts, &named, args))
             .unwrap_or_else(|| (self.st.get(class_id).ctor_fields.clone(), false));
         if ids.is_empty() {
             Self::strip_named_args(args);
@@ -739,7 +784,7 @@ impl Typer {
                 alts = self.st.lookup(&name);
             }
             let named = self.probe_named_arg_types(args);
-            let found = self.alt_for_named_args(&alts, &named, args.len());
+            let found = self.alt_for_named_args(&alts, &named, args);
             // `alt_for_named_args` answers with its first candidate when none
             // covers the names, so that the call reports one honest "unknown
             // parameter name". A hand-written prelude alternative is that case
@@ -811,7 +856,7 @@ impl Typer {
             }
             if !alts.is_empty() {
                 let named = self.probe_named_arg_types(args);
-                if let Some(found) = self.alt_for_named_args(&alts, &named, args.len()) {
+                if let Some(found) = self.alt_for_named_args(&alts, &named, args) {
                     if self.ids_cover_named(&found.0, &named) {
                         return found;
                     }

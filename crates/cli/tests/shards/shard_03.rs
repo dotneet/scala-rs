@@ -72,6 +72,8 @@ mod implicit_derived_tag_undet;
 mod implicit_misc;
 #[path = "../implicit_structural.rs"]
 mod implicit_structural;
+#[path = "../implicit_view_scope.rs"]
+mod implicit_view_scope;
 #[path = "../implicitcast.rs"]
 mod implicitcast;
 #[path = "../implicitmemo.rs"]

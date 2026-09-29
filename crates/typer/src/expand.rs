@@ -75,11 +75,6 @@ const MAX_WIRE_DEPTH: usize = 512;
 const ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const ENGINE_TIMING_TIMEOUT: Duration = Duration::from_secs(2);
 const ENGINE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
-static RESIDENT_DIRECT_MACRO: AtomicBool = AtomicBool::new(false);
-
-pub fn enable_resident_direct_macro() {
-    RESIDENT_DIRECT_MACRO.store(true, AtomicOrdering::Release);
-}
 
 #[cfg(windows)]
 const ENGINE_WINDOWS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
@@ -118,8 +113,46 @@ pub(crate) struct MacroEngine {
     /// explicitly rejected startup hello must not make `Drop` target the
     /// already-reaped child's now-stale PID or process-group id again.
     terminated: bool,
+    /// How to stop the shared daemon this session runs in, if it does.
+    #[cfg(unix)]
+    daemon: Option<DaemonStop>,
     #[cfg(test)]
     termination_attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The endpoint and token a daemon session was opened with.
+///
+/// Closing a session cannot stop a macro that is looping inside the daemon:
+/// the JVM has no safe way to stop that thread, and it would hold the
+/// daemon's one session from every later compiler. So an engine that is
+/// poisoned -- timed out, or out of step with the protocol -- stops the
+/// whole daemon, and the next compiler starts a fresh one.
+#[cfg(unix)]
+#[derive(Clone)]
+struct DaemonStop {
+    tcp: std::net::SocketAddr,
+    unix: Option<String>,
+    token: String,
+}
+
+#[cfg(unix)]
+impl DaemonStop {
+    fn shutdown(&self) {
+        let mut request = String::from("(shutdown ");
+        quote_into(&mut request, &self.token);
+        request.push_str(")\n");
+        let sent = self
+            .unix
+            .as_ref()
+            .and_then(|path| UnixStream::connect(path).ok())
+            .map(|mut socket| socket.write_all(request.as_bytes()).is_ok())
+            .unwrap_or(false);
+        if !sent {
+            if let Ok(mut socket) = TcpStream::connect_timeout(&self.tcp, Duration::from_secs(1)) {
+                let _ = socket.write_all(request.as_bytes());
+            }
+        }
+    }
 }
 
 enum EngineInput {
@@ -301,6 +334,11 @@ impl MacroEngine {
         }
         #[cfg(unix)]
         if let EngineInput::Socket(socket) = &self.stdin {
+            if self.poisoned {
+                if let Some(daemon) = &self.daemon {
+                    daemon.shutdown();
+                }
+            }
             socket
                 .shutdown()
                 .map_err(|error| format!("cannot close macro daemon session: {error}"))?;
@@ -890,6 +928,7 @@ fn start_direct_daemon_engine(
 ) -> Result<MacroEngine, String> {
     check_startup_cancelled(cancelled)?;
     let mut connected = None;
+    let mut stop = None;
     for refresh in [false, true] {
         let path = direct_daemon_endpoint(dir, classpath, refresh)?;
         let endpoint = match std::fs::read_to_string(path) {
@@ -918,6 +957,11 @@ fn start_direct_daemon_engine(
             });
         match socket {
             Ok(socket) => {
+                stop = Some(DaemonStop {
+                    tcp: address,
+                    unix: unix.map(str::to_string),
+                    token: token.to_string(),
+                });
                 connected = Some((socket, token.to_string()));
                 break;
             }
@@ -987,6 +1031,8 @@ fn start_direct_daemon_engine(
         stderr_thread: None,
         poisoned: false,
         terminated: false,
+        #[cfg(unix)]
+        daemon: stop,
         #[cfg(test)]
         termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
@@ -1005,10 +1051,7 @@ fn start_prepared_engine(
         cp.push_str(&p.display().to_string());
     }
     #[cfg(unix)]
-    if direct_macro_daemon_requested(
-        RESIDENT_DIRECT_MACRO.load(AtomicOrdering::Acquire),
-        std::env::var_os("SCALA_RS_MACRO_DAEMON").as_deref(),
-    ) {
+    if direct_macro_daemon_requested(std::env::var_os("SCALA_RS_MACRO_DAEMON").as_deref()) {
         match start_direct_daemon_engine(dir, &cp, cancelled) {
             Ok(engine) => return Ok(engine),
             Err(error)
@@ -1091,6 +1134,8 @@ fn start_prepared_engine(
         stderr_thread: Some(stderr_thread),
         poisoned: false,
         terminated: false,
+        #[cfg(unix)]
+        daemon: None,
         #[cfg(test)]
         termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
@@ -1118,13 +1163,19 @@ fn start_prepared_engine(
     Ok(engine)
 }
 
+/// Whether an engine is a session of the shared macro daemon rather than a
+/// JVM of its own: yes unless `SCALA_RS_MACRO_DAEMON` says otherwise.
+///
+/// A build of many small modules paid a cold JVM for each of them -- its
+/// start-up and its first, interpreted, macro expansions. The daemon keeps one
+/// warm; it serves one compiler at a time (another gets an engine of its own),
+/// stops when a session is poisoned, and exits after three idle minutes.
 #[cfg(unix)]
-fn direct_macro_daemon_requested(resident: bool, setting: Option<&std::ffi::OsStr>) -> bool {
-    resident
-        && match setting {
-            None => true,
-            Some(value) => value == std::ffi::OsStr::new("1"),
-        }
+fn direct_macro_daemon_requested(setting: Option<&std::ffi::OsStr>) -> bool {
+    match setting {
+        None => true,
+        Some(value) => value == std::ffi::OsStr::new("1"),
+    }
 }
 
 /// Resolve both JVM tools from the same `JAVA_HOME` when one is supplied.
@@ -6508,14 +6559,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resident_compilation_uses_direct_macro_daemon_by_default() {
+    fn compilation_uses_direct_macro_daemon_by_default() {
         let enabled = std::ffi::OsStr::new("1");
         let disabled = std::ffi::OsStr::new("0");
-        assert!(direct_macro_daemon_requested(true, None));
-        assert!(direct_macro_daemon_requested(true, Some(enabled)));
-        assert!(!direct_macro_daemon_requested(true, Some(disabled)));
-        assert!(!direct_macro_daemon_requested(false, None));
-        assert!(!direct_macro_daemon_requested(false, Some(enabled)));
+        assert!(direct_macro_daemon_requested(None));
+        assert!(direct_macro_daemon_requested(Some(enabled)));
+        assert!(!direct_macro_daemon_requested(Some(disabled)));
     }
 
     /// The compiler settings go to the engine with its first request only;
@@ -6665,6 +6714,8 @@ mod tests {
             stderr_thread: Some(stderr_thread),
             poisoned: false,
             terminated: false,
+            #[cfg(unix)]
+            daemon: None,
             termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -6700,6 +6751,8 @@ mod tests {
             stderr_thread: None,
             poisoned: false,
             terminated: false,
+            #[cfg(unix)]
+            daemon: None,
             termination_attempts: Arc::clone(&attempts),
         };
         engine.send("(hello)").unwrap();
@@ -6749,6 +6802,8 @@ mod tests {
             stderr_thread: None,
             poisoned: false,
             terminated: false,
+            #[cfg(unix)]
+            daemon: None,
             termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         engine.send("(hello)").unwrap();

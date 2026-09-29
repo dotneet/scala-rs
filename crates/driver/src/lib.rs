@@ -28,10 +28,6 @@ pub fn enable_resident_archive_cache() {
     scala_rs_typer::enable_resident_signature_cache();
 }
 
-pub fn enable_resident_direct_macro() {
-    scala_rs_typer::enable_resident_direct_macro();
-}
-
 /// Options for [`compile_paths`].
 #[derive(Clone, Debug)]
 pub struct CompileOptions {
@@ -229,7 +225,15 @@ fn failed_result(diags: Vec<Diagnostic>, sources: Vec<SourceFile>) -> CompileRes
 /// other compilation units). Class files are written to `opts.out_dir` on
 /// success unless `parse_only` is set.
 pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult {
-    let mut result = compile_paths_unreported(files, opts);
+    let (java, scala): (Vec<PathBuf>, Vec<PathBuf>) = files
+        .iter()
+        .cloned()
+        .partition(|f| f.extension().is_some_and(|e| e == "java"));
+    let mut result = if java.is_empty() {
+        compile_paths_unreported(files, opts)
+    } else {
+        compile_with_java_sources(&java, &scala, opts)
+    };
     // nsc's reporting layer: phase order, summaries, `-Werror`.
     result.diags = finish_diagnostics(
         std::mem::take(&mut result.diags),
@@ -240,6 +244,83 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             fatal_warnings: opts.fatal_warnings,
         },
     );
+    result
+}
+
+/// A mixed compilation: the Scala sources are typed against the Java ones.
+///
+/// nsc reads a Java source for its declarations and leaves its class files to
+/// javac, which a build tool runs afterwards. This compiler has no Java
+/// parser, so javac compiles the Java sources first, into a directory that
+/// joins the classpath for this run only and is removed afterwards; their
+/// class files are not written to the output directory, as with scalac. That
+/// covers Java sources that stand on their own -- annotations, enums,
+/// interfaces -- and not ones that refer back to this run's Scala sources,
+/// which javac then reports.
+fn compile_with_java_sources(
+    java: &[PathBuf],
+    scala: &[PathBuf],
+    opts: &CompileOptions,
+) -> CompileResult {
+    let error = |message: String| CompileResult {
+        diags: vec![Diagnostic::error(0, Span::DUMMY, message)],
+        sources: Vec::new(),
+        emitted: Vec::new(),
+        mains: Vec::new(),
+    };
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "scala-rs-java-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return error(format!("cannot create {}: {e}", dir.display()));
+    }
+    let mut classpath = opts.class_path.clone();
+    if let Some(library) = &opts.scala_library {
+        classpath.push(library.clone());
+    }
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let joined = classpath
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(sep);
+    let javac = std::env::var_os("JAVA_HOME")
+        .map(|home| PathBuf::from(home).join("bin").join("javac"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("javac"));
+    let mut command = Command::new(&javac);
+    command.arg("-proc:none").arg("-nowarn").arg("-d").arg(&dir);
+    if !joined.is_empty() {
+        command.arg("-cp").arg(&joined);
+    }
+    let output = command.args(java).output();
+    let result = match output {
+        Err(e) => error(format!(
+            "cannot run {} for the Java sources: {e}",
+            javac.display()
+        )),
+        Ok(out) if !out.status.success() => error(format!(
+            "javac could not compile the Java sources (a Java source that refers \
+             to this compilation's Scala sources is not supported):\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )),
+        Ok(_) if scala.is_empty() => CompileResult {
+            diags: Vec::new(),
+            sources: Vec::new(),
+            emitted: Vec::new(),
+            mains: Vec::new(),
+        },
+        Ok(_) => {
+            let mut with_java = opts.clone();
+            with_java.class_path.insert(0, dir.clone());
+            compile_paths_unreported(scala, &with_java)
+        }
+    };
+    let _ = std::fs::remove_dir_all(&dir);
     result
 }
 

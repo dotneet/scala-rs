@@ -68,8 +68,10 @@ archive indexes only while their file identity, size, modification time, and
 change time remain unchanged. Both compilers then exclude process startup
 from the measured repetitions. This is a third comparison mode, not a
 replacement for the fresh-process or macro-daemon-only measurements.
-On Unix, batch compilation reuses a local macro daemon by default when one
-can start. Set `SCALA_RS_MACRO_DAEMON=0` to disable it; if it cannot start,
+On Unix, every compilation (batch or a single `compile`) reuses a local
+macro daemon by default when one can start. A daemon serves one compiler at a
+time; another one that finds it busy starts an engine of its own. Set
+`SCALA_RS_MACRO_DAEMON=0` to disable it; if it cannot start,
 compilation falls back to the ordinary macro engine.
 On JDK 17 and later, the native batch process connects to the macro daemon
 through a private Unix-domain socket. Set `SCALA_RS_MACRO_FORCE_TCP=1` for a

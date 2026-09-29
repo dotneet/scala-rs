@@ -284,9 +284,12 @@ fn remember_archive(path: &Path, stamp: ArchiveStamp, index: ZipIndex, bytes: us
 enum PathKind {
     Dir,
     Zip,
-    /// Neither at startup: re-checked on use, so an output directory created
-    /// during the run is still found.
-    Unknown,
+    /// Neither at startup, and so nothing for this run: a build tool's path
+    /// names the output directories of modules not built yet, and probing
+    /// each of those again for every new class name was up to a twentieth of
+    /// a module's compile. Nothing on the path is written during a run (see
+    /// [`BinaryIndex::class_cache`]).
+    Absent,
 }
 
 pub struct BinaryIndex {
@@ -309,11 +312,8 @@ pub struct BinaryIndex {
     /// Package probes are frequent during implicit search. Directory entries
     /// need filesystem checks, so remember stable answers just like classes.
     package_cache: HashMap<String, bool>,
-    /// The archives' share of [`Self::has_package_prefix`], which is always
-    /// kept: an archive does not change during a run. The whole answer is
-    /// kept only once no path is unclassified, and gitbucket's classpath has
-    /// a Java output directory that does not exist yet -- every miss then
-    /// searched every jar again, a quarter of its type checking.
+    /// The archives' share of [`Self::has_package_prefix`]: an archive does
+    /// not change during a run.
     archive_package_cache: HashMap<String, bool>,
     /// The entry each class found so far was read from, for
     /// [`Self::from_scala_distribution`].
@@ -366,7 +366,19 @@ struct DirPackage {
 
 impl Entry {
     /// What the last component of `rel` is, when every component exists under
-    /// exactly that spelling (see [`path_case_matches`]).
+    /// exactly that spelling.
+    ///
+    /// A JVM name is case-sensitive; a file system need not be. macOS's
+    /// default APFS volume is not, so `<classpath>/scala/Math` answered
+    /// `is_dir()` for the real directory `scala/math` and
+    /// `<classpath>/scala/Runtime` for `scala/runtime`.
+    /// `complete_binary_member` takes a directory under a package as proof
+    /// that a *package* of that name exists, so compiling the standard library
+    /// invented `package scala.Math` and `package scala.Runtime`, entered them
+    /// in scope ahead of the implicit `import java.lang._`, and every
+    /// `Math.min` / `Runtime.getRuntime` in the sources selected on a package.
+    /// The same hazard reaches class files (`p/foo.class` answering for
+    /// `p/Foo`), so both lookups go through the listings.
     fn directory_case_kind(&mut self, rel: &str) -> Option<ChildKind> {
         let mut at = self.path.clone();
         let mut prefix = String::new();
@@ -463,7 +475,7 @@ impl BinaryIndex {
                 } else if is_zip_like(&p) {
                     PathKind::Zip
                 } else {
-                    PathKind::Unknown
+                    PathKind::Absent
                 };
                 let scala_distribution = is_zip_like(&p)
                     && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
@@ -588,29 +600,18 @@ impl BinaryIndex {
                         }
                     }
                 }
-                // `Unknown` too: a path that was neither a directory nor an
-                // archive at startup may have become a directory since.
-                PathKind::Dir | PathKind::Unknown => {
-                    if matches!(self.paths[i].kind, PathKind::Dir) {
-                        let file = rel.rsplit('/').next().expect("class file name");
-                        if !self.paths[i].has_directory_class(package, file) {
-                            continue;
-                        }
-                        let f = self.paths[i].path.join(&rel);
-                        self.class_origin.insert(internal.to_string(), i);
-                        return std::fs::read(&f)
-                            .map(Some)
-                            .map_err(|e| format!("cannot read {}: {e}", f.display()));
+                PathKind::Dir => {
+                    let file = rel.rsplit('/').next().expect("class file name");
+                    if !self.paths[i].has_directory_class(package, file) {
+                        continue;
                     }
-                    let root = self.paths[i].path.clone();
-                    let f = root.join(&rel);
-                    if f.is_file() && path_case_matches(&root, &rel) {
-                        self.class_origin.insert(internal.to_string(), i);
-                        return std::fs::read(&f)
-                            .map(Some)
-                            .map_err(|e| format!("cannot read {}: {e}", f.display()));
-                    }
+                    let f = self.paths[i].path.join(&rel);
+                    self.class_origin.insert(internal.to_string(), i);
+                    return std::fs::read(&f)
+                        .map(Some)
+                        .map_err(|e| format!("cannot read {}: {e}", f.display()));
                 }
+                PathKind::Absent => {}
             }
         }
         if limit == self.paths.len() {
@@ -634,14 +635,14 @@ impl BinaryIndex {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, entry)| {
-                    // Directory contents retain their existing lookup rules. Unknown
-                    // paths must remain in the plan: a later lookup may find a directory.
+                    // Directory contents retain their existing lookup rules.
                     let possible = match entry.kind {
                         PathKind::Zip => {
                             let zip = entry.zip.as_ref().expect("archives opened");
                             zip.has_prefix(&prefix) || zip.has_prefix(&alt)
                         }
-                        PathKind::Dir | PathKind::Unknown => true,
+                        PathKind::Dir => true,
+                        PathKind::Absent => false,
                     };
                     possible.then_some(i)
                 })
@@ -660,16 +661,7 @@ impl BinaryIndex {
             return found;
         }
         let found = self.has_package_prefix_uncached(prefix);
-        // A path that did not exist at startup may become a directory later.
-        // Cache a miss only when every classpath entry was already classified.
-        if found
-            || self
-                .paths
-                .iter()
-                .all(|entry| !matches!(entry.kind, PathKind::Unknown))
-        {
-            self.package_cache.insert(prefix.to_string(), found);
-        }
+        self.package_cache.insert(prefix.to_string(), found);
         found
     }
 
@@ -715,51 +707,11 @@ impl BinaryIndex {
                         return true;
                     }
                 }
-                PathKind::Unknown => {
-                    if self.paths[i].path.join(dir_rel).is_dir()
-                        && path_case_matches(&self.paths[i].path, dir_rel)
-                    {
-                        return true;
-                    }
-                }
+                PathKind::Absent => {}
             }
         }
         false
     }
-}
-
-/// Does `root/rel` exist under *exactly* the spelling `rel` gives it?
-///
-/// A JVM name is case-sensitive; a file system need not be. macOS's default
-/// APFS volume is not, so `<classpath>/scala/Math` answered `is_dir()` for the
-/// real directory `scala/math` and `<classpath>/scala/Runtime` for
-/// `scala/runtime`. `complete_binary_member` takes a directory under a package
-/// as proof that a *package* of that name exists, so compiling the standard
-/// library invented `package scala.Math` and `package scala.Runtime`, entered
-/// them in scope ahead of the implicit `import java.lang._`, and every
-/// `Math.min` / `Runtime.getRuntime` in the sources selected on a package:
-/// "value min is not a member of <notype>", with nothing said about `Math`.
-/// The same hazard reaches class files (`p/foo.class` answering for `p/Foo`),
-/// so both lookups verify the case.
-///
-/// Only ever called once the cheap `is_dir()` / `is_file()` has said yes, and
-/// `find_class` memoises its answer, so the directory reads are bounded by the
-/// number of distinct names actually found on a directory classpath entry.
-fn path_case_matches(root: &Path, rel: &str) -> bool {
-    let mut at = root.to_path_buf();
-    for comp in rel.split('/') {
-        if comp.is_empty() {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&at) else {
-            return false;
-        };
-        if !entries.flatten().any(|e| e.file_name() == comp) {
-            return false;
-        }
-        at.push(comp);
-    }
-    true
 }
 
 /// Parse `e`'s archive if it has not been parsed yet, and hand `e` back.
@@ -1311,9 +1263,8 @@ mod tests {
         assert!(!dirs.contains(""));
     }
 
-    /// A directory on the class path that does not exist yet keeps package
-    /// misses from being remembered whole, but the archives' part of the
-    /// answer is: asking twice searches them once.
+    /// A directory on the class path that does not exist does not stop package
+    /// misses from being remembered: asking twice searches the archives once.
     #[test]
     fn a_missing_directory_does_not_make_archives_searched_again() {
         let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
@@ -1538,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn package_path_plans_preserve_lazy_archive_errors_and_late_directories() {
+    fn package_path_plans_preserve_lazy_archive_errors_and_skip_absent_directories() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1566,13 +1517,14 @@ mod tests {
         assert_eq!(index.find_class("p/FirstMissing").unwrap(), None);
         assert!(index.archives_ready);
         assert_eq!(index.find_class("p/SecondMissing").unwrap(), None);
-        assert_eq!(&**index.package_paths.get("p").unwrap(), &[0, 1]);
+        // A path absent at startup is not in any plan: it is nothing for the
+        // run, even once it has been created.
+        assert_eq!(&**index.package_paths.get("p").unwrap(), &[1]);
         std::fs::create_dir_all(late.join("p")).unwrap();
         std::fs::write(late.join("p/Found.class"), b"directory").unwrap();
-        assert_eq!(
-            index.find_class("p/Found").unwrap(),
-            Some(b"directory".to_vec())
-        );
+        std::fs::write(late.join("p/Late.class"), b"directory").unwrap();
+        assert_eq!(index.find_class("p/Found").unwrap(), Some(b"jar".to_vec()));
+        assert_eq!(index.find_class("p/Late").unwrap(), None);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1608,18 +1560,24 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A classpath directory that does not exist at startup is never probed:
+    /// neither a package nor a class in it is found, and asking costs no
+    /// file-system call, even after the directory has been created.
     #[test]
-    fn package_probe_rechecks_path_created_after_indexing() {
+    fn a_path_absent_at_startup_is_not_probed() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!("scala-rs-package-probe-{unique}"));
         let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+        index.paths.truncate(1);
         assert!(!index.has_package_prefix("late_package/"));
         std::fs::create_dir_all(root.join("late_package")).unwrap();
-        assert!(index.has_package_prefix("late_package/"));
-        assert!(index.has_package_prefix("late_package/"));
+        std::fs::write(root.join("late_package/C.class"), b"c").unwrap();
+        assert!(!index.has_package_prefix("late_package/"));
+        assert_eq!(index.find_class("late_package/C").unwrap(), None);
+        assert!(index.paths[0].dir_packages.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 

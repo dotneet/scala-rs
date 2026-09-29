@@ -4055,6 +4055,14 @@ impl SymbolTable {
     /// everywhere before projections existed, and `is_sub_type` relates it to
     /// a projection in both directions, so no question gets a worse answer
     /// than it had.
+    ///
+    /// Unless that projection already exists: an alias applied at a type
+    /// parameter, `Identified[T]` for `type Identified[+X <: Identify] =
+    /// IdentifiedEntity[X#ID, X]`, sits beside `T#ID` itself in the same
+    /// signature (`def identify(id: T#ID): Identified[T]`), which made the
+    /// projection through `T` when it was read. Reusing it keeps the result
+    /// reducible once `T` is known, where the declaration left
+    /// `IdentifiedEntity[Identify.ID, Foo]` for a `Foo` whose `ID` is `FooId`.
     pub fn subst_projections(&self, tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
         if !self.mentions_abs_projection(ty) {
             return ty.clone();
@@ -4072,7 +4080,17 @@ impl SymbolTable {
             let Some(arg) = args.get(i) else {
                 return t.clone();
             };
-            self.reduce_projection(arg, decl)
+            if let Some(reduced) = self.reduce_projection(arg, decl) {
+                return reduced;
+            }
+            let prefix = match arg {
+                Type::TypeParam(p) => Some(*p),
+                Type::TypeMember(p) if self.is_deferred_type_member(*p) => Some(*p),
+                _ => None,
+            };
+            prefix
+                .and_then(|p| self.abs_projections.get(&(p, decl)))
+                .map(|id| Type::TypeMember(*id))
                 .unwrap_or(Type::TypeMember(decl))
         })
     }
