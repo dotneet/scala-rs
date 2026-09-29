@@ -1649,6 +1649,39 @@ impl Typer {
         Some(seen)
     }
 
+    /// [`Self::nominal_ancestors`], kept while the class graph stands still.
+    ///
+    /// A member defined along a chain of 150 traits has 150 owners, and every
+    /// wildcard import of an object mixing them in asked for each owner's
+    /// ancestors again, once per imported name: the sets were the largest
+    /// allocation cost of importing `cats.implicits._`.
+    fn nominal_ancestors_cached(
+        &self,
+        cls: SymbolId,
+    ) -> Option<std::rc::Rc<rustc_hash::FxHashSet<SymbolId>>> {
+        /// Past this many classes the cache is emptied.
+        const MAX_CLASSES: usize = 20_000;
+        let gen = self.st.graph_gen.get();
+        {
+            let cache = self.nominal_ancestors_cache.borrow();
+            if cache.0 == gen {
+                if let Some(hit) = cache.1.get(&cls) {
+                    return hit.clone();
+                }
+            }
+        }
+        let computed = self.nominal_ancestors(cls).map(std::rc::Rc::new);
+        if self.st.graph_gen.get() == gen {
+            let mut cache = self.nominal_ancestors_cache.borrow_mut();
+            if cache.0 != gen || cache.1.len() >= MAX_CLASSES {
+                cache.0 = gen;
+                cache.1.clear();
+            }
+            cache.1.insert(cls, computed.clone());
+        }
+        computed
+    }
+
     fn drop_overridden_uncached(&self, recv: SymbolId, found: Vec<SymbolId>) -> Vec<SymbolId> {
         let found = self.collapse_pickled_copies(found);
         let found = self.drop_classfile_forwarders(found);
@@ -1658,13 +1691,6 @@ impl Typer {
         // builder's `append` has some thirty alternatives from three owners.
         let below: std::cell::RefCell<rustc_hash::FxHashMap<(SymbolId, SymbolId), bool>> =
             Default::default();
-        // Each owner's ancestors, walked once for the whole set: a member
-        // defined along a chain of 150 traits has 150 owners, and asking each
-        // pair separately walked the chain again for every pair whenever the
-        // class graph had moved since the last selection.
-        let ancestors: std::cell::RefCell<
-            rustc_hash::FxHashMap<SymbolId, Option<rustc_hash::FxHashSet<SymbolId>>>,
-        > = Default::default();
         let owner_below = |child: SymbolId, parent: SymbolId| -> bool {
             if let Some(&known) = below.borrow().get(&(child, parent)) {
                 return known;
@@ -1679,11 +1705,7 @@ impl Typer {
                 _ => None,
             };
             let reached = nominal.and_then(|_| {
-                ancestors
-                    .borrow_mut()
-                    .entry(child)
-                    .or_insert_with(|| self.nominal_ancestors(child))
-                    .as_ref()
+                self.nominal_ancestors_cached(child)
                     .map(|set| set.contains(&parent))
             });
             let answer = match (reached, nominal) {

@@ -1894,12 +1894,12 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     let orig_class = ctx.class_name.to_string();
     let lam_name2 = lam_name.clone();
     let outer_desc = format!("L{orig_class};");
-    let vparams = vparams.clone();
-    let body = body.clone();
-    let local_caps = local_caps.clone();
-    let vparams_pf = vparams.clone();
-    let body_pf = body.clone();
-    let local_caps_pf = local_caps.clone();
+    // The method bodies below are generated as `add_code` runs them, so they
+    // read the function's own trees. Copying them here copied every lambda
+    // nested inside once per enclosing lambda.
+    let vparams_pf = vparams;
+    let body_pf = body;
+    let local_caps_pf = &local_caps;
     let ret_ty = if is_pf {
         body.ty.clone()
     } else if sam.is_some() {

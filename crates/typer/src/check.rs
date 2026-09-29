@@ -618,6 +618,13 @@ pub struct Typer {
     /// The files whose text the engine already holds (`fill_source_text` in
     /// `expand.rs`). There is one engine per typer.
     pub(crate) macro_sources_sent: rustc_hash::FxHashSet<usize>,
+    /// The `(settings ...)` field of an expansion request, written once, and
+    /// whether the engine has been sent it (`elide_sent_settings`).
+    pub(crate) macro_settings_wire: Option<String>,
+    pub(crate) macro_settings_sent: bool,
+    /// Per file, the last (byte, UTF-16) position a macro request computed,
+    /// so the next one counts only the text after it (`utf16_offset`).
+    pub(crate) macro_position_marks: rustc_hash::FxHashMap<usize, (usize, usize)>,
     /// The previous successful top-level macro prefix, for a compact reference
     /// when the next call contains the same typed subtree.
     pub(crate) macro_cached_prefix: Option<(u64, String)>,
@@ -727,6 +734,9 @@ pub struct Typer {
     /// during a run, and every `sb.append(…)` on a Java builder sorted its
     /// thirty alternatives pairwise again.
     pub(crate) overridden_cache: std::cell::RefCell<GenMap<Alternatives, Vec<SymbolId>>>,
+    /// [`Typer::nominal_ancestors_cached`]: each class's nominal ancestors.
+    pub(crate) nominal_ancestors_cache:
+        std::cell::RefCell<GenMap<SymbolId, Option<std::rc::Rc<rustc_hash::FxHashSet<SymbolId>>>>>,
     /// The requests [`Typer::warm_implicit_derivation_scopes`] has completed:
     /// the wanted type with its candidates, while the class graph
     /// (`graph_gen`) stands still. Warming is idempotent, so the same request
@@ -1401,6 +1411,9 @@ impl Typer {
             macro_engine: None,
             macro_engine_pending: None,
             macro_sources_sent: Default::default(),
+            macro_settings_wire: None,
+            macro_settings_sent: false,
+            macro_position_marks: Default::default(),
             macro_cached_prefix: None,
             macro_next_prefix_id: 0,
             open_implicit_handles: Default::default(),
@@ -1465,6 +1478,7 @@ impl Typer {
             shadowing_decls_cache: Default::default(),
             scope_search_cache: Default::default(),
             overridden_cache: Default::default(),
+            nominal_ancestors_cache: Default::default(),
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
             undet_tvars: Vec::new(),

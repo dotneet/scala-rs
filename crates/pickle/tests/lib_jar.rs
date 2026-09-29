@@ -515,3 +515,50 @@ fn protected_this_methods_are_inheritable_but_not_public_api() {
         assert!(!member.is_protected_this_method(), "flags={flags:#x}");
     }
 }
+
+/// A pickle holds every class nested in its top-level one, and is decoded
+/// once however many of them are asked for: `scala.Enumeration`'s file answers
+/// for `Enumeration`, `Enumeration.Value` and `Enumeration.Val`, with the same
+/// signatures a loader asked for only one of them returns.
+#[test]
+fn nested_classes_share_one_decoded_pickle() {
+    let jar = jar_path();
+    if !jar.is_file() {
+        eprintln!("skipping: {} not found", jar.display());
+        return;
+    }
+    type Reads = std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, usize>>>;
+    struct Counting {
+        jar: JarSource,
+        reads: Reads,
+    }
+    impl ClassSource for Counting {
+        fn class_bytes(&mut self, internal_name: &str) -> Option<Vec<u8>> {
+            *self
+                .reads
+                .borrow_mut()
+                .entry(internal_name.to_string())
+                .or_default() += 1;
+            self.jar.class_bytes(internal_name)
+        }
+    }
+    let reads = Reads::default();
+    let names = [
+        "scala.Enumeration",
+        "scala.Enumeration.Value",
+        "scala.Enumeration.Val",
+    ];
+    let mut loader = SigLoader::new(Counting {
+        jar: JarSource::open(&jar),
+        reads: reads.clone(),
+    });
+    for name in names {
+        let shared = loader.class_sig(name, false).expect(name);
+        let alone = SigLoader::new(JarSource::open(&jar))
+            .class_sig(name, false)
+            .expect(name);
+        assert_eq!(shared.full_name, name);
+        assert_eq!(format!("{shared:?}"), format!("{alone:?}"), "{name}");
+    }
+    assert_eq!(reads.borrow().get("scala/Enumeration"), Some(&1));
+}

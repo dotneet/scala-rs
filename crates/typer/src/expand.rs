@@ -663,6 +663,29 @@ fn wire_line_payload(line: &str) -> &str {
 }
 
 impl Typer {
+    /// Replace the trailing `(settings ...)` field by `(settingsSame)` once
+    /// this engine has been sent it.
+    ///
+    /// The settings hold the whole `-classpath`, which for a module with
+    /// hundreds of dependency jars was about 40 KB on every `(expand ...)`:
+    /// most of the bytes the bridge wrote and the engine scanned. They cannot
+    /// change during a run, so the engine keeps the last ones it was given.
+    fn elide_sent_settings(&mut self, mut request: String) -> String {
+        if !self.macro_settings_sent {
+            self.macro_settings_sent = true;
+            return request;
+        }
+        let Some(wire) = self.macro_settings_wire.as_deref() else {
+            return request;
+        };
+        if request.ends_with(wire) || request.strip_suffix(')').is_some_and(|r| r.ends_with(wire)) {
+            let keep = request.len() - 1 - wire.len();
+            request.truncate(keep);
+            request.push_str(" (settingsSame))");
+        }
+        request
+    }
+
     /// Insert the file's text at `slot` in `(position src <file> <text>?
     /// <path> <point>)` the first time this engine sees the file, and nothing
     /// after that.
@@ -1793,6 +1816,13 @@ fn jar_kind(p: &Path) -> Option<&'static str> {
 /// scalac user never lists either jar, and a derivation that needed them
 /// failed here with nothing but "could not find implicit value of type
 /// Enc[R0]".
+///
+/// That parent is also asked *first*, so the Scala distribution's jars lead
+/// the engine's path here. It changes no class a lookup finds, since nothing
+/// else on a path defines `scala.*`, but the JVM searches a path in order:
+/// with scala-reflect a few hundred jars and directories down a build tool's
+/// path, loading each of its classes probed every entry ahead of it, a fifth
+/// of a second of every engine's start-up.
 pub(crate) fn macro_engine_classpath(binary: &[PathBuf], runtime: &[PathBuf]) -> Vec<PathBuf> {
     let mut cp = binary.to_vec();
     for jar in runtime {
@@ -1801,7 +1831,19 @@ pub(crate) fn macro_engine_classpath(binary: &[PathBuf], runtime: &[PathBuf]) ->
             cp.push(jar.clone());
         }
     }
-    cp
+    let (mut distribution, rest): (Vec<PathBuf>, Vec<PathBuf>) =
+        cp.into_iter().partition(|p| is_scala_distribution_jar(p));
+    distribution.extend(rest);
+    distribution
+}
+
+/// A scala-library, scala-reflect or scala-compiler jar.
+fn is_scala_distribution_jar(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e == "jar")
+        && (jar_kind(p).is_some()
+            || p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("scala-library")))
 }
 
 /// Where the compiled engine is cached, keyed by the source it was built from
@@ -2063,7 +2105,10 @@ impl Typer {
                 self.macro_timing.engine_start += started.elapsed();
             }
             match engine {
-                Ok(e) => self.macro_engine = Some(e),
+                Ok(e) => {
+                    self.macro_engine = Some(e);
+                    self.macro_settings_sent = false;
+                }
                 Err(why) => {
                     self.macro_engine_error = Some(why.clone());
                     return Err(why);
@@ -2074,6 +2119,7 @@ impl Typer {
         let saved_span = self.macro_rpc_span;
         self.macro_rpc_span = tree.span;
         let request = self.fill_source_text(request, text_slot);
+        let request = self.elide_sent_settings(request);
         let saved_answers = std::mem::take(&mut self.macro_answer_splices);
         let saved_answer_base = std::mem::replace(&mut self.macro_answer_base, splices.len());
         let reply =
@@ -2524,7 +2570,7 @@ impl Typer {
                             self.macro_next_prefix_id += 1;
                             let mut compact = built.clone();
                             if let Some((previous_id, previous)) = &self.macro_cached_prefix {
-                                if let Some(at) = compact.find(previous) {
+                                if let Some(at) = find_large(&compact, previous) {
                                     compact.replace_range(
                                         at..at + previous.len(),
                                         &format!("(cachedPrefixRef {previous_id})"),
@@ -2570,11 +2616,13 @@ impl Typer {
                     byte = start + offset;
                 }
             }
-            let point = source
-                .get(..byte)
-                .ok_or("macro position splits a UTF-8 character")?
-                .encode_utf16()
-                .count();
+            let point = utf16_offset(
+                &mut self.macro_position_marks,
+                self.file_index,
+                source,
+                byte,
+            )
+            .ok_or("macro position splits a UTF-8 character")?;
             // The text itself goes to the engine once per file; see
             // [`SOURCE_TEXT_SLOT`].
             out.push_str(&format!("src {} ", self.file_index));
@@ -2628,12 +2676,17 @@ impl Typer {
             out.push_str(&application_type);
         }
         out.push(')');
-        out.push_str(" (settings");
-        for setting in &self.compiler_settings {
-            out.push(' ');
-            quote_into(&mut out, setting);
+        if self.macro_settings_wire.is_none() {
+            let mut wire = String::from(" (settings");
+            for setting in &self.compiler_settings {
+                wire.push(' ');
+                quote_into(&mut wire, setting);
+            }
+            wire.push(')');
+            self.macro_settings_wire = Some(wire);
         }
-        out.push_str("))");
+        out.push_str(self.macro_settings_wire.as_deref().unwrap_or_default());
+        out.push(')');
         Ok((out, splices, text_slot, cached_prefix))
     }
 
@@ -6307,26 +6360,151 @@ impl std::fmt::Display for Sexp {
     }
 }
 
+/// The UTF-16 offset of byte `at` in file `file`'s `text`, counting from the
+/// last offset asked for in that file when it lies before `at`.
+///
+/// A macro engine gets a UTF-16 point for every expansion, and encoding the
+/// whole file prefix each time made a file with thousands of expansions
+/// quadratic. Expansions mostly proceed down the file, so the previous
+/// answer is the starting point. `None` when `at` splits a character.
+fn utf16_offset(
+    marks: &mut rustc_hash::FxHashMap<usize, (usize, usize)>,
+    file: usize,
+    text: &str,
+    at: usize,
+) -> Option<usize> {
+    let (from, units) = match marks.get(&file) {
+        Some(&(byte, units)) if byte <= at => (byte, units),
+        _ => (0, 0),
+    };
+    let delta = text.get(from..at)?;
+    let units = units
+        + if delta.is_ascii() {
+            delta.len()
+        } else {
+            delta.encode_utf16().count()
+        };
+    marks.insert(file, (at, units));
+    Some(units)
+}
+
+/// `haystack.find(needle)` for a needle of tens of kilobytes.
+///
+/// `str::find` prepares the whole needle before it looks at the haystack, and
+/// a macro prefix is searched for in the next one on every expansion. A short
+/// leading slice locates the candidates and each is then checked in full, so
+/// the answer is the same first match.
+fn find_large(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let mut keyed = needle.len().min(48);
+    while !needle.is_char_boundary(keyed) {
+        keyed -= 1;
+    }
+    if keyed == 0 {
+        return Some(0);
+    }
+    let key = &needle[..keyed];
+    let step = key.chars().next().map_or(1, char::len_utf8);
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(key) {
+        let at = from + offset;
+        if haystack[at..].starts_with(needle) {
+            return Some(at);
+        }
+        from = at + step;
+    }
+    None
+}
+
 pub(crate) fn quote_into(out: &mut String, s: &str) {
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' | '\\' => {
-                out.push('\\');
-                out.push(c);
-            }
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(c),
-        }
+    // The escaped characters are all ASCII, and no byte of a multi-byte
+    // UTF-8 sequence is, so the text between two of them can be copied whole.
+    let mut copied = 0;
+    for (at, &byte) in s.as_bytes().iter().enumerate() {
+        let escaped = match byte {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\t' => "\\t",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        out.push_str(&s[copied..at]);
+        out.push_str(escaped);
+        copied = at + 1;
     }
+    out.push_str(&s[copied..]);
     out.push('"');
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keyed search answers exactly what `str::find` does, including for
+    /// needles shorter than the key, multi-byte text, and a key that occurs
+    /// where the whole needle does not.
+    #[test]
+    fn find_large_matches_str_find() {
+        let long = "(t \"Select\" (s0) é";
+        let needle = format!("{long}{}", "x".repeat(200));
+        let cases = [
+            (format!("aa{needle}bb"), needle.clone()),
+            (format!("{long}y {needle}"), needle.clone()),
+            (format!("{long}{}", "x".repeat(100)), needle.clone()),
+            ("short".to_string(), needle.clone()),
+            ("héllo wörld".to_string(), "wörld".to_string()),
+            ("héllo".to_string(), "".to_string()),
+            ("".to_string(), "".to_string()),
+            ("ééé".to_string(), "éé".to_string()),
+        ];
+        for (haystack, needle) in cases {
+            assert_eq!(
+                find_large(&haystack, &needle),
+                haystack.find(&needle),
+                "{haystack:?} / {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_offsets_resume_from_the_previous_answer() {
+        let text = "aé😀b\nc";
+        let expected = |at: usize| text[..at].encode_utf16().count();
+        let boundaries: Vec<usize> = (0..=text.len())
+            .filter(|&i| text.is_char_boundary(i))
+            .collect();
+        let mut marks = Default::default();
+        // Forward, backward, repeated and interleaved with another file.
+        let order = [
+            boundaries.clone(),
+            boundaries.iter().rev().copied().collect(),
+            vec![3, 3, 0, 8],
+        ];
+        for at in order.into_iter().flatten() {
+            assert_eq!(utf16_offset(&mut marks, 0, text, at), Some(expected(at)));
+            assert_eq!(
+                utf16_offset(&mut marks, 1, "xyz", at.min(3)),
+                Some(at.min(3))
+            );
+        }
+        // Inside the four-byte character.
+        assert_eq!(utf16_offset(&mut marks, 0, text, 4), None);
+        assert_eq!(utf16_offset(&mut marks, 0, text, 0), Some(0));
+    }
+
+    #[test]
+    fn quote_into_escapes_only_the_wire_specials() {
+        let mut out = String::new();
+        quote_into(&mut out, "a\"b\\c\nd\te\rf é\u{1F600}");
+        assert_eq!(out, "\"a\\\"b\\\\c\\nd\\te\\rf é\u{1F600}\"");
+        let mut empty = String::new();
+        quote_into(&mut empty, "");
+        assert_eq!(empty, "\"\"");
+    }
 
     #[cfg(unix)]
     #[test]
@@ -6338,6 +6516,21 @@ mod tests {
         assert!(!direct_macro_daemon_requested(true, Some(disabled)));
         assert!(!direct_macro_daemon_requested(false, None));
         assert!(!direct_macro_daemon_requested(false, Some(enabled)));
+    }
+
+    /// The compiler settings go to the engine with its first request only;
+    /// later requests say the engine already has them.
+    #[test]
+    fn settings_are_sent_once_per_engine() {
+        let mut typer = Typer::new(0, &crate::TypecheckOptions::default());
+        let wire = " (settings \"-classpath\" \"a:b\")";
+        typer.macro_settings_wire = Some(wire.to_string());
+        let request = format!("(expand \"C\" \"m\"{wire})");
+        assert_eq!(typer.elide_sent_settings(request.clone()), request);
+        assert_eq!(
+            typer.elide_sent_settings(request),
+            "(expand \"C\" \"m\" (settingsSame))"
+        );
     }
 
     /// A file's text goes to the engine with the first request from that
@@ -7065,17 +7258,49 @@ mod macro_runtime_tests {
             PathBuf::from("/dist/lib/scala-compiler.jar"),
         ];
         // The run's own scala-reflect stays the one; the compiler is added.
+        // The distribution's jars lead, in the order they were found.
         assert_eq!(
             macro_engine_classpath(&user, &runtime),
             vec![
-                user[0].clone(),
                 user[1].clone(),
                 PathBuf::from("/dist/lib/scala-compiler.jar"),
+                user[0].clone(),
             ]
         );
         assert_eq!(
-            macro_engine_classpath(&user[..1], &runtime)[1..],
+            macro_engine_classpath(&user[..1], &runtime)[..2],
             runtime[..]
         );
+    }
+
+    /// The Scala distribution's jars move to the front of the engine's path;
+    /// everything else keeps its order, a directory named like a jar included.
+    #[test]
+    fn engine_classpath_puts_the_scala_distribution_first() {
+        let user: Vec<PathBuf> = [
+            "/out/classes",
+            "/cp/circe-core_2.13-0.14.jar",
+            "/missing/classes",
+            "/cp/scala-library-2.13.16.jar",
+            "/cp/scala-library-sources",
+            "/cp/airframe_2.13-24.jar",
+            "/cp/scala-reflect-2.13.16.jar",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let expected: Vec<PathBuf> = [
+            "/cp/scala-library-2.13.16.jar",
+            "/cp/scala-reflect-2.13.16.jar",
+            "/out/classes",
+            "/cp/circe-core_2.13-0.14.jar",
+            "/missing/classes",
+            "/cp/scala-library-sources",
+            "/cp/airframe_2.13-24.jar",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(macro_engine_classpath(&user, &[]), expected);
     }
 }

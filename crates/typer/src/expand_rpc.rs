@@ -1193,27 +1193,32 @@ impl Typer {
     /// structural types use their corresponding reflection representations.
     /// Unsupported shapes are refused rather than widened to another type.
     /// [`Self::type_to_wire_uncached`], kept for a type made only of
-    /// classes, tuples, functions, arrays and constants.
+    /// classes, tuples, functions, arrays, constants and refinements of them.
     ///
     /// `c.openImplicits` is asked at every level of a shapeless derivation,
     /// and its answer spells the type every open implicit wants -- a long
     /// `Show[Int :: String :: ... :: HNil]` for each, rewritten every time.
     /// Such a type's wire reads nothing but class names and kinds: no type
-    /// parameter in scope, no alias, no refinement tag, no path. It is kept
-    /// while no class-like symbol changes ([`SymbolTable::graph_gen`]), since
-    /// a class read from its file can be renamed.
+    /// parameter in scope, no alias, no path. It is kept while no class-like
+    /// symbol changes ([`SymbolTable::graph_gen`]), since a class read from
+    /// its file can be renamed.
+    ///
+    /// A refinement's wire also names its tag ([`Self::refined_label`]),
+    /// which is the same for equal refinements for the whole run. A labelled
+    /// generic's representation is a refinement at every field
+    /// (`FieldType[K, V] :: ...`), and spelling it again at every level of
+    /// its derivation compared each field with every tag known so far.
     pub(crate) fn type_to_wire(&mut self, ty: &Type) -> Result<String, String> {
         use scala_rs_parser::TypeFlags as F;
         let context_free = !ty.flags().contains(
             F::TYPE_PARAM
                 | F::TYPE_MEMBER
-                | F::REFINED
                 | F::SINGLETON
                 | F::NAMED
                 | F::WILDCARD
                 | F::APPLIED
                 | F::ERROR,
-        ) && !matches!(ty, Type::Refined { .. } | Type::Annotated { .. });
+        ) && !matches!(ty, Type::Annotated { .. });
         if !context_free {
             return self.type_to_wire_uncached(ty);
         }

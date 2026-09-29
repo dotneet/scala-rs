@@ -599,6 +599,9 @@ pub struct Pickle {
     pub entries: Vec<Entry>,
     /// Tag byte of each entry, in table order.
     pub entry_tags: Vec<u8>,
+    /// [`Self::sym_full_name`] of each entry, worked out on first use. A
+    /// signature names the same few classes thousands of times.
+    full_names: Vec<std::sync::OnceLock<Option<String>>>,
 }
 
 impl Pickle {
@@ -632,23 +635,42 @@ impl Pickle {
 
     /// Dotted name of a symbol, walking owners up to the root.
     pub fn sym_full_name(&self, i: Idx) -> Option<String> {
-        let mut parts: Vec<&str> = Vec::new();
-        let mut cur = Some(i);
-        let mut guard = 0;
-        while let Some(c) = cur {
-            guard += 1;
-            if guard > 64 {
-                return None;
-            }
-            let n = self.sym_name(c)?;
-            if n == "<root>" || n == "<empty>" {
-                break;
-            }
-            parts.push(n);
-            cur = self.sym_owner(c);
+        self.sym_full_name_ref(i).map(str::to_owned)
+    }
+
+    /// [`Self::sym_full_name`] without copying it.
+    pub fn sym_full_name_ref(&self, i: Idx) -> Option<&str> {
+        self.full_name_at(i, 0)
+    }
+
+    fn full_name_at(&self, i: Idx, depth: usize) -> Option<&str> {
+        /// An owner chain longer than this is not a name.
+        const MAX_DEPTH: usize = 64;
+        let slot = self.full_names.get(i as usize)?;
+        if let Some(known) = slot.get() {
+            return known.as_deref();
         }
-        parts.reverse();
-        Some(parts.join("."))
+        if depth >= MAX_DEPTH {
+            return None;
+        }
+        let name = (|| {
+            let n = self.sym_name(i)?;
+            if n == "<root>" || n == "<empty>" {
+                return Some(String::new());
+            }
+            match self.sym_owner(i) {
+                None => Some(n.to_owned()),
+                Some(owner) => {
+                    let above = self.full_name_at(owner, depth + 1)?;
+                    Some(if above.is_empty() {
+                        n.to_owned()
+                    } else {
+                        format!("{above}.{n}")
+                    })
+                }
+            }
+        })();
+        slot.get_or_init(|| name).as_deref()
     }
 }
 
@@ -774,11 +796,15 @@ pub fn read_pickle(bytes: &[u8]) -> Result<Pickle> {
         entries.push(e);
     }
 
+    let full_names = (0..entries.len())
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
     Ok(Pickle {
         major,
         minor,
         entries,
         entry_tags,
+        full_names,
     })
 }
 

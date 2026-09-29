@@ -114,6 +114,54 @@ struct ZipIndex {
     /// Entry names, sorted, so a package-prefix query is a binary search rather
     /// than a linear walk over every entry.
     sorted_names: std::rc::Rc<Vec<String>>,
+    /// Every directory prefix (`a/`, `a/b/`) some entry lies under, built on
+    /// the first package query. Shared by clones, like `sorted_names`.
+    dirs: std::rc::Rc<std::cell::OnceCell<rustc_hash::FxHashSet<String>>>,
+}
+
+impl ZipIndex {
+    /// Whether some entry's name starts with `prefix`.
+    ///
+    /// Package probes are frequent and each one used to binary-search the
+    /// names of every archive on the classpath, a comparison of long shared
+    /// prefixes per step. A directory prefix is a set lookup instead.
+    fn has_prefix(&self, prefix: &str) -> bool {
+        if !prefix.ends_with('/') {
+            return has_sorted_prefix(&self.sorted_names, prefix);
+        }
+        self.dirs
+            .get_or_init(|| directory_prefixes(&self.sorted_names))
+            .contains(prefix)
+    }
+}
+
+/// The directory prefixes of `names`, which are sorted, so the names under one
+/// directory are adjacent and only a change of directory needs a lookup.
+fn directory_prefixes(names: &[String]) -> rustc_hash::FxHashSet<String> {
+    let mut dirs = rustc_hash::FxHashSet::default();
+    let mut last = "";
+    for name in names {
+        let Some(end) = name.rfind('/') else {
+            continue;
+        };
+        let dir = &name[..=end];
+        if dir == last {
+            continue;
+        }
+        last = dir;
+        let mut at = end;
+        loop {
+            if !dirs.insert(name[..=at].to_string()) {
+                // Its ancestors were entered with it.
+                break;
+            }
+            match name[..at].rfind('/') {
+                Some(parent) => at = parent,
+                None => break,
+            }
+        }
+    }
+    dirs
 }
 
 const RESIDENT_ARCHIVE_LIMIT: usize = 512 * 1024 * 1024;
@@ -286,7 +334,27 @@ struct Entry {
     dir_packages: HashMap<String, DirPackage>,
     /// Exact names in each directory already traversed for case-sensitive
     /// package lookup. A deep package otherwise rereads every ancestor.
-    dir_children: HashMap<String, Option<HashSet<std::ffi::OsString>>>,
+    dir_children: HashMap<String, Option<HashMap<std::ffi::OsString, ChildKind>>>,
+}
+
+/// What a directory listing says an entry is, without asking the file system
+/// again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildKind {
+    Dir,
+    /// Its target decides; only these cost a `stat`.
+    Symlink,
+    Other,
+}
+
+impl ChildKind {
+    fn of(entry: &std::fs::DirEntry) -> Self {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => Self::Dir,
+            Ok(kind) if !kind.is_symlink() => Self::Other,
+            _ => Self::Symlink,
+        }
+    }
 }
 
 struct DirPackage {
@@ -297,35 +365,49 @@ struct DirPackage {
 }
 
 impl Entry {
-    fn directory_case_matches(&mut self, rel: &str) -> bool {
+    /// What the last component of `rel` is, when every component exists under
+    /// exactly that spelling (see [`path_case_matches`]).
+    fn directory_case_kind(&mut self, rel: &str) -> Option<ChildKind> {
         let mut at = self.path.clone();
         let mut prefix = String::new();
+        let mut kind = ChildKind::Dir;
         for comp in rel.split('/').filter(|part| !part.is_empty()) {
             let children = self.dir_children.entry(prefix.clone()).or_insert_with(|| {
-                std::fs::read_dir(&at)
-                    .ok()
-                    .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+                std::fs::read_dir(&at).ok().map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| (entry.file_name(), ChildKind::of(&entry)))
+                        .collect()
+                })
             });
-            if !children
-                .as_ref()
-                .is_some_and(|names| names.contains(std::ffi::OsStr::new(comp)))
-            {
-                return false;
-            }
+            kind = *children.as_ref()?.get(std::ffi::OsStr::new(comp))?;
             at.push(comp);
             if !prefix.is_empty() {
                 prefix.push('/');
             }
             prefix.push_str(comp);
         }
-        true
+        Some(kind)
+    }
+
+    fn directory_case_matches(&mut self, rel: &str) -> bool {
+        self.directory_case_kind(rel).is_some()
     }
 
     fn has_directory_package(&mut self, package: &str) -> bool {
         if let Some(found) = self.dir_packages.get(package) {
             return found.exists;
         }
-        let found = self.directory_case_matches(package) && self.path.join(package).is_dir();
+        // The listing that proved the spelling also says whether the name is a
+        // directory, so only a symlink or the root itself needs a `stat`.
+        let found = match self.directory_case_kind(package) {
+            Some(ChildKind::Dir) if !package.split('/').any(|part| !part.is_empty()) => {
+                self.path.is_dir()
+            }
+            Some(ChildKind::Dir) => true,
+            Some(ChildKind::Symlink) => self.path.join(package).is_dir(),
+            Some(ChildKind::Other) | None => false,
+        };
         self.dir_packages.insert(
             package.to_string(),
             DirPackage {
@@ -556,8 +638,8 @@ impl BinaryIndex {
                     // paths must remain in the plan: a later lookup may find a directory.
                     let possible = match entry.kind {
                         PathKind::Zip => {
-                            let names = &entry.zip.as_ref().expect("archives opened").sorted_names;
-                            has_sorted_prefix(names, &prefix) || has_sorted_prefix(names, &alt)
+                            let zip = entry.zip.as_ref().expect("archives opened");
+                            zip.has_prefix(&prefix) || zip.has_prefix(&alt)
                         }
                         PathKind::Dir | PathKind::Unknown => true,
                     };
@@ -612,8 +694,8 @@ impl BinaryIndex {
                     let Ok(e) = load_zip(&mut self.paths[i]) else {
                         continue;
                     };
-                    let names = &e.zip.as_ref().expect("zip loaded").sorted_names;
-                    if has_sorted_prefix(names, prefix) || has_sorted_prefix(names, &alt) {
+                    let zip = e.zip.as_ref().expect("zip loaded");
+                    if zip.has_prefix(prefix) || zip.has_prefix(&alt) {
                         found = true;
                         break;
                     }
@@ -713,6 +795,7 @@ fn load_zip(e: &mut Entry) -> Result<&mut Entry, String> {
         e.zip = Some(ZipIndex {
             archive,
             sorted_names: std::rc::Rc::new(sorted_names),
+            dirs: Default::default(),
         });
         #[cfg(unix)]
         if let Some(stamp) = stamp {
@@ -1182,6 +1265,52 @@ fn nested_is_static(this: &str, inners: &[JavaInnerClass]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A directory-prefix probe answers exactly what the binary search over
+    /// the sorted names does, for every prefix a name can be cut at.
+    #[test]
+    fn directory_prefixes_agree_with_sorted_prefix_search() {
+        let mut names: Vec<String> = [
+            "a/b/C.class",
+            "a/b/D.class",
+            "a/bc/E.class",
+            "a/F.class",
+            "classes/a/b/G.class",
+            "root.class",
+            "x/y/z/",
+            "META-INF/MANIFEST.MF",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        names.sort_unstable();
+        let dirs = directory_prefixes(&names);
+        let probes = [
+            "a/",
+            "a/b/",
+            "a/bc/",
+            "a/b",
+            "a/c/",
+            "classes/",
+            "classes/a/",
+            "classes/a/b/",
+            "x/",
+            "x/y/",
+            "x/y/z/",
+            "x/y/z/w/",
+            "META-INF/",
+            "root/",
+            "nothing/",
+        ];
+        for probe in probes {
+            assert_eq!(
+                dirs.contains(probe),
+                has_sorted_prefix(&names, probe) && probe.ends_with('/'),
+                "{probe}"
+            );
+        }
+        assert!(!dirs.contains(""));
+    }
+
     /// A directory on the class path that does not exist yet keeps package
     /// misses from being remembered whole, but the archives' part of the
     /// answer is: asking twice searches them once.
@@ -1444,6 +1573,38 @@ mod tests {
             index.find_class("p/Found").unwrap(),
             Some(b"directory".to_vec())
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A package is a directory named in the listing exactly; a symlink is
+    /// followed, and a file of that name, a name spelled in another case and
+    /// the missing one are not packages.
+    #[cfg(unix)]
+    #[test]
+    fn package_probe_classifies_directory_entries() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-package-kinds-{unique}"));
+        std::fs::create_dir_all(root.join("real/inner")).unwrap();
+        std::fs::create_dir_all(root.join("target_dir")).unwrap();
+        std::os::unix::fs::symlink(root.join("target_dir"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing_target"), root.join("dangling")).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+        for (probe, expected) in [
+            ("real/", true),
+            ("real/inner/", true),
+            ("link/", true),
+            ("dangling/", false),
+            ("file/", false),
+            ("Real/", false),
+            ("real/Inner/", false),
+            ("none/", false),
+        ] {
+            assert_eq!(index.has_package_prefix(probe), expected, "{probe}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

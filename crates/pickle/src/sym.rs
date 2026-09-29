@@ -415,7 +415,7 @@ pub fn is_object_only_class(p: &Pickle, full_name: &str) -> bool {
         let Entry::ClassSym { info, .. } = entry else {
             continue;
         };
-        if p.sym_full_name(i as Idx).as_deref() != Some(full_name) {
+        if p.sym_full_name_ref(i as Idx) != Some(full_name) {
             continue;
         }
         if info.has(pflags::MODULE) {
@@ -515,7 +515,7 @@ impl Builder<'_> {
                 Some(Entry::TypeRefTpe { sym, .. }) => *sym,
                 _ => a.tpe,
             };
-            self.p.sym_full_name(tsym).as_deref() == Some("scala.deprecated")
+            self.p.sym_full_name_ref(tsym) == Some("scala.deprecated")
         })?;
         // A literal argument is pickled as the constant itself, anything else
         // (a default getter call) as a tree. The library's `@deprecated`s come
@@ -561,12 +561,12 @@ impl Builder<'_> {
     }
 
     fn members_of(&mut self, owner: Idx) -> Vec<Member> {
-        let Some(ids) = self.owners.get(&owner) else {
+        let owners = self.owners;
+        let Some(ids) = owners.get(&owner) else {
             return Vec::new();
         };
-        let ids = ids.clone();
-        let mut out = Vec::new();
-        for id in ids {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
             if let Some(m) = self.member(id) {
                 out.push(m);
             }
@@ -696,12 +696,12 @@ impl Builder<'_> {
             Entry::SymAnnot { sym, annot } if *sym == id => Some(annot),
             _ => None,
         })?;
-        if self.p.sym_full_name(annot.tpe).as_deref() != Some(MACRO_IMPL_ANNOT) {
+        if self.p.sym_full_name_ref(annot.tpe) != Some(MACRO_IMPL_ANNOT) {
             // `AnnotInfo::tpe` points at the annotation *type*; a `TypeRefTpe`
             // has to be followed to its symbol first.
             match self.p.entry(annot.tpe) {
                 Some(Entry::TypeRefTpe { sym, .. })
-                    if self.p.sym_full_name(*sym).as_deref() == Some(MACRO_IMPL_ANNOT) => {}
+                    if self.p.sym_full_name_ref(*sym) == Some(MACRO_IMPL_ANNOT) => {}
                 _ => return None,
             }
         }
@@ -1176,8 +1176,26 @@ impl std::fmt::Display for LoadError {
 #[derive(Default)]
 pub struct SigCache {
     cache: HashMap<String, Result<Rc<ClassSig>, LoadError>>,
+    /// What each class file's pickle held, decoded once. A pickle carries
+    /// every class nested in its top-level one (slick's generated `Tables`
+    /// has hundreds), and each class asked for used to decode the whole
+    /// pickle again just to pick its own signature out.
+    files: HashMap<String, FileSigs>,
     linearizations: HashMap<(String, bool), (Vec<LinStep>, Vec<LoadError>)>,
     member_indexes: HashMap<usize, HashMap<String, Vec<usize>>>,
+}
+
+/// The signatures of one class file's pickle, and where each class is in them.
+struct PickleSigs {
+    sigs: Rc<Vec<Rc<ClassSig>>>,
+    /// Position of the first signature with each (full name, is module).
+    index: HashMap<(String, bool), usize>,
+}
+
+enum FileSigs {
+    Sigs(Rc<PickleSigs>),
+    /// The class file exists and has no `ScalaSignature`.
+    NoSignature,
 }
 
 const RESIDENT_SIGNATURE_LIMIT: usize = 128 * 1024 * 1024;
@@ -1271,7 +1289,7 @@ impl SigCache {
         if let Some(hit) = self.cache.get(&key) {
             return hit.clone();
         }
-        let got = load(src, full_name, module);
+        let got = load(src, full_name, module, &mut self.files);
         self.cache.insert(key, got.clone());
         got
     }
@@ -1561,37 +1579,54 @@ fn load<S: ClassSource + ?Sized>(
     src: &mut S,
     full_name: &str,
     module: bool,
+    files: &mut HashMap<String, FileSigs>,
 ) -> Result<Rc<ClassSig>, LoadError> {
     let candidates = pickle_files_for(full_name, module);
     let mut last = LoadError::NotFound(full_name.to_string());
     for c in &candidates {
-        let Some(bytes) = src.class_bytes(c) else {
-            continue;
-        };
-        let Some(raw) = crate::classfile::scala_signature_bytes(&bytes) else {
-            last = LoadError::NoSignature(full_name.to_string());
-            continue;
-        };
-        let found = if RESIDENT_SIGNATURES_ENABLED.get() {
-            class_sigs_cached(&raw, || read_pickle(&raw).map(|p| class_sigs(&p))).map(|sigs| {
-                sigs.iter()
-                    .find(|c| c.full_name == full_name && c.is_module == module)
-                    .cloned()
-            })
-        } else {
-            read_pickle(&raw).map(|p| {
-                class_sigs(&p)
-                    .into_iter()
-                    .find(|c| c.full_name == full_name && c.is_module == module)
-                    .map(Rc::new)
-            })
-        };
-        match found {
-            Ok(Some(sig)) => return Ok(sig),
-            Ok(None) => last = LoadError::NoSuchClass(full_name.to_string()),
-            Err(e) => {
-                last = LoadError::BadPickle(full_name.to_string(), e);
+        let pickle = match files.get(c) {
+            Some(FileSigs::Sigs(pickle)) => pickle.clone(),
+            Some(FileSigs::NoSignature) => {
+                last = LoadError::NoSignature(full_name.to_string());
+                continue;
             }
+            None => {
+                let Some(bytes) = src.class_bytes(c) else {
+                    continue;
+                };
+                let Some(raw) = crate::classfile::scala_signature_bytes(&bytes) else {
+                    last = LoadError::NoSignature(full_name.to_string());
+                    files.insert(c.clone(), FileSigs::NoSignature);
+                    continue;
+                };
+                let decoded = if RESIDENT_SIGNATURES_ENABLED.get() {
+                    class_sigs_cached(&raw, || read_pickle(&raw).map(|p| class_sigs(&p)))
+                } else {
+                    read_pickle(&raw)
+                        .map(|p| Rc::new(class_sigs(&p).into_iter().map(Rc::new).collect()))
+                };
+                match decoded {
+                    Ok(sigs) => {
+                        let mut index = HashMap::new();
+                        for (at, sig) in sigs.iter().enumerate() {
+                            index
+                                .entry((sig.full_name.clone(), sig.is_module))
+                                .or_insert(at);
+                        }
+                        let pickle = Rc::new(PickleSigs { sigs, index });
+                        files.insert(c.clone(), FileSigs::Sigs(pickle.clone()));
+                        pickle
+                    }
+                    Err(e) => {
+                        last = LoadError::BadPickle(full_name.to_string(), e);
+                        continue;
+                    }
+                }
+            }
+        };
+        match pickle.index.get(&(full_name.to_string(), module)) {
+            Some(&at) => return Ok(pickle.sigs[at].clone()),
+            None => last = LoadError::NoSuchClass(full_name.to_string()),
         }
     }
     Err(last)

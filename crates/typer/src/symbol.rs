@@ -1552,6 +1552,9 @@ struct BtaBucket {
 
 /// Keep each class's scan bounded even when it has many instantiations.
 const BTA_BUCKET_MAX: usize = 16;
+/// Symbols the table has room for before it first grows ([`SymbolTable::new`]).
+const SYMBOL_TABLE_RESERVE: usize = 1 << 19;
+
 /// Past this many entries in total the cache is emptied.
 const BTA_CACHE_MAX: usize = 100_000;
 
@@ -1813,6 +1816,12 @@ impl SymbolTable {
             abs_projections: rustc_hash::FxHashMap::default(),
             abs_projection_of: rustc_hash::FxHashMap::default(),
         };
+        // A build tool's classpath gives a module hundreds of thousands of
+        // symbols, and a symbol is over a kilobyte: every doubling of the
+        // table copied all of it. Address space is cheap and untouched
+        // capacity is never backed by memory, so reserve past what a large
+        // module needs at the start.
+        st.symbols.reserve(SYMBOL_TABLE_RESERVE);
         st.root = st.alloc(
             "<_root_>",
             SymbolId(0),

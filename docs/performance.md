@@ -60,6 +60,9 @@ rather than an absolute benchmark:
 * **Library-heavy code, 2026-09-27** (below): code over cats, cats-effect and
   monad transformers had been 1.8--5.3 times slower than scalac; it is now
   0.3--0.5 of scalac's time.
+* **A private 97-module application, 2026-09-29** (below): 175 s -> 121 s for
+  every module in turn; its largest module 22.1 s -> 15.3 s against scalac's
+  27.2 s, with identical class files.
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -834,6 +837,67 @@ several times over (`sample` on the process shows it). What saved time:
 * The engine is prestarted for a library that depends on scala-reflect, not
   only when scala-reflect is named; the first expansion then waits 0.35 s
   instead of 0.41 s. The JVM's own start-up is the rest.
+
+### A private multi-module application (2026-09-29)
+
+The workload is a private sbt build of 97 modules with sources (2,940 files),
+each compiled on its own with the classpath sbt exports for it: 350--480
+entries, most of them jars, and up to 16 directories that do not exist. Its
+macros are circe's and shapeless's derivations, airframe's DI and logging.
+Every module compiled one after another, fresh processes, JDK 21.0.2:
+
+| | before | after |
+|---|---:|---:|
+| all 97 modules | 175.4 s | 120--122 s |
+| largest module (351 files, 10,705 expansions) | 22.1 s | 15.3 s |
+| its instructions | 2.20e11 | 1.52e11 |
+
+scalac 2.13.16 takes 27.2 s wall (81.9 s user) for that module. Every
+module's class files and diagnostics are byte-identical before and after.
+On slick's 184 sources (`tests/bench_compare.py`, four alternating pairs,
+`-Xsource:3-cross`) the medians are 1.60 s -> 1.37 s wall, with identical
+output.
+
+* The compiler settings, `-classpath` included, went with every `(expand …)`
+  request: about 40 KB of a 57 KB average request, 612 MB for the module.
+  They now go with an engine's first request only (`(settingsSame)` after).
+* A shapeless labelled representation is a refinement at every field
+  (`FieldType[K, V] :: …`), and refinements were left out of the kept wire
+  spellings of context-free types. A refinement's label is fixed for the
+  run, so they are kept too: -18% instructions on the largest module.
+* A pickle holds every class nested in its top-level one, and each class
+  asked for decoded the whole pickle again; a slick `Tables` with hundreds of
+  nested row classes was decoded once per class. `SigCache` keeps each file's
+  decoded signatures, and `Pickle::sym_full_name` is memoized per entry
+  (a one-line use of such a `Tables` went from 1.5 s to 0.25 s).
+* Package probes on an archive were a binary search over its sorted entry
+  names, comparing long shared prefixes; they are a set lookup of directory
+  prefixes. A directory classpath entry's package check uses the kind its
+  parent's listing already recorded instead of a `stat`.
+* `drop_overridden` walked each owner's ancestors once per selection; a
+  wildcard import asks once per imported name, so the sets are kept while the
+  class graph stands still.
+* The engine's classpath starts with the Scala distribution's jars, which is
+  where nsc's parent-first macro class loader finds them: loading
+  scala-reflect's classes probed every entry ahead of it (about 0.2 s of
+  every engine start on these classpaths; 5--7% of a mid-sized module).
+* Smaller: macro positions count UTF-16 units from the previous position in
+  the file, the cached-prefix search keys on a short slice of the needle,
+  `quote_into` copies unescaped runs whole, the symbol table reserves room
+  for half a million symbols (a symbol is 1.2 KB, and each doubling copied the
+  table), and lambda bodies are no longer copied once per enclosing lambda.
+
+Measured and not kept: mapping jars instead of reading them (3% fewer
+instructions, no wall-clock change: they are in the page cache), and JVM
+flags for the engine (C1 only is 7% faster on small modules, 13% slower on
+the largest; a dynamic CDS archive is slower, since the classpath differs per
+module).
+
+What remains on these modules: about 28% of the largest one's wall time is
+the engine's JVM computing (a cold JIT; with `SCALA_RS_MACRO_DAEMON=1` the
+whole build takes 99 s), and 4--5% is `stat` on classpath directories that
+do not exist, which `BinaryIndex` re-checks at every new name so that a
+directory created during the run is found.
 
 ### What is left
 

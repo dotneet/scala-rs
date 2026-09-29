@@ -940,14 +940,25 @@ public final class ScalaRsMacroEngine {
         }
     }
 
+    static boolean hasField(Sexp req, String name) {
+        for (Sexp s : req.items) {
+            if (s.isList() && !s.items.isEmpty() && name.equals(s.items.get(0).atom)) return true;
+        }
+        return false;
+    }
+
     static String expand(Sexp req) throws Exception {
         String className = req.items.get(1).text();
         String methodName = req.items.get(2).text();
         Sexp argss = req.field("argss");
         Sexp tags = req.field("tags");
-        compilerSettings = new ArrayList<>();
-        for (Sexp x : req.field("settings").items.subList(1, req.field("settings").items.size())) {
-            compilerSettings.add(x.text());
+        // The settings travel with the first request of a session only; a
+        // later request says `(settingsSame)` and the engine keeps them.
+        if (!hasField(req, "settingsSame")) {
+            compilerSettings = new ArrayList<>();
+            for (Sexp x : req.field("settings").items.subList(1, req.field("settings").items.size())) {
+                compilerSettings.add(x.text());
+            }
         }
 
         // The file this call sits in. Registered before anything else reads
@@ -2804,6 +2815,14 @@ public final class ScalaRsMacroEngine {
 
     static void collectRequestSymbolIds(Sexp value, java.util.Set<Long> ids) {
         if (!value.isList() || value.items.isEmpty()) return;
+        // A request's lists read from the wire are walked over the packet's
+        // spans: materializing every node of a large receiver just to look
+        // for symbol references was a tenth of the engine's time.
+        if (value.items instanceof Sexp.Children) {
+            Sexp.Children children = (Sexp.Children) value.items;
+            children.packet.collectSymbolIds(children.first - 1, ids);
+            return;
+        }
         if (value.items.size() >= 3 && "t".equals(value.items.get(0).text())) {
             Sexp meta = value.items.get(2);
             if (meta.isList() && meta.items.size() >= 2
@@ -4474,6 +4493,47 @@ public final class ScalaRsMacroEngine {
                 position = at;
                 spans[slot + 1] = at;
                 spans[slot + 2] = count;
+            }
+
+            /** Whether node `index` reads as `s` through `Sexp.text`: an atom
+             * or a quoted string of exactly that text. */
+            boolean textIs(int index, String s) {
+                int slot = index * 4;
+                int start = spans[slot], end = spans[slot + 1], children = spans[slot + 3];
+                if (children == -2) {
+                    return end - start == s.length() && text.regionMatches(start, s, 0, s.length());
+                }
+                if (children == -1) {
+                    int escape = text.indexOf('\\', start + 1);
+                    if (escape >= 0 && escape < end - 1) return s.equals(node(index).atom);
+                    return end - start - 2 == s.length()
+                        && text.regionMatches(start + 1, s, 0, s.length());
+                }
+                return false;
+            }
+
+            int next(int index) { return spans[index * 4 + 2]; }
+
+            int childCount(int index) { return spans[index * 4 + 3]; }
+
+            /** `collectRequestSymbolIds` over the list at node `index`. */
+            void collectSymbolIds(int index, java.util.Set<Long> ids) {
+                int children = childCount(index);
+                if (children <= 0) return;
+                int first = index + 1;
+                if (children >= 3 && textIs(first, "t")) {
+                    int meta = next(next(first));
+                    if (childCount(meta) >= 2
+                            && (textIs(meta + 1, "sr") || textIs(meta + 1, "srm"))) {
+                        ids.add(Long.parseLong(node(next(meta + 1)).text()));
+                    }
+                }
+                if (children == 2 && textIs(first, "appSymbol")) {
+                    ids.add(Long.parseLong(node(next(first)).text()));
+                }
+                for (int at = first, k = 0; k < children; k++, at = next(at)) {
+                    collectSymbolIds(at, ids);
+                }
             }
 
             Sexp node(int index) {
