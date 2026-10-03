@@ -101,23 +101,28 @@ pub fn assemble_f(parts: &[String], nargs: usize) -> Result<(String, Vec<FSpec>)
 }
 
 fn check_literal(s: &str) -> Result<String, FInterpError> {
-    let b = s.as_bytes();
-    let mut i = 0;
+    // By character: pushing each byte as a `char` turned every non-ASCII
+    // character into its UTF-8 bytes read as Latin-1 (`【` came out `ã`).
     let mut out = String::new();
-    while i < b.len() {
-        if b[i] == b'%' {
-            if i + 1 < b.len() && (b[i + 1] == b'%' || b[i + 1] == b'n' || b[i + 1] == b'N') {
-                out.push('%');
-                out.push(b[i + 1] as char);
-                i += 2;
-                continue;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.peek() {
+                Some(&n @ ('%' | 'n' | 'N')) => {
+                    out.push('%');
+                    out.push(n);
+                    chars.next();
+                    continue;
+                }
+                _ => {
+                    return Err(FInterpError::Message(
+                        "f interpolator: stray % in string part (use %% for a literal percent)"
+                            .into(),
+                    ))
+                }
             }
-            return Err(FInterpError::Message(
-                "f interpolator: stray % in string part (use %% for a literal percent)".into(),
-            ));
         }
-        out.push(b[i] as char);
-        i += 1;
+        out.push(c);
     }
     Ok(out)
 }

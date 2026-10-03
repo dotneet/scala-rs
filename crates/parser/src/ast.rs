@@ -1141,6 +1141,8 @@ impl Tree {
                 }
             }
             TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => fun.annotation_path(),
+            // `@(A @field)`: the meta-annotations say where `A` goes.
+            TreeKind::AnnotatedTypeTree { tpt, .. } => tpt.annotation_path(),
             _ => self.name().unwrap_or("").to_string(),
         }
     }

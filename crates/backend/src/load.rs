@@ -485,6 +485,8 @@ mod tests {
                 desc: method_desc.into(),
                 code: None,
                 java_annots: Vec::new(),
+                param_annots: Vec::new(),
+                local_names: Vec::new(),
                 signature: None,
                 param_names: Vec::new(),
                 param_flags: Vec::new(),
@@ -496,6 +498,7 @@ mod tests {
             enclosing_method: None,
             signature: None,
             field_signatures: std::collections::HashMap::new(),
+            annots: Default::default(),
             field_constants: std::collections::HashMap::new(),
         }
     }
@@ -543,6 +546,8 @@ mod tests {
             desc: "(I)V".into(),
             code: None,
             java_annots: Vec::new(),
+            param_annots: Vec::new(),
+            local_names: Vec::new(),
             signature: None,
             param_names: Vec::new(),
             param_flags: Vec::new(),

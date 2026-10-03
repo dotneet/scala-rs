@@ -86,6 +86,8 @@ mod string_generic_flat_map;
 mod stringops8;
 #[path = "../subtypeterm.rs"]
 mod subtypeterm;
+#[path = "../super_call_class_outer.rs"]
+mod super_call_class_outer;
 #[path = "../super_object.rs"]
 mod super_object;
 #[path = "../sysout.rs"]
@@ -98,5 +100,13 @@ mod tail1;
 mod tail2;
 #[path = "../tail3.rs"]
 mod tail3;
+#[path = "../trait_bridge_default.rs"]
+mod trait_bridge_default;
+#[path = "../trait_constant_val.rs"]
+mod trait_constant_val;
+#[path = "../trait_pattern_binder.rs"]
+mod trait_pattern_binder;
+#[path = "../unit_local_scope.rs"]
+mod unit_local_scope;
 #[path = "../withfilter_subtype.rs"]
 mod withfilter_subtype;

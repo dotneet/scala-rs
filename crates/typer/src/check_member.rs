@@ -356,6 +356,13 @@ impl Typer {
                 if self.st.expand_applied_hk_alias(written.clone()) == *semantic {
                     pickle_ty = Some(written);
                 }
+            } else if !matches!(ty, Type::ByName(_) | Type::Repeated(_)) {
+                // An alias of a static object without type parameters
+                // (`x: O.Alias`, `List[O.Alias]`), which the capture above
+                // does not see: nsc's signature names it, and reflection
+                // over the class (Airframe's constructor injection) reads
+                // the name.
+                pickle_ty = self.alias_view_of_tree(&tpt);
             }
             ty
         };
@@ -1212,6 +1219,11 @@ impl Typer {
                     pickle_ret = Some(written);
                     has_pickle_alias = true;
                 }
+            } else if let Some(view) = self.alias_view_of_tree(&tpt) {
+                // An alias of a static object, as for a parameter
+                // (`type_val_sig`).
+                pickle_ret = Some(view);
+                has_pickle_alias = true;
             }
             ret
         };
@@ -1560,7 +1572,37 @@ impl Typer {
             }
             _ => ret,
         };
+        // The scope the default was written in has the method's parameters
+        // bound, but only those of earlier lists are visible to a default
+        // (`preceding`). The others -- `mode` in `def copy(mode: String =
+        // mode)` -- mean what they mean outside the method, here the field;
+        // resolved to the parameter, the getter read it off a class named
+        // after the method (`NoClassDefFoundError: copy`).
+        let hidden: Vec<(String, Vec<SymbolId>)> = {
+            let method = self.st.get(param).owner;
+            let own = self.st.get(method).params.clone();
+            own.iter()
+                .filter(|q| !preceding.contains(q))
+                .filter_map(|&q| {
+                    let name = self.st.get(q).name.clone();
+                    let outer = self.st.scopes.iter().rev().find_map(|sc| {
+                        let found: Vec<SymbolId> = sc
+                            .lookup(&name)
+                            .into_iter()
+                            .filter(|id| !own.contains(id))
+                            .collect();
+                        (!found.is_empty()).then_some(found)
+                    })?;
+                    Some((name, outer))
+                })
+                .collect()
+        };
         self.st.push_scope();
+        for (name, ids) in &hidden {
+            for id in ids {
+                self.st.enter_in_current(name, *id);
+            }
+        }
         for tp in tparams {
             let n = self.st.get(*tp).name.clone();
             self.st.enter_in_current(&n, *tp);

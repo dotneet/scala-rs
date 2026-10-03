@@ -434,6 +434,35 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         self.add(SINGLETPE, body)
     }
 
+    /// `SINGLETPE` of the package object of the package `jvm_name`
+    /// (`cats`, `a/b`): `<root>.a.b.package.type`.
+    fn package_object_singleton(&mut self, jvm_name: &str) -> u32 {
+        let root = self.ext_mod("<root>", Some(self.none));
+        let mut tb = Vec::new();
+        write_nat_to(&mut tb, root);
+        let mut prefix = self.add(THISTPE, tb);
+        let mut owner: Option<u32> = None;
+        for seg in jvm_name.split('/').filter(|s| !s.is_empty()) {
+            let term = match owner {
+                Some(o) => self.ext_term_ref_owned(seg, o),
+                None => self.ext_term_ref_unowned(seg),
+            };
+            let mut sb = Vec::new();
+            write_nat_to(&mut sb, prefix);
+            write_nat_to(&mut sb, term);
+            prefix = self.add(SINGLETPE, sb);
+            owner = Some(self.ext_mod(seg, owner));
+        }
+        let package_term = match owner {
+            Some(o) => self.ext_term_ref_owned("package", o),
+            None => self.ext_term_ref_unowned("package"),
+        };
+        let mut pb = Vec::new();
+        write_nat_to(&mut pb, prefix);
+        write_nat_to(&mut pb, package_term);
+        self.add(SINGLETPE, pb)
+    }
+
     fn java_lang_module(&mut self) -> u32 {
         if let Some(i) = self.java_lang_mod {
             return i;
@@ -1175,7 +1204,9 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             }
             Type::Annotated { tpe, annot } => {
                 let inner = self.pickle_type_pack(tpe, quantified);
-                let atp = self.pickle_type_annot_ref(annot);
+                let Some(atp) = self.pickle_type_annot_ref(annot) else {
+                    return inner;
+                };
                 let mut ab = Vec::new();
                 write_nat_to(&mut ab, atp);
                 let info = self.add(ANNOTINFO, ab);
@@ -2192,16 +2223,28 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
 
     /// `T @unchecked` is `scala.unchecked`; `T @uncheckedVariance` is
     /// `scala.annotation.unchecked.uncheckedVariance`.
-    fn pickle_type_annot_ref(&mut self, annot: &str) -> u32 {
+    /// The annotation class of a type annotation, or `None` for one the
+    /// pickle leaves out. A type keeps only the annotation's simple name, so
+    /// only the classes that name is known to denote are written. nsc pickles
+    /// nothing but static annotations there anyway: `@unchecked` and
+    /// `@nowarn` never reach its pickle. Writing each name as a member of
+    /// `scala` made `scala.annotation.nowarn` a `scala.nowarn` that does not
+    /// exist, and runtime reflection over the type failed (`unsafe symbol
+    /// nowarn (child of package scala)`).
+    fn pickle_type_annot_ref(&mut self, annot: &str) -> Option<u32> {
         let simple = annot.rsplit('.').next().unwrap_or(annot);
-        if simple == "uncheckedVariance" {
-            let sc = self.scala_module();
-            let ann = self.ext_mod("annotation", Some(sc));
-            let unc = self.ext_mod("unchecked", Some(ann));
-            self.type_ref_in(unc, "uncheckedVariance")
-        } else {
-            let sc = self.scala_module();
-            self.type_ref_in(sc, simple)
+        match simple {
+            "uncheckedVariance" => {
+                let sc = self.scala_module();
+                let ann = self.ext_mod("annotation", Some(sc));
+                let unc = self.ext_mod("unchecked", Some(ann));
+                Some(self.type_ref_in(unc, "uncheckedVariance"))
+            }
+            "deprecated" | "specialized" => {
+                let sc = self.scala_module();
+                Some(self.type_ref_in(sc, simple))
+            }
+            _ => None,
         }
     }
 
@@ -2322,7 +2365,9 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             }
             Type::Annotated { tpe, annot } => {
                 let inner = self.pickle_type(tpe);
-                let atp = self.pickle_type_annot_ref(annot);
+                let Some(atp) = self.pickle_type_annot_ref(annot) else {
+                    return inner;
+                };
                 let mut ab = Vec::new();
                 write_nat_to(&mut ab, atp);
                 let info = self.add(ANNOTINFO, ab);
@@ -3715,9 +3760,12 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             // Keep the argument references intact, including existential
             // binders already packed by the caller.
             let package = self.package_ref_of(&format!("{}/package", os.jvm_name));
-            let mut pb = Vec::new();
-            write_nat_to(&mut pb, package);
-            let pref = self.add(THISTPE, pb);
+            // nsc's prefix is the stable path to the package object,
+            // `<root>.cats.package.type`, not `ThisType(cats.package)`:
+            // reflection prints the latter as `cats.package.Id`, and a
+            // library comparing the names a type carries (Airframe) tells the
+            // two spellings apart.
+            let pref = self.package_object_singleton(&os.jvm_name.clone());
             let name = self.facts.get(id).name.clone();
             let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(&name), package);
             let mut body = Vec::new();
@@ -3731,7 +3779,23 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         if !os.is_class_like() || !os.jvm_name.contains('/') {
             return None;
         }
-        let pref = self.inherited_this_prefix(owner);
+        // An alias of a top-level object, package objects included, is seen
+        // through the object's stable path, `<root>.cats.package.type#Id`, as
+        // nsc writes it -- unless this pickle's class inherits it. Reflection
+        // printed `ThisType(cats.package)` as `cats.package.Id`, and a library
+        // comparing the names a type carries (Airframe) told the two apart.
+        let root = self.root_class;
+        let inherited = !root.is_none() && root != owner && self.facts.is_ancestor_of(owner, root);
+        let top_level_object =
+            os.kind == SymKind::ModuleClass && self.facts.get(os.owner).kind == SymKind::Package;
+        let pref = if self.facts.get(id).is_type_alias && top_level_object && !inherited {
+            match os.jvm_name.strip_suffix("/package$") {
+                Some(package) => self.package_object_singleton(package),
+                None => self.module_singleton_prefix(owner),
+            }
+        } else {
+            self.inherited_this_prefix(owner)
+        };
         let decl_owner = self
             .facts
             .binary_alias_decl_owners
@@ -5621,7 +5685,8 @@ class Holder {
 }
 object Lib {
   def f(xs: List[_ <: AnyRef]): Int = 0
-  def h(x: Int @unchecked): Int = x
+  // nsc pickles static annotations on a type only (not `@unchecked`).
+  def h(x: Int @scala.annotation.unchecked.uncheckedVariance): Int = x
 }
 "#;
         let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
@@ -5660,7 +5725,7 @@ object Lib {
         );
         assert!(
             tags.contains(&ANNOTATEDTPE),
-            "expected ANNOTATEDtpe for Int @unchecked, tags={tags:?}"
+            "expected ANNOTATEDtpe for Int @uncheckedVariance, tags={tags:?}"
         );
         assert!(
             tags.contains(&ANNOTINFO),
@@ -5788,8 +5853,11 @@ object Lib {
             .iter()
             .find(|m| m.name == "usesAlias")
             .expect("usesAlias");
-        assert_eq!(u.param_types, vec!["Int".to_string()]);
-        assert_eq!(u.ret, "Int");
+        // nsc's signature keeps the alias it was written with: `(x: Lib.T):
+        // Lib.T`.
+        let names: Vec<&str> = u.param_types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["T"]);
+        assert_eq!(u.ret.name, "T");
     }
 
     #[test]

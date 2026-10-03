@@ -97,23 +97,28 @@ fn imported_annotation_on_nested_template_has_qualified_pickle_owner() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    for name in ["Host$Nested.class", "Host$Inner$.class"] {
-        let class = fs::read(classes.join("sample").join(name)).unwrap();
-        let signature = scala_signature_bytes(&class).expect("ScalaSignature");
-        let pickle = read_pickle(&signature).expect("valid ScalaSignature");
-        assert!(
-            pickle.entries.iter().any(|entry| {
-                let Entry::SymAnnot { annot, .. } = entry else {
-                    return false;
-                };
-                let Some(Entry::TypeRefTpe { sym, .. }) = pickle.entry(annot.tpe) else {
-                    return false;
-                };
-                pickle.sym_full_name(*sym).as_deref() == Some("sample.marker.Marker")
-            }),
-            "{name} must refer to sample.marker.Marker"
-        );
-    }
+    // A nested class carries no pickle of its own (only the `Scala` marker,
+    // as nsc emits it): both annotations are in the top-level `Host`'s.
+    let class = fs::read(classes.join("sample").join("Host.class")).unwrap();
+    let signature = scala_signature_bytes(&class).expect("ScalaSignature");
+    let pickle = read_pickle(&signature).expect("valid ScalaSignature");
+    let markers = pickle
+        .entries
+        .iter()
+        .filter(|entry| {
+            let Entry::SymAnnot { annot, .. } = entry else {
+                return false;
+            };
+            let Some(Entry::TypeRefTpe { sym, .. }) = pickle.entry(annot.tpe) else {
+                return false;
+            };
+            pickle.sym_full_name(*sym).as_deref() == Some("sample.marker.Marker")
+        })
+        .count();
+    assert_eq!(
+        markers, 2,
+        "Nested and Inner must each refer to sample.marker.Marker"
+    );
 }
 
 #[test]

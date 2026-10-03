@@ -27,8 +27,8 @@
 //! proven structural progress; shrinking paths terminate by the stack-wide
 //! product-order check instead.
 
-use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_parser::TyBox;
+use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_span::Span;
 
 use crate::check::Typer;
@@ -911,7 +911,10 @@ impl Typer {
     /// flag and the class graph with its member lists stand still.
     fn outer_implicits(&self, split: usize) -> std::rc::Rc<Vec<(SymbolId, String)>> {
         let key = OuterImplicitsKey {
-            stamps: self.st.scopes[..split].iter().map(|sc| sc.stamp()).collect(),
+            stamps: self.st.scopes[..split]
+                .iter()
+                .map(|sc| sc.stamp())
+                .collect(),
             this_class: self.st.this_class,
             parent_ctor_scope: self.parent_ctor_scope,
             gen: self.st.member_graph_gen(),
@@ -1106,8 +1109,10 @@ impl Typer {
         // Only a same-named declaration can hide a candidate, so the others
         // are not collected: a controller mixing in a dozen traits has
         // thousands of members and a handful of implicit names.
-        let names: rustc_hash::FxHashSet<&str> =
-            cands.iter().map(|&c| self.st.get(c).name.as_str()).collect();
+        let names: rustc_hash::FxHashSet<&str> = cands
+            .iter()
+            .map(|&c| self.st.get(c).name.as_str())
+            .collect();
         // Every search in a body asks this again of the same enclosing class
         // and mostly the same names, and the scan reads each member of the
         // class once: typing an `object` of 5000 members this way was
@@ -1151,12 +1156,17 @@ impl Typer {
                 return hit.clone();
             }
             let declared = &self.st.get(id).ty;
-            let ty = self.seen_cached(SeenKind::ValueFromThis, id, Some(id), &receiver, declared, || {
-                match self.st.subst_as_seen_from(&receiver, declared) {
+            let ty = self.seen_cached(
+                SeenKind::ValueFromThis,
+                id,
+                Some(id),
+                &receiver,
+                declared,
+                || match self.st.subst_as_seen_from(&receiver, declared) {
                     Type::Method { paramss, ret } if paramss.is_empty() => ret.into_inner(),
                     other => other,
-                }
-            });
+                },
+            );
             value_types.borrow_mut().insert(id, ty.clone());
             ty
         };
@@ -1664,9 +1674,11 @@ impl Typer {
         if prefix.is_no_type() || prefix.is_error() {
             return None;
         }
-        Some(self.seen_cached(SeenKind::ImportPrefix, id, declared, &prefix, ty, || {
-            self.at_import_prefix_uncached(&prefix, ty)
-        }))
+        Some(
+            self.seen_cached(SeenKind::ImportPrefix, id, declared, &prefix, ty, || {
+                self.at_import_prefix_uncached(&prefix, ty)
+            }),
+        )
     }
 
     /// `compute()`, which reads `ty` as seen from `prefix`, through
@@ -1703,9 +1715,8 @@ impl Typer {
             (Some(t), None) => t == ty,
             _ => false,
         };
-        let same_entry = |e: &SeenEntry| {
-            e.kind == kind && e.id == id && same_ty(e) && e.prefix == *prefix
-        };
+        let same_entry =
+            |e: &SeenEntry| e.kind == kind && e.id == id && same_ty(e) && e.prefix == *prefix;
         {
             let cache = self.seen_cache.borrow();
             if cache.epoch == epoch {
@@ -1722,7 +1733,7 @@ impl Typer {
         let named = |t: &Type| t.flags().contains(scala_rs_parser::TypeFlags::NAMED);
         let scope = (prefix.flags().contains(scala_rs_parser::TypeFlags::TUPLE)
             || ty.flags().contains(scala_rs_parser::TypeFlags::TUPLE))
-            .then_some(scope_version);
+        .then_some(scope_version);
         // The substitution may itself have completed a symbol.
         if (self.st.mutation_gen.get(), self.st.abs_projection_of.len()) != epoch
             || named(prefix)
@@ -1773,13 +1784,12 @@ impl Typer {
             ),
             _ => false,
         };
-        let expanded = if plain_prefix
-            && !ty.flags().contains(scala_rs_parser::TypeFlags::TYPE_MEMBER)
-        {
-            std::borrow::Cow::Borrowed(ty)
-        } else {
-            std::borrow::Cow::Owned(self.st.expand_in_type(&prefix, ty))
-        };
+        let expanded =
+            if plain_prefix && !ty.flags().contains(scala_rs_parser::TypeFlags::TYPE_MEMBER) {
+                std::borrow::Cow::Borrowed(ty)
+            } else {
+                std::borrow::Cow::Owned(self.st.expand_in_type(&prefix, ty))
+            };
         // The companion of an inner class imported through a path (`import
         // o1.Inner.fromOther`): its members are read as seen from the path
         // (`Inner` is `o1.Inner`, pos/t4947).
@@ -1900,11 +1910,18 @@ impl Typer {
                             recv = self.st.type_of_class(k);
                         }
                         return (
-                            Some(std::rc::Rc::new(self.st.subst_as_seen_from_at(&recv, Some(&pres[0]), ty))),
+                            Some(std::rc::Rc::new(self.st.subst_as_seen_from_at(
+                                &recv,
+                                Some(&pres[0]),
+                                ty,
+                            ))),
                             false,
                         );
                     }
-                    return (Some(std::rc::Rc::new(crate::prefix::bare_this_views(ty, k))), false);
+                    return (
+                        Some(std::rc::Rc::new(crate::prefix::bare_this_views(ty, k))),
+                        false,
+                    );
                 }
             }
         }
@@ -1914,7 +1931,10 @@ impl Typer {
         if !owner.is_none() && !self.st.get(owner).tparams.is_empty() {
             if let Some(module) = self.wildcard_module_for(origin) {
                 let recv = Type::ModuleRef(self.st.module_class_of(module));
-                return (Some(std::rc::Rc::new(self.st.subst_as_seen_from(&recv, ty))), true);
+                return (
+                    Some(std::rc::Rc::new(self.st.subst_as_seen_from(&recv, ty))),
+                    true,
+                );
             }
         }
         if this.is_none()
@@ -2039,6 +2059,14 @@ impl Typer {
         depth: usize,
         undet: &[SymbolId],
     ) -> Option<ImplicitFit> {
+        if self
+            .aborted_implicits
+            .borrow()
+            .iter()
+            .any(|(m, t)| *m == id && t == pt)
+        {
+            return None;
+        }
         let id = self
             .implicit_instances
             .get(&id)
@@ -3098,9 +3126,10 @@ impl Typer {
                     _ => None,
                 };
                 match f {
-                    Some(Type::Function { params, ret }) if params.len() == 1 => {
-                        Some((params[0].clone(), <scala_rs_parser::Type as Clone>::clone(&*ret)))
-                    }
+                    Some(Type::Function { params, ret }) if params.len() == 1 => Some((
+                        params[0].clone(),
+                        <scala_rs_parser::Type as Clone>::clone(&*ret),
+                    )),
                     _ => None,
                 }
             }),
@@ -3328,6 +3357,13 @@ impl Typer {
         self.search_conversion(from, to).is_found()
     }
 
+    /// Drop the answers searches have recorded, after a candidate they may
+    /// have chosen turned out to be inapplicable.
+    pub(crate) fn forget_implicit_answers(&self) {
+        self.implicit_memo.borrow_mut().entries.clear();
+        self.scope_search_cache.borrow_mut().map.clear();
+    }
+
     pub(crate) fn search_implicit(&self, pt: &Type) -> ImplicitSearch {
         *self.diverged_implicit.borrow_mut() = None;
         self.search_implicit_at(pt, 0)
@@ -3363,9 +3399,8 @@ impl Typer {
         // An explicit macro implicit query is a new top-level operation even
         // though its detached search runs at depth one. Only admit it when
         // there is no enclosing implicit search to affect the answer.
-        let top_level_macro_query = depth == 1
-            && self.macro_query_depth == 1
-            && self.implicit_search_depth == 0;
+        let top_level_macro_query =
+            depth == 1 && self.macro_query_depth == 1 && self.implicit_search_depth == 0;
         let scope_key = ((depth == 0 || top_level_macro_query)
             && undet.is_empty()
             && open == 0
@@ -4209,9 +4244,8 @@ impl Typer {
         // beats `derive[T]: Show[T]` for a `Show[Option[Int]]`, which was
         // "ambiguous implicit: opt, derive". The same holds on a derived
         // owner (`Shrink.shrinkIntegral` versus inherited `shrinkAny`).
-        let is_view = |id: SymbolId| {
-            self.conversion_arg_ty(id).is_some() && !self.only_implicit_clauses(id)
-        };
+        let is_view =
+            |id: SymbolId| self.conversion_arg_ty(id).is_some() && !self.only_implicit_clauses(id);
         !(is_view(a) && self.conversion_arg_ty(b).is_none())
     }
 
@@ -5034,7 +5068,9 @@ impl Typer {
         for _ in 0..8 {
             current = match current {
                 Type::TypeMember(id) | Type::TypeParam(id) => self.st.get(id).bound_hi.clone()?,
-                Type::BoundedWildcard { hi: Some(hi), .. } => <scala_rs_parser::Type as Clone>::clone(&*hi),
+                Type::BoundedWildcard { hi: Some(hi), .. } => {
+                    <scala_rs_parser::Type as Clone>::clone(&*hi)
+                }
                 Type::Applied { ctor, .. } => <scala_rs_parser::Type as Clone>::clone(&*ctor),
                 _ => return None,
             };
@@ -5065,7 +5101,9 @@ impl Typer {
         for _ in 0..8 {
             current = match current {
                 Type::TypeMember(id) | Type::TypeParam(id) => self.st.get(id).bound_hi.clone()?,
-                Type::BoundedWildcard { hi: Some(hi), .. } => <scala_rs_parser::Type as Clone>::clone(&*hi),
+                Type::BoundedWildcard { hi: Some(hi), .. } => {
+                    <scala_rs_parser::Type as Clone>::clone(&*hi)
+                }
                 Type::Applied { ctor, args } => match ctor.as_ref() {
                     Type::TypeMember(id) | Type::TypeParam(id) => {
                         let hi = self.st.get(*id).bound_hi.clone()?;
@@ -6788,9 +6826,13 @@ mod memo_tests {
         let base = typer
             .st
             .alloc("Base", root, SymKind::Class, Flags::EMPTY, "priority/Base");
-        let derived = typer
-            .st
-            .alloc("Derived", root, SymKind::Class, Flags::EMPTY, "priority/Derived");
+        let derived = typer.st.alloc(
+            "Derived",
+            root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "priority/Derived",
+        );
         typer.st.get_mut(derived).parents = vec![Type::Class {
             sym: base,
             args: vec![].into(),
@@ -6798,9 +6840,13 @@ mod memo_tests {
         let concrete = typer
             .st
             .alloc("concrete", base, SymKind::Term, Flags::IMPLICIT, "concrete");
-        let generic = typer
-            .st
-            .alloc("generic", derived, SymKind::Term, Flags::IMPLICIT, "generic");
+        let generic = typer.st.alloc(
+            "generic",
+            derived,
+            SymKind::Term,
+            Flags::IMPLICIT,
+            "generic",
+        );
         typer.st.get_mut(concrete).ty = Type::Int;
         typer.st.get_mut(generic).ty = Type::Any;
         typer.st.get_mut(concrete).pickled_origin = "priority.Base#concrete@1".into();
@@ -6851,9 +6897,15 @@ mod memo_tests {
     fn specificity_memo_keeps_both_directions_and_expires_with_search() {
         let mut typer = Typer::new(0, &TypecheckOptions::default());
         let root = typer.st.root;
-        let a = typer.st.alloc("a", root, SymKind::Term, Flags::IMPLICIT, "a");
-        let b = typer.st.alloc("b", root, SymKind::Term, Flags::IMPLICIT, "b");
-        let c = typer.st.alloc("c", root, SymKind::Term, Flags::IMPLICIT, "c");
+        let a = typer
+            .st
+            .alloc("a", root, SymKind::Term, Flags::IMPLICIT, "a");
+        let b = typer
+            .st
+            .alloc("b", root, SymKind::Term, Flags::IMPLICIT, "b");
+        let c = typer
+            .st
+            .alloc("c", root, SymKind::Term, Flags::IMPLICIT, "c");
         typer.st.get_mut(a).ty = Type::Int;
         typer.st.get_mut(b).ty = Type::Any;
         typer.st.get_mut(c).ty = Type::Int;
@@ -7018,9 +7070,13 @@ mod memo_tests {
             .st
             .alloc("T", have, SymKind::TypeParam, Flags::EMPTY, "T");
         typer.st.get_mut(have).tparams = vec![class_tp];
-        let candidate = typer
-            .st
-            .alloc("candidate", root, SymKind::Method, Flags::IMPLICIT, "candidate");
+        let candidate = typer.st.alloc(
+            "candidate",
+            root,
+            SymKind::Method,
+            Flags::IMPLICIT,
+            "candidate",
+        );
         let tp = typer
             .st
             .alloc("A", candidate, SymKind::TypeParam, Flags::EMPTY, "A");
@@ -7309,7 +7365,8 @@ mod memo_tests {
             ret: (Box::new(Type::Class {
                 sym: result,
                 args: vec![Type::TypeParam(tp)].into(),
-            })).into(),
+            }))
+            .into(),
         };
         typer.st.this_class = owner;
         let wanted_type = Type::Class {
@@ -7457,13 +7514,10 @@ mod memo_tests {
         let wanted = typer
             .st
             .alloc("Wanted", root, SymKind::Class, Flags::EMPTY, "Wanted");
-        let unrelated = typer.st.alloc(
-            "Unrelated",
-            root,
-            SymKind::Class,
-            Flags::EMPTY,
-            "Unrelated",
-        );
+        let unrelated =
+            typer
+                .st
+                .alloc("Unrelated", root, SymKind::Class, Flags::EMPTY, "Unrelated");
         let child = typer
             .st
             .alloc("Child", root, SymKind::Class, Flags::EMPTY, "Child");
@@ -7530,7 +7584,9 @@ mod memo_tests {
         let mut typer = Typer::new(0, &TypecheckOptions::default());
         let root = typer.st.root;
         let class = |typer: &mut Typer, name: &str| {
-            typer.st.alloc(name, root, SymKind::Class, Flags::EMPTY, name)
+            typer
+                .st
+                .alloc(name, root, SymKind::Class, Flags::EMPTY, name)
         };
         let owner = class(&mut typer, "Scope");
         let input = class(&mut typer, "Input");
@@ -7543,9 +7599,13 @@ mod memo_tests {
             args: vec![].into(),
         };
         typer.st.get_mut(child).parents.push(class_ty(wanted));
-        let witness = typer
-            .st
-            .alloc("witness", owner, SymKind::Method, Flags::IMPLICIT, "witness");
+        let witness = typer.st.alloc(
+            "witness",
+            owner,
+            SymKind::Method,
+            Flags::IMPLICIT,
+            "witness",
+        );
         let tp = typer
             .st
             .alloc("A", witness, SymKind::TypeParam, Flags::EMPTY, "A");
@@ -7642,11 +7702,15 @@ mod memo_tests {
         let owner = typer
             .st
             .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
-        let ev = typer.st.alloc("Ev", root, SymKind::Class, Flags::EMPTY, "Ev");
+        let ev = typer
+            .st
+            .alloc("Ev", root, SymKind::Class, Flags::EMPTY, "Ev");
         let other = typer
             .st
             .alloc("Other", root, SymKind::Class, Flags::EMPTY, "Other");
-        let ev_tp = typer.st.alloc("T", ev, SymKind::TypeParam, Flags::EMPTY, "T");
+        let ev_tp = typer
+            .st
+            .alloc("T", ev, SymKind::TypeParam, Flags::EMPTY, "T");
         typer.st.get_mut(ev).tparams = vec![ev_tp];
         let candidate = typer
             .st
@@ -7670,11 +7734,15 @@ mod memo_tests {
         };
 
         unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
-        assert!(matches!(typer.search_implicit(&wanted), ImplicitSearch::Found(c) if c == candidate));
+        assert!(
+            matches!(typer.search_implicit(&wanted), ImplicitSearch::Found(c) if c == candidate)
+        );
         assert!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()) > 0);
         // The same search from the same scope is answered without fitting.
         unify::UNIFY_CONSTRUCTIONS.with(|count| count.set(0));
-        assert!(matches!(typer.search_implicit(&wanted), ImplicitSearch::Found(c) if c == candidate));
+        assert!(
+            matches!(typer.search_implicit(&wanted), ImplicitSearch::Found(c) if c == candidate)
+        );
         assert_eq!(unify::UNIFY_CONSTRUCTIONS.with(|count| count.get()), 0);
         // A source candidate whose type changed (an `implicit def` typed
         // later) makes it a different search.
@@ -7741,7 +7809,8 @@ mod memo_tests {
             args: vec![Type::Annotated {
                 tpe: TyBox::new(tail.clone()),
                 annot: "uncheckedVariance".into(),
-            }].into(),
+            }]
+            .into(),
         };
         assert!(!dominates(&typer, &tail, &full));
         assert!(dominates(&typer, &full, &full));

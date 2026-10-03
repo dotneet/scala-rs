@@ -97,6 +97,23 @@ pub fn add_value_class_companions(tree: &Tree, st: &mut SymbolTable) {
             };
             methods.push(method);
         }
+        // A case class's synthesized `copy` is a member like the written
+        // ones: nsc's erasure looks its `copy$extension` up on the companion
+        // when a client calls `v.copy(...)`.
+        if st.get(cls).flags.contains(Flags::CASE) {
+            let copies: Vec<SymbolId> = st
+                .get(cls)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    st.get(m).name == "copy"
+                        && st.get(m).kind == SymKind::Method
+                        && !methods.contains(&m)
+                })
+                .collect();
+            methods.extend(copies);
+        }
         for m in methods {
             declare_extension(st, comp, cls, m);
         }

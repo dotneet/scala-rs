@@ -1038,11 +1038,22 @@ fn rewrite_calls(tree: &mut Tree, caps: &HashMap<SymbolId, Vec<SymbolId>>, st: &
             rewrite_calls(body, caps, st);
         }
         TreeKind::Apply { fun, args } => {
+            let bare = matches!(fun.kind, TreeKind::Ident { .. });
             rewrite_calls(fun, caps, st);
+            // `keep(x)` for a parameterless `def keep: Int => Boolean` applies
+            // its result. The captures went to `keep` itself above
+            // (`rewrite_auto_apply`), and the call it became still names
+            // `keep`: adding them here as well handed the function the
+            // captures for arguments (`ClassCastException`).
+            let auto_applied = bare && matches!(fun.kind, TreeKind::Apply { .. });
             for a in args.iter_mut() {
                 rewrite_calls(a, caps, st);
             }
-            let sid = call_sym(fun);
+            let sid = if auto_applied {
+                SymbolId::NONE
+            } else {
+                call_sym(fun)
+            };
             if let Some(cs) = caps.get(&sid) {
                 if !cs.is_empty() {
                     let extra: Vec<Tree> = cs

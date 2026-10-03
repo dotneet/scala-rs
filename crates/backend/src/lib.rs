@@ -3,7 +3,9 @@
 pub mod classfile;
 pub mod code;
 mod companion_fwd;
+pub mod field_access;
 pub mod gen;
+mod gen_annot;
 mod gen_call;
 mod gen_class;
 mod gen_desc;

@@ -22,6 +22,10 @@ mod gbopt;
 mod gbshape;
 #[path = "../gbtrait.rs"]
 mod gbtrait;
+#[path = "../generic_value_class_arg.rs"]
+mod generic_value_class_arg;
+#[path = "../generic_value_class_primitive_arg.rs"]
+mod generic_value_class_primitive_arg;
 #[path = "../genrep.rs"]
 mod genrep;
 #[path = "../gitbucket2.rs"]
@@ -96,12 +100,16 @@ mod inherited_bridge_owner;
 mod inherited_extension_pickle;
 #[path = "../inherited_generic_binary.rs"]
 mod inherited_generic_binary;
+#[path = "../inherited_generic_value_class_arg.rs"]
+mod inherited_generic_value_class_arg;
 #[path = "../inner_class_type_members.rs"]
 mod inner_class_type_members;
 #[path = "../innerclasses.rs"]
 mod innerclasses;
 #[path = "../integral.rs"]
 mod integral;
+#[path = "../interpolated_value_class.rs"]
+mod interpolated_value_class;
 #[path = "../intersection_expected.rs"]
 mod intersection_expected;
 #[path = "../intersection_schema.rs"]
@@ -110,5 +118,7 @@ mod intersection_schema;
 mod intrinsicqual;
 #[path = "../jarpickle.rs"]
 mod jarpickle;
+#[path = "../java_annotations.rs"]
+mod java_annotations;
 #[path = "../java_descriptor_identity.rs"]
 mod java_descriptor_identity;

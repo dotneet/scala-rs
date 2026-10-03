@@ -150,6 +150,157 @@ impl Typer {
         r
     }
 
+    /// The type a typed type tree names, with the aliases of static objects
+    /// it was written with kept as `Type::TypeMember` rather than expanded.
+    /// `None` when it names none. Only a type tag reads this form: nsc's
+    /// tag of `O.Alias` is the alias, and Airframe tells bindings apart by
+    /// the names a tag carries.
+    pub(crate) fn alias_view_of_tree(&mut self, tpt: &Tree) -> Option<Type> {
+        let expanded = self.type_of_type_tree(tpt);
+        let alias = |this: &Self, id: SymbolId| {
+            let s = this.st.get(id);
+            (s.kind == SymKind::TypeMember
+                && s.tparams.is_empty()
+                && !this.st.is_deferred_type_member(id)
+                && matches!(
+                    this.st.get(s.owner).kind,
+                    SymKind::ModuleClass | SymKind::Module
+                )
+                && this.st.dealias(&Type::TypeMember(id)) == expanded)
+                .then_some(Type::TypeMember(id))
+        };
+        let direct = match &tpt.kind {
+            TreeKind::Ident { name } if name != crate::materialize::RESOLVED_TYPE => {
+                let named = self.st.lookup_type(name).first().copied();
+                named.and_then(|id| alias(self, id))
+            }
+            TreeKind::Select { qual, name } if !self.type_select_is_term_prefix(qual) => {
+                let id = self.lookup_qualified_type(qual, name);
+                id.and_then(|id| alias(self, id))
+            }
+            // `O.F[A]`, a parameterized alias applied as written.
+            TreeKind::AppliedTypeTree { tpt: ctor, args }
+                if self.static_alias_named(ctor, args.len()).is_some() =>
+            {
+                let id = self.static_alias_named(ctor, args.len()).unwrap();
+                let plain: Vec<Type> = args.iter().map(|a| self.type_of_type_tree(a)).collect();
+                let applied = Type::Applied {
+                    ctor: TyBox::new(Type::TypeMember(id)),
+                    args: plain.clone().into(),
+                };
+                (self.st.expand_applied_hk_alias(applied) == expanded).then(|| Type::Applied {
+                    ctor: TyBox::new(Type::TypeMember(id)),
+                    args: args
+                        .iter()
+                        .zip(plain)
+                        .map(|(a, t)| self.alias_view_of_tree(a).unwrap_or(t))
+                        .collect::<Vec<_>>()
+                        .into(),
+                })
+            }
+            TreeKind::AppliedTypeTree { args, .. } => match &expanded {
+                Type::Class { sym, args: tys } if tys.len() == args.len() => {
+                    let views: Vec<Option<Type>> =
+                        args.iter().map(|a| self.alias_view_of_tree(a)).collect();
+                    views.iter().any(Option::is_some).then(|| Type::Class {
+                        sym: *sym,
+                        args: views
+                            .into_iter()
+                            .zip(tys.iter())
+                            .map(|(v, t)| v.unwrap_or_else(|| t.clone()))
+                            .collect::<Vec<_>>()
+                            .into(),
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        direct.or_else(|| {
+            self.alias_views
+                .iter()
+                .rev()
+                .find(|(key, _)| *key == expanded)
+                .map(|(_, view)| view.clone())
+        })
+    }
+
+    /// The alias of a static object taking `arity` type parameters that a
+    /// type constructor tree names.
+    fn static_alias_named(&mut self, ctor: &Tree, arity: usize) -> Option<SymbolId> {
+        let id = match &ctor.kind {
+            TreeKind::Ident { name } => self.st.lookup_type(name).first().copied(),
+            TreeKind::Select { qual, name } if !self.type_select_is_term_prefix(qual) => {
+                self.lookup_qualified_type(qual, name)
+            }
+            _ => None,
+        }?;
+        let s = self.st.get(id);
+        (s.kind == SymKind::TypeMember
+            && s.is_type_alias
+            && s.tparams.len() == arity
+            && arity > 0
+            && matches!(
+                self.st.get(s.owner).kind,
+                SymKind::ModuleClass | SymKind::Module
+            ))
+        .then_some(id)
+    }
+
+    /// The type a type tree that has already been typed names. A typed tree
+    /// does not always carry it: an applied type keeps only its constructor.
+    pub(crate) fn type_of_type_tree(&mut self, tpt: &Tree) -> Type {
+        if matches!(&tpt.kind, TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE)
+        {
+            return tpt.ty.clone();
+        }
+        let mark = self.diags.len();
+        let ty = self.tree_to_type(tpt);
+        self.diags.truncate(mark);
+        ty
+    }
+
+    /// `pty`, the type of an implicit parameter of `fun`, with the aliases
+    /// `fun`'s written type arguments name kept (`Self::alias_view_of_tree`);
+    /// `pty` itself when they name none.
+    pub(crate) fn alias_kept_param_type(
+        &mut self,
+        fun: &Tree,
+        param: SymbolId,
+        pty: &Type,
+    ) -> Type {
+        let mut node = fun;
+        let (callee, targs) = loop {
+            match &node.kind {
+                TreeKind::Apply { fun, .. } => node = fun,
+                TreeKind::TypeApply { fun, args } => break (fun.sym, args),
+                _ => return pty.clone(),
+            }
+        };
+        if callee.is_none() {
+            return pty.clone();
+        }
+        let tps = self.st.get(callee).tparams.clone();
+        if tps.len() != targs.len() {
+            return pty.clone();
+        }
+        let raw = self.st.get(param).ty.clone();
+        let plain: Vec<Type> = targs.iter().map(|t| self.type_of_type_tree(t)).collect();
+        if crate::symbol::subst_tparams_slice(&tps, &plain, &raw) != *pty {
+            return pty.clone();
+        }
+        let views: Vec<Option<Type>> = targs.iter().map(|t| self.alias_view_of_tree(t)).collect();
+        if views.iter().all(Option::is_none) {
+            return pty.clone();
+        }
+        let kept: Vec<Type> = views
+            .into_iter()
+            .zip(plain)
+            .map(|(v, t)| v.unwrap_or(t))
+            .collect();
+        crate::symbol::subst_tparams_slice(&tps, &kept, &raw)
+    }
+
     pub(crate) fn tree_to_type(&mut self, tpt: &Tree) -> Type {
         match &tpt.kind {
             TreeKind::Empty => Type::NoType,

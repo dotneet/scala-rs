@@ -43,7 +43,10 @@ diagnostic or, where marked, is a known divergence. What is supported is in
   `LazyRef` and passes the enclosing instance and captured locals.
   `crates/typer/src/localobj.rs` therefore refuses a local `object` whose body
   reads anything outside itself ("not implemented: a local `object` that reads
-  a local of the enclosing method").
+  a local of the enclosing method"). The synthetic companion of a local
+  `case class` is such an `object` too, so a local case class that reads a
+  local of the enclosing method or the enclosing instance is refused the same
+  way.
 - **Remaining tail-call shapes.** A recursive call inside an explicit `return`
   or inside `try` / `catch` / `finally` is rejected under `@tailrec`; mutual
   recursion is not transformed ([tailrec.md](tailrec.md)).
@@ -81,11 +84,26 @@ diagnostic or, where marked, is a known divergence. What is supported is in
   SAM type (and `PartialFunction`) becomes an anonymous class, where scalac
   uses `invokedynamic` for SAM types it considers functional interfaces.
   Behaviour is the same; class count and call-site shape differ.
-- **Java annotations on classes, fields and parameters are not written to
-  the class file**, and a method's only when they take no arguments. A class
-  annotated `@Marker` (a Java annotation with `RetentionPolicy.RUNTIME`) or
-  `@Schema(description = "…")` is compiled, but reflection finds neither on
-  it at run time, where scalac's class carries both.
+- **Java annotations on the members a class copies from a trait on the
+  class path.** Java annotations are written where nsc writes them (classes,
+  objects and their mirrors, methods and static forwarders, fields,
+  accessors and parameters, `@field`/`@getter`/`@setter`/`@param` targets,
+  `@Repeatable` containers, `CLASS` and `RUNTIME` retention), and a source
+  trait's `val` annotates the field of every class mixing it in. A trait read
+  from a class file gives its mixin forwarders and fields none: nsc copies
+  them from the trait, so `javap` shows a `@ApiMayChange` on pekko-http's
+  forwarders in scalac's class and not in ours. `@BeanProperty` accessors
+  carry none either.
+- **Mixin forwarders for a trait on the class path.** nsc gives a class a
+  forwarder for every concrete method of every trait it mixes in; for a trait
+  read from a class file we rely on the interface's `default` method instead.
+  Calls behave the same, but `getDeclaredMethods` lists fewer methods.
+- **A class nested in a class, pickled from outside it.** The typer keeps no
+  prefix for a class type, so a parameter typed `Outer#Inner` (or reached
+  through a path) is pickled as `Outer.this.Inner`; scalac pickles the
+  projection or the path. `=:=` holds between the two, but Scala reflection
+  prints `Outer.this.Inner`. A materialized `TypeTag` does build the
+  projection when it is named from outside `Outer`.
 - **Java sources are compiled by javac, not read.** A `.java` source given
   with the Scala ones is compiled with `javac` against the classpath before
   the Scala sources are typed, and its class files are not written to the

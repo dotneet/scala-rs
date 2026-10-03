@@ -574,6 +574,9 @@ pub struct Symbol {
     pub java_object_field: bool,
     /// Language annotations (`@deprecated(...)`, `@tailrec`, …) copied from modifiers.
     pub annotations: Vec<scala_rs_parser::Tree>,
+    /// The Java annotations among them, in their class-file form
+    /// (`crate::java_annot`).
+    pub java_annots: Vec<crate::java_annot::JavaAnnot>,
     /// Lower bound of an abstract/HK type member (`type F[_] >: Lo`).
     pub bound_lo: Option<Type>,
     /// Upper bound of an abstract/HK type member (`type F[_] <: Hi`).
@@ -1328,6 +1331,15 @@ pub struct SymbolTable {
     /// boxing is tracked separately and restored before skipping the next
     /// pass. Cleared by `alloc` and by boxing that changes the erased form.
     pub erasure_settled: bool,
+    /// Template `val`s of a constant type (`final val N = 42`), recorded
+    /// before erasure widens the type: nsc gives them no field, only an
+    /// accessor that answers the constant.
+    pub constant_vals: rustc_hash::FxHashMap<SymbolId, scala_rs_parser::Lit>,
+    /// Classes written in a template's super constructor call, and that
+    /// template. They are owned by the template's owner instead
+    /// (`anon_capture::reown_super_call_classes`) and capture its
+    /// constructor parameters like locals.
+    pub super_call_classes: rustc_hash::FxHashMap<SymbolId, SymbolId>,
     /// Parameter, value class, and settled type to restore on the next pass.
     pub(crate) erasure_boxed_params: Vec<(SymbolId, SymbolId, Type)>,
     /// How many symbols `uncurry::flatten_method_symbols` has already joined
@@ -1723,6 +1735,7 @@ impl SymbolTable {
                 low_priority: false,
                 java_object_field: false,
                 annotations: vec![],
+                java_annots: vec![],
                 bound_lo: None,
                 bound_hi: None,
                 is_type_alias: false,
@@ -1802,6 +1815,8 @@ impl SymbolTable {
             ops_shapes: rustc_hash::FxHashMap::default(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
+            constant_vals: Default::default(),
+            super_call_classes: Default::default(),
             erasure_boxed_params: Vec::new(),
             flattened_upto: 0,
             method_variants: rustc_hash::FxHashMap::default(),
@@ -1873,6 +1888,7 @@ impl SymbolTable {
             low_priority: false,
             java_object_field: false,
             annotations: vec![],
+            java_annots: vec![],
             bound_lo: None,
             bound_hi: None,
             is_type_alias: false,
@@ -6974,7 +6990,10 @@ impl SymbolTable {
             return !self.is_tuple_arity(*sym, ts.len())
                 && !matches!(
                     self.get(*sym).jvm_name.as_str(),
-                    "scala/Nothing" | "scala/Null" | "scala/runtime/Nothing$" | "scala/runtime/Null$"
+                    "scala/Nothing"
+                        | "scala/Null"
+                        | "scala/runtime/Nothing$"
+                        | "scala/runtime/Null$"
                 );
         }
         let primitive = matches!(
@@ -10268,7 +10287,13 @@ mod api_boundary_tests {
             st.get_mut(next).parents = vec![Type::AnyRef, class_ty(deep)];
             deep = next;
         }
-        let tuple2 = st.alloc("Tuple2", st.root, SymKind::Class, Flags::FINAL, "scala/Tuple2");
+        let tuple2 = st.alloc(
+            "Tuple2",
+            st.root,
+            SymKind::Class,
+            Flags::FINAL,
+            "scala/Tuple2",
+        );
         let pair = Type::Tuple(vec![Type::Int, Type::Int].into());
         PARENT_WALKS.with(|n| n.set(0));
         assert!(!st.is_sub_type(&class_ty(deep), &pair));

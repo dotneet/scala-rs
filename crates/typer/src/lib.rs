@@ -39,6 +39,7 @@ mod expand_rpc;
 mod expand_timing;
 mod fasttrack_mirror;
 mod implicits;
+pub mod java_annot;
 pub mod javaclass;
 mod javasign;
 mod kind_bounds;
@@ -183,9 +184,9 @@ pub use check::{
 pub use classpath::adapt_classpath;
 pub use default_recv::hoist_default_receivers;
 pub use erasure::{
-    collect_source_classes, erase, erase_type, erase_value_class_default_getters,
-    note_source_value_classes,
-    tree_mentions_symbol,
+    collect_source_classes, erase, erase_default_getters, erase_prepared, erase_type,
+    erase_type_in, note_source_value_classes, prepare_erasure, rebox_value_class_lambda_params,
+    tree_mentions_symbol, BoxedParams, ErasurePrep,
 };
 pub use expand_private::{expand_private_names, expand_trait_private_vals};
 pub use lambda_lift::lambda_lift;

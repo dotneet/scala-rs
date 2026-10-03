@@ -1366,7 +1366,9 @@ impl PickleSupply {
         }
         let mut supplied = 0;
         for name in names {
-            supplied += self.complete_named(st, bin, class_sym, &name, false, false).len();
+            supplied += self
+                .complete_named(st, bin, class_sym, &name, false, false)
+                .len();
         }
         if supplied != 0 || promoted != 0 {
             trace(format_args!(
@@ -8406,16 +8408,21 @@ fn inherits_walk(
     mut matches: impl FnMut(SymbolId) -> bool,
     keep: &mut bool,
 ) -> bool {
-    let mut seen: Vec<u32> = Vec::new();
+    // `seen` alone ends the walk: the parent graph is finite. The bound only
+    // guards against a runaway table. A fixed 256 used to be the bound, and
+    // `cats.implicits` inherits from more classes than that: the search gave
+    // up before reaching `Bifunctor.ToBifunctorOps`, the imported view
+    // `toBifunctorOps` lost its `implicits` qualifier, and the call was
+    // emitted on `this` (`ClassCastException`).
+    let mut seen: rustc_hash::FxHashSet<u32> = Default::default();
     let mut work = vec![cls];
     while let Some(c) = work.pop() {
         if matches(c) {
             return true;
         }
-        if seen.contains(&c.0) || seen.len() > 256 {
+        if seen.len() > 65536 || !seen.insert(c.0) {
             continue;
         }
-        seen.push(c.0);
         for p in &st.get(c).parents {
             *keep &= crate::lin::parent_names_its_class(p);
             if let Some(ps) = st.class_sym_of(p) {
@@ -8545,7 +8552,7 @@ pub(crate) fn flat_erased_params(st: &SymbolTable, ty: &Type) -> Vec<Option<Stri
     }
 }
 
-fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
+pub(crate) fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
     // An abstract type member (`Type::TypeMember`) has to resolve to its own
     // upper bound before it can name a fixed slot; the loop below re-runs
     // this match on that bound (which may itself be another abstract type
@@ -8554,6 +8561,14 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
     let mut cur = ty.clone();
     for _ in 0..16 {
         cur = match &cur {
+            // An erased value class kept as its box (`erasure::boxed_value_class`).
+            Type::Annotated { tpe, annot } if annot == crate::erasure::BOXED_VALUE_CLASS => {
+                if let Type::Class { sym, .. } = tpe.as_ref() {
+                    let n = st.get(*sym).jvm_name.clone();
+                    return (!n.is_empty()).then(|| format!("L{n};"));
+                }
+                return None;
+            }
             Type::Boolean => return Some("Z".into()),
             Type::Byte => return Some("B".into()),
             Type::Short => return Some("S".into()),
@@ -8601,6 +8616,17 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
                 let erased = crate::erasure::erase_member_ty(&cur, st);
                 if erased == cur {
                     return None;
+                }
+                // A generic value class over another value class erases to
+                // that one's box (`Wrap[Code]` is `Lpkg/Code;`): the slot is
+                // settled, not to be erased a second time down to `String`.
+                if let Type::Annotated { tpe, annot } = &erased {
+                    if annot == crate::erasure::BOXED_VALUE_CLASS {
+                        if let Type::Class { sym, .. } = tpe.as_ref() {
+                            let n = st.get(*sym).jvm_name.clone();
+                            return (!n.is_empty()).then(|| format!("L{n};"));
+                        }
+                    }
                 }
                 erased
             }

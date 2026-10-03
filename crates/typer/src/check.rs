@@ -734,6 +734,10 @@ pub struct Typer {
     /// during a run, and every `sb.append(…)` on a Java builder sorted its
     /// thirty alternatives pairwise again.
     pub(crate) overridden_cache: std::cell::RefCell<GenMap<Alternatives, Vec<SymbolId>>>,
+    /// Annotation interfaces read from their class files
+    /// (`crate::java_annot`); `None` for a class that is not one.
+    pub(crate) java_annot_classes:
+        rustc_hash::FxHashMap<String, Option<crate::java_annot::AnnotClassMeta>>,
     /// [`Typer::nominal_ancestors_cached`]: each class's nominal ancestors.
     pub(crate) nominal_ancestors_cache:
         std::cell::RefCell<GenMap<SymbolId, Option<std::rc::Rc<rustc_hash::FxHashSet<SymbolId>>>>>,
@@ -975,6 +979,20 @@ pub struct Typer {
     /// The first expansion cut off as diverging during the current top-level
     /// implicit search, for the diagnostic.
     pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
+    /// Implicits set aside while a search is redone, because their witness
+    /// for the wanted type could not be built once a macro expansion inside
+    /// it ended in `c.abort`. nsc expands a macro candidate while it
+    /// searches, and an abort only makes that candidate inapplicable to that
+    /// search; it goes on without it (`Typer::build_found_implicit`).
+    pub(crate) aborted_implicits: std::cell::RefCell<Vec<(SymbolId, Type)>>,
+    /// While a macro expansion is typed: each type argument of the macro
+    /// application with the aliases it was written with
+    /// (`Typer::alias_view_of_tree`), keyed by its expansion. The expansion
+    /// carries only the expanded type in its type trees.
+    pub(crate) alias_views: Vec<(Type, Type)>,
+    /// How many macro expansions have aborted, to tell an abort apart from
+    /// other errors a materialization reports.
+    pub(crate) macro_aborts: std::cell::Cell<u32>,
     /// Results of the implicit searches the outermost one in flight has
     /// already answered (`crate::implicits::ImplicitMemo`). Empty whenever no
     /// search is running.
@@ -1478,6 +1496,7 @@ impl Typer {
             shadowing_decls_cache: Default::default(),
             scope_search_cache: Default::default(),
             overridden_cache: Default::default(),
+            java_annot_classes: Default::default(),
             nominal_ancestors_cache: Default::default(),
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
@@ -1523,6 +1542,9 @@ impl Typer {
             view_retry: None,
             selected_implicit_fit: std::cell::RefCell::new(None),
             diverged_implicit: std::cell::RefCell::new(None),
+            aborted_implicits: Default::default(),
+            alias_views: Vec::new(),
+            macro_aborts: Default::default(),
             implicit_memo: std::cell::RefCell::new(Default::default()),
             seen_cache: std::cell::RefCell::new(Default::default()),
             implicit_class_parts: std::cell::RefCell::new(Default::default()),

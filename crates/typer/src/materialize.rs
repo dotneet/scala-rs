@@ -31,13 +31,9 @@
 //!    them; the body here selects on the mirror parameter directly. The tree
 //!    is smaller, and `tag.tpe` is the same type -- which is what the fixture
 //!    compares, `=:=` and `toString`, against real scalac.
-//! 2. nsc reaches the runtime universe's mirror with
-//!    `runtimeMirror(getClass.getClassLoader)` and a macro context's with
-//!    `rootMirror`; scala-rs uses `rootMirror` for both, because
-//!    `JavaUniverse#runtimeMirror` is not a member scala-rs can supply yet
-//!    (its `java.lang.ClassLoader` parameter has no symbol). The two differ
-//!    only for a class the root mirror's class loader cannot see, and that
-//!    case raises `ScalaReflectionException` rather than going quiet.
+//! 2. (none: the runtime universe's mirror is
+//!    `runtimeMirror(this.getClass.getClassLoader)` and a macro context's
+//!    `rootMirror`, as in nsc.)
 //! 3. nsc writes the creator's result as `U#Type` and its own erasure turns
 //!    that into `Types$TypeApi`; scala-rs erases an abstract type member to
 //!    `Object` (`erasure::erase_ty`), which would leave `TypeCreator.apply`
@@ -589,6 +585,9 @@ pub(crate) struct Materialiser<'a> {
     /// Tags in scope a reified body splices, bound to locals ahead of the
     /// creator; see `crate::reify_expand::ReifyExpander::tag_bindings`.
     pub(crate) tag_bindings: Vec<(String, Tree)>,
+    /// The universe is the runtime one, whose mirror nsc asks the call
+    /// site's class loader for.
+    pub(crate) runtime_universe: bool,
     pub(crate) span: Span,
 }
 
@@ -623,7 +622,12 @@ impl Materialiser<'_> {
         })
     }
 
-    /// `<universe>.rootMirror.asInstanceOf[scala.reflect.api.Mirror]`.
+    /// `<universe>.runtimeMirror(this.getClass.getClassLoader)` for the
+    /// runtime universe, as nsc writes it, else `<universe>.rootMirror`;
+    /// either `.asInstanceOf[scala.reflect.api.Mirror]`. The root mirror
+    /// sees only the classes of scala-reflect's own class loader: under a
+    /// layered loader (a build tool's test runner, an application server)
+    /// `staticClass` of an application class raised `ScalaReflectionException`.
     ///
     /// The cast is not decoration. `rootMirror`'s type is the universe's
     /// abstract member `Mirror`, whose upper bound scala-rs reads from the
@@ -633,7 +637,18 @@ impl Materialiser<'_> {
     /// `Mirror` and the typer cannot see it; the cast says so, and erases to
     /// a `checkcast` that always succeeds.
     fn mirror(&self) -> Tree {
-        let root = self.select(self.universe.clone(), "rootMirror");
+        let root = if self.runtime_universe {
+            let loader = self.select(
+                self.select(self.node(TreeKind::This { qual: None }), "getClass"),
+                "getClassLoader",
+            );
+            self.node(TreeKind::Apply {
+                fun: Box::new(self.select(self.universe.clone(), "runtimeMirror")),
+                args: vec![loader],
+            })
+        } else {
+            self.select(self.universe.clone(), "rootMirror")
+        };
         self.node(TreeKind::TypeApply {
             fun: Box::new(self.select(root, "asInstanceOf")),
             args: vec![self.resolved_type(self.mirror_ty.clone())],

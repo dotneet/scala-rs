@@ -91,6 +91,24 @@ impl Typer {
         let saved = std::mem::replace(&mut self.resolving_annot, true);
         for (sym, index, annot) in &annots {
             if let Some(ty) = self.resolve_one_annotation(annot) {
+                let java = if self.library_abi && !sym.is_none() {
+                    self.java_annotation(annot, &ty)
+                } else {
+                    None
+                };
+                if let Some(java) = java {
+                    let targets = if self.st.get(*sym).kind == SymKind::Module {
+                        vec![*sym, self.st.module_class_of(*sym)]
+                    } else {
+                        vec![*sym]
+                    };
+                    for target in targets {
+                        let list = &mut self.st.get_mut(target).java_annots;
+                        if !list.contains(&java) {
+                            list.push(java.clone());
+                        }
+                    }
+                }
                 if !sym.is_none() {
                     // A source object has two symbols: its stable module and
                     // the module class that carries the classfile and pickle
@@ -143,6 +161,14 @@ impl Typer {
                 t
             }
             TreeKind::Ident { .. } | TreeKind::Select { .. } => fun.clone(),
+            // `@(A @field)`: the meta-annotations say where `A` goes.
+            TreeKind::AnnotatedTypeTree { .. } => {
+                let mut head = fun;
+                while let TreeKind::AnnotatedTypeTree { tpt, .. } = &head.kind {
+                    head = tpt;
+                }
+                head.clone()
+            }
             _ => return None,
         };
         // Even in private-runtime mode, a source annotation may name a class

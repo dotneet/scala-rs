@@ -439,8 +439,11 @@ pub struct Method {
     pub name: String,
     pub desc: String,
     pub code: Option<Code>,
-    /// RuntimeVisible Java annotations (`Ljava/lang/Deprecated;`, …).
-    pub java_annots: Vec<String>,
+    /// Java annotations on the method (`@Deprecated`, `@GET`, …).
+    pub java_annots: Vec<Annotation>,
+    /// Java annotations on each parameter, in source order; empty when no
+    /// parameter has one.
+    pub param_annots: Vec<Vec<Annotation>>,
     /// JVMS §4.7.9 `Signature`: the generic shape `desc` erased away. Set
     /// through [`crate::gen::ClassBuilder::sign_last`], which refuses any
     /// string that does not erase back to `desc`.
@@ -452,6 +455,207 @@ pub struct Method {
     pub param_names: Vec<Option<String>>,
     /// JVMS `MethodParameters` access flags, parallel to `param_names`.
     pub param_flags: Vec<u16>,
+    /// Parameter names for the `LocalVariableTable` of a method without
+    /// `MethodParameters`, in descriptor order.
+    pub local_names: Vec<Option<String>>,
+}
+
+/// A Java annotation as JVMS §4.7.16 stores it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Annotation {
+    /// The annotation interface's descriptor (`Ljakarta/ws/rs/GET;`).
+    pub desc: String,
+    /// `RuntimeVisibleAnnotations` rather than `RuntimeInvisibleAnnotations`.
+    pub visible: bool,
+    pub elems: Vec<(String, ElementValue)>,
+}
+
+impl Annotation {
+    /// A runtime-visible annotation without elements.
+    pub fn marker(desc: &str) -> Self {
+        Annotation {
+            desc: desc.to_string(),
+            visible: true,
+            elems: Vec::new(),
+        }
+    }
+}
+
+/// JVMS §4.7.16.1 `element_value`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ElementValue {
+    /// `B C I S Z`, with the tag.
+    Int(u8, i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    Str(String),
+    Enum {
+        desc: String,
+        name: String,
+    },
+    /// A class literal, by its return descriptor (`Ljava/lang/String;`, `V`).
+    Class(String),
+    Annot(Annotation),
+    Array(Vec<ElementValue>),
+}
+
+/// Java annotations of a class and its fields, which live beside the
+/// [`Field`] literals rather than in them.
+#[derive(Clone, Debug, Default)]
+pub struct ClassAnnots {
+    pub class: Vec<Annotation>,
+    /// Keyed by the field's source name, as `field_signatures` is.
+    pub fields: HashMap<String, Vec<Annotation>>,
+}
+
+fn encode_annotation(pool: &mut Pool, a: &Annotation, out: &mut Vec<u8>) {
+    out.extend_from_slice(&pool.utf8(&a.desc).to_be_bytes());
+    out.extend_from_slice(&(a.elems.len() as u16).to_be_bytes());
+    for (name, value) in &a.elems {
+        out.extend_from_slice(&pool.utf8(name).to_be_bytes());
+        encode_element_value(pool, value, out);
+    }
+}
+
+fn encode_element_value(pool: &mut Pool, v: &ElementValue, out: &mut Vec<u8>) {
+    match v {
+        ElementValue::Int(tag, n) => {
+            out.push(*tag);
+            out.extend_from_slice(&pool.integer(*n).to_be_bytes());
+        }
+        ElementValue::Long(n) => {
+            out.push(b'J');
+            out.extend_from_slice(&pool.long(*n).to_be_bytes());
+        }
+        ElementValue::Float(f) => {
+            out.push(b'F');
+            out.extend_from_slice(&pool.float(*f).to_be_bytes());
+        }
+        ElementValue::Double(d) => {
+            out.push(b'D');
+            out.extend_from_slice(&pool.double(*d).to_be_bytes());
+        }
+        ElementValue::Str(s) => {
+            out.push(b's');
+            out.extend_from_slice(&pool.utf8(s).to_be_bytes());
+        }
+        ElementValue::Enum { desc, name } => {
+            out.push(b'e');
+            out.extend_from_slice(&pool.utf8(desc).to_be_bytes());
+            out.extend_from_slice(&pool.utf8(name).to_be_bytes());
+        }
+        ElementValue::Class(desc) => {
+            out.push(b'c');
+            out.extend_from_slice(&pool.utf8(desc).to_be_bytes());
+        }
+        ElementValue::Annot(a) => {
+            out.push(b'@');
+            encode_annotation(pool, a, out);
+        }
+        ElementValue::Array(items) => {
+            out.push(b'[');
+            out.extend_from_slice(&(items.len() as u16).to_be_bytes());
+            for item in items {
+                encode_element_value(pool, item, out);
+            }
+        }
+    }
+}
+
+/// `Runtime{Visible,Invisible}Annotations` for `annots`, as (attribute name,
+/// body) pairs; `extra_visible` is appended to the visible attribute (nsc
+/// writes a class's `ScalaSignature` after its Java annotations).
+fn annotation_attrs(
+    pool: &mut Pool,
+    annots: &[Annotation],
+    extra_visible: Option<(u16, Vec<u8>)>,
+) -> Vec<(u16, Vec<u8>)> {
+    let mut attrs = Vec::new();
+    for visible in [true, false] {
+        let mut chosen: Vec<&Annotation> = annots.iter().filter(|a| a.visible == visible).collect();
+        chosen.dedup_by(|a, b| a.desc == b.desc);
+        let extra = if visible {
+            extra_visible.as_ref()
+        } else {
+            None
+        };
+        let count = chosen.len() + extra.map_or(0, |(n, _)| *n as usize);
+        if count == 0 {
+            continue;
+        }
+        let name = pool.utf8(if visible {
+            "RuntimeVisibleAnnotations"
+        } else {
+            "RuntimeInvisibleAnnotations"
+        });
+        let mut body = (count as u16).to_be_bytes().to_vec();
+        for a in chosen {
+            encode_annotation(pool, a, &mut body);
+        }
+        if let Some((_, bytes)) = extra {
+            body.extend_from_slice(bytes);
+        }
+        attrs.push((name, body));
+    }
+    attrs
+}
+
+/// `Runtime{Visible,Invisible}ParameterAnnotations` (JVMS §4.7.18).
+fn param_annotation_attrs(pool: &mut Pool, params: &[Vec<Annotation>]) -> Vec<(u16, Vec<u8>)> {
+    let mut attrs = Vec::new();
+    for visible in [true, false] {
+        if !params.iter().flatten().any(|a| a.visible == visible) {
+            continue;
+        }
+        let name = pool.utf8(if visible {
+            "RuntimeVisibleParameterAnnotations"
+        } else {
+            "RuntimeInvisibleParameterAnnotations"
+        });
+        let mut body = vec![params.len() as u8];
+        for p in params {
+            let chosen: Vec<&Annotation> = p.iter().filter(|a| a.visible == visible).collect();
+            body.extend_from_slice(&(chosen.len() as u16).to_be_bytes());
+            for a in chosen {
+                encode_annotation(pool, a, &mut body);
+            }
+        }
+        attrs.push((name, body));
+    }
+    attrs
+}
+
+fn write_attrs(out: &mut Vec<u8>, attrs: &[(u16, Vec<u8>)]) {
+    for (name, body) in attrs {
+        out.extend_from_slice(&name.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+    }
+}
+
+/// The parameter descriptors of method descriptor `desc`.
+fn param_descriptors(desc: &str) -> Vec<String> {
+    let Some(end) = desc.find(')') else {
+        return Vec::new();
+    };
+    let bytes = desc.as_bytes();
+    let mut i = usize::from(bytes.first() == Some(&b'('));
+    let mut out = Vec::new();
+    while i < end {
+        let start = i;
+        while i < end && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i < end && bytes[i] == b'L' {
+            while i < end && bytes[i] != b';' {
+                i += 1;
+            }
+        }
+        i += 1;
+        out.push(desc[start..i.min(end)].to_string());
+    }
+    out
 }
 
 fn method_parameter_count(desc: &str) -> usize {
@@ -524,6 +728,7 @@ pub struct ClassEmit {
     /// JVMS §4.7.2 `ConstantValue` for a `static final` field, keyed the same
     /// way. Only `long` is produced (`@SerialVersionUID`).
     pub field_constants: std::collections::HashMap<String, i64>,
+    pub annots: ClassAnnots,
 }
 
 impl ClassEmit {
@@ -549,16 +754,26 @@ impl ClassEmit {
             // uses for methods, so `/` is `$div`.
             let sig = self.field_signatures.get(&f.name).map(|s| pool.utf8(s));
             let cst = self.field_constants.get(&f.name).map(|v| pool.long(*v));
+            let annots = match self.annots.fields.get(&f.name) {
+                Some(a) => annotation_attrs(&mut pool, a, None),
+                None => Vec::new(),
+            };
             field_idxs.push((
                 f.access,
                 pool.utf8(&encode_method_name(&f.name)),
                 pool.utf8(&f.desc),
                 sig,
                 cst,
+                annots,
             ));
         }
         let code_attr = pool.utf8("Code");
         let stack_map_attr = pool.utf8("StackMapTable");
+        let lvt_attr = self
+            .methods
+            .iter()
+            .any(|m| m.code.is_some() && (!m.param_names.is_empty() || !m.local_names.is_empty()))
+            .then(|| pool.utf8("LocalVariableTable"));
         let src_attr = pool.utf8("SourceFile");
         let src_name = pool.utf8(&self.source);
         let scala_raw_attr = if self.scala_raw {
@@ -568,11 +783,6 @@ impl ClassEmit {
         };
         let scala_sig_attr = if self.scala_signature.is_some() && !self.scala_raw {
             Some(pool.utf8("ScalaSig"))
-        } else {
-            None
-        };
-        let rva_attr = if self.scala_signature.is_some() {
-            Some(pool.utf8("RuntimeVisibleAnnotations"))
         } else {
             None
         };
@@ -641,21 +851,40 @@ impl ClassEmit {
         } else {
             None
         };
-        let method_rva = if self.methods.iter().any(|m| !m.java_annots.is_empty()) {
-            Some(pool.utf8("RuntimeVisibleAnnotations"))
-        } else {
-            None
-        };
         let method_params_attr = if self.methods.iter().any(|m| !m.param_names.is_empty()) {
             Some(pool.utf8("MethodParameters"))
         } else {
             None
         };
+        // RuntimeVisibleAnnotations { ScalaSignature { bytes = Utf8 } }, or
+        // `ScalaLongSignature { bytes = { Utf8, ... } }` when one constant
+        // could not hold the whole pickle, after the class's own Java
+        // annotations.
+        let scala_sig_annot = match (sig_type, bytes_name) {
+            (Some(sig_ty), Some(bn)) => {
+                let mut body = Vec::new();
+                body.extend_from_slice(&sig_ty.to_be_bytes());
+                body.extend_from_slice(&1u16.to_be_bytes());
+                body.extend_from_slice(&bn.to_be_bytes());
+                if long_sig {
+                    body.push(b'[');
+                    body.extend_from_slice(&(sig_utf8s.len() as u16).to_be_bytes());
+                }
+                for su in &sig_utf8s {
+                    body.push(b's');
+                    body.extend_from_slice(&su.to_be_bytes());
+                }
+                Some((1u16, body))
+            }
+            _ => None,
+        };
+        let class_annots = annotation_attrs(&mut pool, &self.annots.class, scala_sig_annot);
         let mut methods_data = Vec::new();
         for m in &self.methods {
             let n = pool.utf8(&m.name);
             let d = pool.utf8(&m.desc);
-            let annots: Vec<u16> = m.java_annots.iter().map(|a| pool.utf8(a)).collect();
+            let mut annots = annotation_attrs(&mut pool, &m.java_annots, None);
+            annots.extend(param_annotation_attrs(&mut pool, &m.param_annots));
             let sig = m.signature.as_deref().map(|s| pool.utf8(s));
             if m.param_names.len() != m.param_flags.len()
                 || (!m.param_names.is_empty()
@@ -690,7 +919,44 @@ impl ClassEmit {
                     format!("too many MethodParameters entries on {}{}", m.name, m.desc),
                 ));
             }
-            methods_data.push((m.access, n, d, m.code.clone(), annots, sig, param_names));
+            // JVMS §4.7.13, for the parameters only, as scalac's default
+            // `-g:vars` writes them: libraries that read parameter names off
+            // the bytecode (paranamer, which jackson-module-scala uses to pair
+            // a case class's properties with its constructor) find none in
+            // `MethodParameters`.
+            let mut lvt: Vec<(u16, u16, u16)> = Vec::new();
+            let names = if m.param_names.is_empty() {
+                &m.local_names
+            } else {
+                &m.param_names
+            };
+            if m.code.is_some() && !names.is_empty() {
+                let mut slot = 0u16;
+                if m.access & ACC_STATIC == 0 {
+                    let this_desc = format!("L{};", self.this_name);
+                    lvt.push((pool.utf8("this"), pool.utf8(&this_desc), 0));
+                    slot = 1;
+                }
+                for (desc, name) in param_descriptors(&m.desc).iter().zip(names) {
+                    // Encoded, as nsc writes it: the JVM checks a table
+                    // entry's name as it checks a field's, so a backquoted
+                    // `https://…` parameter made the class unloadable.
+                    if let Some(name) = name {
+                        lvt.push((pool.utf8(&encode_method_name(name)), pool.utf8(desc), slot));
+                    }
+                    slot += if desc == "J" || desc == "D" { 2 } else { 1 };
+                }
+            }
+            methods_data.push((
+                m.access,
+                n,
+                d,
+                m.code.clone(),
+                annots,
+                sig,
+                param_names,
+                lvt,
+            ));
         }
         let mut out = Vec::new();
         out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
@@ -705,11 +971,11 @@ impl ClassEmit {
             out.extend_from_slice(&i.to_be_bytes());
         }
         out.extend_from_slice(&(field_idxs.len() as u16).to_be_bytes());
-        for (acc, n, d, sig, cst) in field_idxs {
+        for (acc, n, d, sig, cst, annots) in field_idxs {
             out.extend_from_slice(&acc.to_be_bytes());
             out.extend_from_slice(&n.to_be_bytes());
             out.extend_from_slice(&d.to_be_bytes());
-            let n_attrs = u16::from(sig.is_some()) + u16::from(cst.is_some());
+            let n_attrs = u16::from(sig.is_some()) + u16::from(cst.is_some()) + annots.len() as u16;
             out.extend_from_slice(&n_attrs.to_be_bytes());
             if let (Some(a), Some(s)) = (const_attr, cst) {
                 out.extend_from_slice(&a.to_be_bytes());
@@ -721,14 +987,15 @@ impl ClassEmit {
                 out.extend_from_slice(&2u32.to_be_bytes());
                 out.extend_from_slice(&s.to_be_bytes());
             }
+            write_attrs(&mut out, &annots);
         }
         out.extend_from_slice(&(methods_data.len() as u16).to_be_bytes());
-        for (acc, n, d, code, annots, sig, param_names) in methods_data {
+        for (acc, n, d, code, annots, sig, param_names, lvt) in methods_data {
             out.extend_from_slice(&acc.to_be_bytes());
             out.extend_from_slice(&n.to_be_bytes());
             out.extend_from_slice(&d.to_be_bytes());
             let n_attrs = u16::from(code.is_some())
-                + u16::from(!annots.is_empty())
+                + annots.len() as u16
                 + u16::from(sig.is_some())
                 + u16::from(!param_names.is_empty());
             out.extend_from_slice(&n_attrs.to_be_bytes());
@@ -746,30 +1013,31 @@ impl ClassEmit {
                     body.extend_from_slice(&e.handler_pc.to_be_bytes());
                     body.extend_from_slice(&e.catch_type.to_be_bytes());
                 }
-                let n_code_attrs = if c.stack_map.is_some() { 1u16 } else { 0 };
+                let lvt_attr = lvt_attr.filter(|_| !lvt.is_empty());
+                let n_code_attrs = u16::from(c.stack_map.is_some()) + u16::from(lvt_attr.is_some());
                 body.extend_from_slice(&n_code_attrs.to_be_bytes());
                 if let Some(sm) = &c.stack_map {
                     body.extend_from_slice(&stack_map_attr.to_be_bytes());
                     body.extend_from_slice(&(sm.len() as u32).to_be_bytes());
                     body.extend_from_slice(sm);
                 }
-                out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-                out.extend_from_slice(&body);
-            }
-            if !annots.is_empty() {
-                let rva = method_rva
-                    .or(rva_attr)
-                    .expect("RuntimeVisibleAnnotations utf8");
-                let mut body = Vec::new();
-                body.extend_from_slice(&(annots.len() as u16).to_be_bytes());
-                for ty in annots {
-                    body.extend_from_slice(&ty.to_be_bytes());
-                    body.extend_from_slice(&0u16.to_be_bytes());
+                if let Some(a) = lvt_attr {
+                    body.extend_from_slice(&a.to_be_bytes());
+                    body.extend_from_slice(&((2 + lvt.len() * 10) as u32).to_be_bytes());
+                    body.extend_from_slice(&(lvt.len() as u16).to_be_bytes());
+                    let len = c.bytes.len() as u16;
+                    for (name, desc, slot) in &lvt {
+                        body.extend_from_slice(&0u16.to_be_bytes());
+                        body.extend_from_slice(&len.to_be_bytes());
+                        body.extend_from_slice(&name.to_be_bytes());
+                        body.extend_from_slice(&desc.to_be_bytes());
+                        body.extend_from_slice(&slot.to_be_bytes());
+                    }
                 }
-                out.extend_from_slice(&rva.to_be_bytes());
                 out.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 out.extend_from_slice(&body);
             }
+            write_attrs(&mut out, &annots);
             if let (Some(a), Some(s)) = (sig_attr, sig) {
                 out.extend_from_slice(&a.to_be_bytes());
                 out.extend_from_slice(&2u32.to_be_bytes());
@@ -788,7 +1056,7 @@ impl ClassEmit {
         }
         let n_class_attrs = 1u16
             + if class_sig_idx.is_some() { 1 } else { 0 }
-            + if rva_attr.is_some() { 1 } else { 0 }
+            + class_annots.len() as u16
             + if scala_sig_attr.is_some() { 1 } else { 0 }
             + if scala_raw_attr.is_some() { 1 } else { 0 }
             + if inner_classes_attr.is_some() { 1 } else { 0 }
@@ -840,32 +1108,7 @@ impl ClassEmit {
             out.extend_from_slice(&(marker.len() as u32).to_be_bytes());
             out.extend_from_slice(&marker);
         }
-        if let (Some(rva), Some(sig_ty), Some(bn)) = (rva_attr, sig_type, bytes_name) {
-            // RuntimeVisibleAnnotations { num=1, ScalaSignature { bytes = Utf8 } },
-            // or `ScalaLongSignature { bytes = { Utf8, ... } }` when one
-            // constant could not hold the whole pickle.
-            let mut body = Vec::new();
-            body.extend_from_slice(&1u16.to_be_bytes());
-            body.extend_from_slice(&sig_ty.to_be_bytes());
-            body.extend_from_slice(&1u16.to_be_bytes());
-            body.extend_from_slice(&bn.to_be_bytes());
-            if long_sig {
-                body.push(b'[');
-                body.extend_from_slice(&(sig_utf8s.len() as u16).to_be_bytes());
-                for su in &sig_utf8s {
-                    body.push(b's');
-                    body.extend_from_slice(&su.to_be_bytes());
-                }
-            } else {
-                for su in &sig_utf8s {
-                    body.push(b's');
-                    body.extend_from_slice(&su.to_be_bytes());
-                }
-            }
-            out.extend_from_slice(&rva.to_be_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-            out.extend_from_slice(&body);
-        }
+        write_attrs(&mut out, &class_annots);
         out.extend_from_slice(&src_attr.to_be_bytes());
         out.extend_from_slice(&2u32.to_be_bytes());
         out.extend_from_slice(&src_name.to_be_bytes());

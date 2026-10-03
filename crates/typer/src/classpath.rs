@@ -3430,6 +3430,8 @@ mod method_type_param_tests {
             has_module_field: false,
             inner_classes: Vec::new(),
             sole_instance_field: None,
+            retention: None,
+            repeatable: None,
         };
 
         let before_members = st.member_graph_gen();
@@ -3512,6 +3514,8 @@ mod module_view_tests {
             has_module_field: !carrier,
             inner_classes: Vec::new(),
             sole_instance_field: None,
+            retention: None,
+            repeatable: None,
         }
     }
 
@@ -3593,6 +3597,8 @@ mod module_view_tests {
             has_module_field: false,
             inner_classes: Vec::new(),
             sole_instance_field: None,
+            retention: None,
+            repeatable: None,
         };
         apply_java_class_meta(&mut st, cls, &classfile);
 

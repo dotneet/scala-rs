@@ -12,6 +12,8 @@ mod conform;
 mod conspat;
 #[path = "../constant_condition_branches.rs"]
 mod constant_condition_branches;
+#[path = "../constant_val_fields.rs"]
+mod constant_val_fields;
 #[path = "../contextualfollowup.rs"]
 mod contextualfollowup;
 #[path = "../contextualinference.rs"]
@@ -22,6 +24,8 @@ mod conversion_inference;
 mod convimpl;
 #[path = "../cpvalueclass.rs"]
 mod cpvalueclass;
+#[path = "../ctor_param_alias_pickle.rs"]
+mod ctor_param_alias_pickle;
 #[path = "../ctoraccessor.rs"]
 mod ctoraccessor;
 #[path = "../ctorgaps.rs"]
@@ -44,10 +48,14 @@ mod deadcode;
 mod declbound;
 #[path = "../declvsdef.rs"]
 mod declvsdef;
+#[path = "../default_param_scope.rs"]
+mod default_param_scope;
 #[path = "../default_type_imports.rs"]
 mod default_type_imports;
 #[path = "../defaultargs.rs"]
 mod defaultargs;
+#[path = "../delayed_init_names.rs"]
+mod delayed_init_names;
 #[path = "../dependentadaptation.rs"]
 mod dependentadaptation;
 #[path = "../dirsig.rs"]
@@ -58,24 +66,32 @@ mod durrange;
 mod e2e;
 #[path = "../earlyscope.rs"]
 mod earlyscope;
-#[path = "../eithertry.rs"]
-mod eithertry;
 #[path = "../eithert_widen.rs"]
 mod eithert_widen;
+#[path = "../eithertry.rs"]
+mod eithertry;
 #[path = "../elemtype.rs"]
 mod elemtype;
+#[path = "../empty_apply_nullary.rs"]
+mod empty_apply_nullary;
 #[path = "../engine.rs"]
 mod engine;
 #[path = "../eqtail.rs"]
 mod eqtail;
 #[path = "../erascg.rs"]
 mod erascg;
+#[path = "../erased_default_getter.rs"]
+mod erased_default_getter;
 #[path = "../erasure3.rs"]
 mod erasure3;
+#[path = "../erasure_unit_order.rs"]
+mod erasure_unit_order;
 #[path = "../evidencebatch.rs"]
 mod evidencebatch;
 #[path = "../existential.rs"]
 mod existential;
+#[path = "../f_interpolator_unicode.rs"]
+mod f_interpolator_unicode;
 #[path = "../fewerclasses.rs"]
 mod fewerclasses;
 #[path = "../fieldscope.rs"]

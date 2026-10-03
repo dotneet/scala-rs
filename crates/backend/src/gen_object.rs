@@ -96,6 +96,10 @@ impl<'a> Gen<'a> {
         }
         for stt in &impl_.body {
             if let TreeKind::ValDef { name, mods, .. } = &stt.kind {
+                // A constant `final val` has no field (see `emit_val_getters`).
+                if self.st.constant_vals.contains_key(&stt.sym) {
+                    continue;
+                }
                 let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
                     self.st.get(stt.sym).ty.clone()
                 } else {
@@ -111,7 +115,7 @@ impl<'a> Gen<'a> {
         // A classpath lazy val is visible to both the ordinary trait-val and
         // pickle lazy-val scans. Keep the dedicated lazy field only.
         let binary_lazies = self.binary_mixin_lazy_vals(cls, &impl_.body);
-        for (name, ty, extra) in self.mixin_val_fields(cls, &[], &impl_.body) {
+        for (name, ty, extra, sym) in self.mixin_val_fields(cls, &[], &impl_.body) {
             // Nothing is added twice. A trait with a dedicated emission --
             // `scala.App`, whose `executionStart` / `initCode` fields and
             // accessors are written out below -- already put its field here,
@@ -123,8 +127,9 @@ impl<'a> Gen<'a> {
             if binary_lazies.iter().any(|v| v.name == name) {
                 continue;
             }
+            b.annotate_mixin_field(self.st, &name, sym);
             b.fields.push(Field {
-                access: ACC_PUBLIC | extra,
+                access: ACC_PRIVATE | extra,
                 name,
                 desc: jvm_desc_val(self.st, &ty),
             });
@@ -243,8 +248,12 @@ impl<'a> Gen<'a> {
         }
 
         // `case object Asc`: nsc's `toString` / `hashCode` / `productPrefix`
-        // live on the module class, not on a companion.
-        self.emit_case_object_methods(&mut b, cls);
+        // live on the module class, not on a companion. The written `case`
+        // decides: a case class's companion carries `CASE` on its symbol as
+        // well (see `prelude_product`), and it is not a `Product`.
+        if mods.flags.contains(Flags::CASE) {
+            self.emit_case_object_methods(&mut b, cls);
+        }
 
         // `case object Asc extends Direction { override def reverse: Desc.type
         // = Desc }`: a module overriding with a narrower result type needs the
@@ -259,7 +268,11 @@ impl<'a> Gen<'a> {
             }
         }
         self.emit_binary_parent_bridges(&mut b, cls);
+        if inner_outer.is_none() {
+            self.emit_module_write_replace(&mut b, cls);
+        }
         self.drain_lambdas(&mut b, lambda_wm);
+        b.annotate_template(self.st, cls, &[], &impl_.body);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
         b.sign_class(self.sig_of(cls));
 
@@ -348,6 +361,15 @@ impl<'a> Gen<'a> {
     /// [`TraitImpls`] instead, which knows whether the `$init$` we emit has a
     /// body worth calling.
     pub(crate) fn declares_mixin_ctor(&self, trait_id: SymbolId) -> bool {
+        // The class file is the answer when there is one: a trait whose
+        // members came from its pickle (a generic one, `Base[T, C]`) has no
+        // `$init$` symbol, since the pickle does not list it, and its `val`s
+        // were left `null` in every class mixing it in.
+        if let Some(methods) = self.binary_methods(trait_id) {
+            return methods
+                .iter()
+                .any(|(name, _, access)| name == "$init$" && access & ACC_STATIC != 0);
+        }
         self.st
             .get(trait_id)
             .members
@@ -590,6 +612,7 @@ impl<'a> Gen<'a> {
                         if rhs.is_empty()
                             || rhs.is_default_init()
                             || mods.flags.contains(Flags::LAZY)
+                            || st.constant_vals.contains_key(&vd.sym)
                         {
                             continue;
                         }
@@ -823,10 +846,20 @@ impl<'a> Gen<'a> {
             }
             todo.push((name, jvm_method_desc(self.st, &tys, &ret)));
         }
-        for (n, d) in [
+        let mut synthesized = vec![
             ("hashCode$extension", format!("({udesc})I")),
             ("equals$extension", format!("({udesc}Ljava/lang/Object;)Z")),
-        ] {
+        ];
+        // The case class's `copy` and `toString` (see
+        // `emit_value_class_methods`).
+        if self.st.get(class_id).flags.contains(Flags::CASE) {
+            let fdesc = jvm_desc(self.st, &under);
+            synthesized.push(("copy$extension", format!("({fdesc}{fdesc}){fdesc}")));
+            if self.abi.is_library() && !value_class_writes_to_string(self.st, class_id) {
+                synthesized.push(("toString$extension", format!("({fdesc})Ljava/lang/String;")));
+            }
+        }
+        for (n, d) in synthesized {
             if !todo.iter().any(|(m, _)| m == n) {
                 todo.push((n.to_string(), d));
             }
@@ -938,6 +971,9 @@ impl<'a> Gen<'a> {
                 self.emit_value_extension_forwarders(&mut b, class_id, &impl_.body);
             }
         }
+        if inner_outer.is_none() {
+            self.emit_module_write_replace(&mut b, comp.unwrap_or(SymbolId::NONE));
+        }
         self.drain_lambdas(&mut b, lambda_wm);
         // The companion classfile is named `C$`, but `class_id` is the
         // ordinary case class `C`.  For a nested case class this used to put
@@ -982,6 +1018,41 @@ impl<'a> Gen<'a> {
 
     /// `java.io.Serializable` alone -- a case class's companion, which is not
     /// a `Product`. A JDK interface, so it needs no library.
+    /// nsc's `writeReplace` for a serializable singleton: the stream holds a
+    /// `ModuleSerializationProxy` whose `readResolve` answers `MODULE$`, so
+    /// deserializing never makes a second instance of the object.
+    pub(crate) fn emit_module_write_replace(&self, b: &mut ClassBuilder, cls: SymbolId) {
+        const DESC: &str = "()Ljava/lang/Object;";
+        if !self.abi.is_library()
+            || b.methods
+                .iter()
+                .any(|m| m.name == "writeReplace" && m.desc == DESC)
+        {
+            return;
+        }
+        let serializable = b.interfaces.iter().any(|i| i == "java/io/Serializable")
+            || (!cls.is_none()
+                && self.lin_above(cls).into_iter().any(|p| {
+                    let s = self.st.get(p);
+                    s.jvm_name == "java/io/Serializable" || s.jvm_name == "scala/Serializable"
+                }));
+        if !serializable {
+            return;
+        }
+        let this = b.this_name.clone();
+        b.add_code(ACC_PRIVATE, "writeReplace", DESC, 1, move |asm| {
+            asm.new_obj("scala/runtime/ModuleSerializationProxy");
+            asm.dup();
+            asm.ldc_class(&this);
+            asm.invokespecial(
+                "scala/runtime/ModuleSerializationProxy",
+                "<init>",
+                "(Ljava/lang/Class;)V",
+            );
+            asm.areturn();
+        });
+    }
+
     pub(crate) fn add_serializable(&self, b: &mut ClassBuilder) {
         if !b.interfaces.iter().any(|i| i == "java/io/Serializable") {
             b.interfaces.push("java/io/Serializable".into());
@@ -998,6 +1069,8 @@ impl<'a> Gen<'a> {
         let mut b = ClassBuilder::new(fwd_name, self.source_name);
         b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
         add_static_forwarders(&mut b, module_jvm, methods);
+        // A mirror class carries the object's annotations too.
+        b.annotate_template(self.st, class_id, &[], &[]);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         // `class_id` is the module's own symbol: `fwd_name` (`Main`, no `$`)
         // never matches a symbol's own jvm name, so the self-entry lookup
@@ -1043,6 +1116,8 @@ impl<'a> Gen<'a> {
                 name,
                 desc: desc.clone(),
                 signature: None,
+                annots: Vec::new(),
+                param_annots: Vec::new(),
             });
         }
         out
@@ -1547,7 +1622,13 @@ pub(crate) fn emit_case_apply(
         .find(|f| f.name == "$outer")
         .map(|f| (b.this_name.clone(), f.desc.clone()));
     let base_ctor_d = jvm_method_desc(st, &params, &Type::Unit);
-    let ctor_d = if outer.is_some() {
+    // The static companion of a local case class that never reads its
+    // enclosing instance: the class keeps the constructor slot (see
+    // `with_enclosing_outer_param`) and no field, so `null` fills it.
+    let null_outer = outer.is_none()
+        && enclosing_instance_desc(st, class_id).is_some()
+        && outer_field_desc(st, class_id).is_none();
+    let ctor_d = if outer.is_some() || null_outer {
         with_enclosing_outer_param(st, class_id, &base_ctor_d)
     } else {
         base_ctor_d
@@ -1559,6 +1640,8 @@ pub(crate) fn emit_case_apply(
         if let Some((owner, d)) = &outer {
             asm.aload(0);
             asm.getfield(owner, "$outer", d);
+        } else if null_outer {
+            asm.aconst_null();
         }
         for (slot, sort) in &loads {
             load(asm, *slot, *sort);
@@ -1757,7 +1840,22 @@ pub(crate) fn emit_case_unapply(
             (s.name.clone(), s.ty.clone(), jvm_desc_val(st, &s.ty), vc)
         })
         .collect();
+    // nsc's `unapply` reads each field through its accessor, which is what
+    // lets the field stay private (see `crate::field_access`).
+    let getters: Vec<Option<String>> = fields[..arity]
+        .iter()
+        .map(|f| {
+            let ty = &st.get(*f).ty;
+            (crate::gen_desc::param_field_has_getter(st, *f) && !erases_to_boxed_unit(ty))
+                .then(|| format!("(){}", jvm_desc(st, ty)))
+        })
+        .collect();
     let cj = class_jvm.clone();
+    let read =
+        move |asm: &mut crate::code::Assembler, i: usize, name: &str, d: &str| match &getters[i] {
+            Some(g) => asm.invokevirtual(&cj, &encode_method_name(name), g),
+            None => asm.getfield(&cj, name, d),
+        };
     b.add_code(ACC_PUBLIC, "unapply", &desc, 2, move |asm| {
         let nonnull = asm.fresh_label();
         asm.aload(1);
@@ -1782,18 +1880,18 @@ pub(crate) fn emit_case_unapply(
             asm.new_obj(&tuple);
             asm.dup();
         }
-        for (name, ty, d, vc) in &field_info {
+        for (i, (name, ty, d, vc)) in field_info.iter().enumerate() {
             match vc {
                 Some((internal, ctor)) => {
                     asm.new_obj(internal);
                     asm.dup();
                     asm.aload(1);
-                    asm.getfield(&cj, name, d);
+                    read(asm, i, name, d);
                     asm.invokespecial(internal, "<init>", ctor);
                 }
                 None => {
                     asm.aload(1);
-                    asm.getfield(&cj, name, d);
+                    read(asm, i, name, d);
                     if is_jvm_primitive(ty) && !erases_to_boxed_unit(ty) {
                         emit_box(asm, ty);
                     }
@@ -1854,6 +1952,9 @@ pub(crate) fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: S
     let ctor_d =
         with_enclosing_outer_param(st, class_id, &jvm_method_desc(st, &params, &Type::Unit));
     let outer = outer_field_desc(st, class_id);
+    // A local class that never reads its enclosing instance keeps the
+    // constructor slot but no field, and is built with `null` there.
+    let null_outer = outer.is_none() && enclosing_instance_desc(st, class_id).is_some();
     let acc = synthetic_case_member_access(st, copy_id);
     b.add_code(acc, "copy", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
@@ -1861,6 +1962,8 @@ pub(crate) fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: S
         if let Some(d) = &outer {
             asm.aload(0);
             asm.getfield(&class_jvm, "$outer", d);
+        } else if null_outer {
+            asm.aconst_null();
         }
         for (slot, sort) in &loads {
             load(asm, *slot, *sort);
@@ -1946,10 +2049,21 @@ pub(crate) fn add_static_forwarders(b: &mut ClassBuilder, module_jvm: &str, meth
                 ret_of_sort(asm, jvm_sort_of(ret));
             },
         );
-        if let Some(sig) = &f.signature {
-            if let Some(m) = b.methods.last_mut() {
+        if let Some(m) = b.methods.last_mut() {
+            if let Some(sig) = &f.signature {
                 m.signature = Some(sig.clone());
             }
+            m.java_annots = f.annots.clone();
+            m.param_annots = f.param_annots.clone();
         }
     }
+}
+
+/// Whether a value class's source writes its own `toString`, whose
+/// `$extension` is then an ordinary member's.
+pub(crate) fn value_class_writes_to_string(st: &SymbolTable, class_id: SymbolId) -> bool {
+    st.get(class_id).members.iter().any(|&m| {
+        let s = st.get(m);
+        s.name == "toString" && s.kind == SymKind::Method && !s.flags.contains(Flags::SYNTHETIC)
+    })
 }

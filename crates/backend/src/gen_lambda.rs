@@ -219,7 +219,7 @@ pub(crate) fn ident_reads_enclosing_this(st: &SymbolTable, id: SymbolId) -> bool
         {
             return false;
         }
-        return matches!(st.get(s.owner).kind, SymKind::Class);
+        return owner_is_an_instance(st, s.owner);
     }
     if !matches!(s.kind, SymKind::Method | SymKind::Term)
         || s.flags.contains(Flags::STATIC)
@@ -233,7 +233,33 @@ pub(crate) fn ident_reads_enclosing_this(st: &SymbolTable, id: SymbolId) -> bool
     {
         return false;
     }
-    matches!(st.get(s.owner).kind, SymKind::Class)
+    owner_is_an_instance(st, s.owner)
+}
+
+/// Whether a member of `owner` is reached through an instance of it: a
+/// class, or an object nested in a class, a trait or a method -- one per
+/// enclosing instance, with no `MODULE$` to read it from. A lambda in such
+/// an object's method that calls another of its methods has to capture the
+/// object, or the call went to whatever the lambda's first capture was.
+fn owner_is_an_instance(st: &SymbolTable, owner: SymbolId) -> bool {
+    match st.get(owner).kind {
+        SymKind::Class => true,
+        SymKind::ModuleClass => {
+            let mut at = owner;
+            loop {
+                let s = st.get(at);
+                match s.kind {
+                    SymKind::ModuleClass => at = s.owner,
+                    SymKind::Package | SymKind::NoSymbol => return false,
+                    _ => return true,
+                }
+                if at.is_none() {
+                    return false;
+                }
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Is `qual` the compiler-generated class-side receiver alias of a static Java
@@ -745,7 +771,20 @@ pub(crate) fn pf_bind_arg_and_captures(
 ) {
     if let Some(p) = vparams.first() {
         a.aload(1);
-        if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
+        // A parameter erased to a value class's underlying value receives
+        // the box (`case s if … => s.value` over a `Seq[Sid]`): read its
+        // field. Unboxing the box itself was a `ClassCastException`.
+        let value_class = (!p.sym.is_none())
+            .then(|| st.value_class_for_term(p.sym))
+            .flatten()
+            .filter(|&c| jvm_desc(st, &p.ty) != format!("L{};", class_internal(st, c)));
+        if let Some(cls) = value_class {
+            let boxed = Type::Class {
+                sym: cls,
+                args: vec![].into(),
+            };
+            emit_sam_bridge_arg(a, st, &Type::Any, &boxed, &p.ty, abi);
+        } else if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
             emit_unbox(a, &p.ty, abi);
         } else if let Type::Class { sym, .. } = &p.ty {
             let n = class_internal(st, *sym);

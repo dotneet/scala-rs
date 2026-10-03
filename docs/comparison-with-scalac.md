@@ -65,11 +65,13 @@ differs from scalac 2.13.16. The gaps themselves are in
 - **Case classes** get nsc's synthesized members (`copy` / `copy$default$N` /
   `productPrefix` / `productArity` / `productElement` / `productIterator` /
   `canEqual` / `productElementName` / `hashCode` / `toString` / `equals`, and
-  the companion's `toString` / `apply` / `unapply`). Differences: no
-  companion `writeReplace`; no static forwarders on the class for the
-  companion's `apply` / `unapply` / `tupled` / `curried`; case accessor
-  fields are `public final` where nsc's are `private final`, and our own
-  synthesized members read them with `getfield` where nsc calls the accessor.
+  the companion's `toString` / `apply` / `unapply` / `writeReplace`).
+  Difference: no static forwarders on the class for the companion's
+  `apply` / `unapply` / `tupled` / `curried`. A field is `private`, as nsc's
+  is, and another class reads a constructor `val` through its accessor;
+  a field that another class of the run still reads directly (a
+  `private[this]` value a lambda class captures) is made `public` once the
+  run's classes are generated.
   `hashCode` under the library ABI is nsc's, chosen as
   `SyntheticMethods.chooseHashcode` does: `ScalaRunTime._hashCode(this)` when
   no case accessor has a primitive value type, otherwise the written-out

@@ -1268,6 +1268,31 @@ fn compile_engine(dir: &Path) -> Result<(), String> {
             let _ = std::fs::remove_dir_all(&staging);
             Ok(())
         }
+        // The directory outlived its class files: a periodic temporary-file
+        // sweep removes old files but keeps a directory a live daemon's
+        // endpoint directory still occupies. Every later compile then failed
+        // to publish into it. Move the classes in one by one instead, the
+        // class `valid_engine_class` reads last, so no process sees it before
+        // the classes it refers to.
+        Err(_e) if dir.is_dir() => {
+            let moved = (|| -> std::io::Result<()> {
+                let mut names: Vec<_> = std::fs::read_dir(&staging)?
+                    .filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .filter(|n| n != "ScalaRsMacroEngine.java")
+                    .collect();
+                names.sort_by_key(|n| n == "ScalaRsMacroEngine.class");
+                for name in names {
+                    std::fs::rename(staging.join(&name), dir.join(&name))?;
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_dir_all(&staging);
+            match moved {
+                Ok(()) => Ok(()),
+                Err(_) if valid_engine_class(&dir.join("ScalaRsMacroEngine.class")) => Ok(()),
+                Err(e) => Err(format!("cannot publish the macro engine cache: {e}")),
+            }
+        }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&staging);
             Err(format!("cannot publish the macro engine cache: {e}"))
@@ -2018,6 +2043,44 @@ impl Typer {
         let timing_slot = self
             .macro_timing
             .begin_expansion(|| format!("{}.{}", binding.impl_class, binding.impl_method));
+        // The expansion's type trees carry the macro's type arguments
+        // expanded; a type tag built inside it keeps the aliases they were
+        // written with, as nsc's does (`Typer::alias_view_of_tree`).
+        let views_mark = self.alias_views.len();
+        // Type arguments inferred from a function literal's parameters
+        // (Airframe's `toProvider { (a: O.Alias) => ... }`) are those
+        // parameters' written types.
+        let mut node: &Tree = tree;
+        let mut written: Vec<Tree> = Vec::new();
+        loop {
+            match &node.kind {
+                TreeKind::Apply { fun, args } => {
+                    for arg in args {
+                        if let TreeKind::Function { vparams, .. } = &arg.kind {
+                            for p in vparams {
+                                if let TreeKind::ValDef { tpt, .. } = &p.kind {
+                                    if !tpt.is_empty() {
+                                        written.push((**tpt).clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    node = fun;
+                }
+                TreeKind::TypeApply { args, .. } => {
+                    written.extend(args.iter().cloned());
+                    break;
+                }
+                _ => break,
+            }
+        }
+        for targ in &written {
+            if let Some(view) = self.alias_view_of_tree(targ) {
+                let expanded = self.type_of_type_tree(targ);
+                self.alias_views.push((expanded, view));
+            }
+        }
         self.with_macro_context(|this| {
             match this.macro_expansion(tree, &binding) {
                 Ok(mut built) => {
@@ -2080,6 +2143,7 @@ impl Typer {
                 Err(reason) => this.note_macro_failure(tree.span, reason),
             }
         });
+        self.alias_views.truncate(views_mark);
         self.macro_timing.end_expansion(timing_slot);
     }
 
@@ -2245,6 +2309,7 @@ impl Typer {
                 // reason, which ends the expansion as an `err` instead.
                 let msg = at(items, 1)?.text();
                 self.error(tree.span, msg);
+                self.macro_aborts.set(self.macro_aborts.get() + 1);
                 Err("the macro implementation aborted the expansion".to_string())
             }
             Some("err") => Err(at(items, 1)?.text()),
@@ -2613,10 +2678,7 @@ impl Typer {
                         out.push(')');
                     }
                     Ok(()) => {
-                        if built.len() >= 4096
-                            && self.macro_depth == 0
-                            && !self.macro_engine_busy
-                        {
+                        if built.len() >= 4096 && self.macro_depth == 0 && !self.macro_engine_busy {
                             let id = self.macro_next_prefix_id;
                             self.macro_next_prefix_id += 1;
                             let mut compact = built.clone();
@@ -2758,7 +2820,9 @@ impl Typer {
         if let TreeKind::InterpolatedString { args, .. } = &t.kind {
             for arg in args {
                 if let Ok(wire) = self.tag_wire(&arg.ty) {
-                    types.interpolation_types.insert(std::ptr::from_ref(arg), wire);
+                    types
+                        .interpolation_types
+                        .insert(std::ptr::from_ref(arg), wire);
                 }
             }
         }
@@ -2797,9 +2861,7 @@ impl Typer {
                         let ty = self.st.get(vparam.sym).ty.clone();
                         if !crate::check::type_is_erroneous(&ty) && !ty.is_no_type() {
                             if let Ok(desc) = self.tag_wire(&ty) {
-                                types
-                                    .param_types
-                                    .insert(std::ptr::from_ref(vparam), desc);
+                                types.param_types.insert(std::ptr::from_ref(vparam), desc);
                             }
                         }
                     }
@@ -2893,7 +2955,10 @@ impl Typer {
             let solve = |(pattern, actual): &(Type, Type)| {
                 crate::check::unify_one(&self.st, tp, pattern, actual).filter(|t| clean(t))
             };
-            let Some(targ) = shapes.as_ref().and_then(solve).or_else(|| result.as_ref().and_then(solve))
+            let Some(targ) = shapes
+                .as_ref()
+                .and_then(solve)
+                .or_else(|| result.as_ref().and_then(solve))
             else {
                 return;
             };
@@ -4058,17 +4123,21 @@ impl Typer {
                     .text()
                     .parse::<isize>()
                     .map_err(|e| e.to_string())?;
-                let typed = self.macro_splices.get(root).and_then(Option::as_ref).and_then(|t| {
-                    if let TreeKind::Block { stats, expr } = &t.kind {
-                        if index == -1 {
-                            Some(expr.as_ref())
+                let typed = self
+                    .macro_splices
+                    .get(root)
+                    .and_then(Option::as_ref)
+                    .and_then(|t| {
+                        if let TreeKind::Block { stats, expr } = &t.kind {
+                            if index == -1 {
+                                Some(expr.as_ref())
+                            } else {
+                                stats.get(index as usize)
+                            }
                         } else {
-                            stats.get(index as usize)
+                            None
                         }
-                    } else {
-                        None
-                    }
-                });
+                    });
                 match typed {
                     Some(t) => {
                         let mut typed = t.clone();
@@ -5059,7 +5128,12 @@ fn static_module_class_path(st: &SymbolTable, module_class: SymbolId) -> Option<
         let jvm = &st.get(module_class).jvm_name;
         if st.get(owner).kind == SymKind::Package
             && jvm.ends_with('$')
-            && *jvm != format!("{}/{}$", st.jvm_internal(owner), encode_method_name(&module))
+            && *jvm
+                != format!(
+                    "{}/{}$",
+                    st.jvm_internal(owner),
+                    encode_method_name(&module)
+                )
         {
             if let Some((pkg, last)) = path.rsplit_once('.') {
                 return Some(format!("{pkg}.package.{last}"));
@@ -6318,7 +6392,9 @@ impl Sexp {
                     out.push_str(&text[run..*i]);
                     *i += 1;
                     if *i >= s.len() {
-                        return Err("the macro engine sent an unterminated string escape".to_string());
+                        return Err(
+                            "the macro engine sent an unterminated string escape".to_string()
+                        );
                     }
                     out.push(match s[*i] {
                         b'n' => '\n',
@@ -6555,6 +6631,35 @@ mod tests {
         let mut empty = String::new();
         quote_into(&mut empty, "");
         assert_eq!(empty, "\"\"");
+    }
+
+    /// A cache directory a temporary-file sweep emptied of its classes, but
+    /// not removed because a daemon's endpoint directory is still in it, is
+    /// filled again rather than failing every later compile.
+    #[test]
+    fn engine_cache_directory_without_classes_is_republished() {
+        if Command::new(jdk_tool("javac"))
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skip: javac is unavailable");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "scala-rs-engine-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("daemon-endpoint")).unwrap();
+        let result = compile_engine(&dir);
+        let valid = valid_engine_class(&dir.join("ScalaRsMacroEngine.class"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, Ok(()));
+        assert!(valid);
     }
 
     #[cfg(unix)]

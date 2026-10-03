@@ -11,9 +11,8 @@ use scala_rs_span::{
 };
 use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects,
-    collect_source_classes,
-    defines_local_classes, erase, expand_private_names, expand_trait_private_vals, find_mains,
-    hoist_default_receivers, lambda_lift, lazy_locals, mark_anon_captures,
+    collect_source_classes, defines_local_classes, expand_private_names, expand_trait_private_vals,
+    find_mains, hoist_default_receivers, lambda_lift, lazy_locals, mark_anon_captures,
     note_source_value_classes, restore_named_arg_order, restore_rassoc_order, typecheck_units_src,
     uncurry, TypecheckOptions,
 };
@@ -557,9 +556,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             let emitted_symbols: Vec<_> = st
                 .symbols
                 .iter()
-                .filter(|s| {
-                    output_owners.contains(&s.id) || output_owners.contains(&s.owner)
-                })
+                .filter(|s| output_owners.contains(&s.id) || output_owners.contains(&s.owner))
                 .map(|s| s.id)
                 .collect();
             let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_selected(
@@ -598,11 +595,17 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             generic_sigs = Some(std::rc::Rc::new(
                 scala_rs_backend::record_generic_signatures_for(&st, emitted_symbols),
             ));
-            for u in units.iter_mut() {
+            let preps: Vec<_> = units
+                .iter_mut()
+                .map(|u| scala_rs_typer::prepare_erasure(&mut u.tree, &mut st))
+                .collect();
+            let mut boxed = scala_rs_typer::BoxedParams::default();
+            for (u, prep) in units.iter_mut().zip(preps) {
                 u.pickles = std::rc::Rc::clone(&pickles);
-                erase(&mut u.tree, &mut st);
+                boxed.extend(scala_rs_typer::erase_prepared(&mut u.tree, &mut st, prep));
             }
-            scala_rs_typer::erase_value_class_default_getters(&mut st);
+            scala_rs_typer::rebox_value_class_lambda_params(&mut st, &boxed);
+            scala_rs_typer::erase_default_getters(&mut st);
         }
         shared_st = Some(st);
     }
@@ -730,7 +733,20 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             mains,
         };
     }
-    let (emitted, write_result) = writer.finish();
+    let (mut emitted, mut write_result) = writer.finish();
+    // Fields are private until another class of the run is seen to read one
+    // (`scala_rs_backend::field_access`); the few classes that changes are
+    // written again.
+    let reopened = scala_rs_backend::field_access::widen_cross_class_fields(&mut emitted);
+    if write_result.is_ok() {
+        let mut made = std::collections::HashSet::new();
+        for i in reopened {
+            if let Err(e) = write_class(&opts.out_dir, &mut made, &emitted[i]) {
+                write_result = Err(e);
+                break;
+            }
+        }
+    }
     phase!("write");
     let _ = phase_start;
     if let Err(e) = write_result {

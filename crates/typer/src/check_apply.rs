@@ -45,7 +45,8 @@ fn merge_argument_prototypes(left: &Type, right: &Type) -> Option<Type> {
                 .iter()
                 .zip(right_args)
                 .map(|(l, r)| merge_argument_prototypes(l, r))
-                .collect::<Option<Vec<_>>>()?.into(),
+                .collect::<Option<Vec<_>>>()?
+                .into(),
         }),
         (
             Type::Applied {
@@ -62,7 +63,8 @@ fn merge_argument_prototypes(left: &Type, right: &Type) -> Option<Type> {
                 .iter()
                 .zip(right_args)
                 .map(|(l, r)| merge_argument_prototypes(l, r))
-                .collect::<Option<Vec<_>>>()?.into(),
+                .collect::<Option<Vec<_>>>()?
+                .into(),
         }),
         _ if left == right => Some(left.clone()),
         _ => None,
@@ -1204,6 +1206,19 @@ impl Typer {
                     && matches!(crate::prefix::strip_view(ret), Type::ModuleRef(_) | Type::Class { .. }))
         {
             self.insert_apply_on_nullary(fun);
+        } else if args.is_empty()
+            && !fun.sym.is_none()
+            && self.st.get(fun.sym).parameterless_method == Some(true)
+            && matches!(&fun.ty, Type::Method { paramss, .. } if paramss.is_empty())
+            && self.result_takes_empty_apply(&fun.ty)
+            && !self.overrides_empty_paren_method(fun.sym)
+        {
+            // `def update: SQLUpdate` written `update()`: the empty argument
+            // list goes to the result's `apply()`, as in nsc (scalikejdbc's
+            // `sql"...".update()` runs the statement). Dropping it compiled
+            // to a statement that was never executed. A `def toString = …`
+            // overriding `toString()` keeps taking the empty list itself.
+            self.insert_apply_on_nullary(fun);
         }
         self.auto_apply_nullary_function(fun, args.len());
         fun.ty = self.expand_binary_method_alias(fun.sym, &fun.ty, fun.span);
@@ -1218,7 +1233,35 @@ impl Typer {
                 })
                 .collect();
             let ret = Box::new(self.expand_binary_method_alias(fun.sym, &ret, fun.span));
-            fun.ty = Type::Method { paramss, ret: ret.into() };
+            fun.ty = Type::Method {
+                paramss,
+                ret: ret.into(),
+            };
+        }
+        // `pkg.Atom(2, k = 3)`: a qualified reference to a module is left
+        // unrewritten (`rewrite_receiver_apply`), and this path places named
+        // arguments but never fills the defaults they skip, so the call was
+        // matched against `(2, 3)` and reported no matching overload. Spell
+        // it `pkg.Atom.apply(2, k = 3)`, which the method path completes.
+        if Self::has_named_arg(args)
+            && matches!(fun.kind, TreeKind::Select { .. })
+            && matches!(crate::prefix::strip_view(&fun.ty), Type::ModuleRef(_))
+            && self.type_has_apply(&fun.ty)
+        {
+            if let TreeKind::Apply { fun, .. } = &mut tree.kind {
+                let old = std::mem::replace(fun.as_mut(), Tree::dummy(TreeKind::Empty));
+                let span = old.span;
+                **fun = Tree::new(
+                    NodeId(0),
+                    span,
+                    TreeKind::Select {
+                        qual: Box::new(old),
+                        name: "apply".to_string(),
+                    },
+                );
+            }
+            self.type_apply_in(tree, pt);
+            return;
         }
         let placed = self.reorder_named_args(args, fun);
         self.record_named_arg_order(tree_id);
@@ -2608,7 +2651,8 @@ impl Typer {
                                                 &vec![Type::Wildcard; open.len()],
                                                 &args[1],
                                             ),
-                                        ].into(),
+                                        ]
+                                        .into(),
                                     }
                                 }
                                 Type::Function { params, ret } if mentions_tparam(ret, &open) => {
@@ -3335,7 +3379,8 @@ impl Typer {
                                                     r,
                                                     &Type::Class {
                                                         sym: d,
-                                                        args: vec![fr.as_ref().widen_constant()].into(),
+                                                        args: vec![fr.as_ref().widen_constant()]
+                                                            .into(),
                                                     },
                                                 )
                                             },
@@ -3672,8 +3717,10 @@ impl Typer {
                                     let pair_rebuilt = self.pair_args(&elem).and_then(|pair| {
                                         let r =
                                             self.receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)?;
-                                        (self.st.get(r).tparams.len() == 2)
-                                            .then_some(Type::Class { sym: r, args: pair.into() })
+                                        (self.st.get(r).tparams.len() == 2).then_some(Type::Class {
+                                            sym: r,
+                                            args: pair.into(),
+                                        })
                                     });
                                     if let Some(t) = pair_rebuilt {
                                         ret = t;
@@ -3736,7 +3783,8 @@ impl Typer {
                                     args: vec![
                                         args[0].ty.widen_constant(),
                                         args[1].ty.widen_constant(),
-                                    ].into(),
+                                    ]
+                                    .into(),
                                 };
                             } else if n == "Vector" && args.len() >= 2 {
                                 ret = Type::Class {
@@ -3791,7 +3839,8 @@ impl Typer {
                                                     *targs = vec![
                                                         self.st.lub(&targs[0], &more[0]),
                                                         self.st.lub(&targs[1], &more[1]),
-                                                    ].into();
+                                                    ]
+                                                    .into();
                                                 }
                                             }
                                         }
@@ -4823,7 +4872,11 @@ impl Typer {
         let Type::Function { ret, .. } = fun else {
             return None;
         };
-        let elem = if flatten { self.elem_type(&ret)? } else { ret.clone().into_inner() };
+        let elem = if flatten {
+            self.elem_type(&ret)?
+        } else {
+            ret.clone().into_inner()
+        };
         if self.pair_args(&elem).is_some() {
             return None;
         }
@@ -5333,5 +5386,73 @@ mod sequential_prototype_tests {
         let elems: Vec<String> = (0..200).map(|i| format!("(\"k{i}\", {i})")).collect();
         let n = solves(&format!("val a = F.pairs({})", elems.join(", ")));
         assert!((1..=3).contains(&n), "{n} solves");
+    }
+}
+
+impl Typer {
+    /// Whether the result of nullary method type `ty` has an `apply` whose
+    /// first parameter list is empty (implicit lists may follow).
+    fn result_takes_empty_apply(&self, ty: &Type) -> bool {
+        let Type::Method { ret, .. } = ty else {
+            return false;
+        };
+        let Some(cls) = self.st.class_sym_of(crate::prefix::strip_view(ret)) else {
+            return false;
+        };
+        self.st.lookup_member(cls, "apply").into_iter().any(|m| {
+            matches!(&self.st.get(m).ty, Type::Method { paramss, .. }
+                if paramss.first().is_some_and(|c| c.is_empty()))
+        })
+    }
+
+    /// Whether `sym` overrides a method declared with an empty parameter
+    /// list, which a call may still write `f()`.
+    fn overrides_empty_paren_method(&self, sym: SymbolId) -> bool {
+        let s = self.st.get(sym);
+        let owner = s.owner;
+        if owner.is_none() || !self.st.get(owner).is_class_like() {
+            return false;
+        }
+        let name = s.name.clone();
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut work: Vec<SymbolId> = self
+            .st
+            .get(owner)
+            .parents
+            .iter()
+            .filter_map(|p| self.st.class_sym_of(p))
+            .collect();
+        while let Some(c) = work.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            for &m in &self.st.get(c).members {
+                let ms = self.st.get(m);
+                if ms.name == name
+                    && matches!(&ms.ty, Type::Method { paramss, .. }
+                        if paramss.len() == 1 && paramss[0].is_empty())
+                {
+                    return true;
+                }
+            }
+            work.extend(
+                self.st
+                    .get(c)
+                    .parents
+                    .iter()
+                    .filter_map(|p| self.st.class_sym_of(p)),
+            );
+        }
+        matches!(
+            name.as_str(),
+            "toString"
+                | "hashCode"
+                | "getClass"
+                | "clone"
+                | "finalize"
+                | "notify"
+                | "notifyAll"
+                | "wait"
+        )
     }
 }

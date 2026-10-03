@@ -1710,6 +1710,33 @@ impl<'a> Reifier<'a> {
             .find(|c| *c == owner)
     }
 
+    /// The module class `cls` really belongs to, when `cls` is the twin of a
+    /// member of an object that a class-path read gave to the companion
+    /// class instead. `InnerClasses` names the class `X` as the outer one of
+    /// a member of the object `X` too, so the class file alone puts the class
+    /// in `X`'s trait or class; the pickle has it in the object. Reified
+    /// there, the mirror found nothing (`ScalaReflectionException: type Inner
+    /// in X not found`) and the type printed as the projection `X#Inner`.
+    fn object_member_twin(&self, cls: SymbolId) -> Option<SymbolId> {
+        let st = self.st();
+        let owner = st.get(cls).owner;
+        if owner.is_none() || st.get(owner).kind != SymKind::Class {
+            return None;
+        }
+        // The pickle names the declaring owner even when the module class
+        // has not entered the member yet.
+        if let Some(&decl) = st.binary_nested_decl_owners.get(&cls) {
+            return (st.get(decl).kind == SymKind::ModuleClass).then_some(decl);
+        }
+        let mcls = st.module_class_of(st.companion_module(owner)?);
+        let name = &st.get(cls).name;
+        st.get(mcls)
+            .members
+            .iter()
+            .any(|&x| st.get(x).name == *name)
+            .then_some(mcls)
+    }
+
     /// `$m.staticClass("...")` or `rs.selectType(<static object>.asModule
     /// .moduleClass, "Name")`: the class symbol itself.
     fn class_symbol(&self, cls: SymbolId) -> Result<Tree, String> {
@@ -1741,12 +1768,32 @@ impl<'a> Reifier<'a> {
                     .ok_or_else(|| {
                         format!("`{}`, a class nested in a class or an object", s.name)
                     })?;
+                // `Outer$Inner` names a member of the class `Outer` or of the
+                // object `Outer` alike. With both a trait and its companion
+                // object, `selectType(staticClass("Outer"), "Inner")` looked
+                // in the trait and failed at run time (`ScalaReflectionException:
+                // type Inner in Outer not found`) for a class of the object.
+                let in_class = st
+                    .find_class_by_jvm(outer)
+                    .is_some_and(|c| st.get(c).members.iter().any(|&m| st.get(m).name == inner));
+                let in_module = st.find_class_by_jvm(&format!("{outer}$")).is_some();
+                let owner_tree = if in_module && !in_class {
+                    self.select(
+                        self.select(
+                            self.call(
+                                self.select(self.local(&self.mirror_local()), "staticModule"),
+                                vec![self.lit(Lit::String(outer.replace('/', ".")))],
+                            ),
+                            "asModule",
+                        ),
+                        "moduleClass",
+                    )
+                } else {
+                    self.static_class(&outer.replace('/', "."))
+                };
                 Ok(self.call(
                     self.support_member("selectType"),
-                    vec![
-                        self.static_class(&outer.replace('/', ".")),
-                        self.lit(Lit::String(inner.to_string())),
-                    ],
+                    vec![owner_tree, self.lit(Lit::String(inner.to_string()))],
                 ))
             }
             // `object O { class Inner }`: `selectType(O.moduleClass, "Inner")`.
@@ -1764,6 +1811,17 @@ impl<'a> Reifier<'a> {
             // "Expr")`. The prefix the type had (`universe.Expr`) is not
             // recorded, so its value form is `Exprs.this.Expr`.
             _ => {
+                if let Some(mcls) = self.object_member_twin(cls) {
+                    if let Ok(module) = self.module_symbol(mcls) {
+                        return Ok(self.call(
+                            self.support_member("selectType"),
+                            vec![
+                                self.select(self.select(module, "asModule"), "moduleClass"),
+                                self.lit(Lit::String(s.name.clone())),
+                            ],
+                        ));
+                    }
+                }
                 let outer = self.class_symbol(s.owner)?;
                 Ok(self.call(
                     self.support_member("selectType"),
@@ -1862,7 +1920,8 @@ impl<'a> Reifier<'a> {
                 let name = crate::materialize::static_class_name(st, ty)?;
                 Ok(self.type_constructor(self.static_class(&name)))
             }
-            Type::Applied { ctor, args } => {
+            Type::Applied { ctor, args } if !matches!(ctor.as_ref(), Type::TypeMember(id) if self.static_alias_owner(*id, args.len()).is_some()) =>
+            {
                 let constructor = self.type_value(ctor)?;
                 let args: Result<Vec<_>, _> = args.iter().map(|arg| self.type_value(arg)).collect();
                 Ok(self.call(
@@ -1885,6 +1944,55 @@ impl<'a> Reifier<'a> {
             }
             Type::Array(elem) => {
                 self.applied_value(self.static_class("scala.Array"), std::slice::from_ref(elem))
+            }
+            // `O.Alias` for `object O { type Alias = ... }`, kept as written
+            // (`crate::alias_view`): `TypeRef(O.type, selectType(O.moduleClass,
+            // "Alias"), Nil)`, as nsc builds it. A tag that expands the alias
+            // names a different type to anything that compares names --
+            // Airframe binds by them.
+            // A parameterized alias unapplied (`F[cats.Id]`) is the same
+            // reference with no arguments, as nsc writes it.
+            Type::TypeMember(id) if self.is_static_alias(*id) => {
+                let arity = st.get(*id).tparams.len();
+                let mcls = self.static_alias_owner(*id, arity).unwrap();
+                let module = self.module_symbol(mcls)?;
+                let prefix = self.type_value(&Type::ModuleRef(mcls))?;
+                let alias = self.call(
+                    self.support_member("selectType"),
+                    vec![
+                        self.select(self.select(module, "asModule"), "moduleClass"),
+                        self.lit(Lit::String(st.get(*id).name.clone())),
+                    ],
+                );
+                Ok(self.call(
+                    self.support_member("TypeRef"),
+                    vec![prefix, alias, self.list(vec![])],
+                ))
+            }
+            // `O.F[A]` for `object O { type F[X] = ... }`, the same way.
+            Type::Applied { ctor, args } if matches!(ctor.as_ref(), Type::TypeMember(id) if self.static_alias_owner(*id, args.len()).is_some()) =>
+            {
+                let Type::TypeMember(id) = ctor.as_ref() else {
+                    unreachable!()
+                };
+                let mcls = self.static_alias_owner(*id, args.len()).unwrap();
+                let module = self.module_symbol(mcls)?;
+                let prefix = self.type_value(&Type::ModuleRef(mcls))?;
+                let alias = self.call(
+                    self.support_member("selectType"),
+                    vec![
+                        self.select(self.select(module, "asModule"), "moduleClass"),
+                        self.lit(Lit::String(st.get(*id).name.clone())),
+                    ],
+                );
+                let mut vs = Vec::new();
+                for a in args.iter() {
+                    vs.push(self.type_value(a)?);
+                }
+                Ok(self.call(
+                    self.support_member("TypeRef"),
+                    vec![prefix, alias, self.list(vs)],
+                ))
             }
             Type::TypeParam(id) | Type::TypeMember(id) => {
                 if self.is_local(*id) {
@@ -1933,6 +2041,33 @@ impl<'a> Reifier<'a> {
                 st.display_type(other)
             )),
         }
+    }
+
+    /// A type alias of a static object, of any arity.
+    fn is_static_alias(&self, id: SymbolId) -> bool {
+        let arity = self.st().get(id).tparams.len();
+        self.static_alias_owner(id, arity).is_some()
+    }
+
+    /// The module class of the static object that declares `id`, when `id`
+    /// is a type alias taking `arity` type parameters (`type Alias = ...`).
+    fn static_alias_owner(&self, id: SymbolId, arity: usize) -> Option<SymbolId> {
+        let st = self.st();
+        let s = st.get(id);
+        if s.kind != SymKind::TypeMember
+            || s.tparams.len() != arity
+            || st.is_deferred_type_member(id)
+            || self.is_local(id)
+        {
+            return None;
+        }
+        let owner = s.owner;
+        if owner.is_none() || !matches!(st.get(owner).kind, SymKind::ModuleClass | SymKind::Module)
+        {
+            return None;
+        }
+        let mcls = st.module_class_of(owner);
+        self.module_symbol(mcls).is_ok().then_some(mcls)
     }
 
     /// The module symbol of a static `object`: `$m.staticModule("O")` for a
@@ -2058,6 +2193,21 @@ impl<'a> Reifier<'a> {
         ))
     }
 
+    /// Whether the code being typed is inside class `cls`'s template.
+    fn inside_class(&self, cls: SymbolId) -> bool {
+        let st = self.st();
+        let mut at = st.this_class;
+        let mut steps = 0;
+        while !at.is_none() && steps < 64 {
+            if at == cls {
+                return true;
+            }
+            at = st.get(at).owner;
+            steps += 1;
+        }
+        false
+    }
+
     /// A class at type arguments, as a type value.
     fn class_type_value(&self, cls: SymbolId, args: &[Type]) -> Result<Tree, String> {
         let st = self.st();
@@ -2069,17 +2219,25 @@ impl<'a> Reifier<'a> {
             Type::Class { sym, args } if *sym == cls => {
                 let class = self.class_symbol(*sym)?;
                 let owner = st.get(*sym).owner;
-                if st.get(owner).kind == SymKind::Class {
+                if st.get(owner).kind == SymKind::Class && self.object_member_twin(*sym).is_none() {
                     // A class nested in a class: `TypeRef(<prefix>, <class>,
                     // args)`, since `toTypeConstructor` would give the type
                     // seen from nowhere. For the reflection API's own cake
                     // (`Exprs.Expr`, `Trees.Tree`) the prefix that makes the
                     // type the one a program names is the runtime universe,
-                    // `scala.reflect.runtime.universe.Expr[T]`; any other
-                    // outer class gives `Outer.this`.
+                    // `scala.reflect.runtime.universe.Expr[T]`. Inside the
+                    // outer class it is `Outer.this`; from anywhere else the
+                    // type is the projection `Outer#Inner`, whose prefix is
+                    // the outer class's type -- nsc's tag of
+                    // `JdbcProfile#Backend#Database` prints
+                    // `slick.jdbc.JdbcBackend#DatabaseDef`, and a dependency
+                    // injector keyed by that string found no binding for
+                    // `JdbcBackend.this.DatabaseDef`.
                     let outer = self.class_symbol(owner)?;
                     let prefix = if st.jvm_internal(owner).starts_with("scala/reflect/api/") {
                         self.runtime_universe_singleton()
+                    } else if st.get(owner).tparams.is_empty() && !self.inside_class(owner) {
+                        self.class_type_value(owner, &[])?
                     } else {
                         self.call(self.support_member("ThisType"), vec![outer])
                     };
@@ -2124,8 +2282,9 @@ impl<'a> Reifier<'a> {
         let mut ids = Vec::new();
         collect_abstract(ty, &mut ids);
         let env = self.env();
-        ids.iter()
-            .any(|id| !env.local_syms.contains(id) && !env.tags.contains_key(id))
+        ids.iter().any(|id| {
+            !env.local_syms.contains(id) && !env.tags.contains_key(id) && !self.is_static_alias(*id)
+        })
     }
 
     /// nsc's `reificationIsConcrete`: no free type, and every tag spliced in
@@ -2137,8 +2296,9 @@ impl<'a> Reifier<'a> {
         let mut ids = Vec::new();
         collect_abstract(ty, &mut ids);
         let env = self.env();
-        ids.iter()
-            .all(|id| env.local_syms.contains(id) || env.strong_tags.contains(id))
+        ids.iter().all(|id| {
+            env.local_syms.contains(id) || env.strong_tags.contains(id) || self.is_static_alias(*id)
+        })
     }
 
     // -- patterns ------------------------------------------------------------

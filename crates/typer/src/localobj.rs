@@ -98,6 +98,25 @@ fn walk_case_captures(file_index: usize, tree: &Tree, st: &SymbolTable, out: &mu
                      ordinary local `class`."
                 ),
             ));
+        } else if mods.flags.contains(Flags::CASE)
+            && !tree.sym.is_none()
+            && is_local_case_class(st, tree.sym)
+            && st.get(tree.sym).requires_outer_field
+        {
+            // The same shape for the enclosing instance: the class stores it
+            // in `$outer`, and the static companion's `apply` has none to
+            // pass (`NoSuchMethodError` on the constructor at run time).
+            out.push(Diagnostic::error(
+                file_index,
+                tree.span,
+                format!(
+                    "not implemented: a local `case class {name}` that reads the \
+                     enclosing instance (its synthetic companion would have to hold \
+                     it too, the same shape a local `object` needs and cannot get \
+                     yet). Move it out of the method, or drop `case` and write an \
+                     ordinary local `class`."
+                ),
+            ));
         }
     }
     each_child(tree, &mut |c| walk_case_captures(file_index, c, st, out));

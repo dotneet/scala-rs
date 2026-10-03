@@ -1240,6 +1240,76 @@ pub(crate) fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str
     }
 }
 
+/// A local of an enclosing method that a class around this one captured:
+/// `class U { object Root { def f = a } }` inside `def m(a: A)` reads `a` from
+/// `U`'s capture field, through `Root`'s `$outer`. `Root` captures nothing
+/// itself, and the read used to take the method for a class and the local
+/// for its field (`NoClassDefFoundError: m`).
+fn load_capture_of_enclosing_class(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) -> bool {
+    if !load_capture_field_of_enclosing_class(asm, ctx, id) {
+        return false;
+    }
+    if is_boxed_var(ctx, id) {
+        let ty = ctx.st.get(id).ty.clone();
+        if is_unit_like(&ty) {
+            asm.pop();
+            return true;
+        }
+        load_runtime_ref_elem(asm, ctx, &ty);
+    }
+    true
+}
+
+/// The capture field itself (the `IntRef` of a captured `var`) for
+/// [`load_capture_of_enclosing_class`], and for an assignment to the local.
+fn load_capture_field_of_enclosing_class(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) -> bool {
+    let st = ctx.st;
+    let s = st.get(id);
+    if !matches!(s.kind, SymKind::Term)
+        || s.owner.is_none()
+        || st.get(s.owner).kind != SymKind::Method
+    {
+        return false;
+    }
+    if ctx.class_sym.is_none() || class_captures(st, ctx.class_sym).contains(&id) {
+        return false;
+    }
+    let mut cur = ctx.class_sym;
+    let mut target = None;
+    let mut steps = 0;
+    while let Some(outer) = enclosing_instance(st, cur) {
+        if let Some(i) = class_captures(st, outer).iter().position(|c| *c == id) {
+            target = Some((outer, i));
+            break;
+        }
+        cur = outer;
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+    }
+    let Some((target, index)) = target else {
+        return false;
+    };
+    let (mut at, _) = start_outer_walk(asm, ctx, true);
+    while !at.is_none() && at != target {
+        let Some(outer) = enclosing_instance(st, at) else {
+            return false;
+        };
+        let f = outer_field_class(st, at).unwrap_or(outer);
+        load_outer_of(asm, st, at, f);
+        at = outer;
+    }
+    let owner = class_internal(st, target);
+    crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
+    asm.getfield(
+        &owner,
+        &capture_field_name(st, id, index),
+        &capture_field_desc(st, ctx.boxed_vars, id),
+    );
+    true
+}
+
 pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     if matches!(&tree.kind, TreeKind::Ident { name } if name == "$classOf") {
         gen_java_class_of(asm, ctx, &tree.ty);
@@ -1273,6 +1343,13 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
         }
         return;
     }
+    // A bare `##` is `this.##`; as a plain member call it named
+    // `Object.$hash$hash`, which no class declares.
+    if matches!(ic, Intrinsic::AnyHash) {
+        load_this(asm, ctx);
+        emit_any_hash(asm, &Type::Any);
+        return;
+    }
     if let Some((slot, sort)) = frame.get(id) {
         if is_boxed_var(ctx, id) {
             let ty = ctx.st.get(id).ty.clone();
@@ -1286,6 +1363,9 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
             return;
         }
         load(asm, slot, sort);
+        return;
+    }
+    if load_capture_of_enclosing_class(asm, ctx, id) {
         return;
     }
     let sym = ctx.st.get(id);
@@ -1402,8 +1482,7 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
                     // ("Type 'java/lang/Object' is not assignable to
                     // 'cats/arrow/FunctionKMacros$Lifter'" -- which made real
                     // scalac crash while *running* our `FunctionK.lift` macro).
-                    crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
-                    emit_getfield(asm, &owner, &sym.name, &desc);
+                    crate::gen_desc::emit_param_field_read(asm, ctx, &owner, id, &sym.name, &desc);
                 } else {
                     let acc = sym.jvm_name.clone();
                     asm.invokevirtual(&owner, &acc, &format!("(){}", jvm_desc(ctx.st, &sym.ty)));
@@ -1786,8 +1865,9 @@ pub(crate) fn gen_select(
                         } else {
                             desc
                         };
-                        crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
-                        crate::gen_desc::emit_field_read(asm, ctx, &owner, &s.name, &desc);
+                        crate::gen_desc::emit_param_field_read(
+                            asm, ctx, &owner, tree.sym, &s.name, &desc,
+                        );
                     } else {
                         let acc = s.jvm_name.clone();
                         asm.invokevirtual(&owner, &acc, &format!("(){}", jvm_desc(ctx.st, &s.ty)));
@@ -2000,8 +2080,15 @@ pub(crate) fn gen_select(
         gen_expr(asm, frame, ctx, qual);
         let owner = class_internal(ctx.st, cid);
         let desc = jvm_desc_val(ctx.st, &tree.ty);
-        crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
-        crate::gen_desc::emit_field_read(asm, ctx, &owner, name, &desc);
+        let field = ctx
+            .st
+            .get(cid)
+            .ctor_fields
+            .iter()
+            .copied()
+            .find(|&f| ctx.st.get(f).name == name)
+            .unwrap_or(SymbolId::NONE);
+        crate::gen_desc::emit_param_field_read(asm, ctx, &owner, field, name, &desc);
         return;
     }
     report_ctx_error(ctx, tree.span, format!("select {name}"));
@@ -2074,6 +2161,15 @@ pub(crate) fn gen_assign(
                     );
                 }
                 store(asm, slot, sort);
+                return;
+            }
+            if is_boxed_var(ctx, id) && load_capture_field_of_enclosing_class(asm, ctx, id) {
+                gen_expr(asm, frame, ctx, rhs);
+                let ty = ctx.st.get(id).ty.clone();
+                if is_unit_like(&ty) {
+                    adapt_unit_arg(asm, ctx, rhs, &Type::Unit);
+                }
+                store_runtime_ref_elem(asm, &ty);
                 return;
             }
             if !id.is_none() {
@@ -4645,7 +4741,25 @@ pub(crate) fn invoke_value_extension(
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
-    let desc = value_extension_desc(ctx.st, id);
+    let mut desc = value_extension_desc(ctx.st, id);
+    // A class-path value class says in its class file what its extension
+    // method takes: the underlying field's pickled type parameter
+    // (`final class Ext[O <: Rep[_]](val r: O)`) may have been erased before
+    // its bound was ever read, and `m$extension(Object)` does not link.
+    if !ctx.st.is_source_class(ctx.st.get(id).owner) {
+        let target = value_extension_module(ctx.st, id).unwrap_or_else(|| owner.clone());
+        let found = ctx
+            .mixins
+            .class_file_method_descs(&target, &format!("{}$extension", s.name));
+        let arity = count_value_ext_args(&desc);
+        let matching: Vec<&String> = found
+            .iter()
+            .filter(|d| count_value_ext_args(d) == arity)
+            .collect();
+        if let [only] = matching.as_slice() {
+            desc = (*only).clone();
+        }
+    }
     if let Some(ext_owner) = value_extension_module(ctx.st, id) {
         if !module_pushed {
             // Paren-less selection: no arguments follow, so the module can be
@@ -4955,7 +5069,13 @@ pub(crate) fn peel_identity_arg<'a>(ctx: &EmitCtx, tree: &'a Tree) -> &'a Tree {
 
 pub(crate) fn value_extension_desc(st: &SymbolTable, id: SymbolId) -> String {
     let owner = st.get(id).owner;
-    let under = st.value_class_underlying(owner).unwrap_or(Type::Int);
+    // Erased to its bound: a class-path value class's underlying field keeps
+    // its pickled type, and `final class Ext[O <: Rep[_]](val r: O)` takes a
+    // `Rep` in `m$extension`, not an `Object` (`NoSuchMethodError`).
+    let under = st
+        .value_class_underlying(owner)
+        .map(|t| scala_rs_typer::erase_type_in(&t, st))
+        .unwrap_or(Type::Int);
     let inst = method_desc_from_sym(st, id);
     let rest = inst.strip_prefix('(').unwrap_or(&inst);
     format!("({}{}", jvm_desc(st, &under), rest)

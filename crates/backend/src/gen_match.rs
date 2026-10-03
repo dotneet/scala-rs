@@ -323,6 +323,12 @@ pub(crate) fn gen_ctor_fields_pattern(
                 && has_nullary_accessor(ctx.st, class_id, &fname)
             {
                 Some(fname.clone())
+            } else if ctx.class_sym != class_id
+                && crate::gen_desc::param_field_has_getter(ctx.st, *fid)
+            {
+                // nsc reads another class's case field through its
+                // accessor, and the field stays private.
+                Some(crate::classfile::encode_method_name(&fname))
             } else {
                 None
             };
@@ -541,9 +547,25 @@ fn gen_unapply_pattern(
     // 'slick/ast/Apply'"). The `instanceof` test above already ran for the
     // sequence shapes; only the cast was missing, so compute the class for
     // those too and let the `checkcast` below use it.
-    let param_class = (sel_sort == JvmSort::Ref && shape != SeqPatShape::Array)
+    let mut param_class = (sel_sort == JvmSort::Ref && shape != SeqPatShape::Array)
         .then(|| unapply_param_class(ctx, uid))
         .flatten();
+    // An `unapply` declared at a value class takes the underlying value
+    // (`Off$.unapply(I)` for `case class Off(value: Int) extends AnyVal`), but
+    // a reference scrutinee holds the box. nsc tests the box, then reads its
+    // field; unboxing the box as an `Integer` (or casting it to `String`)
+    // was a `ClassCastException`.
+    let vc_param = (sel_sort == JvmSort::Ref && !is_seq && !uid.is_none())
+        .then(|| ctx.st.get(uid).params.first().copied())
+        .flatten()
+        .and_then(|p| ctx.st.value_class_for_term(p))
+        .filter(|&vc| param_class.as_deref() != Some(class_internal(ctx.st, vc).as_str()));
+    if let Some(vc) = vc_param {
+        param_class = None;
+        load(asm, tmp, sel_sort);
+        asm.instanceof(&class_internal(ctx.st, vc));
+        asm.ifeq(fail);
+    }
     if !is_seq {
         if let Some(cls) = &param_class {
             let known = param0
@@ -607,6 +629,22 @@ fn gen_unapply_pattern(
         asm.checkcast(&seq_pat_test_class(ctx, param0.as_ref()));
     } else if let Some(cls) = &param_class {
         asm.checkcast(cls);
+    } else if let Some(vc) = vc_param {
+        let class = class_internal(ctx.st, vc);
+        asm.checkcast(&class);
+        let under = ctx
+            .st
+            .recorded_value_class_underlying(vc)
+            .cloned()
+            .or_else(|| ctx.st.value_class_underlying(vc));
+        let desc = under
+            .as_ref()
+            .map_or_else(|| "Ljava/lang/Object;".to_string(), |u| jvm_desc(ctx.st, u));
+        asm.invokevirtual(&class, ctx.st.value_class_getter(vc), &format!("(){desc}"));
+        // A generic value class's getter answers `Object`.
+        if let Some(p) = param0.as_ref().filter(|p| jvm_desc(ctx.st, p) != desc) {
+            emit_from_erased_object(asm, ctx.st, p, ctx.abi);
+        }
     } else if sel_sort == JvmSort::Ref {
         // A primitive-parameter `unapply` reached through an erased field:
         // the descriptor wants the unboxed value.
@@ -945,6 +983,33 @@ fn extracted_want(ctx: &EmitCtx, a: &Tree, raw: &Type) -> (Type, JvmSort) {
 pub(crate) fn coerce_subpattern(asm: &mut Assembler, ctx: &EmitCtx, pat: &Tree) -> JvmSort {
     if reads_erased_value(ctx, pat) {
         return JvmSort::Ref;
+    }
+    // A value class read out of a generic slot (a `Seq`'s element for
+    // `case Seq(c)`) is its box, and the binder holds the underlying value:
+    // unwrap it as the constructor-field path above does. Cast to the
+    // underlying class instead, `Code` met a `checkcast String`.
+    if let Some(vc) = (!pat.sym.is_none())
+        .then(|| ctx.st.value_class_for_term(pat.sym))
+        .flatten()
+    {
+        let class = class_internal(ctx.st, vc);
+        asm.checkcast(&class);
+        let under = ctx
+            .st
+            .recorded_value_class_underlying(vc)
+            .cloned()
+            .or_else(|| ctx.st.value_class_underlying(vc))
+            .unwrap_or_else(|| pat.ty.clone());
+        asm.invokevirtual(
+            &class,
+            ctx.st.value_class_getter(vc),
+            &format!("(){}", jvm_desc(ctx.st, &under)),
+        );
+        // A generic value class's getter answers `Object`.
+        if jvm_desc(ctx.st, &under) != jvm_desc(ctx.st, &pat.ty) {
+            emit_from_erased_object(asm, ctx.st, &pat.ty, ctx.abi);
+        }
+        return jvm_sort(&pat.ty);
     }
     if is_jvm_primitive(&pat.ty) {
         emit_unbox(asm, &pat.ty, ctx.abi);
@@ -1525,6 +1590,22 @@ pub(crate) fn gen_pattern(
             if binds && (want != sel_sort || jvm != "java/lang/Object") {
                 load(asm, tmp, sel_sort);
                 emit_from_erased_object(asm, ctx.st, &pat.ty, ctx.abi);
+                // The binder is the scrutinee narrowed to the pattern type,
+                // `Throwable with Compat` for `case e: Compat` on a
+                // `Throwable`, and erases to the class of the two, as nsc's
+                // intersection dominator does. Stored as the trait it
+                // disagreed with every use of `e` as that class
+                // (`VerifyError: Inconsistent stackmap frames`).
+                if want == JvmSort::Ref && !expr.sym.is_none() {
+                    let bound = type_jvm_name(ctx.st, &ctx.st.get(expr.sym).ty);
+                    if !bound.is_empty()
+                        && bound != jvm
+                        && bound != "java/lang/Object"
+                        && !matches!(ctx.st.get(expr.sym).ty, Type::Array(_))
+                    {
+                        asm.checkcast(&bound);
+                    }
+                }
                 let narrowed = frame.alloc_tmp(want);
                 store(asm, narrowed, want);
                 gen_pattern(asm, frame, ctx, expr, narrowed, want, fail);

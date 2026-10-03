@@ -1,9 +1,9 @@
 //! Walk a typed compilation unit and emit JVM classfiles (major 52).
 
 use crate::classfile::{
-    encode_method_name, ClassEmit, EmittedClass, Field, InnerClassEntry, Method, Pool, ACC_FINAL,
-    ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC, ACC_STRICT, ACC_SUPER, ACC_SYNTHETIC,
-    MAX_CODE_LENGTH,
+    encode_method_name, Annotation, ClassAnnots, ClassEmit, EmittedClass, Field, InnerClassEntry,
+    Method, Pool, ACC_FINAL, ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC, ACC_STRICT,
+    ACC_SUPER, ACC_SYNTHETIC, MAX_CODE_LENGTH,
 };
 use crate::code::{Assembler, Label};
 use crate::companion_fwd::{self};
@@ -154,7 +154,37 @@ pub struct OuterSuper {
 /// super accessors its classes owe their nested classes.
 pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpls) {
     collect_trait_impls(tree, into);
+    constant_trait_vals_as_defs(st, into);
     collect_outer_supers(tree, st, SymbolId::NONE, into);
+}
+
+/// nsc's trait `final val N = 5` is a `default` method answering the
+/// constant (with its `N$` static): there is no mixin setter, no field in an
+/// implementing class and nothing in `$init$`. A class scalac compiles
+/// against the trait implements nothing more, so an abstract accessor and
+/// setter left it with `AbstractMethodError`.
+pub(crate) fn constant_trait_vals_as_defs(st: &SymbolTable, into: &mut TraitImpls) {
+    let traits: Vec<SymbolId> = into.vals.keys().copied().collect();
+    for t in traits {
+        let Some(vals) = into.vals.get_mut(&t) else {
+            continue;
+        };
+        let (constants, rest): (Vec<Tree>, Vec<Tree>) = std::mem::take(vals)
+            .into_iter()
+            .partition(|v| st.constant_vals.contains_key(&v.sym));
+        *vals = rest;
+        if vals.is_empty() {
+            into.vals.remove(&t);
+        }
+        if constants.is_empty() {
+            continue;
+        }
+        if let Some(inits) = into.inits.get_mut(&t) {
+            inits.retain(|s| !st.constant_vals.contains_key(&s.sym) || s.sym.is_none());
+        }
+        let defs = into.impls.entry(t).or_default();
+        defs.extend(constants.iter().map(crate::gen_desc::lazy_val_as_def));
+    }
 }
 
 /// The accessor through which a `Q.super.m` selection has to be made, when
@@ -462,6 +492,7 @@ pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpt
         None => {
             let mut own = TraitImpls::default();
             collect_trait_impls(tree, &mut own);
+            constant_trait_vals_as_defs(st, &mut own);
             Rc::new(own)
         }
     };
@@ -772,6 +803,9 @@ pub(crate) trait SamMixins {
     /// Whether `rel` is one of those names, which a literal class named any
     /// other way must stay clear of.
     fn is_anonfun_class_name(&self, rel: &str) -> bool;
+    /// The descriptors of the methods named `name` in class-path class
+    /// `class` (internal name), from its class file.
+    fn class_file_method_descs(&self, class: &str, name: &str) -> Vec<String>;
 }
 
 pub(crate) fn report_emit_error(
@@ -1257,7 +1291,13 @@ impl Frame {
         if floor >= self.next_slot {
             return;
         }
-        self.locals.retain(|_, (slot, _)| *slot < floor);
+        // A `Unit` local occupies no slot: declared just before the block it
+        // sits at the block's first slot, and releasing it with the block's
+        // own locals turned a later read into a field access on the enclosing
+        // method's name (`NoClassDefFoundError: $anonfun`). Holding nothing,
+        // it can be kept whatever its scope.
+        self.locals
+            .retain(|_, (slot, sort)| *slot < floor || *sort == JvmSort::Void);
         self.next_slot = floor;
         asm.release_locals_from(floor);
     }
@@ -1309,6 +1349,8 @@ pub(crate) struct ClassBuilder {
     /// JVMS §4.7.9 `Signature` on the class, and on its fields by name.
     pub(crate) signature: Option<String>,
     pub(crate) field_signatures: HashMap<String, String>,
+    /// Java annotations of the class and of its fields.
+    pub(crate) annots: ClassAnnots,
     /// JVMS §4.7.2 `ConstantValue` on a `static final long` field
     /// (`@SerialVersionUID`).
     pub(crate) field_constants: HashMap<String, i64>,
@@ -1321,7 +1363,7 @@ pub(crate) struct ClassBuilder {
 /// Stable handle to a method in a [`ClassBuilder`]. Metadata attachment can
 /// use this handle instead of depending on whichever method is last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MethodIndex(usize);
+pub(crate) struct MethodIndex(pub(crate) usize);
 
 /// nsc `Symbol.isStrictFP` minus `isDeferred` (only methods with code ask):
 /// `sym` or anything it is nested in carries `@strictfp`.
@@ -1363,6 +1405,7 @@ impl ClassBuilder {
             format_errors: Vec::new(),
             signature: None,
             field_signatures: HashMap::default(),
+            annots: Default::default(),
             field_constants: HashMap::default(),
             strict_fp: false,
         }
@@ -1403,6 +1446,8 @@ impl ClassBuilder {
             desc: desc.to_string(),
             code: Some(code),
             java_annots: Vec::new(),
+            param_annots: Vec::new(),
+            local_names: Vec::new(),
             signature: None,
             param_names: Vec::new(),
             param_flags: Vec::new(),
@@ -1417,6 +1462,8 @@ impl ClassBuilder {
             desc: desc.to_string(),
             code: None,
             java_annots: Vec::new(),
+            param_annots: Vec::new(),
+            local_names: Vec::new(),
             signature: None,
             param_names: Vec::new(),
             param_flags: Vec::new(),
@@ -1609,10 +1656,52 @@ impl ClassBuilder {
     }
 
     pub(crate) fn add_java_annot_to_last(&mut self, desc: &str) {
+        self.add_java_annots_to_last(&[Annotation::marker(desc)]);
+    }
+
+    /// Adds `annots` to the method added last, each interface at most once.
+    pub(crate) fn add_java_annots_to_last(&mut self, annots: &[Annotation]) {
         if let Some(m) = self.methods.last_mut() {
-            if !m.java_annots.iter().any(|a| a == desc) {
-                m.java_annots.push(desc.to_string());
+            for a in annots {
+                if !m.java_annots.iter().any(|b| b.desc == a.desc) {
+                    m.java_annots.push(a.clone());
+                }
             }
+        }
+    }
+
+    /// Names the parameters of the method added last in its
+    /// `LocalVariableTable`; `offset` leading descriptor parameters (a
+    /// `$outer`, a trait static's `$this`) stay unnamed.
+    pub(crate) fn set_local_names_of_last(&mut self, def: &Tree, offset: usize) {
+        let TreeKind::DefDef { vparamss, .. } = &def.kind else {
+            return;
+        };
+        let mut names = vec![None; offset];
+        names.extend(
+            vparamss
+                .iter()
+                .flatten()
+                .map(|p| p.name().map(str::to_string)),
+        );
+        if let Some(m) = self.methods.last_mut() {
+            if m.param_names.is_empty()
+                && crate::companion_fwd::desc_slots(&m.desc)
+                    .is_some_and(|s| s.0.len() == names.len())
+            {
+                m.local_names = names;
+            }
+        }
+    }
+
+    /// Sets the parameter annotations of the method added last, unless no
+    /// parameter has one.
+    pub(crate) fn set_param_annots_of_last(&mut self, params: Vec<Vec<Annotation>>) {
+        if params.iter().all(|p| p.is_empty()) {
+            return;
+        }
+        if let Some(m) = self.methods.last_mut() {
+            m.param_annots = params;
         }
     }
 
@@ -1672,7 +1761,7 @@ impl ClassBuilder {
     /// has the same name, so the annotations are copied from there here.
     fn copy_annotations_to_bridges(&mut self) {
         const ACC_BRIDGE: u16 = 0x0040;
-        let annotated: HashMap<String, Vec<String>> = self
+        let annotated: HashMap<String, Vec<Annotation>> = self
             .methods
             .iter()
             .filter(|m| m.access & ACC_BRIDGE == 0 && !m.java_annots.is_empty())
@@ -1756,6 +1845,7 @@ impl ClassBuilder {
             enclosing_method,
             signature: self.signature,
             field_signatures: self.field_signatures,
+            annots: self.annots,
             field_constants: self.field_constants,
         };
         let bytes = class.write_with_pool(self.pool).expect("classfile write");
@@ -1774,6 +1864,17 @@ pub(crate) fn attach_scala_sig(
     pickles: &HashMap<u32, Vec<u8>>,
 ) {
     if class_id.is_none() {
+        return;
+    }
+    // A nested class's symbols are in its top-level class's pickle, and
+    // nsc marks its own class file with the `Scala` attribute alone. A
+    // pickle of its own made nsc's class-file reader, which enters a
+    // nested class under the owner its `InnerClasses` entry names, see a
+    // second root for it.
+    let owner = st.get(class_id).owner;
+    if !owner.is_none() && st.get(owner).kind != scala_rs_typer::SymKind::Package {
+        b.scala_raw = true;
+        b.scala_signature = None;
         return;
     }
     let raw = pickles
@@ -1835,7 +1936,25 @@ pub(crate) fn compute_inner_classes(
     }
 
     let members_owner = self_sym.filter(|id| !id.is_none()).unwrap_or(extra_owner);
-    if !members_owner.is_none() {
+    let mut owners = vec![members_owner];
+    // A top-level class declares its companion object's member classes too:
+    // their `InnerClasses` entries name this class as the outer one (see
+    // `describe_nested`), and the JVM checks that both sides agree.
+    if let Some(id) = self_sym.filter(|id| !id.is_none()) {
+        let s = st.get(id);
+        if s.kind == SymKind::Class
+            && !s.owner.is_none()
+            && st.get(s.owner).kind == SymKind::Package
+        {
+            if let Some(m) = st.companion_module(id) {
+                owners.push(st.module_class_of(m));
+            }
+        }
+    }
+    for members_owner in owners {
+        if members_owner.is_none() {
+            continue;
+        }
         for m in st.get(members_owner).members.clone() {
             let mk = st.get(m).kind;
             if !matches!(mk, SymKind::Class | SymKind::ModuleClass) {
@@ -1961,9 +2080,22 @@ pub(crate) fn describe_nested(
     if sflags.contains(Flags::FINAL) && sym.kind != SymKind::ModuleClass {
         flags |= ACC_FINAL;
     }
+    // A member of a top-level object is declared by the object's mirror
+    // class as far as the JVM is concerned: nsc strips the module suffix
+    // (`BTypesFromSymbols`, `isTopLevelModuleClass(rawowner)`), and Scala
+    // reflection finds the class among the mirror's `getDeclaredClasses`.
+    let mut outer = st.jvm_internal(owner);
+    if owner_kind == SymKind::ModuleClass
+        && !st.get(owner).owner.is_none()
+        && st.get(st.get(owner).owner).kind == SymKind::Package
+    {
+        if let Some(m) = outer.strip_suffix('$') {
+            outer = m.to_string();
+        }
+    }
     let entry = InnerClassEntry {
         inner_class: name.to_string(),
-        outer_class: Some(st.jvm_internal(owner)),
+        outer_class: Some(outer),
         inner_name: Some(sym.name.clone()),
         access_flags: flags,
     };
@@ -2052,6 +2184,8 @@ mod tests {
         scala_rs_typer::erase(&mut tree, &mut st);
         let mut classes = crate::runtime::emit_runtime();
         classes.extend(emit(&tree, &st, "Test.scala").expect("backend emit"));
+        // What the driver does once every class of a run exists.
+        crate::field_access::widen_cross_class_fields(&mut classes);
         classes
     }
 
@@ -2075,7 +2209,7 @@ mod tests {
         scala_rs_typer::uncurry(&mut tree, &mut st);
         scala_rs_typer::lambda_lift(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
-        emit_opts(
+        let mut classes = emit_opts(
             &tree,
             &st,
             "Test.scala",
@@ -2084,7 +2218,10 @@ mod tests {
                 ..Default::default()
             },
         )
-        .expect("backend emit")
+        .expect("backend emit");
+        // What the driver does once every class of a run exists.
+        crate::field_access::widen_cross_class_fields(&mut classes);
+        classes
     }
 
     fn run_main(src: &str) -> Option<String> {

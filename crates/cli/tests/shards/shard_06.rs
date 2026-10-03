@@ -12,6 +12,8 @@ mod ovl3;
 mod ovl4;
 #[path = "../ovl_exptype.rs"]
 mod ovl_exptype;
+#[path = "../param_local_names.rs"]
+mod param_local_names;
 #[path = "../parameterless_result_inference.rs"]
 mod parameterless_result_inference;
 #[path = "../parent_lambda.rs"]
@@ -28,6 +30,10 @@ mod parse;
 mod parser_combinators;
 #[path = "../partfactory.rs"]
 mod partfactory;
+#[path = "../partial_function_value_class.rs"]
+mod partial_function_value_class;
+#[path = "../partial_function_value_class_param.rs"]
+mod partial_function_value_class_param;
 #[path = "../patbind.rs"]
 mod patbind;
 #[path = "../pathdep.rs"]
@@ -42,6 +48,12 @@ mod pf_empty_inference;
 mod pfx;
 #[path = "../pickle_lib.rs"]
 mod pickle_lib;
+#[path = "../pickled_package_object_alias.rs"]
+mod pickled_package_object_alias;
+#[path = "../pickled_param_alias.rs"]
+mod pickled_param_alias;
+#[path = "../pickled_type_annotations.rs"]
+mod pickled_type_annotations;
 #[path = "../pickleparams.rs"]
 mod pickleparams;
 #[path = "../pkgalias.rs"]
@@ -68,10 +80,14 @@ mod proj;
 mod proven;
 #[path = "../qualfallback.rs"]
 mod qualfallback;
+#[path = "../qualified_named_default_apply.rs"]
+mod qualified_named_default_apply;
 #[path = "../qualifier_retry.rs"]
 mod qualifier_retry;
 #[path = "../quasi.rs"]
 mod quasi;
+#[path = "../reified_object_member_owner.rs"]
+mod reified_object_member_owner;
 #[path = "../reify.rs"]
 mod reify;
 #[path = "../reify2.rs"]
@@ -104,3 +120,5 @@ mod rtv;
 mod runwrong;
 #[path = "../runwrong3.rs"]
 mod runwrong3;
+#[path = "../seq_pattern_value_class.rs"]
+mod seq_pattern_value_class;

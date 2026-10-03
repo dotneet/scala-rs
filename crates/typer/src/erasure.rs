@@ -2,20 +2,150 @@
 //! `Object`, wrap by-name as `Function0`, and insert box/unbox trees so the
 //! backend does not have to guess at call sites.
 
+use rustc_hash::FxHashMap as HashMap;
 use scala_rs_parser::TyBox;
-use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{Flags, Lit, ParamClauses, SymbolId, Tree, TreeKind, Type};
 
 use crate::symbol::{Intrinsic, SymbolTable};
 
 /// Rewrite `tree` in place after typer, mutating symbol types to their JVM
 /// (erased) forms.
 pub fn erase(tree: &mut Tree, st: &mut SymbolTable) {
-    let boxed_params = value_class_lambda_params(tree, st);
-    // Before `erase_symbols`, which erases the constant types away.
+    let prep = prepare_erasure(tree, st);
+    erase_prepared(tree, st, prep);
+}
+
+/// What erasure reads of a unit while the symbol table still holds the
+/// source types. `erase_symbols` rewrites the whole table, so in a run of
+/// several units every unit has to be prepared before the first is erased:
+/// otherwise a later unit saw `final val N = "x"` as a `String` and read
+/// the value instead of inlining it, and took a lambda's value-class
+/// parameter for its unboxed underlying value.
+pub struct ErasurePrep {
+    boxed: BoxedParams,
+}
+
+/// The value-class parameters erasure keeps boxed: those of lambdas, and the
+/// same symbols where lambda lifting made them a parameter of a lifted local
+/// `def` (method, flattened parameter index, value class).
+#[derive(Default)]
+pub struct BoxedParams {
+    params: Vec<(SymbolId, SymbolId)>,
+    lifted: Vec<(SymbolId, usize, SymbolId)>,
+}
+
+impl BoxedParams {
+    pub fn extend(&mut self, other: BoxedParams) {
+        self.params.extend(other.params);
+        self.lifted.extend(other.lifted);
+    }
+}
+
+pub fn prepare_erasure(tree: &mut Tree, st: &mut SymbolTable) -> ErasurePrep {
+    let params = value_class_lambda_params(tree, st);
+    let mut lifted = Vec::new();
+    if !params.is_empty() {
+        let classes: HashMap<SymbolId, SymbolId> = params.iter().copied().collect();
+        collect_lifted_boxed_params(tree, &classes, &mut lifted);
+    }
+    let mut constants = Vec::new();
+    collect_constant_vals(tree, st, &mut constants);
+    st.constant_vals.extend(constants);
     inline_constant_refs(tree, st);
+    ErasurePrep {
+        boxed: BoxedParams { params, lifted },
+    }
+}
+
+/// The parameters of `def`s that are boxed lambda parameters. Lambda lifting
+/// hands a lifted local `def` the captured lambda parameter itself, so the
+/// method has to take it boxed as well: its body reads the symbol as the box
+/// (a lambda inside it captures it as one), and erasing the parameter to the
+/// underlying value made the method's frame and its body disagree
+/// (`VerifyError: Bad type on operand stack`).
+fn collect_lifted_boxed_params(
+    tree: &Tree,
+    classes: &HashMap<SymbolId, SymbolId>,
+    out: &mut Vec<(SymbolId, usize, SymbolId)>,
+) {
+    if let TreeKind::DefDef { vparamss, .. } = &tree.kind {
+        for (i, p) in vparamss.iter().flatten().enumerate() {
+            if let Some(&c) = classes.get(&p.sym) {
+                out.push((tree.sym, i, c));
+            }
+        }
+    }
+    for_each_child(tree, &mut |c| collect_lifted_boxed_params(c, classes, out));
+}
+
+/// The template `val`s of `tree` whose type is a constant.
+fn collect_constant_vals(tree: &Tree, st: &SymbolTable, out: &mut Vec<(SymbolId, Lit)>) {
+    if let TreeKind::ValDef { mods, .. } = &tree.kind {
+        if !tree.sym.is_none()
+            && !mods.flags.contains(Flags::LAZY)
+            && !mods.flags.contains(Flags::MUTABLE)
+            && !mods.flags.contains(Flags::PARAM)
+        {
+            let s = st.get(tree.sym);
+            if let Type::Constant(lit) = &s.ty {
+                if !matches!(lit, Lit::Unit | Lit::Symbol(_))
+                    && !s.owner.is_none()
+                    && st.get(s.owner).is_class_like()
+                {
+                    out.push((tree.sym, lit.clone()));
+                }
+            }
+        }
+    }
+    for_each_child(tree, &mut |c| collect_constant_vals(c, st, out));
+}
+
+/// Erases a unit [`prepare_erasure`] saw, and answers the lambda parameters
+/// it boxed for [`rebox_value_class_lambda_params`].
+pub fn erase_prepared(tree: &mut Tree, st: &mut SymbolTable, prep: ErasurePrep) -> BoxedParams {
     erase_symbols(st);
-    box_value_class_lambda_params(st, &boxed_params);
+    box_value_class_lambda_params(st, &prep.boxed.params);
+    box_lifted_params(st, &prep.boxed.lifted);
     erase_tree(tree, st, None);
+    prep.boxed
+}
+
+/// Boxes every unit's value-class lambda parameters again once the last
+/// unit is erased. Erasing a unit restores the parameters the unit before
+/// boxed, and code generation runs after every unit is erased: without this
+/// a lambda in any unit but the last unboxed its boxed argument
+/// (`unboxToInt` on a `Count`), a `ClassCastException` at run time.
+pub fn rebox_value_class_lambda_params(st: &mut SymbolTable, boxed: &BoxedParams) {
+    for (p, c) in &boxed.params {
+        st.get_mut(*p).ty = Type::Class {
+            sym: *c,
+            args: vec![].into(),
+        };
+    }
+    box_lifted_params(st, &boxed.lifted);
+}
+
+/// Gives the erased type of each lifted `def` in `lifted` the boxed value
+/// class at the parameter's position. See [`collect_lifted_boxed_params`].
+fn box_lifted_params(st: &mut SymbolTable, lifted: &[(SymbolId, usize, SymbolId)]) {
+    for &(m, i, c) in lifted {
+        let Type::Method { paramss, ret } = &st.get(m).ty else {
+            continue;
+        };
+        let mut clauses = paramss.clone().into_vec();
+        let Some(slot) = clauses.iter_mut().flatten().nth(i) else {
+            continue;
+        };
+        *slot = Type::Class {
+            sym: c,
+            args: vec![].into(),
+        };
+        let ret = ret.clone();
+        st.get_mut(m).ty = Type::Method {
+            paramss: ParamClauses::new(clauses),
+            ret,
+        };
+    }
 }
 
 fn box_value_class_lambda_params(st: &mut SymbolTable, params: &[(SymbolId, SymbolId)]) {
@@ -147,18 +277,17 @@ fn is_pure_path(t: &Tree, st: &SymbolTable) -> bool {
 }
 
 /// Default getters are stored on symbols instead of in the compilation-unit
-/// tree. Erase value-class results there too, after all units' symbols have
-/// been erased, so a copy getter reads the underlying field representation.
-pub fn erase_value_class_default_getters(st: &mut SymbolTable) {
+/// tree. Erase them there too, after all units' symbols have been erased, so
+/// a copy getter reads the underlying field representation and a value class
+/// inside any default (`Instant.EPOCH plusMillis Iv(d).millis`) is in its
+/// erased form: left unerased, `Iv.apply`'s underlying result met a cast to
+/// the box (`ClassCastException`).
+pub fn erase_default_getters(st: &mut SymbolTable) {
     let getters: Vec<_> = st
         .symbols
         .iter()
-        .filter_map(|s| {
-            if !s.name.contains("$default$") || s.default_rhs.is_none() {
-                return None;
-            }
-            st.value_class_for_result(s.id).map(|class| (s.id, class))
-        })
+        .filter(|s| s.name.contains("$default$") && s.default_rhs.is_some())
+        .map(|s| (s.id, st.value_class_for_result(s.id)))
         .collect();
     for (id, class) in getters {
         let Some(mut rhs) = st.get_mut(id).default_rhs.take() else {
@@ -166,7 +295,9 @@ pub fn erase_value_class_default_getters(st: &mut SymbolTable) {
         };
         let ret = st.get(id).ty.result().clone();
         erase_tree(&mut rhs, st, Some(&ret));
-        unbox_value_class_result(&mut rhs, class, &ret);
+        if let Some(class) = class {
+            unbox_value_class_result(&mut rhs, class, &ret);
+        }
         st.get_mut(id).default_rhs = Some(rhs);
     }
 }
@@ -435,6 +566,8 @@ fn erase_symbols(st: &mut SymbolTable) {
             };
             let (erased, abstract_params) = if kind == crate::symbol::SymKind::Method {
                 (erase_overriding_method(st, id, ty), abstract_param_mask(ty))
+            } else if parametric_eta_receiver(st, id) {
+                (Type::Any, 0)
             } else {
                 (erase_ty(ty, st), 0)
             };
@@ -655,6 +788,12 @@ fn existential_body(params: &[(SymbolId, Type)], body: &Type) -> Type {
     crate::symbol::subst_tparams_slice(&ids, &bounds, body)
 }
 
+/// `ty` erased against the symbol table: a type parameter or an abstract
+/// member to its bound, as nsc erases it.
+pub fn erase_type_in(ty: &Type, st: &SymbolTable) -> Type {
+    erase_ty(ty, st)
+}
+
 pub fn erase_type(ty: &Type) -> Type {
     match ty {
         Type::Existential { params, body } => erase_type(&existential_body(params, body)),
@@ -829,6 +968,25 @@ fn head_type_sym(ty: &Type) -> Option<SymbolId> {
 /// The erasure of one member type, for callers outside this module.
 /// `double_def` compares two signatures the way the class file will record
 /// them.
+/// The marker [`boxed_value_class`] puts on an erased type.
+pub(crate) const BOXED_VALUE_CLASS: &str = "$boxedValueClass";
+
+/// The erasure of a value class kept as its box, as the argument of a
+/// generic value class is (`Wrap[Code]` erases to `Code`'s box). A bare
+/// `Code` in an erased type would erase once more to its underlying value,
+/// and erasure runs over already erased symbol types (`erase_symbols`), so
+/// the box is marked as final. The backend reads the marked type as the
+/// class itself.
+pub(crate) fn boxed_value_class(class: SymbolId) -> Type {
+    Type::Annotated {
+        tpe: TyBox::new(Type::Class {
+            sym: class,
+            args: vec![].into(),
+        }),
+        annot: BOXED_VALUE_CLASS.into(),
+    }
+}
+
 pub(crate) fn erase_member_ty(ty: &Type, st: &SymbolTable) -> Type {
     erase_ty(ty, st)
 }
@@ -846,6 +1004,8 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         return erase_ty(&a, st);
     }
     match ty {
+        // Already erased, and to a box: see `boxed_value_class`.
+        Type::Annotated { annot, .. } if annot == BOXED_VALUE_CLASS => ty.clone(),
         Type::Class { sym, .. } if *sym == st.singleton_sym => Type::Any,
         // A value class erases to what it wraps -- but a value class that
         // wraps itself, directly or through another one, has no such type.
@@ -865,7 +1025,23 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                     .or_else(|| st.value_class_underlying(*sym))
                 {
                     Some(u) => {
-                        let e = erase_ty(&st.subst_tparams(*sym, args, &u), st);
+                        let inst = st.subst_tparams(*sym, args, &u);
+                        // nsc's `erasedValueClassArg`: a generic underlying
+                        // is erased with boxing erasure, which keeps a value
+                        // class a box. `Wrap[Code]` for `class Wrap[A](val a:
+                        // A) extends AnyVal` is `Lpkg/Code;`, not `Code`'s own
+                        // underlying `String`. Erasing it further gave
+                        // `show(String)` where scalac's class file has
+                        // `show(Lpkg/Code;)`, and the pickled member then
+                        // matched no descriptor of a scalac library.
+                        if value_class_of(&u, st).is_none() {
+                            if let Some(c) = value_class_of(&inst, st) {
+                                if c != *sym {
+                                    return boxed_value_class(c);
+                                }
+                            }
+                        }
+                        let e = erase_ty(&inst, st);
                         // nsc's `eraseDerivedValueClassRef`: an underlying
                         // type that is *not* primitive as declared but
                         // becomes one through the type arguments stays
@@ -1281,9 +1457,15 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             for tp in tparams {
                 erase_tree(tp, st, None);
             }
-            for clause in vparamss {
+            for clause in vparamss.iter_mut() {
                 for p in clause {
                     erase_tree(p, st, None);
+                    // A boxed lambda parameter that lambda lifting made a
+                    // parameter of this `def` (`collect_lifted_boxed_params`)
+                    // stays the box here too.
+                    if let Some(t) = boxed_value_class_param(p, st) {
+                        p.ty = t;
+                    }
                 }
             }
             erase_tree(tpt, st, None);
@@ -1354,6 +1536,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             for c in cases {
                 mark_value_class_patterns(&mut c.pat, st);
                 erase_tree(&mut c.pat, st, None);
+                strip_pattern_adapters(&mut c.pat);
                 if !c.guard.is_empty() {
                     erase_tree(&mut c.guard, st, Some(&Type::Boolean));
                 }
@@ -1366,7 +1549,24 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
             let ret = match &tree.ty {
                 Type::Function { ret, .. } => Some(erase_elem_ty(ret, st)),
-                Type::Class { .. } => st.sam_sig(&tree.ty).map(|s| erase_ty(&s.ret_ty, st)),
+                // A SAM whose method returns a type parameter returns a value
+                // class boxed, as a `FunctionN` does: a partial function
+                // literal for `collectFirst` yielding a `Gid` handed back
+                // an `Integer`, which the `Option[Gid]` reader then cast to
+                // `Gid` (`ClassCastException`).
+                Type::Class { sym, args } => match st.sam_sig(&tree.ty) {
+                    Some(s) => Some(if is_ref_erased(&erase_ty(&s.raw_ret_ty, st)) {
+                        erase_elem_ty(&s.ret_ty, st)
+                    } else {
+                        erase_ty(&s.ret_ty, st)
+                    }),
+                    // A partial function literal: no SAM (`isDefinedAt` is
+                    // abstract too), and its result is `B`'s.
+                    None if st.get(*sym).name == "PartialFunction" && args.len() == 2 => {
+                        Some(erase_elem_ty(&args[1], st))
+                    }
+                    None => None,
+                },
                 _ => None,
             };
             erase_tree(body, st, ret.as_ref());
@@ -1459,7 +1659,23 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 _ => None,
             };
             let prelude_box = prelude_value_class_box(&qual.ty, tree.sym, st);
+            let generic_recv =
+                recv_pt.is_none() && parametric_value_class_member(&qual.ty, tree.sym, st);
             erase_tree(qual, st, recv_pt.as_ref());
+            // The `$extension` receiver of a value class wrapping a type
+            // parameter is the erasure of that parameter, and whatever the
+            // instantiation it may hold a box: `ArrowAssoc[Code]` built by
+            // `ArrowAssoc(x: A): A` holds the `Code` instance. Unboxing it to
+            // the instantiation's erasure (`String`) cast the box and failed.
+            if generic_recv {
+                strip_unbox(qual);
+                // A reference underlying is not wrapped but retyped, and the
+                // backend casts to that type just the same. A receiver typed
+                // as the value class itself is a box the backend unwraps.
+                if is_ref_erased(&qual.ty) && any_value_class_of(&qual.ty, st).is_none() {
+                    qual.ty = Type::Any;
+                }
+            }
             if let Some(c) = prelude_box {
                 wrap_vc_box(qual, c);
             }
@@ -1563,8 +1779,15 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             erase_tree(finalizer, st, Some(&Type::Unit));
         }
         TreeKind::InterpolatedString { args, .. } => {
+            // The arguments are `StringContext`'s `Any*`: a value class is
+            // formatted as the instance (`Sid(404)`), not as the underlying
+            // value it erases to.
             for a in args {
-                erase_tree(a, st, None);
+                let boxed = value_class_of(&a.ty, st).map(|c| Type::Class {
+                    sym: c,
+                    args: vec![].into(),
+                });
+                erase_tree(a, st, boxed.as_ref());
             }
         }
         TreeKind::Ident { name } if name == "$classOf" => {
@@ -1696,6 +1919,19 @@ fn adapt_member_read(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>)
         }
     }
     false
+}
+
+/// The boxed value class a `def` parameter holds, when its symbol is a boxed
+/// lambda parameter. Erasing a symbol always yields the underlying type, so a
+/// value-class symbol type is only ever one of those.
+fn boxed_value_class_param(p: &Tree, st: &SymbolTable) -> Option<Type> {
+    if !matches!(p.kind, TreeKind::ValDef { .. }) || p.sym.is_none() {
+        return None;
+    }
+    match &st.get(p.sym).ty {
+        t @ Type::Class { sym, .. } if st.is_value_class(*sym) => Some(t.clone()),
+        _ => None,
+    }
 }
 
 fn boxed_value_class_ref(tree: &Tree, st: &SymbolTable) -> Option<Type> {
@@ -1875,7 +2111,32 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             _ => true,
         };
         if !fun.sym.is_none() && sym_denotes_callee {
-            declared_value_result = st.value_class_for_result(fun.sym).is_some();
+            // As for a parameter (`declared_vc` below): a member copied down
+            // from a generic parent (`Ops[A].first: A` seen from `MeterBox
+            // extends Ops[Meters]`) records the instantiation, while its
+            // class file still answers `Object`, the box.
+            declared_value_result = st.value_class_for_result(fun.sym).is_some_and(|c| {
+                let Some(desc) = st.get(fun.sym).jvm_name.strip_prefix('(') else {
+                    return true;
+                };
+                let Some((_, result)) = desc.rsplit_once(')') else {
+                    return true;
+                };
+                let under = match &st.get(fun.sym).ty {
+                    Type::Method { ret, .. } => crate::pickle_supply::erased_param_desc(st, ret),
+                    _ => None,
+                }
+                .or_else(|| {
+                    crate::pickle_supply::erased_param_desc(
+                        st,
+                        &Type::Class {
+                            sym: c,
+                            args: vec![].into(),
+                        },
+                    )
+                });
+                under.map_or(true, |u| u == result)
+            });
             match &st.get(fun.sym).ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => {
                     // Binary specialization can expose a primitive JVM
@@ -1930,11 +2191,39 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             } else {
                 st.get(callee).params.get(i).copied()
             };
-            let declared_vc = formal.and_then(|id| st.value_class_for_term(id));
+            // A parameter declared at a value class takes the underlying
+            // value -- unless its JVM slot says otherwise. A member copied
+            // down from a generic parent (`EntityList[ID].findById(id: ID)`
+            // seen from `UserList extends EntityList[UserId, ...]`) carries
+            // the instantiation on its parameter symbol while the method
+            // still takes `Object`, which wants the box: unboxed, `UserId(1)`
+            // went in as an `Integer` and matched nothing.
+            let declared_vc = formal
+                .and_then(|id| st.value_class_for_term(id))
+                .filter(|_| {
+                    // The parameter's own instantiated type, type arguments
+                    // included: `Wrap[Int]` is `Integer`, a bare `Wrap` is
+                    // not. Without one there is nothing to tell the two
+                    // apart, and the declaration is taken at its word.
+                    let under = || {
+                        param_at(&pre_params, i)
+                            .and_then(|t| crate::pickle_supply::erased_param_desc(st, t))
+                    };
+                    match descriptor_param_descs(st, callee).and_then(|d| d.get(i).cloned()) {
+                        Some(slot) => under().map_or(true, |u| u == slot),
+                        None => match (param_tys.get(i), param_at(&pre_params, i)) {
+                            (Some(slot), Some(pre)) if is_ref_erased(slot) => {
+                                erase_ty(pre, st) == *slot
+                            }
+                            _ => true,
+                        },
+                    }
+                });
             let vc_elem = if declared_vc.is_some() {
                 None
             } else {
                 vc_arg_expected(st, &pre_params, &param_tys, i)
+                    .or_else(|| vc_repeated_arg_expected(st, &param_tys, i, &a.ty))
             };
             let p = vc_elem.or_else(|| param_tys.get(i).cloned());
             if i == 0
@@ -1944,7 +2233,12 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 a.ty = class_tag_type_arg.clone().unwrap();
             }
             erase_tree(a, st, p.as_ref());
-            if let (Some(cls), Some(pt)) = (declared_vc, p.as_ref()) {
+            // A lifted `def`'s boxed parameter (`box_lifted_params`) takes
+            // the instance itself.
+            let boxed_slot = p.as_ref().is_some_and(
+                |pt| matches!(pt, Type::Class { sym, .. } if Some(*sym) == declared_vc),
+            );
+            if let (Some(cls), Some(pt), false) = (declared_vc, p.as_ref(), boxed_slot) {
                 unbox_value_class_result(a, cls, pt);
             }
         }
@@ -1990,6 +2284,20 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         },
         _ => false,
     };
+    // A value class wrapping a type parameter is held as that parameter's
+    // erasure, whatever the instantiation (see `parametric_value_class`):
+    // `ArrowAssoc(Code(x))` returns the `Code` box, not a `String`. Only for
+    // a method declared to return the value class: a generic result
+    // (`List[Wrap[Int]].head`) hands back the box, unwrapped below. The
+    // prelude's own value classes are not recorded as such results.
+    if parametric_value_class(&orig, st)
+        && (declared_value_result || value_class_of(&orig, st).is_none())
+        && is_ref_erased(&ret_erased)
+        && expected.map_or(true, |e| matches!(e, Type::Any | Type::AnyRef))
+    {
+        tree.ty = ret_erased;
+        return;
+    }
     if let Some(c) = value_class_of(&orig, st)
         .filter(|_| !array_prim_load && is_ref_erased(&ret_erased) && !declared_value_result)
     {
@@ -2061,9 +2369,58 @@ fn vc_arg_expected(st: &SymbolTable, pre: &[Type], declared: &[Type], i: usize) 
     })
 }
 
+/// The expected type for a value-class argument to a repeated parameter. The
+/// elements of a `T*` sequence are always references, so the argument stays
+/// boxed whatever `T` is; with the repeated type itself as the expected type
+/// the argument was erased to its underlying value, and `f(a: Any*)` called
+/// with a value class received the bare underlying value.
+fn vc_repeated_arg_expected(
+    st: &SymbolTable,
+    declared: &[Type],
+    i: usize,
+    arg: &Type,
+) -> Option<Type> {
+    let repeated = match declared.get(i) {
+        Some(t) => matches!(t, Type::Repeated(_)),
+        None => matches!(declared.last(), Some(Type::Repeated(_))),
+    };
+    if !repeated {
+        return None;
+    }
+    let c = value_class_of(arg, st)?;
+    Some(Type::Class {
+        sym: c,
+        args: vec![].into(),
+    })
+}
+
 /// The parameter and result descriptors of a binary member whose `jvm_name`
 /// records the class file's method descriptor (`(II)Ljava/lang/Object;`), each
 /// answered as "is this slot a reference". `None` for any other `jvm_name`.
+/// The parameter descriptors of a binary member whose `jvm_name` records its
+/// class-file descriptor, one per slot.
+fn descriptor_param_descs(st: &SymbolTable, sym: SymbolId) -> Option<Vec<String>> {
+    if sym.is_none() {
+        return None;
+    }
+    let desc = st.get(sym).jvm_name.strip_prefix('(')?;
+    let (params, _) = desc.rsplit_once(')')?;
+    let mut out = Vec::new();
+    let mut rest = params;
+    while !rest.is_empty() {
+        let dims = rest.len() - rest.trim_start_matches('[').len();
+        let body = &rest[dims..];
+        let len = if body.starts_with('L') {
+            body.find(';')? + 1
+        } else {
+            1
+        };
+        out.push(rest[..dims + len].to_string());
+        rest = &rest[dims + len..];
+    }
+    Some(out)
+}
+
 fn descriptor_ref_slots(st: &SymbolTable, sym: SymbolId) -> Option<(Vec<bool>, bool)> {
     let desc = st.get(sym).jvm_name.strip_prefix('(')?;
     let (params, result) = desc.rsplit_once(')')?;
@@ -2552,6 +2909,90 @@ fn wrap_box(tree: &mut Tree) {
         byname_thunk: false,
         byname_type_marker: false,
     };
+}
+
+/// Whether `member` is declared by the value class `recv` is an instance of,
+/// and that class wraps a type parameter (its underlying erases to `Object`).
+fn parametric_value_class_member(recv: &Type, member: SymbolId, st: &SymbolTable) -> bool {
+    !member.is_none()
+        && any_value_class_of(recv, st) == Some(st.get(member).owner)
+        && parametric_value_class(recv, st)
+}
+
+/// Whether `id` is the local an eta-expansion keeps its receiver in, and the
+/// receiver is a value class wrapping a type parameter (`Gid(3).->` holds
+/// `ArrowAssoc[Gid]`). Such a local holds what the conversion returned, the
+/// erasure of the type parameter: `Object`, holding the `Gid` box. Erasing
+/// it to the instantiation (`Integer` for an `Int` underlying) cast the box
+/// to that and failed.
+fn parametric_eta_receiver(st: &SymbolTable, id: SymbolId) -> bool {
+    let s = st.get(id);
+    s.name.starts_with("eta$receiver$") && parametric_value_class(&s.ty, st)
+}
+
+/// The value class `ty` is an instance of, prelude-modelled ones included.
+fn any_value_class_of(ty: &Type, st: &SymbolTable) -> Option<SymbolId> {
+    match ty {
+        Type::Class { sym, .. } if st.is_value_class(*sym) => Some(*sym),
+        Type::Applied { ctor, .. } => any_value_class_of(ctor, st),
+        _ => None,
+    }
+}
+
+/// Whether `ty` is a value class whose underlying type is a type parameter
+/// (`Predef.ArrowAssoc[A](self: A)`, `ChainingOps[A]`).
+fn parametric_value_class(ty: &Type, st: &SymbolTable) -> bool {
+    any_value_class_of(ty, st).is_some_and(|c| {
+        st.recorded_value_class_underlying(c)
+            .cloned()
+            .or_else(|| st.value_class_underlying(c))
+            .is_some_and(|u| matches!(u, Type::TypeParam(_)))
+    })
+}
+
+/// Drops the value adaptations erasing a pattern as an expression wrapped
+/// around its parts. A pattern is matched, not evaluated: `case (i,
+/// Code(s))` got `$vcunbox(Code(s))` for the `Code` the tuple holds, and the
+/// backend then unwrapped the box and tested the `String` for a `Code`
+/// again, so the case never matched (`MatchError`).
+fn strip_pattern_adapters(pat: &mut Tree) {
+    loop {
+        let TreeKind::Apply { fun, args } = &mut pat.kind else {
+            break;
+        };
+        if args.len() != 1 || !matches!(fun.name(), Some("$vcunbox" | "$unbox" | "$box" | "$vcbox"))
+        {
+            break;
+        }
+        *pat = args.pop().unwrap();
+    }
+    match &mut pat.kind {
+        TreeKind::Apply { args, .. } | TreeKind::UnApply { args, .. } => {
+            for a in args {
+                strip_pattern_adapters(a);
+            }
+        }
+        TreeKind::Typed { expr, .. } | TreeKind::Bind { body: expr, .. } => {
+            strip_pattern_adapters(expr)
+        }
+        TreeKind::Alternative { trees } => {
+            for t in trees {
+                strip_pattern_adapters(t);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drops a `$unbox` that erasure put around `tree`.
+fn strip_unbox(tree: &mut Tree) {
+    let TreeKind::Apply { fun, args } = &mut tree.kind else {
+        return;
+    };
+    if fun.name() != Some("$unbox") || args.len() != 1 {
+        return;
+    }
+    *tree = args.pop().unwrap();
 }
 
 fn wrap_unbox(tree: &mut Tree, to: Type) {

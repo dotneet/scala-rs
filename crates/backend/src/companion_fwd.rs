@@ -55,6 +55,10 @@ pub(crate) struct Forwarder {
     /// The module method's own JVMS §4.7.9 `Signature`, carried over: the
     /// forwarder has the same descriptor, so scalac signs it the same way.
     pub signature: Option<String>,
+    /// The module method's Java annotations, which nsc copies onto the
+    /// forwarder (`addForwarder`'s `emitAnnotations`).
+    pub annots: Vec<crate::classfile::Annotation>,
+    pub param_annots: Vec<Vec<crate::classfile::Annotation>>,
 }
 
 /// The class (or trait) written next to a module class, if the source wrote
@@ -179,6 +183,8 @@ pub(crate) fn pick(
             name: m.name.clone(),
             desc: m.desc.clone(),
             signature: m.signature.clone(),
+            annots: m.java_annots.clone(),
+            param_annots: m.param_annots.clone(),
         });
     }
     out

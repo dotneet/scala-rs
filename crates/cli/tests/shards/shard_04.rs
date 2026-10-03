@@ -66,12 +66,18 @@ mod libprelude;
 mod library_client_compat;
 #[path = "../library_trait_bridges.rs"]
 mod library_trait_bridges;
+#[path = "../lifted_value_class_param.rs"]
+mod lifted_value_class_param;
 #[path = "../linearization.rs"]
 mod linearization;
 #[path = "../list_alias_implicit.rs"]
 mod list_alias_implicit;
 #[path = "../listcore_text.rs"]
 mod listcore_text;
+#[path = "../local_case_class_outer_slot.rs"]
+mod local_case_class_outer_slot;
+#[path = "../local_class_nested_capture.rs"]
+mod local_class_nested_capture;
 #[path = "../local_slot_reuse.rs"]
 mod local_slot_reuse;
 #[path = "../localcc.rs"]
@@ -92,12 +98,14 @@ mod lz;
 mod lz2;
 #[path = "../lzorigin.rs"]
 mod lzorigin;
-#[path = "../macromirror.rs"]
-mod macromirror;
+#[path = "../macro_abort_implicit_fallback.rs"]
+mod macro_abort_implicit_fallback;
 #[path = "../macro_runtime.rs"]
 mod macro_runtime;
 #[path = "../macro_tree_shape.rs"]
 mod macro_tree_shape;
+#[path = "../macromirror.rs"]
+mod macromirror;
 #[path = "../macros.rs"]
 mod macros;
 #[path = "../macrotag.rs"]

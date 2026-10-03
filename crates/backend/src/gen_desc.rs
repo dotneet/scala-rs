@@ -1007,6 +1007,67 @@ pub(crate) fn reads_via_accessor(st: &SymbolTable, id: SymbolId) -> bool {
     !o.is_none() && st.get(o).is_class_like() && !is_interface_sym(st, o) && st.is_source_class(o)
 }
 
+/// Whether the field of constructor parameter `id` has the accessor nsc
+/// gives it: a `val` or `var` parameter, or one of a case class's first
+/// clause. Another class reads the field through that accessor, as nsc
+/// does, so the field can stay private.
+pub(crate) fn param_field_has_getter(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    let s = st.get(id);
+    if s.kind != SymKind::Term || !s.flags.contains(Flags::PARAM) || !s.jvm_name.is_empty() {
+        return false;
+    }
+    let o = s.owner;
+    if o.is_none()
+        || !st.get(o).is_class_like()
+        || is_interface_sym(st, o)
+        || !st.is_source_class(o)
+    {
+        return false;
+    }
+    if s.flags.contains(Flags::PRIVATE) && !widened(st, id) {
+        return false;
+    }
+    if s.flags.contains(Flags::ACCESSOR) || s.flags.contains(Flags::MUTABLE) {
+        return true;
+    }
+    let class = st.get(o);
+    class.flags.contains(Flags::CASE)
+        && !s.flags.contains(Flags::IMPLICIT)
+        && class.members.iter().any(|&m| {
+            let c = st.get(m);
+            c.name == "<init>"
+                && c.params == class.ctor_fields
+                && c.paramss.first().is_some_and(|first| first.contains(&id))
+        })
+}
+
+/// Reads constructor field `id` (named `name`, stored as `desc`) of JVM class
+/// `owner` off the receiver on the stack: through its accessor from another
+/// class when [`param_field_has_getter`], else with `getfield`.
+pub(crate) fn emit_param_field_read(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    owner: &str,
+    id: SymbolId,
+    name: &str,
+    desc: &str,
+) {
+    checkcast_field_receiver(asm, ctx, owner);
+    if owner != ctx.class_name && param_field_has_getter(ctx.st, id) {
+        let ty = &ctx.st.get(id).ty;
+        asm.invokevirtual(
+            owner,
+            &encode_method_name(name),
+            &format!("(){}", jvm_desc(ctx.st, ty)),
+        );
+    } else {
+        emit_field_read(asm, ctx, owner, name, desc);
+    }
+}
+
 pub(crate) fn trait_static_desc(iface: &str, inst_desc: &str) -> String {
     let rest = inst_desc.strip_prefix('(').unwrap_or(inst_desc);
     format!("(L{iface};{rest}")
@@ -2008,14 +2069,13 @@ pub(crate) fn is_delayed_ctor_stat(t: &Tree) -> bool {
     }
 }
 
-/// `widened` marks a `private` member the companion reads: nsc renames such a
-/// member and exposes it, because the JVM would reject the cross-class access.
+/// A `val`'s field is `private`, as nsc declares every field; the driver
+/// makes public the ones another class of the run reads directly (see
+/// [`crate::field_access`]). `widened` marks a `private` member the
+/// companion reads: nsc renames such a member and exposes it, because the
+/// JVM would reject the cross-class access.
 pub(crate) fn field_access_flags(mods: Flags, widened: bool) -> u16 {
-    let mut acc = if mods.contains(Flags::PRIVATE) && !widened {
-        ACC_PRIVATE
-    } else {
-        ACC_PUBLIC
-    };
+    let mut acc = if widened { ACC_PUBLIC } else { ACC_PRIVATE };
     if !mods.contains(Flags::MUTABLE) {
         acc |= ACC_FINAL;
     }

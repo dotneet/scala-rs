@@ -438,6 +438,7 @@ impl<'a> Gen<'a> {
                             | ACC_ABSTRACT;
                         let method = b.add_abstract(acc, name, &def_method_desc(self.st, stt));
                         b.sign_method(method, self.sig_of(stt.sym));
+                        b.annotate_last_def(self.st, stt, 0, false);
                     }
                     let mut super_accesses = Vec::new();
                     collect_super_accesses(rhs, &mut super_accesses);
@@ -469,6 +470,11 @@ impl<'a> Gen<'a> {
                     name, mods, rhs, ..
                 } = &stt.kind
                 {
+                    // A constant `final val` is a `default` method from
+                    // `emit_trait_bodies` (see `constant_trait_vals_as_defs`).
+                    if self.st.constant_vals.contains_key(&stt.sym) {
+                        continue;
+                    }
                     let ty = val_tree_ty(self.st, stt);
                     let gdesc = format!("(){}", jvm_desc(self.st, &ty));
                     // A `lazy val` with an initialiser is the one `val` whose
@@ -551,6 +557,10 @@ impl<'a> Gen<'a> {
             // The concrete half: `default` methods, their `m$` statics and
             // `$init$`, all on the interface itself (nsc 2.13's trait ABI).
             self.emit_trait_bodies(&mut b, class_id, &this_name);
+            self.emit_erasure_bridges(&mut b, class_id);
+            // A trait `val`'s annotations stay in the pickle: nsc puts them
+            // on none of the accessors the interface declares.
+            b.annotate_template(self.st, class_id, &[], &[]);
             attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
             b.sign_class(self.sig_of(class_id));
             self.finish_companion_class(b, has_object);
@@ -626,6 +636,11 @@ impl<'a> Gen<'a> {
                 if !stt.sym.is_none() && self.st.get(stt.sym).deferred_val {
                     continue;
                 }
+                // `final val N = 42` has no field: its accessor answers the
+                // constant, as nsc emits it.
+                if self.st.constant_vals.contains_key(&stt.sym) {
+                    continue;
+                }
                 let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
                     self.st.get(stt.sym).ty.clone()
                 } else {
@@ -658,7 +673,7 @@ impl<'a> Gen<'a> {
         // Pickle loading exposes the same member to both scans; emitting both
         // copies gives the JVM a duplicate-field ClassFormatError.
         let binary_lazies = self.binary_mixin_lazy_vals(class_id, &impl_.body);
-        for (name, ty, extra) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
+        for (name, ty, extra, sym) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
             // Nothing is added twice. A trait with a dedicated emission --
             // `scala.App`, whose `executionStart` / `initCode` fields and
             // accessors are written out below -- already put its field here,
@@ -670,8 +685,9 @@ impl<'a> Gen<'a> {
             if binary_lazies.iter().any(|v| v.name == name) {
                 continue;
             }
+            b.annotate_mixin_field(self.st, &name, sym);
             b.fields.push(Field {
-                access: ACC_PUBLIC | extra,
+                access: ACC_PRIVATE | extra,
                 name,
                 desc: jvm_desc_val(self.st, &ty),
             });
@@ -735,13 +751,21 @@ impl<'a> Gen<'a> {
         self.emit_inherited_covariant_bridges(&mut b, class_id);
         self.emit_binary_parent_bridges(&mut b, class_id);
         self.drain_lambdas(&mut b, lambda_wm);
+        b.annotate_template(self.st, class_id, vparamss, &impl_.body);
         attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
         b.sign_class(self.sig_of(class_id));
         self.finish_companion_class(b, has_object);
     }
 
+    /// nsc's `delayedInit$body` closure class. It is a member of the class,
+    /// so it lives in the class's package: `p/C$delayedInit$body`, and
+    /// `p/O$delayedInit$body` for the module class `p/O$`.
     pub(crate) fn delayed_body_class(class_name: &str) -> String {
-        format!("{}$delayedInit$body", class_name.replace('/', "$"))
+        if class_name.ends_with('$') {
+            format!("{class_name}delayedInit$body")
+        } else {
+            format!("{class_name}$delayedInit$body")
+        }
     }
 
     /// nsc's `delayedEndpoint$<fullName with $>$1` (`Constructors.
@@ -1138,7 +1162,11 @@ impl<'a> Gen<'a> {
                     // `var x: T = _` stores nothing: the field keeps whatever
                     // it holds, including a value written by a superclass
                     // constructor through an overridden method.
-                    if rhs.is_empty() || rhs.is_default_init() || mods.flags.contains(Flags::LAZY) {
+                    if rhs.is_empty()
+                        || rhs.is_default_init()
+                        || mods.flags.contains(Flags::LAZY)
+                        || st.constant_vals.contains_key(&stt.sym)
+                    {
                         continue;
                     }
                     asm.aload(0);
@@ -1564,6 +1592,7 @@ impl<'a> Gen<'a> {
                         if rhs.is_empty()
                             || rhs.is_default_init()
                             || mods.flags.contains(Flags::LAZY)
+                            || st.constant_vals.contains_key(&vd.sym)
                         {
                             continue;
                         }
@@ -1585,6 +1614,12 @@ impl<'a> Gen<'a> {
             asm.vreturn();
         });
         b.set_method_params(ctor_method, ctor_params);
+        b.annotate_ctor_params(
+            self.st,
+            ctor_method,
+            vparamss,
+            usize::from(ctor_outer_ty.is_some()),
+        );
         // Generic constructor parameter types are part of the public class
         // shape.  In particular json4s obtains `Option[Restrictions]` from
         // the case-class constructor's Signature; without it the JVM exposes
@@ -1654,6 +1689,7 @@ impl<'a> Gen<'a> {
             if let Some(d) = java_deprecated_desc(mods) {
                 b.add_java_annot_to_last(d);
             }
+            b.annotate_last_def(self.st, def, usize::from(ctor_outer.is_some()), false);
             return;
         }
         if rhs.is_empty() {
@@ -1662,6 +1698,7 @@ impl<'a> Gen<'a> {
             if let Some(d) = java_deprecated_desc(mods) {
                 b.add_java_annot_to_last(d);
             }
+            b.annotate_last_def(self.st, def, usize::from(ctor_outer.is_some()), false);
             return;
         }
         let mut frame = Frame::instance();
@@ -1749,6 +1786,8 @@ impl<'a> Gen<'a> {
         if let Some(d) = java_deprecated_desc(mods) {
             b.add_java_annot_to_last(d);
         }
+        b.annotate_last_def(self.st, def, usize::from(ctor_outer.is_some()), false);
+        b.set_local_names_of_last(def, usize::from(ctor_outer.is_some()));
         self.emit_java_varargs_forwarder(b, def, name, &desc, acc);
     }
 
@@ -2028,6 +2067,60 @@ impl<'a> Gen<'a> {
         let wide = matches!(fty, Type::Long | Type::Double);
         let fslots = if wide { 2u16 } else { 1 };
 
+        // A value case class's synthesized `copy(x)` is `new C(x)`, which is
+        // `x` itself in the erased representation. nsc gives it an
+        // `$extension` like any other member, and a client compiled by nsc
+        // calls the companion's `copy$extension`.
+        if self.st.get(class_id).flags.contains(Flags::CASE) && !defined.contains("copy$extension")
+        {
+            let (t, d) = (fty.clone(), fdesc.clone());
+            b.add_code(
+                ACC_PUBLIC | ACC_STATIC,
+                "copy$extension",
+                &format!("({d}{d}){d}"),
+                fslots * 2,
+                move |asm| {
+                    load(asm, fslots, jvm_sort(&t));
+                    emit_return(asm, &t);
+                },
+            );
+        }
+        // A value case class's synthesized `toString` has an `$extension` too,
+        // `ScalaRunTime._toString(new C(u))`, and a client nsc compiles calls
+        // the companion's `toString$extension` for `v.toString` and in
+        // interpolation (`NoSuchMethodError` without it).
+        // The private runtime has no `ScalaRunTime` to delegate to, and no
+        // nsc client to call it.
+        if self.st.get(class_id).flags.contains(Flags::CASE)
+            && self.abi.is_library()
+            && !defined.contains("toString$extension")
+            && !crate::gen_object::value_class_writes_to_string(self.st, class_id)
+        {
+            let (t, d, cj2) = (fty.clone(), fdesc.clone(), cj.clone());
+            b.add_code(
+                ACC_PUBLIC | ACC_STATIC,
+                "toString$extension",
+                &format!("({d})Ljava/lang/String;"),
+                fslots,
+                move |asm| {
+                    asm.getstatic(
+                        "scala/runtime/ScalaRunTime$",
+                        "MODULE$",
+                        "Lscala/runtime/ScalaRunTime$;",
+                    );
+                    asm.new_obj(&cj2);
+                    asm.dup();
+                    load(asm, 0, jvm_sort(&t));
+                    asm.invokespecial(&cj2, "<init>", &format!("({d})V"));
+                    asm.invokevirtual(
+                        "scala/runtime/ScalaRunTime$",
+                        "_toString",
+                        "(Lscala/Product;)Ljava/lang/String;",
+                    );
+                    asm.areturn();
+                },
+            );
+        }
         // `hashCode$extension(u)` = the underlying's own hash, which is what
         // `Integer.hashCode(n)` gives for the common `Int` case.
         if !defined.contains("hashCode$extension") {

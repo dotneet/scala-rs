@@ -87,6 +87,12 @@ pub struct JavaClass {
     /// nowhere else to read the underlying type from. See
     /// `pickle_supply::ensure_value_class_field`.
     pub sole_instance_field: Option<JavaField>,
+    /// The constant of a `@java.lang.annotation.Retention` on the class
+    /// (`"RUNTIME"`, `"CLASS"`, `"SOURCE"`), when it has one.
+    pub retention: Option<String>,
+    /// The container of a `@java.lang.annotation.Repeatable` annotation
+    /// interface, as a descriptor.
+    pub repeatable: Option<String>,
 }
 
 /// A jar/jmod's bytes, shared so the `ZipArchive` that parses them can be kept
@@ -988,6 +994,10 @@ fn parse_classfile_members(
         false
     };
     let has_module_field = fields.iter().any(|f| f.name == "MODULE$");
+    let retention =
+        class_annotation_value(&class_attrs, &cp, "Ljava/lang/annotation/Retention;", b'e');
+    let repeatable =
+        class_annotation_value(&class_attrs, &cp, "Ljava/lang/annotation/Repeatable;", b'c');
     Ok(JavaClass {
         internal_name,
         access,
@@ -1003,7 +1013,67 @@ fn parse_classfile_members(
         has_module_field,
         inner_classes,
         sole_instance_field,
+        retention,
+        repeatable,
     })
+}
+
+/// The `value` of the runtime-visible class annotation `desc`, when it is an
+/// element of kind `tag`: the constant name of an enum (`e`), or the
+/// descriptor of a class literal (`c`).
+fn class_annotation_value(
+    attrs: &[(String, Vec<u8>)],
+    cp: &Cp,
+    desc: &str,
+    tag: u8,
+) -> Option<String> {
+    let body = attrs
+        .iter()
+        .find(|(n, _)| n == "RuntimeVisibleAnnotations")?
+        .1
+        .as_slice();
+    let mut c = CursorJ::new(body);
+    for _ in 0..c.u2()? {
+        let this = cp.utf8(c.u2()?)?;
+        for _ in 0..c.u2()? {
+            let _name = c.u2()?;
+            if this == desc && c.peek()? == tag {
+                c.u1()?;
+                if tag == b'e' {
+                    let _type = c.u2()?;
+                }
+                return cp.utf8(c.u2()?);
+            }
+            skip_element_value(&mut c)?;
+        }
+    }
+    None
+}
+
+/// Step over one `element_value` (JVMS §4.7.16.1).
+fn skip_element_value(c: &mut CursorJ) -> Option<()> {
+    match c.u1()? {
+        b'e' => {
+            c.u2()?;
+            c.u2()?;
+        }
+        b'@' => {
+            c.u2()?;
+            for _ in 0..c.u2()? {
+                c.u2()?;
+                skip_element_value(c)?;
+            }
+        }
+        b'[' => {
+            for _ in 0..c.u2()? {
+                skip_element_value(c)?;
+            }
+        }
+        _ => {
+            c.u2()?;
+        }
+    }
+    Some(())
 }
 
 pub fn is_java_interface(access: u16) -> bool {
@@ -1136,6 +1206,9 @@ impl<'a> CursorJ<'a> {
         let v = self.b[self.i];
         self.i += 1;
         Some(v)
+    }
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
     }
     fn u2(&mut self) -> Option<u16> {
         let hi = self.u1()? as u16;
@@ -1271,10 +1344,8 @@ mod tests {
         if !jar.is_file() {
             return;
         }
-        let missing = std::env::temp_dir().join(format!(
-            "scala-rs-missing-classes-{}",
-            std::process::id()
-        ));
+        let missing =
+            std::env::temp_dir().join(format!("scala-rs-missing-classes-{}", std::process::id()));
         let mut index = BinaryIndex::from_user_paths(vec![missing, jar]);
         ARCHIVE_PACKAGE_SCANS.with(|count| count.set(0));
         assert!(!index.has_package_prefix("no/such/pkg/"));

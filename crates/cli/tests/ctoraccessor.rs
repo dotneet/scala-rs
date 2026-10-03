@@ -387,8 +387,9 @@ fn generic_case_class_ctor_and_apply_metadata() {
         "companion apply MethodParameters must preserve both source names:\n{companion}"
     );
     assert!(
-        companion.contains("Field GenericMeta.value:")
-            && !companion.contains("Field GenericMeta.extra:"),
+        // Read through the accessor, as nsc's `unapply` does.
+        companion.contains("Method GenericMeta.value:")
+            && !companion.contains("GenericMeta.extra:"),
         "unapply must extract only the first case-parameter section:\n{companion}"
     );
 

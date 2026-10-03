@@ -644,6 +644,10 @@ impl Typer {
                 {
                     search = self.search_implicit(want);
                 }
+                if let Some(a) = self.build_found_implicit(&mut search, want, span, 0, true) {
+                    args.push(a);
+                    continue;
+                }
                 match search {
                     ImplicitSearch::Found(id) => {
                         let mut a = self.implicit_tree(id, want, span, 0);
@@ -685,7 +689,18 @@ impl Typer {
                 .get(clause_index + 1)
                 .cloned()
                 .unwrap_or_default();
-            let ty = self.subst_dependent_paths(&params, &args, tree.ty.clone());
+            // What is applied so far still takes this clause, as any partial
+            // application of a curried method does. With the final result
+            // type instead, the backend took `view(x)(ev)` for a function
+            // value applied to `ev` when the view returns a function:
+            // pekko-http's `parameters(...) { (a, b) => ... }` called
+            // `addDirectiveApply(directive)` without its `ApplyConverter`.
+            let rest = tree.ty.clone();
+            tree.ty = Type::Method {
+                paramss: ParamClauses::new(vec![clause.clone()]),
+                ret: TyBox::new(rest.clone()),
+            };
+            let ty = self.subst_dependent_paths(&params, &args, rest);
             tree = Tree {
                 id: NodeId(0),
                 span,
@@ -967,12 +982,19 @@ impl Typer {
                 }
             }
         }
+        // A query from a running macro searches from its own query depth
+        // (`answer_infer_implicit_search`), not from zero. Instances only up
+        // to the usual bound left every level of a recursive rule there on
+        // the shared declaration: shapeless's `hconsZipWithKeys` for the tail
+        // of a two-field record then had to unify its own `ZwkOut` with
+        // `... :: ZwkOut`, failed, and the record could not be derived.
         let instance_depth = wanted
             .iter()
             .map(crate::implicits::complexity)
             .max()
             .unwrap_or(0)
-            .max(crate::implicits::MAX_IMPLICIT_DEPTH);
+            .max(crate::implicits::MAX_IMPLICIT_DEPTH)
+            + self.macro_query_depth;
         for &id in &cands {
             // Detached generic signatures are needed only for candidates a
             // search can actually try.  A concrete result class cannot

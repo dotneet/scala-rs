@@ -18,6 +18,7 @@ use crate::symbol::{SymKind, SymbolTable};
 
 /// Record captured enclosing-method locals on every class symbol in `tree`.
 pub fn mark_anon_captures(tree: &Tree, st: &mut SymbolTable) {
+    reown_super_call_classes(tree, st);
     let mut found: Vec<(SymbolId, Vec<SymbolId>)> = Vec::new();
     let mut classes: Vec<SymbolId> = Vec::new();
     walk(tree, st, &mut found, &mut classes);
@@ -25,6 +26,10 @@ pub fn mark_anon_captures(tree: &Tree, st: &mut SymbolTable) {
         st.get_mut(cls).captures = caps;
     }
     inherit_trait_captures(st, &classes);
+    // Twice: whether a class extending a local trait needs its `$outer`
+    // depends on the trait's own answer (`inherited_trait_needs_outer`),
+    // and the trait may be written after the class.
+    mark_outer_captures(tree, st);
     mark_outer_captures(tree, st);
 }
 
@@ -35,6 +40,59 @@ pub fn mark_anon_captures(tree: &Tree, st: &mut SymbolTable) {
 /// `this` or one of its members.  Keeping that distinction is important for
 /// serializable typeclass singletons: an otherwise unused outer object would
 /// make Java serialization walk into a non-serializable package module.
+/// A class written in the arguments of a template's super constructor call
+/// (`object O extends Base(new T { ... })`) is created before that template's
+/// instance exists, so it cannot be its enclosing instance. nsc makes it an
+/// inner class of the next one out: its `$outer` is the constructor's own
+/// outer argument. Owned by the template, it was handed the uninitialised
+/// instance as `null` and any read of an enclosing member failed with a
+/// `NullPointerException`. Owning it by the template's owner gives it the
+/// enclosing instance nsc gives it.
+fn reown_super_call_classes(tree: &Tree, st: &mut SymbolTable) {
+    let (template, parents) = match &tree.kind {
+        TreeKind::ClassDef { impl_, .. } => (tree.sym, &impl_.parents),
+        TreeKind::ModuleDef { impl_, .. } => (st.module_class_of(tree.sym), &impl_.parents),
+        _ => {
+            each_child(tree, &mut |c| reown_super_call_classes(c, st));
+            return;
+        }
+    };
+    if !template.is_none() {
+        let outer = st.get(template).owner;
+        let mut classes = Vec::new();
+        for p in parents {
+            collect_classes(p, &mut classes);
+        }
+        for c in classes {
+            if lexical_template(st, c) == Some(template) {
+                st.get_mut(c).owner = outer;
+                st.super_call_classes.insert(c, template);
+            }
+        }
+    }
+    each_child(tree, &mut |c| reown_super_call_classes(c, st));
+}
+
+/// The classes defined anywhere in `tree`, outermost first.
+fn collect_classes(tree: &Tree, out: &mut Vec<SymbolId>) {
+    if let TreeKind::ClassDef { .. } = &tree.kind {
+        if !tree.sym.is_none() {
+            out.push(tree.sym);
+        }
+    }
+    each_child(tree, &mut |c| collect_classes(c, out));
+}
+
+/// The class or module class `id` is lexically inside, past any methods and
+/// values.
+fn lexical_template(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
+    let mut owner = st.get(id).owner;
+    while !owner.is_none() && matches!(st.get(owner).kind, SymKind::Method | SymKind::Term) {
+        owner = st.get(owner).owner;
+    }
+    (!owner.is_none()).then_some(owner)
+}
+
 fn mark_outer_captures(tree: &Tree, st: &mut SymbolTable) {
     match &tree.kind {
         TreeKind::ClassDef { impl_, .. } => {
@@ -229,6 +287,14 @@ fn inherited_trait_needs_outer(st: &SymbolTable, current: SymbolId, parents: &[T
             let Some(want) = enclosing_instance(st, parent) else {
                 return false;
             };
+            // A local trait is analysed like a local class: one whose body
+            // never reaches the enclosing instance calls no outer accessor.
+            // Keeping `$outer` for it anyway gave a local case class
+            // extending such a trait a field its static companion's `apply`
+            // cannot fill (`NoSuchMethodError` on the constructor).
+            if is_local_or_anonymous(st, parent) && !st.get(parent).captures_outer {
+                return false;
+            }
             outers
                 .iter()
                 .copied()
@@ -328,7 +394,63 @@ fn class_outer_use(class_def: &Tree, st: &SymbolTable, current: SymbolId) -> Out
         };
         uses.merge(used);
     }
+    // A class nested anywhere in this one that reads past it -- a member of
+    // a class enclosing this one -- walks the `$outer` chain through this
+    // class's own `$outer`, so this class keeps the field even when it reads
+    // nothing outside itself. circe's derived encoders are such a shape: the
+    // macro's anonymous encoder class holds another one that reads an
+    // implicit of the case class around both, and with the middle class's
+    // field elided the inner one failed with `NoSuchFieldError: $outer`.
+    let mut nested_reach = false;
+    for p in &impl_.parents {
+        nested_reach |= nested_reads_past(p, st, current);
+    }
+    for tree in &impl_.body {
+        nested_reach |= nested_reads_past(tree, st, current);
+    }
+    if nested_reach {
+        uses.merge(OuterUse {
+            any: true,
+            requires_field: true,
+        });
+    }
     uses
+}
+
+/// Whether a class or module defined in `tree` reads, at any depth, past
+/// `current` (a member or `this` of a class enclosing `current`).
+fn nested_reads_past(tree: &Tree, st: &SymbolTable, current: SymbolId) -> bool {
+    match &tree.kind {
+        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
+            scan_outer_deep(tree, st, current)
+        }
+        _ => {
+            let mut found = false;
+            each_child(tree, &mut |c| {
+                if !found && nested_reads_past(c, st, current) {
+                    found = true;
+                }
+            });
+            found
+        }
+    }
+}
+
+/// [`scan_outer`], descending into nested class and module bodies as well.
+fn scan_outer_deep(tree: &Tree, st: &SymbolTable, current: SymbolId) -> bool {
+    match &tree.kind {
+        TreeKind::Ident { .. } => member_needs_outer(st, current, tree.sym),
+        TreeKind::This { .. } | TreeKind::Super { .. } => this_needs_outer(st, current, tree.sym),
+        _ => {
+            let mut found = false;
+            each_child(tree, &mut |c| {
+                if !found && scan_outer_deep(c, st, current) {
+                    found = true;
+                }
+            });
+            found
+        }
+    }
 }
 
 /// Find enclosing-instance reads that occur in code retained beyond the
@@ -458,9 +580,24 @@ fn class_captures(class_def: &Tree, st: &SymbolTable) -> Vec<SymbolId> {
         free(s, &bound, &mut out, st);
     }
     let lexical_owner = st.get(class_def.sym).owner;
+    // Before the template's instance exists, its constructor parameters are
+    // only locals of the constructor, and a class of its super call captures
+    // them like any.
+    let super_call = super_call_template(st, class_def.sym);
+    if let Some(t) = super_call {
+        for p in &impl_.parents {
+            template_params(p, t, &bound, &mut out, st);
+        }
+        for b in &impl_.body {
+            template_params(b, t, &bound, &mut out, st);
+        }
+    }
     out.retain(|id| {
         let term = st.get(*id);
         let owner = st.get(term.owner);
+        if super_call == Some(term.owner) {
+            return true;
+        }
         // Method-owned terms are ordinary local captures. A term owned by a
         // class but absent from its member list is a template-block local only
         // when that class is also this definition's lexical owner. Imported
@@ -470,6 +607,42 @@ fn class_captures(class_def: &Tree, st: &SymbolTable) -> Vec<SymbolId> {
         owner.kind == SymKind::Method || term.owner == lexical_owner
     });
     out
+}
+
+/// The template whose super constructor call `class` is written in, directly
+/// or inside another class that is.
+fn super_call_template(st: &SymbolTable, class: SymbolId) -> Option<SymbolId> {
+    let mut c = class;
+    while !c.is_none() {
+        if let Some(&t) = st.super_call_classes.get(&c) {
+            return Some(t);
+        }
+        c = lexical_template(st, c)?;
+    }
+    None
+}
+
+/// The constructor parameters of `template` that `tree` names.
+fn template_params(
+    tree: &Tree,
+    template: SymbolId,
+    bound: &HashSet<SymbolId>,
+    out: &mut Vec<SymbolId>,
+    st: &SymbolTable,
+) {
+    if let TreeKind::Ident { .. } = &tree.kind {
+        let id = tree.sym;
+        if !id.is_none()
+            && !bound.contains(&id)
+            && !out.contains(&id)
+            && st.get(id).kind == SymKind::Term
+            && st.get(id).owner == template
+            && st.get(id).flags.contains(Flags::PARAM)
+        {
+            out.push(id);
+        }
+    }
+    each_child(tree, &mut |c| template_params(c, template, bound, out, st));
 }
 
 fn consider(id: SymbolId, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &SymbolTable) {

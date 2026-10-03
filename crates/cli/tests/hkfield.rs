@@ -231,18 +231,21 @@ fn hkfield_casts_the_wide_loads_and_only_those() {
     for (load, cast) in [
         // (1) the higher-kinded field, and (2) the first-order bounded one:
         // both descriptors are the bound `Lhkf/Boxy;`.
-        ("Field hkf/Holder.f:Lhkf/Boxy;", "class hkf/OneBox"),
-        ("Field hkf/BHolder.f:Lhkf/Boxy;", "class hkf/OneBox"),
+        ("Method hkf/Holder.f:()Lhkf/Boxy;", "class hkf/OneBox"),
+        ("Method hkf/BHolder.f:()Lhkf/Boxy;", "class hkf/OneBox"),
         // (3) the `Object` case, which already worked: still cast.
-        ("Field hkf/OHolder.f:Ljava/lang/Object;", "class hkf/OneBox"),
+        (
+            "Method hkf/OHolder.f:()Ljava/lang/Object;",
+            "class hkf/OneBox",
+        ),
         // (4) the method result, which already worked: still cast.
         ("Method hkf/MHolder.m:()Lhkf/Boxy;", "class hkf/OneBox"),
         // (5) through a pattern, (5b) bound by a case-class extractor -- the
         // second site of the root, in the match lowering rather than the
         // `Select` path -- and (6) at a higher-kinded bound.
-        ("Field hkf/PBox.f:Lhkf/Boxy;", "class hkf/OneBox"),
-        ("Field hkf/CBox.f:Lhkf/Boxy;", "class hkf/OneBox"),
-        ("Field hkf/WHolder.w:Lhkf/Wrap;", "class hkf/WOne"),
+        ("Method hkf/PBox.f:()Lhkf/Boxy;", "class hkf/OneBox"),
+        ("Method hkf/CBox.f:()Lhkf/Boxy;", "class hkf/OneBox"),
+        ("Method hkf/WHolder.w:()Lhkf/Wrap;", "class hkf/WOne"),
     ] {
         let at = code
             .find(load)
@@ -261,7 +264,7 @@ fn hkfield_casts_the_wide_loads_and_only_those() {
     // descriptor already *is* `Lhkf/OneBox;` and scalac emits no cast. A rule
     // that cast here would be wrong in the other direction.
     let at = code
-        .find("Field hkf/Plain.c:Lhkf/OneBox;")
+        .find("Method hkf/Plain.c:()Lhkf/OneBox;")
         .unwrap_or_else(|| panic!("no `Plain.c` read in hkf.Main$:\n{code}"));
     let rest = &code[at..];
     let next_insn: String = rest.lines().nth(1).unwrap_or_default().into();

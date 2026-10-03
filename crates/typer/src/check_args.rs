@@ -2376,6 +2376,12 @@ impl Typer {
                         self.retry_whitebox_fits(|this| this.search_implicit_at(want, depth + 1))
                     }
                 };
+                let mut found = found;
+                if let Some(r) = self.build_found_implicit(&mut found, want, span, depth + 1, false)
+                {
+                    cargs.push(r);
+                    continue;
+                }
                 match found {
                     ImplicitSearch::Found(inner) => {
                         cargs.push(self.implicit_tree(inner, want, span, depth + 1))
@@ -2461,6 +2467,89 @@ impl Typer {
         tree
     }
 
+    /// Build the witness `search` found. A macro that aborts inside the
+    /// evidence of that witness makes the witness inapplicable (nsc expands
+    /// macros as it searches), so search again without it, and take the
+    /// first other witness that builds cleanly. With none, the first attempt
+    /// and its diagnostics stand as they would have without the retry. A
+    /// witness that is itself the aborting macro reports the abort, as nsc
+    /// does, instead of falling back to a lower-priority candidate.
+    ///
+    /// A query from a running macro is already transactional
+    /// (`answer_infer_implicit_search`), so it is left alone; and a candidate
+    /// is set aside only for this search, not for later ones of the type.
+    pub(crate) fn build_found_implicit(
+        &mut self,
+        search: &mut ImplicitSearch,
+        want: &Type,
+        span: Span,
+        depth: usize,
+        adapt: bool,
+    ) -> Option<Tree> {
+        let ImplicitSearch::Found(first) = *search else {
+            return None;
+        };
+        let mark = self.diags.len();
+        let aborts = self.macro_aborts.get();
+        let mut r = self.implicit_tree(first, want, span, depth);
+        if adapt {
+            self.adapt(&mut r, want);
+        }
+        let first_origin = self
+            .implicit_instance_origins
+            .get(&first)
+            .copied()
+            .unwrap_or(first);
+        if self.macro_query_depth > 0
+            || self.st.get(first_origin).macro_impl.is_some()
+            || self.macro_aborts.get() == aborts
+            || self.error_count_since(mark) == 0
+        {
+            return Some(r);
+        }
+        let first_diags = self.diags.split_off(mark);
+        let excluded = self.aborted_implicits.borrow().len();
+        let mut id = first;
+        let mut built = None;
+        for _ in 0..4 {
+            let origin = self
+                .implicit_instance_origins
+                .get(&id)
+                .copied()
+                .unwrap_or(id);
+            self.aborted_implicits
+                .borrow_mut()
+                .push((origin, want.clone()));
+            self.forget_implicit_answers();
+            let ImplicitSearch::Found(next) = self.search_implicit_at(want, depth) else {
+                break;
+            };
+            id = next;
+            let mut other = self.implicit_tree(id, want, span, depth);
+            if adapt {
+                self.adapt(&mut other, want);
+            }
+            if self.error_count_since(mark) == 0 {
+                built = Some(other);
+                break;
+            }
+            self.diags.truncate(mark);
+        }
+        self.aborted_implicits.borrow_mut().truncate(excluded);
+        self.forget_implicit_answers();
+        match built {
+            Some(other) => {
+                *search = ImplicitSearch::Found(id);
+                Some(other)
+            }
+            None => {
+                self.diags.truncate(mark);
+                self.diags.extend(first_diags);
+                Some(r)
+            }
+        }
+    }
+
     pub(crate) fn fill_implicit_params(
         &mut self,
         span: Span,
@@ -2510,6 +2599,10 @@ impl Typer {
             {
                 search = self.retry_whitebox_fits(|this| this.search_implicit_at(&pty, depth));
             }
+            if let Some(r) = self.build_found_implicit(&mut search, &pty, span, depth, true) {
+                args.push(r);
+                continue;
+            }
             match search {
                 ImplicitSearch::Found(id) => {
                     let mut r = self.implicit_tree(id, &pty, span, depth);
@@ -2537,7 +2630,15 @@ impl Typer {
                         args.push(lam);
                     // nsc does not report a missing `TypeTag[T]` either: it
                     // expands `materializeTypeTag` (`crate::materialize`).
-                    } else if let Some(tag) = self.materialize_tag(&pty, span) {
+                    } else if let Some(tag) = {
+                        let kept = self.alias_kept_param_type(fun, *pid, &pty);
+                        self.materialize_tag(&kept, span).map(|mut tag| {
+                            if kept != pty && !tag.ty.is_error() {
+                                tag.ty = pty.clone();
+                            }
+                            tag
+                        })
+                    } {
                         args.push(tag);
                     } else if let Some(d) = self.implicit_param_default(*pid, &pty, fun, args) {
                         args.push(d);
@@ -2864,6 +2965,34 @@ impl Typer {
     /// here and the error is this method's, because "could not find implicit
     /// value of type TypeTag[List[Int]]" points at the wrong thing: no
     /// program was ever going to define that value.
+    /// Whether `universe` is `scala.reflect.runtime.universe`, whichever way
+    /// the call site reached it.
+    fn is_runtime_universe(&self, universe: &Tree) -> bool {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut work: Vec<SymbolId> = self.st.class_sym_of(&universe.ty).into_iter().collect();
+        if !universe.sym.is_none() {
+            if let Some(c) = self
+                .st
+                .class_sym_of(&self.st.get(universe.sym).ty.result().clone())
+            {
+                work.push(c);
+            }
+        }
+        while let Some(c) = work.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            let s = self.st.get(c);
+            if s.jvm_name == "scala/reflect/api/JavaUniverse" {
+                return true;
+            }
+            work.extend(s.parents.iter().filter_map(|p| self.st.class_sym_of(p)));
+        }
+        universe
+            .annotation_path()
+            .ends_with("reflect.runtime.universe")
+    }
+
     fn materialize_tag(&mut self, pt: &Type, span: Span) -> Option<Tree> {
         if !self.library_abi {
             return None;
@@ -3075,6 +3204,7 @@ impl Typer {
                 args: vec![].into(),
             },
             tag_bindings,
+            runtime_universe: self.is_runtime_universe(&universe),
             span,
         }
         .build();

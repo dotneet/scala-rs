@@ -1050,21 +1050,15 @@ impl<'a> Parser<'a> {
     /// `simpleType` and may therefore be parenthesised and carry
     /// meta-annotations (`@getter`, `@setter`, `@field`, `@companionMethod`,
     /// `@companionClass`, ...). A meta-annotation only says which of the
-    /// members a definition expands into should receive the annotation. This
-    /// subset does not redirect an annotation onto an accessor or a companion
-    /// member, so the meta-annotations are dropped and the base annotation is
-    /// kept on the definition itself. The two shapes the 2.13 standard library
-    /// writes are inert under that treatment: ``@(`inline` @getter @setter)``
-    /// on a private var (we never inline) and `@(deprecated @companionMethod)`
-    /// on `Predef.any2stringadd`.
+    /// members a definition expands into should receive the annotation, and a
+    /// Java annotation's place in the class file follows them. The head keeps
+    /// them as `AnnotatedTypeTree` layers; `Tree::annotation_path` and the
+    /// other readers of an annotation look through them.
     fn parse_meta_annotation(&mut self) -> Tree {
         let lo = self.span();
         self.bump(); // (
         self.skip_nl();
         let mut base = self.parse_annot_type();
-        while let TreeKind::AnnotatedTypeTree { tpt, .. } = base.kind {
-            base = *tpt;
-        }
         self.skip_nl();
         self.expect(")", |k| matches!(k, TokenKind::RParen));
         while matches!(self.kind(), TokenKind::LParen) {

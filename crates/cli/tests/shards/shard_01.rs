@@ -48,6 +48,8 @@ mod asttype;
 mod auxpickle;
 #[path = "../backendtypes.rs"]
 mod backendtypes;
+#[path = "../bare_any_hash.rs"]
+mod bare_any_hash;
 #[path = "../bare_blocks.rs"]
 mod bare_blocks;
 #[path = "../basetype.rs"]
@@ -56,8 +58,12 @@ mod basetype;
 mod batchtypes;
 #[path = "../binary_client_rules.rs"]
 mod binary_client_rules;
+#[path = "../binary_generic_trait_init.rs"]
+mod binary_generic_trait_init;
 #[path = "../binary_library_members.rs"]
 mod binary_library_members;
+#[path = "../binary_value_class_extractor.rs"]
+mod binary_value_class_extractor;
 #[path = "../binary_value_class_lambda.rs"]
 mod binary_value_class_lambda;
 #[path = "../boxed.rs"]
@@ -100,6 +106,8 @@ mod catstail3;
 mod catsyntax;
 #[path = "../cfwd.rs"]
 mod cfwd;
+#[path = "../circe_nested_record_option.rs"]
+mod circe_nested_record_option;
 #[path = "../classtag_inference.rs"]
 mod classtag_inference;
 #[path = "../codegen_diag.rs"]

@@ -435,6 +435,32 @@ impl Typer {
                         paramss: paramss_ty.clone().into(),
                         ret: TyBox::new(Type::Unit),
                     };
+                    // The pickle keeps a parameter's type alias as written,
+                    // as for a method (`type_def_sig`): reflection-driven
+                    // injection (Airframe) keys a binding by the alias, and
+                    // the expanded function type found none.
+                    let written: Vec<Vec<Type>> = paramss_ids
+                        .iter()
+                        .zip(&paramss_ty)
+                        .map(|(ids, tys)| {
+                            ids.iter()
+                                .zip(tys)
+                                .map(|(p, t)| {
+                                    self.st
+                                        .get(*p)
+                                        .pickle_ty
+                                        .clone()
+                                        .unwrap_or_else(|| t.clone())
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    if written != paramss_ty {
+                        self.st.get_mut(mem).pickle_ty = Some(Type::Method {
+                            paramss: written.into(),
+                            ret: TyBox::new(Type::Unit),
+                        });
+                    }
                     // Unlike an ordinary method's `name$default$N` getters, a
                     // constructor default can't be an instance method on the
                     // class being constructed (there is no receiver yet at

@@ -10,6 +10,10 @@ mod mapkey;
 mod mapredirect;
 #[path = "../mapto2.rs"]
 mod mapto2;
+#[path = "../member_module_lzycompute.rs"]
+mod member_module_lzycompute;
+#[path = "../member_object_lambdas.rs"]
+mod member_object_lambdas;
 #[path = "../memberbatch.rs"]
 mod memberbatch;
 #[path = "../mirrorfwd.rs"]
@@ -44,6 +48,12 @@ mod mismatch8;
 mod mismatch9;
 #[path = "../mixcg.rs"]
 mod mixcg;
+#[path = "../mixin_interface_bridge.rs"]
+mod mixin_interface_bridge;
+#[path = "../mixin_lazy_val_override.rs"]
+mod mixin_lazy_val_override;
+#[path = "../mixin_value_class_overloads.rs"]
+mod mixin_value_class_overloads;
 #[path = "../module_mirror_import.rs"]
 mod module_mirror_import;
 #[path = "../modulepickle.rs"]
@@ -66,10 +76,18 @@ mod negchecks;
 mod neglit;
 #[path = "../nelpkg.rs"]
 mod nelpkg;
+#[path = "../nested_class_metadata.rs"]
+mod nested_class_metadata;
 #[path = "../nested_companion_named_apply.rs"]
 mod nested_companion_named_apply;
 #[path = "../nested_lambda_result.rs"]
 mod nested_lambda_result;
+#[path = "../nested_outer_chain.rs"]
+mod nested_outer_chain;
+#[path = "../nested_value_class_erasure.rs"]
+mod nested_value_class_erasure;
+#[path = "../nested_value_class_pattern.rs"]
+mod nested_value_class_pattern;
 #[path = "../nestedcasepickle.rs"]
 mod nestedcasepickle;
 #[path = "../nestedobj.rs"]
@@ -78,6 +96,8 @@ mod nestedobj;
 mod no_conflict_markers;
 #[path = "../nothingcall.rs"]
 mod nothingcall;
+#[path = "../nullary_def_apply_captures.rs"]
+mod nullary_def_apply_captures;
 #[path = "../nullary_poly_intersection.rs"]
 mod nullary_poly_intersection;
 #[path = "../nullcross.rs"]
@@ -88,10 +108,10 @@ mod numtower;
 mod ordsummon;
 #[path = "../outer.rs"]
 mod outer;
-#[path = "../outercapture.rs"]
-mod outercapture;
 #[path = "../outer_this_implicit.rs"]
 mod outer_this_implicit;
+#[path = "../outercapture.rs"]
+mod outercapture;
 #[path = "../overload_module.rs"]
 mod overload_module;
 #[path = "../overloadshadow.rs"]

@@ -58,12 +58,18 @@ mod tuplepat;
 mod tupletailrec;
 #[path = "../twirl.rs"]
 mod twirl;
+#[path = "../type_tag_alias.rs"]
+mod type_tag_alias;
 #[path = "../typeidentitybatch.rs"]
 mod typeidentitybatch;
 #[path = "../typelambda.rs"]
 mod typelambda;
 #[path = "../typemember.rs"]
 mod typemember;
+#[path = "../typetag_class_loader.rs"]
+mod typetag_class_loader;
+#[path = "../typetag_projection.rs"]
+mod typetag_projection;
 #[path = "../tyvar.rs"]
 mod tyvar;
 #[path = "../unitbox.rs"]
@@ -76,8 +82,14 @@ mod unitpop;
 mod unqname;
 #[path = "../valclass.rs"]
 mod valclass;
+#[path = "../value_case_class_to_string.rs"]
+mod value_case_class_to_string;
 #[path = "../value_class_abi.rs"]
 mod value_class_abi;
+#[path = "../value_class_extension_abi.rs"]
+mod value_class_extension_abi;
+#[path = "../value_class_ref_slots.rs"]
+mod value_class_ref_slots;
 #[path = "../valueclass.rs"]
 mod valueclass;
 #[path = "../varargsrecv.rs"]
@@ -96,6 +108,8 @@ mod vcself;
 mod verify_sql;
 #[path = "../verifyfail.rs"]
 mod verifyfail;
+#[path = "../view_implicit_clause.rs"]
+mod view_implicit_clause;
 #[path = "../view_with_args.rs"]
 mod view_with_args;
 #[path = "../wacc.rs"]
@@ -104,6 +118,8 @@ mod wacc;
 mod warn;
 #[path = "../wcinfer.rs"]
 mod wcinfer;
+#[path = "../wide_import_view.rs"]
+mod wide_import_view;
 #[path = "../wildrecv.rs"]
 mod wildrecv;
 #[path = "../xflags.rs"]

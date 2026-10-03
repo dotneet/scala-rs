@@ -1180,9 +1180,14 @@ which nsc materializes a `ClassTag`).
       $m$untyped.staticClass("Foo").asType.toTypeConstructor
   }
   <universe>.TypeTag.apply[Foo](
-    <universe>.rootMirror.asInstanceOf[<api.Mirror>], new $typecreator1())
+    <mirror>.asInstanceOf[<api.Mirror>], new $typecreator1())
 }
 ```
+
+`<mirror>` is `<universe>.runtimeMirror(this.getClass.getClassLoader)` for the runtime universe, as
+nsc writes it, and `<universe>.rootMirror` for a macro context's. The root mirror sees only
+scala-reflect's own class loader, so under a layered loader (a build tool's test runner) a tag of an
+application class raised `ScalaReflectionException` before.
 
 This is **an ordinary untyped scala-rs tree**, run through `type_expr` just like quasiquote
 reification. A local class can stand inside the block because the typer's `TreeKind::Block` is built
@@ -1193,20 +1198,19 @@ Which universe to use is decided by `universe_in_scope()` — the prefix of `imp
 the same reading by which a quasiquote decides the universe of a `q"..."`. Without that import we do
 not materialize and still say "no implicit", as before.
 
-#### Three points where we differ from nsc (**we do not require the trees to match**)
+#### Two points where we differ from nsc (**we do not require the trees to match**)
 
 Rather than the tag tree itself, what we validate is that the **runtime result of `tag.tpe`**
 (`toString` / `=:=` / `<:<` / `typeSymbol.fullName`) matches the real scalac 2.13.16
-(`tests/fixtures/tt_tags.scala`, 30 lines). There are three differences:
+(`tests/fixtures/tt_tags.scala`, 30 lines). There are two differences:
 
 | | nsc | scala-rs | Why |
 | --- | --- | --- | --- |
 | Binding `$u` / `$m` | binds them to `val`s first | selects `apply`'s arguments directly | The tree is smaller. `tag.tpe` is the same |
-| The runtime universe's mirror | `runtimeMirror(getClass.getClassLoader)` | `rootMirror` | `JavaUniverse#runtimeMirror` cannot be supplied yet (its `java.lang.ClassLoader` parameter has no symbol, and `ensure_class` refuses pickle-less classes outside `scala.`). Behavior differs only for classes invisible from the root mirror's class loader, and in that case you get a `ScalaReflectionException` (it never silently produces a different type) |
 | The creator's result type | writes `U#Type`, which nsc's erasure turns into `Types$TypeApi` | writes `Types$TypeApi` directly | scala-rs erases abstract type members to `Object` (`erasure::erase_ty`). `TypeCreator.apply` is **abstract**, so a descriptor returning `Object` overrides nothing and the first `tag.tpe` gives an `AbstractMethodError` |
 
 Inserting an `asInstanceOf` on the mirror argument compensates for the same kind of thing.
-The type of `rootMirror` is the universe's abstract member `Mirror`, and its upper bound can only be
+The type of either mirror is the universe's abstract member `Mirror`, and its upper bound can only be
 followed as far as `JavaMirror` in the pickle (the parent of
 `JavaMirror extends api.Mirror[self.type]` is dropped by `conv_upper_bound` because the singleton
 argument cannot be converted). The value really is a `Mirror`, so the cast becomes a `checkcast` that

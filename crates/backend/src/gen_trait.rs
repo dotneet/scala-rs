@@ -263,13 +263,21 @@ impl<'a> Gen<'a> {
         // signature rather than handing the bare value signature to the
         // method checker.
         if let TreeKind::DefDef { mods, .. } = &def.kind {
-            if mods.flags.contains(Flags::LAZY) {
+            if mods.flags.contains(Flags::LAZY) || self.st.constant_vals.contains_key(&def.sym) {
                 b.sign_method_accessor(method, self.sig_of(def.sym), false);
             } else {
                 b.sign_method(method, self.sig_of(def.sym));
             }
         } else {
             b.sign_method(method, self.sig_of(def.sym));
+        }
+        // A lazy val lowered to a def is a trait `val`, which nsc leaves
+        // unannotated.
+        let lazy = matches!(&def.kind, TreeKind::DefDef { mods, .. } if mods.flags.contains(Flags::LAZY))
+            || self.st.constant_vals.contains_key(&def.sym);
+        if !lazy {
+            b.annotate_last_def(self.st, def, 0, false);
+            b.set_local_names_of_last(def, 0);
         }
         // `public static m$($this, …)`: nsc's entry point for the mixin
         // forwarder every implementing class carries and for `super` calls
@@ -299,6 +307,10 @@ impl<'a> Gen<'a> {
                 emit_return(asm, &ret);
             },
         );
+        // nsc gives the static its parameters' annotations, not its own.
+        if !lazy {
+            b.annotate_last_def(self.st, def, 1, true);
+        }
     }
 
     /// The `val`s and `var`s a trait read from `-cp` makes every implementing
@@ -525,7 +537,7 @@ impl<'a> Gen<'a> {
         class_id: SymbolId,
         vparamss: &[Vec<Tree>],
         body: &[Tree],
-    ) -> Vec<(String, Type, u16)> {
+    ) -> Vec<(String, Type, u16, SymbolId)> {
         let mut have = HashSet::new();
         for clause in vparamss {
             for p in clause {
@@ -554,7 +566,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     if have.insert(name.clone()) {
-                        out.push((name, ty, 0));
+                        out.push((name, ty, 0, SymbolId::NONE));
                     }
                 }
                 continue;
@@ -568,6 +580,7 @@ impl<'a> Gen<'a> {
                     name,
                     val_tree_ty(self.st, v),
                     Self::mixin_field_extra_access(v),
+                    v.sym,
                 ));
             }
         }
@@ -591,19 +604,47 @@ impl<'a> Gen<'a> {
                 _ => {}
             }
         }
+        let owners = self.mixin_lazy_val_owners(class_id);
         for parent in self.mixin_traits(class_id) {
             let Some(vals) = self.traits.lazy_vals.get(&parent) else {
                 continue;
             };
             for v in vals {
                 let name = v.name().unwrap_or("").to_string();
-                if name.is_empty() || !have.insert(name.clone()) {
+                if name.is_empty()
+                    || owners.get(&name).is_some_and(|&o| o != parent)
+                    || !have.insert(name.clone())
+                {
                     continue;
                 }
                 out.push(v.clone());
             }
         }
         out
+    }
+
+    /// The trait whose `lazy val` of each name the class implements: the
+    /// first one in the linearization, whether it is compiled in this run or
+    /// read from a class file. Taking the first of each kind separately gave
+    /// a class mixing in both a source and a binary override of the same
+    /// `lazy val` two fields of that name (`ClassFormatError: Duplicate
+    /// field name`).
+    fn mixin_lazy_val_owners(&self, class_id: SymbolId) -> HashMap<String, SymbolId> {
+        let mut owners: HashMap<String, SymbolId> = HashMap::new();
+        for parent in self.mixin_traits(class_id) {
+            if let Some(vals) = self.traits.lazy_vals.get(&parent) {
+                for v in vals {
+                    if let Some(name) = v.name() {
+                        owners.entry(name.to_string()).or_insert(parent);
+                    }
+                }
+            } else if !self.traits.impls.contains_key(&parent) {
+                for (name, _) in self.binary_trait_lazy_vals(parent) {
+                    owners.entry(name).or_insert(parent);
+                }
+            }
+        }
+        owners
     }
 
     /// Member `object`s inherited from mixed-in traits, in linearization
@@ -682,44 +723,13 @@ impl<'a> Gen<'a> {
                 _ => {}
             }
         }
+        let owners = self.mixin_lazy_val_owners(class_id);
         for parent in self.mixin_traits(class_id) {
             if self.traits.impls.contains_key(&parent) {
                 continue;
             }
-            for m in self.st.get(parent).members.clone() {
-                let s = self.st.get(m);
-                // Eager classpath installation represents a pickled value as
-                // a `Term`. If that member is later completed on demand,
-                // PickleSupply replaces it with its JVM getter: a zero-arg
-                // `Method` carrying `ACCESSOR`. Both are the same stable
-                // Scala value, and the adjacent `d$` static is what proves it
-                // is a lazy value rather than an ordinary trait `val`.
-                let ty = match s.kind {
-                    SymKind::Term if !s.flags.contains(Flags::MUTABLE) => s.ty.clone(),
-                    SymKind::Method
-                        if s.flags.contains(Flags::ACCESSOR)
-                            && !s.flags.contains(Flags::MUTABLE)
-                            && method_params_from_sym(self.st, m).is_empty() =>
-                    {
-                        method_ret_from_sym(self.st, m)
-                    }
-                    _ => continue,
-                };
-                let name = s.name.clone();
-                // A binary trait's `name$` helper is normally the marker for
-                // a lazy val.  Do not use `binary_trait_defines` here: a
-                // regular val can legitimately share its source name with a
-                // default method (Matchers' `a`/`an` are the concrete
-                // example), and that method also gets an `a$`/`an$` helper.
-                // A lazy-val helper has the exact erased shape
-                // `(<trait>)<getter-result>`, whereas a default method with
-                // the same name has its actual parameters after the trait
-                // receiver.  Requiring that shape keeps ordinary mixin
-                // fields out of the lazy-field list.
-                if !self.binary_trait_defines(parent, &name)
-                    || !self.binary_trait_lazy_helper(parent, &name, &ty)
-                    || !have.insert(name.clone())
-                {
+            for (name, ty) in self.binary_trait_lazy_vals(parent) {
+                if owners.get(&name).is_some_and(|&o| o != parent) || !have.insert(name.clone()) {
                     continue;
                 }
                 out.push(BinaryLazyVal {
@@ -728,6 +738,49 @@ impl<'a> Gen<'a> {
                     owner: parent,
                 });
             }
+        }
+        out
+    }
+
+    /// The `lazy val`s a binary trait declares, as (name, value type).
+    fn binary_trait_lazy_vals(&self, parent: SymbolId) -> Vec<(String, Type)> {
+        let mut out = Vec::new();
+        for m in self.st.get(parent).members.clone() {
+            let s = self.st.get(m);
+            // Eager classpath installation represents a pickled value as
+            // a `Term`. If that member is later completed on demand,
+            // PickleSupply replaces it with its JVM getter: a zero-arg
+            // `Method` carrying `ACCESSOR`. Both are the same stable
+            // Scala value, and the adjacent `d$` static is what proves it
+            // is a lazy value rather than an ordinary trait `val`.
+            let ty = match s.kind {
+                SymKind::Term if !s.flags.contains(Flags::MUTABLE) => s.ty.clone(),
+                SymKind::Method
+                    if s.flags.contains(Flags::ACCESSOR)
+                        && !s.flags.contains(Flags::MUTABLE)
+                        && method_params_from_sym(self.st, m).is_empty() =>
+                {
+                    method_ret_from_sym(self.st, m)
+                }
+                _ => continue,
+            };
+            let name = s.name.clone();
+            // A binary trait's `name$` helper is normally the marker for
+            // a lazy val.  Do not use `binary_trait_defines` here: a
+            // regular val can legitimately share its source name with a
+            // default method (Matchers' `a`/`an` are the concrete
+            // example), and that method also gets an `a$`/`an$` helper.
+            // A lazy-val helper has the exact erased shape
+            // `(<trait>)<getter-result>`, whereas a default method with
+            // the same name has its actual parameters after the trait
+            // receiver.  Requiring that shape keeps ordinary mixin
+            // fields out of the lazy-field list.
+            if !self.binary_trait_defines(parent, &name)
+                || !self.binary_trait_lazy_helper(parent, &name, &ty)
+            {
+                continue;
+            }
+            out.push((name, ty));
         }
         out
     }
@@ -3317,7 +3370,16 @@ impl<'a> Gen<'a> {
         if class_id.is_none() {
             return;
         }
-        self.emit_var_erasure_bridges(b, class_id);
+        // On a trait's interface the bridges are `default` methods, for the
+        // trait's own concrete methods only: a class mixing the trait in
+        // inherits the implementation, and without a bridge beside it the
+        // parent's erased signature stayed abstract (`trait E[T <: C]
+        // extends Encoder[T] { def apply(a: T) = … }` left
+        // `Encoder.apply(Object)` unimplemented in every `new E[X] {}`).
+        let iface = b.access & ACC_INTERFACE != 0;
+        if !iface {
+            self.emit_var_erasure_bridges(b, class_id);
+        }
         // Terms implement parameterless members through their emitted getter.
         // In particular an abstract `val value: T` erases to Object even when
         // a concrete `type T = Int; val value = 7` implements it with ()I.
@@ -3356,6 +3418,15 @@ impl<'a> Gen<'a> {
             .copied()
             .filter(|&id| {
                 let s = self.st.get(id);
+                if iface {
+                    return s.kind == SymKind::Method
+                        && b.methods.iter().any(|m| {
+                            m.name == encode_method_name(&s.name)
+                                && m.desc == desc_of(id)
+                                && m.code.is_some()
+                                && m.access & ACC_STATIC == 0
+                        });
+                }
                 s.kind == SymKind::Method
                     || (s.kind == SymKind::Term
                         && !s.flags.contains(Flags::PRIVATE)
@@ -3368,12 +3439,74 @@ impl<'a> Gen<'a> {
             })
             .map(|id| (self.st.get(id).name.clone(), id))
             .collect();
+        // A concrete method mixed in from a trait implements the class's
+        // interfaces too, through the forwarder the class got for it:
+        // `class C extends UseCase with Helper[Admin]`, whose
+        // `Helper[T <: Tok].search(t: T)` erases to `search(Tok)`, owes
+        // `UseCase.search(Admin)` a bridge like its own methods do. Without
+        // it the interface method stayed abstract (`AbstractMethodError`).
+        // After the class's own members, which win over inherited ones.
+        let mut own = own;
+        let mut inherited: HashSet<SymbolId> = HashSet::new();
+        if !iface {
+            let names: HashSet<String> = own.iter().map(|(n, _)| n.clone()).collect();
+            for t in self.mixin_traits(class_id) {
+                for m in self.st.get(t).members.clone() {
+                    let s = self.st.get(m);
+                    if s.kind != SymKind::Method
+                        || s.flags.contains(Flags::PRIVATE)
+                        || names.contains(&s.name)
+                        || !b.methods.iter().any(|bm| {
+                            bm.name == encode_method_name(&s.name)
+                                && bm.desc == desc_of(m)
+                                && bm.code.is_some()
+                                && bm.access & ACC_STATIC == 0
+                        })
+                    {
+                        continue;
+                    }
+                    own.push((s.name.clone(), m));
+                    inherited.insert(m);
+                }
+            }
+        }
+        // A mixed-in method implements a parent's only where the parent's
+        // parameters conform to its own: `search(t: T)` of `Helper[T <: Tok]`
+        // erased to `search(Tok)` takes `UseCase.search(Admin)`'s `Admin`. A
+        // same-named method of another trait does not (`Encoder.apply(A)` is
+        // not `Decoder.apply(HCursor)`, though `A` erases to `Object`), and
+        // neither does one with type parameters of its own, which overloads.
+        // The comparison is of the parameters' types, not their erasures:
+        // `conv(x: InA)` beside `conv(x: InB)` of the same trait, two value
+        // classes over `Int`, erase alike and are still overloads, and
+        // bridging one to the other replaced `conv(InB)`'s forwarder with a
+        // method boxing `conv(InA)`'s result (`VerifyError: Bad return type`).
+        let is_value = |t: &Type| {
+            self.st
+                .class_sym_of(t)
+                .is_some_and(|c| self.st.is_value_class(c))
+        };
+        let inherited_overrides = |id: SymbolId, pmid: SymbolId, parent: &[Type]| {
+            let child = params_of(id);
+            self.st.get(id).tparams.is_empty()
+                && self.st.get(id).owner != self.st.get(pmid).owner
+                && parent.len() == child.len()
+                && parent.iter().zip(&child).all(|(p, c)| {
+                    p == c
+                        || (jvm_desc(self.st, p) == jvm_desc(self.st, c)
+                            && !is_value(p)
+                            && !is_value(c))
+                        || (!is_jvm_primitive(p)
+                            && !is_jvm_primitive(c)
+                            && self.st.is_sub_type(p, c))
+                })
+        };
         let mut lin = linearize(self.st, class_id);
         // The shared linearization omits universal roots. Their JVM methods
         // still need covariant bridges, e.g. toString(): Nothing overriding
         // Object.toString(): String.
         for root in [self.st.anyref_sym, self.st.any_sym] {
-            if !root.is_none() && !lin.contains(&root) {
+            if !iface && !root.is_none() && !lin.contains(&root) {
                 lin.push(root);
             }
         }
@@ -3411,12 +3544,11 @@ impl<'a> Gen<'a> {
                 let Some((_, cid)) = own.iter().find(|(n, id)| {
                     n == &ps.name
                         && *id != pmid
-                        && bridge_overrides(
-                            self.st,
-                            &parent_params,
-                            &params_of(*id),
-                            parent_abstract,
-                        )
+                        && if inherited.contains(id) {
+                            inherited_overrides(*id, pmid, &parent_params)
+                        } else {
+                            bridge_overrides(self.st, &parent_params, &params_of(*id), parent_abstract)
+                        }
                         // `bridge_overrides` compares erased descriptors, so
                         // it cannot tell `Ops.pp[B](xs: Bag[B])` from
                         // `Table.pp[V2](xs: Bag[(K, V2)])` -- one JVM
@@ -3561,11 +3693,19 @@ impl<'a> Gen<'a> {
                                 emit_adapt(asm, a, self.abi);
                             }
                         }
-                        asm.invokevirtual(
-                            &class_c,
-                            impl_name.as_deref().unwrap_or(&name),
-                            &cdesc_c,
-                        );
+                        if iface {
+                            asm.invokeinterface(
+                                &class_c,
+                                impl_name.as_deref().unwrap_or(&name),
+                                &cdesc_c,
+                            );
+                        } else {
+                            asm.invokevirtual(
+                                &class_c,
+                                impl_name.as_deref().unwrap_or(&name),
+                                &cdesc_c,
+                            );
+                        }
                         if emit_forwarded_nothing(asm, &cret_desc) {
                             return;
                         }
@@ -3940,37 +4080,16 @@ impl<'a> Gen<'a> {
             let cast_to = outer_field_class(self.st, mcls)
                 .filter(|o| class_internal(self.st, *o) != this_name)
                 .map(|o| class_internal(self.st, o));
-            b.add_code(ACC_PUBLIC, &aname, &adesc, 3, |asm| {
-                asm.aload(0);
-                asm.getfield(&this_name, &fname, &mdesc);
-                let done = asm.fresh_label();
-                asm.ifnonnull(done);
-                let lock = 1u16;
-                asm.aload(0);
-                asm.dup();
-                asm.astore(lock);
-                asm.monitorenter();
-                asm.aload(0);
-                asm.getfield(&this_name, &fname, &mdesc);
-                let made = asm.fresh_label();
-                asm.ifnonnull(made);
-                asm.aload(0);
-                asm.new_obj(&mjvm);
-                asm.dup();
-                asm.aload(0);
-                if let Some(c) = &cast_to {
-                    asm.checkcast(c);
-                }
-                asm.invokespecial(&mjvm, "<init>", &ctor_desc);
-                asm.putfield(&this_name, &fname, &mdesc);
-                asm.mark(made);
-                asm.aload(lock);
-                asm.monitorexit();
-                asm.mark(done);
-                asm.aload(0);
-                asm.getfield(&this_name, &fname, &mdesc);
-                asm.areturn();
-            });
+            emit_member_module_accessor(
+                b,
+                &aname,
+                &adesc,
+                &fname,
+                &mdesc,
+                &mjvm,
+                &ctor_desc,
+                cast_to.as_deref(),
+            );
         }
     }
 
@@ -4069,37 +4188,17 @@ impl<'a> Gen<'a> {
                     name: fname.clone(),
                     desc: mdesc.clone(),
                 });
-                b.add_code(ACC_PUBLIC, &name, &adesc, 3, |asm| {
-                    asm.aload(0);
-                    asm.getfield(&this_name, &fname, &mdesc);
-                    let done = asm.fresh_label();
-                    asm.ifnonnull(done);
-                    let lock = 1u16;
-                    asm.aload(0);
-                    asm.dup();
-                    asm.astore(lock);
-                    asm.monitorenter();
-                    asm.aload(0);
-                    asm.getfield(&this_name, &fname, &mdesc);
-                    let made = asm.fresh_label();
-                    asm.ifnonnull(made);
-                    asm.aload(0);
-                    asm.new_obj(&module);
-                    asm.dup();
-                    asm.aload(0);
-                    if let Some(c) = &cast_to {
-                        asm.checkcast(c);
-                    }
-                    asm.invokespecial(&module, "<init>", &ctor_desc);
-                    asm.putfield(&this_name, &fname, &mdesc);
-                    asm.mark(made);
-                    asm.aload(lock);
-                    asm.monitorexit();
-                    asm.mark(done);
-                    asm.aload(0);
-                    asm.getfield(&this_name, &fname, &mdesc);
-                    asm.areturn();
-                });
+                let _ = &this_name;
+                emit_member_module_accessor(
+                    b,
+                    &name,
+                    &adesc,
+                    &fname,
+                    &mdesc,
+                    &module,
+                    &ctor_desc,
+                    cast_to.as_deref(),
+                );
             }
         }
     }
@@ -4503,15 +4602,35 @@ impl<'a> Gen<'a> {
                     let cdesc = getter.clone();
                     let child_ty = ty.clone();
                     let ret_ty = pret.clone();
+                    // A value-class field is stored unboxed, and the parent's
+                    // erased result owes the instance: `def v: F[A]`
+                    // implemented by `val v: Box[A]` handed out the bare
+                    // underlying value, and the caller's cast to `Box` failed.
+                    let value_box = self.st.value_class_for_term(p.sym).map(|c| {
+                        let under = self.st.value_class_underlying(c).unwrap();
+                        (
+                            class_internal(self.st, c),
+                            format!("({})V", jvm_desc(self.st, &under)),
+                            param_adapt(self.st, &child_ty, &under),
+                        )
+                    });
+                    let abi = self.abi;
                     let _bridge_method = b.add_code(
                         ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE,
                         name,
                         &pdesc,
                         1,
                         move |asm| {
+                            if let Some((class, _, _)) = &value_box {
+                                asm.new_obj(class);
+                                asm.dup();
+                            }
                             asm.aload(0);
                             asm.invokevirtual(&cn, &mname, &cdesc);
-                            if is_jvm_primitive(&child_ty) && !is_jvm_primitive(&ret_ty) {
+                            if let Some((class, desc, adapt)) = &value_box {
+                                emit_adapt(asm, adapt, abi);
+                                asm.invokespecial(class, "<init>", desc);
+                            } else if is_jvm_primitive(&child_ty) && !is_jvm_primitive(&ret_ty) {
                                 emit_box(asm, &child_ty);
                             }
                             emit_return(asm, &ret_ty);
@@ -4581,9 +4700,16 @@ impl<'a> Gen<'a> {
             let fdesc = jvm_desc_val(self.st, &ty);
             let ret_ty = ty.clone();
             let cls = class_name.clone();
+            let constant = self.st.constant_vals.get(&stt.sym).cloned();
             let method = b.add_code(access, &fname, &desc, 1, |asm| {
-                asm.aload(0);
-                emit_getfield(asm, &cls, &fname, &fdesc);
+                // nsc's accessor of a constant `final val` answers the
+                // constant; there is no field to read.
+                if let Some(lit) = &constant {
+                    crate::gen_expr::gen_literal(asm, lit);
+                } else {
+                    asm.aload(0);
+                    emit_getfield(asm, &cls, &fname, &fdesc);
+                }
                 emit_return(asm, &ret_ty);
             });
             b.sign_method_accessor(method, self.sig_of(stt.sym), false);
@@ -4833,6 +4959,20 @@ fn emit_case_hash_code(
 /// already carries its traits' fields and runs their `$init$` itself, so
 /// only a trait needs any of it.
 impl SamMixins for Gen<'_> {
+    fn class_file_method_descs(&self, class: &str, name: &str) -> Vec<String> {
+        let Some(bp) = &self.binary_parents else {
+            return Vec::new();
+        };
+        bp.methods_of(class)
+            .map(|ms| {
+                ms.iter()
+                    .filter(|(n, _, _)| n == name)
+                    .map(|(_, d, _)| d.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn anonfun_class_name(&self, span: scala_rs_span::Span) -> Option<&str> {
         if span.is_dummy() {
             return None;
@@ -4852,14 +4992,15 @@ impl SamMixins for Gen<'_> {
         }
         let _host = SamHost::set(self, sam);
         let binary_lazies = self.binary_mixin_lazy_vals(sam, &[]);
-        for (name, ty, extra) in self.mixin_val_fields(sam, &[], &[]) {
+        for (name, ty, extra, sym) in self.mixin_val_fields(sam, &[], &[]) {
             if b.fields.iter().any(|f| f.name == name)
                 || binary_lazies.iter().any(|v| v.name == name)
             {
                 continue;
             }
+            b.annotate_mixin_field(self.st, &name, sym);
             b.fields.push(Field {
-                access: ACC_PUBLIC | extra,
+                access: ACC_PRIVATE | extra,
                 name,
                 desc: jvm_desc_val(self.st, &ty),
             });
@@ -4920,4 +5061,84 @@ impl Drop for SamHost<'_, '_> {
     fn drop(&mut self) {
         self.gen.sam_host.set(self.before);
     }
+}
+
+/// The body of a member object's accessor: create the module under the
+/// instance's monitor on first use. A constructor that throws releases the
+/// monitor in a catch-all handler and rethrows, as nsc's accessor does; left
+/// held, HotSpot reports the unbalanced lock instead
+/// (`IllegalMonitorStateException`) and the real exception is lost.
+/// A member object's accessor and its `name$lzycompute$1`, as nsc emits
+/// them: the accessor reads the `name$module` field and calls the private
+/// initializer only while it is null; the initializer creates the instance
+/// under the enclosing instance's lock. A library reading the class
+/// (singleton-safety checks, for one) tells the field apart from mutable
+/// state by that initializer.
+#[allow(clippy::too_many_arguments)]
+fn emit_member_module_accessor(
+    b: &mut ClassBuilder,
+    aname: &str,
+    adesc: &str,
+    fname: &str,
+    mdesc: &str,
+    module: &str,
+    ctor_desc: &str,
+    cast_to: Option<&str>,
+) {
+    let this_name = b.this_name.clone();
+    let init = format!("{aname}$lzycompute$1");
+    b.add_code(ACC_PRIVATE | ACC_FINAL, &init, "()V", 3, |asm| {
+        let lock = 1u16;
+        asm.aload(0);
+        asm.astore(lock);
+        asm.aload(lock);
+        asm.monitorenter();
+        asm.capture_try_locals();
+        let try_s = asm.fresh_label();
+        asm.mark(try_s);
+        asm.aload(0);
+        asm.getfield(&this_name, fname, mdesc);
+        let made = asm.fresh_label();
+        asm.ifnonnull(made);
+        asm.aload(0);
+        asm.new_obj(module);
+        asm.dup();
+        asm.aload(0);
+        if let Some(c) = cast_to {
+            asm.checkcast(c);
+        }
+        asm.invokespecial(module, "<init>", ctor_desc);
+        asm.putfield(&this_name, fname, mdesc);
+        asm.mark(made);
+        asm.aload(lock);
+        asm.monitorexit();
+        let try_e = asm.fresh_label();
+        asm.mark(try_e);
+        let done = asm.fresh_label();
+        asm.goto(done);
+        let handler = asm.fresh_label();
+        asm.mark(handler);
+        asm.enter_handler_captured_locals();
+        asm.astore(2);
+        asm.aload(lock);
+        asm.monitorexit();
+        asm.aload(2);
+        asm.athrow();
+        asm.exception(try_s, try_e, handler, None);
+        asm.release_try_locals();
+        asm.mark(done);
+        asm.vreturn();
+    });
+    b.add_code(ACC_PUBLIC, aname, adesc, 1, |asm| {
+        asm.aload(0);
+        asm.getfield(&this_name, fname, mdesc);
+        let done = asm.fresh_label();
+        asm.ifnonnull(done);
+        asm.aload(0);
+        asm.invokespecial(&this_name, &init, "()V");
+        asm.mark(done);
+        asm.aload(0);
+        asm.getfield(&this_name, fname, mdesc);
+        asm.areturn();
+    });
 }
