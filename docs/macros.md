@@ -1279,7 +1279,9 @@ and compiled with `javac` (the hash means a stale classfile can never run).
 
 - **One resident process per compilation.** The first expansion starts `java`, and everything after
   that goes over a pipe with one request per line, so the JVM's startup cost is paid once. It is
-  killed from `Drop` when the `Typer` goes away.
+  killed from `Drop` when the `Typer` goes away. (This was the first design. A compilation now
+  opens a session of a shared daemon JVM, or of the engine a resident batch compiler keeps; see
+  [usage](usage.md#macros).)
 - **The classpath is `binary_path` itself** (`-cp` plus `--scala-library`). This mirrors nsc, whose
   `-Ymacro-classpath` defaults to the compilation classpath, and it also satisfies the caveat found
   in §2.3 that "reify's `staticModule` also demands the classes being compiled".

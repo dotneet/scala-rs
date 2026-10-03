@@ -123,6 +123,11 @@ struct ZipIndex {
     /// Every directory prefix (`a/`, `a/b/`) some entry lies under, built on
     /// the first package query. Shared by clones, like `sorted_names`.
     dirs: std::rc::Rc<std::cell::OnceCell<rustc_hash::FxHashSet<String>>>,
+    /// Class files already inflated, by entry name, in a resident process:
+    /// the archive is immutable while its stamp holds, and each module of a
+    /// build reads many of the same classes again. `None` records a name the
+    /// archive lacks, which a split package probes in every compilation.
+    classes: std::rc::Rc<RefCell<rustc_hash::FxHashMap<String, Option<std::rc::Rc<[u8]>>>>>,
 }
 
 impl ZipIndex {
@@ -172,6 +177,47 @@ fn directory_prefixes(names: &[String]) -> rustc_hash::FxHashSet<String> {
 
 const RESIDENT_ARCHIVE_LIMIT: usize = 512 * 1024 * 1024;
 
+/// What the resident caches of class-file bytes and directory listings below
+/// may hold together. Past it, lookups read the file system as a single run
+/// does.
+const RESIDENT_CLASS_LIMIT: usize = 768 * 1024 * 1024;
+
+/// A file's or a directory's identity and last change: equal stamps mean the
+/// contents (a directory's names) read before still stand.
+#[cfg(unix)]
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct FileStamp {
+    size: u64,
+    inode: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            size: meta.len(),
+            inode: meta.ino(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+/// Class files and directory listings of directory classpath entries, kept
+/// between the compilations of a resident process. The output directory of
+/// one module is a dependency of the next, and every module read the same
+/// files and listings again. Each use checks the stamp first, so a class file
+/// rewritten or a directory that gained or lost a name is read afresh.
+#[cfg(unix)]
+#[derive(Default)]
+struct ResidentDirectories {
+    files: HashMap<PathBuf, (FileStamp, std::rc::Rc<[u8]>)>,
+    listings: HashMap<PathBuf, (FileStamp, std::rc::Rc<Vec<(std::ffi::OsString, ChildKind)>>)>,
+}
+
 #[cfg(unix)]
 #[derive(PartialEq, Eq)]
 struct ArchiveStamp {
@@ -187,11 +233,15 @@ struct ArchiveStamp {
 #[cfg(unix)]
 impl ArchiveStamp {
     fn of(path: &Path) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt;
-
         let meta = std::fs::metadata(path)
             .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-        Ok(Self {
+        Ok(Self::of_metadata(&meta))
+    }
+
+    fn of_metadata(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
             size: meta.len(),
             device: meta.dev(),
             inode: meta.ino(),
@@ -199,7 +249,7 @@ impl ArchiveStamp {
             modified_nanos: meta.mtime_nsec(),
             changed_seconds: meta.ctime(),
             changed_nanos: meta.ctime_nsec(),
-        })
+        }
     }
 }
 
@@ -221,6 +271,11 @@ struct ResidentArchives {
 
 thread_local! {
     static RESIDENT_ARCHIVES_ENABLED: Cell<bool> = const { Cell::new(false) };
+    /// Bytes held by `ZipIndex::classes` and `ResidentDirectories`.
+    static RESIDENT_CLASS_BYTES: Cell<usize> = const { Cell::new(0) };
+    #[cfg(unix)]
+    static RESIDENT_DIRECTORIES: RefCell<ResidentDirectories> =
+        RefCell::new(ResidentDirectories::default());
     #[cfg(unix)]
     static RESIDENT_ARCHIVES: RefCell<ResidentArchives> = RefCell::new(ResidentArchives::default());
     #[cfg(test)]
@@ -232,6 +287,106 @@ thread_local! {
 /// directories can gain class files while a dependency graph is compiled.
 pub fn enable_resident_archive_cache() {
     RESIDENT_ARCHIVES_ENABLED.set(true);
+}
+
+/// Whether `bytes` more may be kept by the resident class caches; counts
+/// them when so. A full cache is emptied and starts over, which keeps the
+/// classes the current modules use rather than the first ones ever read.
+fn reserve_resident_class_bytes(bytes: usize) -> bool {
+    if !RESIDENT_ARCHIVES_ENABLED.get() || bytes > RESIDENT_CLASS_LIMIT / 16 {
+        return false;
+    }
+    if RESIDENT_CLASS_BYTES.get() + bytes > RESIDENT_CLASS_LIMIT {
+        clear_resident_classes();
+    }
+    RESIDENT_CLASS_BYTES.set(RESIDENT_CLASS_BYTES.get() + bytes);
+    true
+}
+
+fn clear_resident_classes() {
+    #[cfg(unix)]
+    {
+        RESIDENT_ARCHIVES.with_borrow(|cache| {
+            for archive in cache.by_path.values() {
+                archive.index.classes.borrow_mut().clear();
+            }
+        });
+        RESIDENT_DIRECTORIES.with_borrow_mut(|cache| {
+            cache.files.clear();
+            cache.listings.clear();
+        });
+    }
+    RESIDENT_PARSED.with_borrow_mut(|cache| cache.clear());
+    RESIDENT_CLASS_BYTES.set(0);
+}
+
+/// A directory's names and what each is, from the resident cache while the
+/// directory is unchanged.
+fn list_directory(dir: &Path) -> Option<std::rc::Rc<Vec<(std::ffi::OsString, ChildKind)>>> {
+    let read = || -> Option<Vec<(std::ffi::OsString, ChildKind)>> {
+        Some(
+            std::fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .map(|entry| (entry.file_name(), ChildKind::of(&entry)))
+                .collect(),
+        )
+    };
+    #[cfg(unix)]
+    if RESIDENT_ARCHIVES_ENABLED.get() {
+        let stamp = FileStamp::of(&std::fs::metadata(dir).ok()?);
+        let hit = RESIDENT_DIRECTORIES.with_borrow(|cache| {
+            cache
+                .listings
+                .get(dir)
+                .filter(|(cached, _)| *cached == stamp)
+                .map(|(_, names)| names.clone())
+        });
+        if let Some(names) = hit {
+            return Some(names);
+        }
+        let names = std::rc::Rc::new(read()?);
+        let bytes = names.iter().map(|(n, _)| n.len() + 16).sum::<usize>();
+        // A listing taken in the same instant as a change could miss it
+        // under an unchanged stamp; read such a directory again next time.
+        let settled = std::fs::metadata(dir).ok().map(|m| FileStamp::of(&m)) == Some(stamp);
+        if settled && reserve_resident_class_bytes(bytes) {
+            RESIDENT_DIRECTORIES.with_borrow_mut(|cache| {
+                cache.listings.insert(dir.to_path_buf(), (stamp, names.clone()));
+            });
+        }
+        return Some(names);
+    }
+    read().map(std::rc::Rc::new)
+}
+
+/// A class file of a directory classpath entry, from the resident cache while
+/// the file is unchanged.
+fn read_directory_class(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    if RESIDENT_ARCHIVES_ENABLED.get() {
+        let stamp = FileStamp::of(&std::fs::metadata(path)?);
+        let hit = RESIDENT_DIRECTORIES.with_borrow(|cache| {
+            cache
+                .files
+                .get(path)
+                .filter(|(cached, _)| *cached == stamp)
+                .map(|(_, bytes)| bytes.to_vec())
+        });
+        if let Some(bytes) = hit {
+            return Ok(bytes);
+        }
+        let bytes = std::fs::read(path)?;
+        if bytes.len() as u64 == stamp.size && reserve_resident_class_bytes(bytes.len()) {
+            RESIDENT_DIRECTORIES.with_borrow_mut(|cache| {
+                cache
+                    .files
+                    .insert(path.to_path_buf(), (stamp, std::rc::Rc::from(bytes.as_slice())));
+            });
+        }
+        return Ok(bytes);
+    }
+    std::fs::read(path)
 }
 
 #[cfg(unix)]
@@ -335,6 +490,10 @@ struct Entry {
     /// put on `-cp`.
     scala_distribution: bool,
     zip: Option<ZipIndex>,
+    /// The archive's stamp when the classpath was listed, so that opening it
+    /// from the resident cache needs no second `stat`.
+    #[cfg(unix)]
+    stamp: Option<ArchiveStamp>,
     /// Directory package existence is shared by many distinct class probes.
     /// A missing package lets us skip a class-file `stat` for this root.
     dir_packages: HashMap<String, DirPackage>,
@@ -391,12 +550,7 @@ impl Entry {
         let mut kind = ChildKind::Dir;
         for comp in rel.split('/').filter(|part| !part.is_empty()) {
             let children = self.dir_children.entry(prefix.clone()).or_insert_with(|| {
-                std::fs::read_dir(&at).ok().map(|entries| {
-                    entries
-                        .flatten()
-                        .map(|entry| (entry.file_name(), ChildKind::of(&entry)))
-                        .collect()
-                })
+                list_directory(&at).map(|names| names.iter().cloned().collect())
             });
             kind = *children.as_ref()?.get(std::ffi::OsStr::new(comp))?;
             at.push(comp);
@@ -443,21 +597,20 @@ impl Entry {
         let dir = self.path.join(package);
         let package_entry = self.dir_packages.get_mut(package).expect("package cached");
         if package_entry.files.is_none() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
+            let Some(entries) = list_directory(&dir) else {
                 // Preserve the direct probe if listing is unavailable.
                 return dir.join(file).is_file()
                     && self.directory_case_matches(&format!("{package}/{file}"));
             };
             package_entry.files = Some(
                 entries
-                    .flatten()
-                    .filter(|entry| {
-                        entry.file_type().map_or_else(
-                            |_| entry.path().is_file(),
-                            |kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()),
-                        )
+                    .iter()
+                    .filter(|(name, kind)| match kind {
+                        ChildKind::Other => true,
+                        ChildKind::Symlink => dir.join(name).is_file(),
+                        ChildKind::Dir => false,
                     })
-                    .map(|entry| entry.file_name())
+                    .map(|(name, _)| name.clone())
                     .collect(),
             );
         }
@@ -476,20 +629,29 @@ impl BinaryIndex {
         let paths = raw
             .into_iter()
             .map(|p| {
-                let kind = if p.is_dir() {
+                // One `stat` per entry: a build's classpath has hundreds, and
+                // every compilation of a resident process lists them again.
+                let meta = std::fs::metadata(&p).ok();
+                let zip = meta.as_ref().is_some_and(|m| m.is_file()) && has_zip_extension(&p);
+                let kind = if meta.as_ref().is_some_and(|m| m.is_dir()) {
                     PathKind::Dir
-                } else if is_zip_like(&p) {
+                } else if zip {
                     PathKind::Zip
                 } else {
                     PathKind::Absent
                 };
-                let scala_distribution = is_zip_like(&p)
+                let scala_distribution = zip
                     && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                         ["scala-library", "scala-reflect", "scala-compiler"]
                             .iter()
                             .any(|jar| n.starts_with(jar))
                     });
                 Entry {
+                    #[cfg(unix)]
+                    stamp: meta
+                        .as_ref()
+                        .filter(|_| zip)
+                        .map(ArchiveStamp::of_metadata),
                     path: p,
                     kind,
                     scala_distribution,
@@ -583,7 +745,18 @@ impl BinaryIndex {
                     let e = load_zip(&mut self.paths[i])?;
                     let path = &e.path;
                     let z = e.zip.as_mut().expect("zip loaded");
-                    for n in [&rel, &alt] {
+                    // Only a few archives nest their classes under `classes/`.
+                    let nested = z.has_prefix("classes/");
+                    for n in [&rel, &alt].into_iter().take(1 + usize::from(nested)) {
+                        let cached = z.classes.borrow().get(n.as_str()).cloned();
+                        match cached {
+                            Some(Some(bytes)) => {
+                                self.class_origin.insert(internal.to_string(), i);
+                                return Ok(Some(bytes.to_vec()));
+                            }
+                            Some(None) => continue,
+                            None => {}
+                        }
                         match z.archive.by_name(n) {
                             Ok(mut f) => {
                                 let mut buf = Vec::with_capacity(f.size() as usize);
@@ -593,10 +766,19 @@ impl BinaryIndex {
                                         path.display()
                                     )
                                 })?;
+                                if reserve_resident_class_bytes(buf.len()) {
+                                    z.classes
+                                        .borrow_mut()
+                                        .insert(n.to_string(), Some(std::rc::Rc::from(buf.as_slice())));
+                                }
                                 self.class_origin.insert(internal.to_string(), i);
                                 return Ok(Some(buf));
                             }
-                            Err(zip::result::ZipError::FileNotFound) => {}
+                            Err(zip::result::ZipError::FileNotFound) => {
+                                if reserve_resident_class_bytes(n.len() + 32) {
+                                    z.classes.borrow_mut().insert(n.to_string(), None);
+                                }
+                            }
                             Err(err) => {
                                 return Err(format!(
                                     "unsupported classfile archive {}: {err}",
@@ -613,7 +795,7 @@ impl BinaryIndex {
                     }
                     let f = self.paths[i].path.join(&rel);
                     self.class_origin.insert(internal.to_string(), i);
-                    return std::fs::read(&f)
+                    return read_directory_class(&f)
                         .map(Some)
                         .map_err(|e| format!("cannot read {}: {e}", f.display()));
                 }
@@ -725,7 +907,10 @@ fn load_zip(e: &mut Entry) -> Result<&mut Entry, String> {
     if e.zip.is_none() {
         #[cfg(unix)]
         let stamp = if RESIDENT_ARCHIVES_ENABLED.get() {
-            let stamp = ArchiveStamp::of(&e.path)?;
+            let stamp = match e.stamp.take() {
+                Some(stamp) => stamp,
+                None => ArchiveStamp::of(&e.path)?,
+            };
             if let Some(index) = cached_archive(&e.path, &stamp) {
                 e.zip = Some(index);
                 return Ok(e);
@@ -754,6 +939,7 @@ fn load_zip(e: &mut Entry) -> Result<&mut Entry, String> {
             archive,
             sorted_names: std::rc::Rc::new(sorted_names),
             dirs: Default::default(),
+            classes: Default::default(),
         });
         #[cfg(unix)]
         if let Some(stamp) = stamp {
@@ -770,14 +956,35 @@ fn has_sorted_prefix(names: &[String], prefix: &str) -> bool {
     names.get(at).is_some_and(|n| n.starts_with(prefix))
 }
 
-fn is_zip_like(p: &Path) -> bool {
+fn has_zip_extension(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|s| s.to_str()),
         Some("jar" | "zip" | "jmod")
-    ) && p.is_file()
+    )
 }
 
+/// The JDK's class archives, found once per `JAVA_HOME` / `PATH`: every
+/// compilation of a resident process asks again.
 fn discover_jdk_jmods() -> Vec<PathBuf> {
+    thread_local! {
+        static FOUND: RefCell<Option<(Option<std::ffi::OsString>, Option<std::ffi::OsString>, Vec<PathBuf>)>> =
+            const { RefCell::new(None) };
+    }
+    let key = (std::env::var_os("JAVA_HOME"), std::env::var_os("PATH"));
+    if let Some(paths) = FOUND.with_borrow(|found| {
+        found
+            .as_ref()
+            .filter(|(home, path, _)| (home, path) == (&key.0, &key.1))
+            .map(|(_, _, paths)| paths.clone())
+    }) {
+        return paths;
+    }
+    let paths = discover_jdk_jmods_uncached();
+    FOUND.with_borrow_mut(|found| *found = Some((key.0, key.1, paths.clone())));
+    paths
+}
+
+fn discover_jdk_jmods_uncached() -> Vec<PathBuf> {
     if let Some(paths) = std::env::var_os("JAVA_HOME")
         .as_deref()
         .and_then(|home| jdk_class_paths(Path::new(home)))
@@ -833,13 +1040,53 @@ fn jdk_class_paths(home: &Path) -> Option<Vec<PathBuf>> {
 }
 
 pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
-    parse_classfile_members(bytes, false)
+    parse_classfile_resident(bytes, false)
 }
 
 /// ScalaSignature completion needs descriptors even for inaccessible methods:
 /// installing their actual declaration lets the typer enforce Scala access.
 pub(crate) fn parse_classfile_for_scala_signature(bytes: &[u8]) -> Result<JavaClass, String> {
-    parse_classfile_members(bytes, true)
+    parse_classfile_resident(bytes, true)
+}
+
+type ParsedKey = (u64, usize, bool);
+
+thread_local! {
+    /// Parsed class files of a resident process, by content: every module of
+    /// a build parses the same library classes again. Keyed by the bytes'
+    /// length and hash, and checked against the bytes themselves.
+    static RESIDENT_PARSED: RefCell<HashMap<ParsedKey, (std::rc::Rc<[u8]>, JavaClass)>> =
+        RefCell::new(HashMap::default());
+}
+
+fn parse_classfile_resident(bytes: &[u8], include_private_methods: bool) -> Result<JavaClass, String> {
+    if !RESIDENT_ARCHIVES_ENABLED.get() {
+        return parse_classfile_members(bytes, include_private_methods);
+    }
+    let hash = {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        h.write(bytes);
+        h.finish()
+    };
+    let key = (hash, bytes.len(), include_private_methods);
+    let hit = RESIDENT_PARSED.with_borrow(|cache| {
+        cache
+            .get(&key)
+            .filter(|(cached, _)| cached.as_ref() == bytes)
+            .map(|(_, class)| class.clone())
+    });
+    if let Some(class) = hit {
+        return Ok(class);
+    }
+    let class = parse_classfile_members(bytes, include_private_methods)?;
+    // The parsed form is about the size of the bytes again.
+    if reserve_resident_class_bytes(bytes.len() * 2) {
+        RESIDENT_PARSED.with_borrow_mut(|cache| {
+            cache.insert(key, (std::rc::Rc::from(bytes), class.clone()));
+        });
+    }
+    Ok(class)
 }
 
 fn parse_classfile_members(
@@ -1411,6 +1658,8 @@ mod tests {
         let mut index = BinaryIndex::from_user_paths(vec![user]);
         index.paths.truncate(1);
         index.paths.push(Entry {
+            #[cfg(unix)]
+            stamp: None,
             path: jdk,
             kind: PathKind::Zip,
             scala_distribution: false,
@@ -1465,6 +1714,47 @@ mod tests {
         index.paths.truncate(1);
         assert_eq!(index.find_class("p/Value").unwrap(), Some(b"two".to_vec()));
         assert_eq!(ARCHIVE_LOADS.with(|count| count.get()), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A resident process keeps directory listings and class files between
+    /// compilations; a class file rewritten in place (even to the same size
+    /// and modification time) and a class file added later are read afresh.
+    #[cfg(unix)]
+    #[test]
+    fn resident_directory_classes_follow_rewrites_and_additions() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("scala-rs-resident-dir-{unique}"));
+        let pkg = root.join("p");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let value = pkg.join("Value.class");
+        std::fs::write(&value, b"one").unwrap();
+        enable_resident_archive_cache();
+        let find = |name: &str| {
+            let mut index = BinaryIndex::from_user_paths(vec![root.clone()]);
+            index.paths.truncate(1);
+            index.find_class(name).unwrap()
+        };
+        assert_eq!(find("p/Value"), Some(b"one".to_vec()));
+        assert_eq!(find("p/Other"), None);
+
+        let before = std::fs::metadata(&value).unwrap();
+        std::fs::write(&value, b"two").unwrap();
+        let file = std::fs::File::options().write(true).open(&value).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+            .unwrap();
+        assert_eq!(find("p/Value"), Some(b"two".to_vec()));
+        std::fs::write(&value, b"three").unwrap();
+        assert_eq!(find("p/Value"), Some(b"three".to_vec()));
+
+        std::fs::write(pkg.join("Other.class"), b"other").unwrap();
+        assert_eq!(find("p/Other"), Some(b"other".to_vec()));
+        std::fs::create_dir_all(root.join("q")).unwrap();
+        std::fs::write(root.join("q/New.class"), b"new").unwrap();
+        assert_eq!(find("q/New"), Some(b"new".to_vec()));
         std::fs::remove_dir_all(root).unwrap();
     }
 

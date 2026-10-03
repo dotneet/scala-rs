@@ -188,6 +188,7 @@ pub use erasure::{
     erase_type_in, note_source_value_classes, prepare_erasure, rebox_value_class_lambda_params,
     tree_mentions_symbol, BoxedParams, ErasurePrep,
 };
+pub use expand::enable_resident_macro_engine;
 pub use expand_private::{expand_private_names, expand_trait_private_vals};
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;

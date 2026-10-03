@@ -60,11 +60,14 @@ rather than an absolute benchmark:
 * **Library-heavy code, 2026-09-27** (below): code over cats, cats-effect and
   monad transformers had been 1.8--5.3 times slower than scalac; it is now
   0.3--0.5 of scalac's time.
-* **A private 97-module application, 2026-09-29** (below): 175 s -> 121 s for
+* **A large multi-module build, 2026-09-29** (below): 175 s -> 121 s for
   every module in turn; its largest module 22.1 s -> 15.3 s against scalac's
   27.2 s, with identical class files. With the macro daemon by default and
   the compatibility fixes that let every module compile: 92.5 s against
   scalac's 339.5 s.
+* **The same build, 2026-10-03** (below): with both compilers resident
+  and identical flags, 55.8--56.6 s against scalac's 61.8--62.5 s, and
+  58.0--59.4 s with no macro daemon at all (96.8 s before).
 
 The merge gate's wall time, per step, is printed in each gate's summary and
 recorded per gate in `tests/BASELINE.md`.
@@ -840,18 +843,18 @@ several times over (`sample` on the process shows it). What saved time:
   only when scala-reflect is named; the first expansion then waits 0.35 s
   instead of 0.41 s. The JVM's own start-up is the rest.
 
-### A private multi-module application (2026-09-29)
+### A large multi-module build (2026-09-29)
 
-The workload is a private sbt build of 97 modules with sources (2,940 files),
-each compiled on its own with the classpath sbt exports for it: 350--480
-entries, most of them jars, and up to 16 directories that do not exist. Its
-macros are circe's and shapeless's derivations, airframe's DI and logging.
+The workload is a large sbt build of several dozen modules, each compiled on
+its own with the classpath sbt exports for it: several hundred entries, most
+of them jars, and some directories that do not exist. Its macros are JSON
+codec derivations, dependency injection and logging.
 Every module compiled one after another, fresh processes, JDK 21.0.2:
 
 | | before | after |
 |---|---:|---:|
-| all 97 modules | 175.4 s | 120--122 s |
-| largest module (351 files, 10,705 expansions) | 22.1 s | 15.3 s |
+| all modules | 175.4 s | 120--122 s |
+| largest module | 22.1 s | 15.3 s |
 | its instructions | 2.20e11 | 1.52e11 |
 
 scalac 2.13.16 takes 27.2 s wall (81.9 s user) for that module. Every
@@ -915,23 +918,61 @@ With five compatibility fixes (an `Option` view reached through `Some` and
 `None`, one inherited implicit named through its module, a module entered
 from its header alone, a type projection through an alias parameter, named
 then positional arguments choosing an overload) and Java sources compiled by
-javac, all 97 modules compile. The four modules that did not compile before
+javac, every module compiles. The four modules that did not compile before
 are included from here on:
 
 | | scalac | scala-rs |
 |---|---:|---:|
-| all 97 modules | 339.5 s | 92.5 s |
-| the 64 of 12 files or fewer | 148.5 s | 32.5 s |
+| all modules | 339.5 s | 92.5 s |
+| the small modules | 148.5 s | 32.5 s |
 | largest module | 27.5 s | 13.6 s |
 
-scalac runs with the application's own 67 options, lints included; scala-rs
+scalac runs with the build's own options, lints included; scala-rs
 with the five of them it accepts. No module is slower than with scalac. The
-fixes changed 176 class files of seven modules that already compiled; in
+fixes changed class files of a few modules that already compiled; in
 every one the methods called and fields read are now closer to scalac's
 (counted over the `javap` references), and none moved further away.
 
 What remains is about a quarter of the largest module's time in the engine's
 JVM, even warm.
+
+### Resident against resident, and without the daemon (2026-10-03)
+
+The build of 2026-09-29 was measured again with both compilers
+resident: `__compile_batch` against one scalac JVM creating a fresh `Global`
+per module, both with `-Xsource:3 -Xsource-features:case-apply-copy-access
+-Xasync -nowarn`, fresh output directories per round, JDK 21. Before this
+pass scala-rs took 67.0--68.9 s against scalac's 61.8--62.5 s. Another
+measurement, in an environment where the macro daemon could not be used,
+found 101 s against 74 s: there every module that expands a macro paid a JVM
+start of its own, 0.65--0.9 s even for the smallest modules.
+
+* **Macro class loaders are kept across runs.** The daemon had built a new
+  loader and runtime mirror whenever the classpath changed, which in a
+  multi-module build is every module: over ten thousand library classes were
+  defined again per build, compiled again by the JIT, and their signatures read again
+  by the mirror. It now keeps the loaders of eight recent runs and reuses one
+  while each class it loaded resolves to the same unchanged file; classes are
+  always found in the current classpath's order, and the mirror forgets the
+  classes it missed and the source classes of the previous run
+  ([usage](usage.md#the-shared-daemon)). Exclusive macro time fell from
+  20.9 s to 17.1 s.
+* **A resident compiler without the daemon keeps its own engine**, a JVM
+  serving one session per request over its pipes.
+* **Classpath reads are kept between requests**: dependency class files and
+  directory listings (validated by size, inode and times), parsed class files,
+  negative archive lookups, and one `stat` per classpath entry instead of
+  two. Conversion searches are memoised within a run.
+
+| | wall |
+|---|---:|
+| scalac 2.13.16 | 61.8, 62.5 s |
+| scala-rs before | 67.0, 68.9 s |
+| scala-rs | 55.8, 56.6 s |
+| scala-rs before, no daemon | 96.8 s |
+| scala-rs, no daemon | 58.0, 59.4 s |
+
+The class files are identical to those of the run before.
 
 ### What is left
 

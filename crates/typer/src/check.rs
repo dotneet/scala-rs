@@ -1003,6 +1003,8 @@ pub struct Typer {
     /// Top-level implicit searches' answers across operations; see
     /// [`crate::implicits::ScopeSearchCache`].
     pub(crate) scope_search_cache: std::cell::RefCell<crate::implicits::ScopeSearchCache>,
+    /// Answers of [`Typer::search_conversion`]; see [`crate::implicits::ConversionCache`].
+    pub(crate) conversion_cache: std::cell::RefCell<crate::implicits::ConversionCache>,
     /// The implicits in scope per context; see [`crate::implicits::InScopeCache`].
     pub(crate) in_scope_cache: std::cell::RefCell<crate::implicits::InScopeCache>,
     /// The companion object an implicit was reached *through*, for the ones a
@@ -1495,6 +1497,7 @@ impl Typer {
             outer_implicits_cache: Default::default(),
             shadowing_decls_cache: Default::default(),
             scope_search_cache: Default::default(),
+            conversion_cache: Default::default(),
             overridden_cache: Default::default(),
             java_annot_classes: Default::default(),
             nominal_ancestors_cache: Default::default(),

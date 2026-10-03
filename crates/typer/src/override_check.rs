@@ -1191,7 +1191,7 @@ fn overrides_through_self_type(st: &SymbolTable, cls: SymbolId, child: SymbolId)
 /// `SymbolTable`.  Backend code reads this table after erasure; it never calls
 /// the permissive diagnostic matcher to make a dispatch decision.
 pub fn record_method_override_families(st: &mut SymbolTable) {
-    let classes: std::collections::HashSet<_> = st
+    let classes: rustc_hash::FxHashSet<_> = st
         .symbols
         .iter()
         .filter(|s| s.is_class_like())
@@ -1202,7 +1202,7 @@ pub fn record_method_override_families(st: &mut SymbolTable) {
 
 pub fn record_method_override_families_for(
     st: &mut SymbolTable,
-    owners: &std::collections::HashSet<SymbolId>,
+    owners: &rustc_hash::FxHashSet<SymbolId>,
 ) {
     let methods: Vec<SymbolId> = st
         .symbols
@@ -1340,7 +1340,7 @@ mod selected_override_tests {
         }
         record_method_override_families_for(
             &mut st,
-            &std::collections::HashSet::from([children[0].0]),
+            &rustc_hash::FxHashSet::from_iter([children[0].0]),
         );
         assert!(method_overrides(&st, children[0].1, base));
         assert!(!method_overrides(&st, children[1].1, base));

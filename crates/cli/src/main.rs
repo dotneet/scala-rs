@@ -500,6 +500,7 @@ fn compile_batch(options: &[String]) -> ExitCode {
     if cache_enabled {
         enable_resident_archive_cache();
     }
+    scala_rs_driver::enable_resident_macro_engine();
     let mut args = Vec::new();
     loop {
         let mut bytes = Vec::new();

@@ -11,3 +11,4 @@ scala-rs-lexer.workspace = true
 scala-rs-parser.workspace = true
 scala-rs-typer.workspace = true
 scala-rs-backend.workspace = true
+rustc-hash.workspace = true

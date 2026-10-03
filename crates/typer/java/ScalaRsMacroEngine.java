@@ -73,88 +73,287 @@ public final class ScalaRsMacroEngine {
     static Object mirror;
     static ClassLoader macroCl;
     static RuntimeLoader runtimeCl;
-    static List<String> runtimeEntries = java.util.Collections.emptyList();
+    /** Runtime loaders of recent runs, most recent first: a build's modules
+     * alternate between a few dependency sets, and a loader kept warm keeps
+     * its classes, their compiled code and its mirror's symbols. */
+    static final java.util.LinkedList<RuntimeLoader> runtimeLoaders = new java.util.LinkedList<>();
+    static final int RUNTIME_LOADER_POOL = 8;
 
-    static final class RuntimeLoader extends java.net.URLClassLoader {
-        final java.util.Set<String> entries = new java.util.HashSet<>();
+    /**
+     * The class loader of a run's libraries. Every class is found on the
+     * current run's classpath, in its order, so a loader kept from an earlier
+     * run defines nothing the current classpath would not. A loader is reused
+     * only while each class it already defined still resolves to the same
+     * resource with the same contents ({@link #compatible}).
+     */
+    static final class RuntimeLoader extends ClassLoader {
+        java.net.URLClassLoader resolver;
         final java.util.Set<String> sharedRuntimeUrls = new java.util.HashSet<>();
         final java.util.Map<String, LoadedResource> loadedResources = new java.util.HashMap<>();
+        /** Classes asked for and not found: the mirror remembers such misses. */
+        final java.util.Set<String> missingResources = new java.util.HashSet<>();
+        final java.util.Map<String, java.security.ProtectionDomain> domains = new java.util.HashMap<>();
+        Object mirror;
+        ClassLoader macroLoader;
 
         static final class LoadedResource {
             final String url;
+            final FileStamp stamp;
             final byte[] digest;
 
-            LoadedResource(String url, byte[] digest) {
+            LoadedResource(String url, FileStamp stamp, byte[] digest) {
                 this.url = url;
+                this.stamp = stamp;
                 this.digest = digest;
             }
         }
 
-        RuntimeLoader(ClassLoader parent) {
-            super(new java.net.URL[0], parent);
+        /** Size and modification time of a class file or of the archive that
+         * holds it; contents are compared only when the stamp changed. */
+        static final class FileStamp {
+            final long length;
+            final long modified;
+
+            FileStamp(java.io.File file) {
+                this.length = file.length();
+                this.modified = file.lastModified();
+            }
+
+            boolean same(FileStamp other) {
+                return other != null && length == other.length && modified == other.modified;
+            }
         }
 
-        void addPath(String entry) throws Exception {
-            if (entries.add(entry)) {
-                java.net.URL url = new java.io.File(entry).toURI().toURL();
-                addURL(url);
+        RuntimeLoader(ClassLoader parent) {
+            super(parent);
+        }
+
+        static java.net.URLClassLoader resolverFor(List<String> entries) throws Exception {
+            List<java.net.URL> urls = new ArrayList<>();
+            for (String entry : entries) {
+                if (!entry.isEmpty()) urls.add(new java.io.File(entry).toURI().toURL());
+            }
+            return new java.net.URLClassLoader(urls.toArray(new java.net.URL[urls.size()]), null);
+        }
+
+        /** Resolve later classes on `entries`, through `next`, a resolver for them. */
+        void retarget(List<String> entries, java.net.URLClassLoader next) throws Exception {
+            java.net.URLClassLoader previous = resolver;
+            resolver = next;
+            if (previous != null && previous != next) previous.close();
+            sharedRuntimeUrls.clear();
+            for (String entry : entries) {
                 String name = new java.io.File(entry).getName();
                 if (name.startsWith("scala-library") || name.startsWith("scala-reflect")
                         || name.startsWith("scala-compiler")) {
-                    sharedRuntimeUrls.add(url.toExternalForm());
+                    sharedRuntimeUrls.add(new java.io.File(entry).toURI().toURL().toExternalForm());
                 }
             }
+        }
+
+        void close() throws java.io.IOException {
+            if (resolver != null) resolver.close();
+            resolver = null;
+        }
+
+        /** The classpath entry `resource` (found as `path`) lies in, as a URL. */
+        static String location(java.net.URL resource, String path) {
+            String url = resource.toExternalForm();
+            if (url.startsWith("jar:")) {
+                int bang = url.indexOf("!/");
+                if (bang > 0) return url.substring(4, bang);
+            }
+            return url.endsWith(path) ? url.substring(0, url.length() - path.length()) : url;
+        }
+
+        static FileStamp stamp(String location) {
+            try {
+                return new FileStamp(new java.io.File(new java.net.URI(location)));
+            } catch (Exception unknown) {
+                return null;
+            }
+        }
+
+        static final class ClassBytes {
+            final byte[] bytes;
+            final String location;
+
+            ClassBytes(byte[] bytes, String location) {
+                this.bytes = bytes;
+                this.location = location;
+            }
+        }
+
+        /** Read `path` from the current classpath, remembering where from. */
+        ClassBytes readClass(String path, String name) throws ClassNotFoundException {
+            java.net.URL resource = resolver == null ? null : resolver.findResource(path);
+            if (resource == null) {
+                missingResources.add(path);
+                throw new ClassNotFoundException(name);
+            }
+            byte[] bytes;
+            try (java.io.InputStream stream = resource.openStream()) {
+                bytes = readAll(stream);
+            } catch (java.io.IOException failure) {
+                throw new ClassNotFoundException(name, failure);
+            }
+            String location = location(resource, path);
+            if (!sharedRuntimeUrls.contains(location)) {
+                String file = resource.getProtocol().equals("file") ? resource.toExternalForm() : location;
+                try {
+                    loadedResources.put(path, new LoadedResource(
+                        resource.toExternalForm(), stamp(file), digest(bytes)));
+                } catch (java.security.NoSuchAlgorithmException failure) {
+                    throw new ClassNotFoundException(name, failure);
+                }
+            }
+            return new ClassBytes(bytes, location);
+        }
+
+        java.security.ProtectionDomain domain(String location) {
+            java.security.ProtectionDomain known = domains.get(location);
+            if (known != null) return known;
+            java.security.CodeSource source;
+            try {
+                source = new java.security.CodeSource(new java.net.URL(location),
+                    (java.security.cert.Certificate[]) null);
+            } catch (java.net.MalformedURLException failure) {
+                source = null;
+            }
+            known = new java.security.ProtectionDomain(source, null, this, null);
+            domains.put(location, known);
+            return known;
         }
 
         @Override
         protected Class<?> findClass(String name) throws ClassNotFoundException {
-            Class<?> cls = super.findClass(name);
-            java.security.CodeSource source = cls.getProtectionDomain().getCodeSource();
-            if (source != null && source.getLocation() != null
-                    && !sharedRuntimeUrls.contains(source.getLocation().toExternalForm())) {
-                String path = name.replace('.', '/') + ".class";
-                java.net.URL resource = findResource(path);
-                if (resource != null) {
-                    try {
-                        loadedResources.put(path,
-                            new LoadedResource(resource.toExternalForm(), digest(resource)));
-                    } catch (java.io.IOException | java.security.NoSuchAlgorithmException failure) {
-                        throw new ClassNotFoundException(name, failure);
-                    }
-                }
-            }
-            return cls;
+            ClassBytes found = readClass(name.replace('.', '/') + ".class", name);
+            definePackageOf(name);
+            return defineClass(name, found.bytes, 0, found.bytes.length, domain(found.location));
         }
 
-        boolean conflicts(List<String> currentEntries) throws Exception {
-            if (loadedResources.isEmpty()) return false;
-            try (RuntimeLoader current = new RuntimeLoader(null)) {
-                for (String entry : currentEntries) current.addPath(entry);
-                for (java.util.Map.Entry<String, LoadedResource> entry : loadedResources.entrySet()) {
-                    java.net.URL resource = current.findResource(entry.getKey());
-                    LoadedResource loaded = entry.getValue();
-                    if (resource == null || !loaded.url.equals(resource.toExternalForm())
-                            || !java.util.Arrays.equals(loaded.digest, digest(resource))) {
-                        return true;
-                    }
-                }
+        @SuppressWarnings("deprecation")
+        void definePackageOf(String name) {
+            int dot = name.lastIndexOf('.');
+            if (dot <= 0) return;
+            String pkg = name.substring(0, dot);
+            if (getPackage(pkg) != null) return;
+            try {
+                definePackage(pkg, null, null, null, null, null, null, null);
+            } catch (IllegalArgumentException definedMeanwhile) {
+                // Already defined: nothing to add.
             }
-            return false;
         }
 
-        static byte[] digest(java.net.URL resource)
-                throws java.io.IOException, java.security.NoSuchAlgorithmException {
+        @Override
+        protected java.net.URL findResource(String name) {
+            return resolver == null ? null : resolver.findResource(name);
+        }
+
+        @Override
+        protected java.util.Enumeration<java.net.URL> findResources(String name) throws java.io.IOException {
+            return resolver == null
+                ? java.util.Collections.<java.net.URL>emptyEnumeration()
+                : resolver.findResources(name);
+        }
+
+        /**
+         * Whether this loader can serve the classpath `candidate` resolves:
+         * `null` when some class it defined would now be read from elsewhere
+         * or has changed, else the classes it failed to find that the
+         * candidate has, which the mirror must forget it missed. A class whose
+         * archive or directory the candidate lacks altogether stays defined:
+         * only code compiled against that entry could still reach it, and a
+         * classpath with such code but without the entry is incomplete.
+         */
+        List<String> compatible(java.net.URLClassLoader candidate) throws Exception {
+            java.util.Map<String, FileStamp> stamps = new java.util.HashMap<>();
+            for (java.util.Map.Entry<String, LoadedResource> entry : loadedResources.entrySet()) {
+                java.net.URL resource = candidate.findResource(entry.getKey());
+                if (resource == null) continue;
+                LoadedResource loaded = entry.getValue();
+                if (!loaded.url.equals(resource.toExternalForm())) return null;
+                String file = resource.getProtocol().equals("file")
+                    ? resource.toExternalForm() : location(resource, entry.getKey());
+                FileStamp now = stamps.get(file);
+                if (now == null) {
+                    now = stamp(file);
+                    if (now != null) stamps.put(file, now);
+                }
+                if (now != null && now.same(loaded.stamp)) continue;
+                byte[] current;
+                try (java.io.InputStream stream = openUncached(resource)) {
+                    current = readAll(stream);
+                }
+                if (!java.util.Arrays.equals(loaded.digest, digest(current))) return null;
+            }
+            List<String> appeared = new ArrayList<>();
+            for (String path : missingResources) {
+                if (candidate.findResource(path) != null) appeared.add(path);
+            }
+            return appeared;
+        }
+
+        /** Clear the mirror's record of `paths` as missing classes: a runtime
+         * package scope remembers each name it failed to load, and a failed
+         * static lookup of `p.C` entered a package `p.C` in its stead. False
+         * when the mirror cannot be reached that way. */
+        boolean forgetMissing(List<String> paths) {
+            if (paths.isEmpty()) return true;
+            if (mirror == null) {
+                missingResources.removeAll(paths);
+                return true;
+            }
+            try {
+                java.util.Map<String, List<String>> packages = new java.util.HashMap<>();
+                for (String path : paths) {
+                    int slash = path.lastIndexOf('/');
+                    String pkg = slash < 0 ? "" : path.substring(0, slash).replace('/', '.');
+                    String simple = path.substring(slash + 1, path.length() - ".class".length());
+                    packages.computeIfAbsent(pkg, key -> new ArrayList<>()).add(simple);
+                }
+                for (java.util.Map.Entry<String, List<String>> entry : packages.entrySet()) {
+                    String pkg = entry.getKey();
+                    Object owner = pkg.isEmpty()
+                        ? call(mirror, "EmptyPackageClass", 0)
+                        : call(call(mirror, "staticPackage", 1, pkg), "moduleClass", 0);
+                    Object decls = call(call(owner, "info", 0), "decls", 0);
+                    Field negatives = decls.getClass().getDeclaredField("negatives");
+                    negatives.setAccessible(true);
+                    call(negatives.get(decls), "clear", 0);
+                    for (String simple : entry.getValue()) {
+                        Object existing = call(decls, "lookup", 1, termName(simple));
+                        if (Boolean.TRUE.equals(call(existing, "hasPackageFlag", 0))) {
+                            call(decls, "unlink", 1, existing);
+                        }
+                    }
+                }
+                missingResources.removeAll(paths);
+                return true;
+            } catch (Exception unreachable) {
+                return false;
+            }
+        }
+
+        static java.io.InputStream openUncached(java.net.URL resource) throws java.io.IOException {
             java.net.URLConnection connection = resource.openConnection();
             connection.setUseCaches(false);
-            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
-            try (java.io.InputStream stream = connection.getInputStream()) {
-                byte[] buffer = new byte[8192];
-                int read;
-                while ((read = stream.read(buffer)) != -1) digest.update(buffer, 0, read);
-            }
-            return digest.digest();
+            return connection.getInputStream();
+        }
+
+        static byte[] readAll(java.io.InputStream stream) throws java.io.IOException {
+            java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = stream.read(buffer)) != -1) raw.write(buffer, 0, read);
+            return raw.toByteArray();
+        }
+
+        static byte[] digest(byte[] bytes) throws java.security.NoSuchAlgorithmException {
+            return java.security.MessageDigest.getInstance("SHA-256").digest(bytes);
         }
     }
+
     /** Proxies retained only while their expansion is active in the typer. */
     static final java.util.Map<Long, Object> macroContexts = new java.util.HashMap<>();
     /** The run's source files by file index, sent once each: `(position src
@@ -233,6 +432,14 @@ public final class ScalaRsMacroEngine {
         if ((args.length == 3 || args.length == 4) && "--daemon".equals(args[0])) {
             runDaemon(args[1], args[2], args.length == 4 ? args[3] : null);
             return;
+        }
+        if (args.length == 1 && "--sessions".equals(args[0])) {
+            try {
+                runPipeSessions();
+            } finally {
+                // A thread some macro started must not outlive the compiler.
+                System.exit(0);
+            }
         }
         if (args.length != 0) {
             throw new IllegalArgumentException("unexpected macro engine argument");
@@ -473,34 +680,97 @@ public final class ScalaRsMacroEngine {
         }
     }
 
-    static void resetRun(ClassLoader baseCl, List<String> entries) throws Exception {
-        boolean sameClasspath = runtimeCl != null && runtimeEntries.equals(entries);
-        boolean changedClasses = sameClasspath && runtimeCl.conflicts(entries);
-        if (runtimeCl != null && (!sameClasspath || changedClasses)) {
-            if (macroCl instanceof java.net.URLClassLoader) {
-                ((java.net.URLClassLoader) macroCl).close();
+    /**
+     * One compiler's consecutive runs over this process's own stdin and
+     * stdout, each a daemon session: `(start token entry...)` opens it with
+     * the run's classpath, and `(end)` between expansions closes it with an
+     * `(ended)` reply. A resident compiler that cannot reach the shared
+     * daemon keeps one engine this way instead of starting a JVM per run.
+     */
+    static void runPipeSessions() throws Exception {
+        out = new PrintStream(System.out, true, "UTF-8");
+        in = new WireReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        System.setOut(new PrintStream(new MacroOutput("stdout"), true, "UTF-8"));
+        System.setErr(new PrintStream(new MacroOutput("stderr"), true, "UTF-8"));
+        ClassLoader baseCl = ScalaRsMacroEngine.class.getClassLoader();
+        String line;
+        while ((line = readWireLine(in)) != null) {
+            if (line.isEmpty()) continue;
+            Sexp request = Sexp.parse(line);
+            if (!request.isList() || request.items.size() < 2
+                    || !"start".equals(request.items.get(0).text())) {
+                out.println(err("expected a session start"));
+                return;
             }
-            runtimeCl.close();
-            runtimeCl = null;
+            List<String> entries = new ArrayList<>();
+            for (int i = 2; i < request.items.size(); i++) {
+                entries.add(request.items.get(i).text());
+            }
+            try {
+                resetRun(baseCl, entries);
+            } catch (Throwable failure) {
+                out.println(err(describe(failure)));
+                return;
+            }
+            out.println("(ready)");
+            while ((line = readWireLine(in)) != null) {
+                if (line.isEmpty()) continue;
+                if ("(end)".equals(line)) {
+                    out.println("(ended)");
+                    break;
+                }
+                String reply;
+                long handleStarted = System.nanoTime();
+                try {
+                    reply = handle(line);
+                } catch (Throwable failure) {
+                    reply = err(describe(failure));
+                }
+                handleNanos += System.nanoTime() - handleStarted;
+                out.println(reply);
+            }
         }
-        if (runtimeCl == null) runtimeCl = new RuntimeLoader(baseCl);
-        for (String entry : entries) {
-            runtimeCl.addPath(entry);
+    }
+
+    static void resetRun(ClassLoader baseCl, List<String> entries) throws Exception {
+        unlinkSourceSymbols();
+        java.net.URLClassLoader resolver = RuntimeLoader.resolverFor(entries);
+        RuntimeLoader chosen = null;
+        for (java.util.Iterator<RuntimeLoader> it = runtimeLoaders.iterator(); it.hasNext(); ) {
+            RuntimeLoader candidate = it.next();
+            List<String> appeared = candidate.compatible(resolver);
+            if (appeared != null && candidate.forgetMissing(appeared)) {
+                chosen = candidate;
+                it.remove();
+                break;
+            }
         }
+        if (chosen == null) {
+            while (runtimeLoaders.size() >= RUNTIME_LOADER_POOL) runtimeLoaders.removeLast().close();
+            chosen = new RuntimeLoader(baseCl);
+        }
+        runtimeLoaders.addFirst(chosen);
+        chosen.retarget(entries, resolver);
+        // An idle loader needs no open archives until a run picks it again,
+        // and then it gets that run's resolver.
+        for (RuntimeLoader idle : runtimeLoaders) {
+            if (idle != chosen) idle.close();
+        }
+        runtimeCl = chosen;
         if (universe == null) {
             Class<?> universeClass = Class.forName("scala.reflect.runtime.JavaUniverse", true, runtimeCl);
             universe = universeClass.getConstructor().newInstance();
         }
-        if (!sameClasspath || changedClasses || mirror == null) {
-            mirror = find(universe.getClass(), "runtimeMirror", 1).invoke(universe, runtimeCl);
-            // The runtime universe's default mirror must resolve libraries on
-            // this run's loader, even though the universe itself is shared.
-            call(universe, "rootMirror", 0);
-            Field rootMirror = universe.getClass().getDeclaredField("rootMirror");
-            rootMirror.setAccessible(true);
-            rootMirror.set(universe, mirror);
+        if (chosen.mirror == null) {
+            chosen.mirror = find(universe.getClass(), "runtimeMirror", 1).invoke(universe, runtimeCl);
         }
-        runtimeEntries = new ArrayList<>(entries);
+        mirror = chosen.mirror;
+        // The runtime universe's default mirror must resolve libraries on
+        // this run's loader, even though the universe itself is shared.
+        call(universe, "rootMirror", 0);
+        Field rootMirror = universe.getClass().getDeclaredField("rootMirror");
+        rootMirror.setAccessible(true);
+        rootMirror.set(universe, mirror);
         sourceSymbols.clear();
         activeSymbolMetadata = java.util.Collections.emptyMap();
         sourceSymbolIds.clear();
@@ -546,10 +816,8 @@ public final class ScalaRsMacroEngine {
         overloadCache.clear();
         paramTypesCache.clear();
         methodsCache.clear();
-        if (macroCl instanceof java.net.URLClassLoader) {
-            ((java.net.URLClassLoader) macroCl).close();
-        }
-        macroCl = macroClassLoader(runtimeCl, entries);
+        if (chosen.macroLoader == null) chosen.macroLoader = new ScalaTestCompatLoader(chosen, chosen);
+        macroCl = chosen.macroLoader;
     }
 
     /**
@@ -574,16 +842,24 @@ public final class ScalaRsMacroEngine {
     }
 
     static ClassLoader macroClassLoader(ClassLoader parent, List<String> entries) throws Exception {
-        List<java.net.URL> urls = new ArrayList<>();
-        for (String entry : entries) {
-            if (!entry.isEmpty()) urls.add(new java.io.File(entry).toURI().toURL());
-        }
-        return new ScalaTestCompatLoader(urls.toArray(new java.net.URL[urls.size()]), parent);
+        RuntimeLoader source = new RuntimeLoader(parent);
+        source.retarget(entries, RuntimeLoader.resolverFor(entries));
+        return new ScalaTestCompatLoader(parent, source);
     }
 
-    static final class ScalaTestCompatLoader extends java.net.URLClassLoader {
-        ScalaTestCompatLoader(java.net.URL[] urls, ClassLoader parent) {
-            super(urls, parent);
+    static final class ScalaTestCompatLoader extends ClassLoader {
+        /** Where the child-first classes are read from: the run's classpath. */
+        final RuntimeLoader source;
+
+        ScalaTestCompatLoader(ClassLoader parent, RuntimeLoader source) {
+            super(parent);
+            this.source = source;
+        }
+
+        @Override
+        protected Class<?> findClass(String name) throws ClassNotFoundException {
+            RuntimeLoader.ClassBytes found = source.readClass(name.replace('.', '/') + ".class", name);
+            return defineClass(name, found.bytes, 0, found.bytes.length, source.domain(found.location));
         }
 
         static boolean childFirst(String name) {
@@ -611,17 +887,16 @@ public final class ScalaRsMacroEngine {
                             || name.equals("shapeless.LazyMacros$DerivationContext$State$")
                             || name.equals("shapeless.LazyMacros$SubstMessage$1")
                             || name.equals("shapeless.LazyMacros$DerivationContext$StripUnApplyNodes")) {
-                        try (java.io.InputStream stream = getParent().getResourceAsStream(name.replace('.', '/') + ".class")) {
-                            if (stream == null) throw new ClassNotFoundException(name);
-                            java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream();
-                            byte[] buffer = new byte[8192]; int read;
-                            while ((read = stream.read(buffer)) != -1) raw.write(buffer, 0, read);
+                        try {
+                            byte[] raw = source.readClass(name.replace('.', '/') + ".class", name).bytes;
                             byte[] bytes = name.equals("shapeless.LazyMacros$")
-                                ? compilerApiBytes(raw.toByteArray(), false)
+                                ? compilerApiBytes(raw, false)
                                 : name.equals("shapeless.LazyMacros$DerivationContext$State$")
-                                    ? compilerApiBytes(raw.toByteArray(), true)
-                                    : reflectionUniverseBytes(raw.toByteArray());
+                                    ? compilerApiBytes(raw, true)
+                                    : reflectionUniverseBytes(raw);
                             cls = defineClass(name, bytes, 0, bytes.length);
+                        } catch (ClassNotFoundException missing) {
+                            throw missing;
                         } catch (Exception failure) {
                             throw new ClassNotFoundException(name, failure);
                         }
@@ -3129,6 +3404,20 @@ public final class ScalaRsMacroEngine {
             call(decls, "unlink", 1, existing);
         }
         call(decls, "enter", 1, symbol);
+        enteredSourceSymbols.add(new Object[]{decls, symbol});
+    }
+
+    /** Package-scope entries {@link #enterInOwner} made in this run, as
+     * (scope, symbol): a mirror outlives the run, and its next run must find
+     * the class files compiled meanwhile, not these symbols. */
+    static final List<Object[]> enteredSourceSymbols = new ArrayList<>();
+
+    static void unlinkSourceSymbols() throws Exception {
+        for (Object[] entry : enteredSourceSymbols) {
+            Object existing = call(entry[0], "lookup", 1, call(entry[1], "name", 0));
+            if (existing == entry[1]) call(entry[0], "unlink", 1, entry[1]);
+        }
+        enteredSourceSymbols.clear();
     }
 
     /** Compiler-owned symbols may change lexical owners. Runtime classpath

@@ -205,6 +205,41 @@ pub(crate) struct OuterImplicitsKey {
 /// in source (an `implicit val` typed later changes its answer). Only found,
 /// non-macro winners are kept; their own implicit arguments are searched
 /// again when the tree is built, so a macro among them still expands.
+/// [`Typer::search_conversion`]'s answers for the symbol graph generation
+/// `gen`.
+#[derive(Default)]
+pub(crate) struct ConversionCache {
+    gen: u64,
+    map: rustc_hash::FxHashMap<ConversionKey, ImplicitSearch>,
+}
+
+#[derive(PartialEq)]
+pub(crate) struct ConversionKey {
+    from: Type,
+    to: Type,
+    scope: u64,
+    open: Vec<(SymbolId, Type)>,
+    macro_query_depth: usize,
+    macros_disabled: bool,
+}
+
+impl Eq for ConversionKey {}
+
+impl std::hash::Hash for ConversionKey {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        hash_type(&self.from, h);
+        hash_type(&self.to, h);
+        self.scope.hash(h);
+        self.open.len().hash(h);
+        for (id, ty) in &self.open {
+            id.0.hash(h);
+            hash_type(ty, h);
+        }
+        self.macro_query_depth.hash(h);
+        self.macros_disabled.hash(h);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ScopeSearchCache {
     gen: u64,
@@ -3148,6 +3183,14 @@ impl Typer {
         let Some((param, ret)) = self.view_shape(&self.implicit_candidate_ty(id)) else {
             return false;
         };
+        // A result whose class cannot reach the wanted class settles nothing,
+        // whatever its type arguments: rejecting it here skips solving them
+        // from implicits, the expensive part of a candidate that fails.
+        if let (Type::Class { sym: have, .. }, Type::Class { sym: want, .. }) = (&ret, to) {
+            if have != want && self.st.class_reaches(*have, *want) == Some(false) {
+                return false;
+            }
+        }
         let tps = s.tparams.clone();
         if tps.is_empty() {
             return self.weak_conforms(from, &param)
@@ -3907,6 +3950,43 @@ impl Typer {
     }
 
     pub(crate) fn search_conversion(&self, from: &Type, to: &Type) -> ImplicitSearch {
+        // The same view is asked for again and again while one expression is
+        // typed -- every candidate of an extension search that wants a
+        // function-typed witness asks whether `Tuple2[A, B]` converts to
+        // `Iterable[B]` -- and each ask tried every implicit in scope. The
+        // answer depends on the types, the candidates in scope, the open
+        // implicit stack (divergence) and the symbol graph, which the key
+        // and the generation cover.
+        let key = ConversionKey {
+            from: from.clone(),
+            to: to.clone(),
+            scope: self.scope_search_fingerprint(to),
+            open: self.open_implicits.borrow().clone(),
+            macro_query_depth: self.macro_query_depth,
+            macros_disabled: self.implicit_macros_disabled,
+        };
+        let gen = self.st.member_graph_gen();
+        {
+            let cache = self.conversion_cache.borrow();
+            if cache.gen == gen {
+                if let Some(hit) = cache.map.get(&key) {
+                    return hit.clone();
+                }
+            }
+        }
+        let out = self.search_conversion_uncached(from, to);
+        if self.st.member_graph_gen() == gen {
+            let mut cache = self.conversion_cache.borrow_mut();
+            if cache.gen != gen || cache.map.len() >= 4096 {
+                cache.gen = gen;
+                cache.map.clear();
+            }
+            cache.map.insert(key, out.clone());
+        }
+        out
+    }
+
+    fn search_conversion_uncached(&self, from: &Type, to: &Type) -> ImplicitSearch {
         let _live = self.memo_scope();
         let local: Vec<SymbolId> = self
             .implicits_in_scope()

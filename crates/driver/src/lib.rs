@@ -19,6 +19,7 @@ use scala_rs_typer::{
 
 pub use scala_rs_backend::EmittedClass;
 pub use scala_rs_typer::{ParsedFeatures, SourceFeature, SourceFeatures};
+pub use scala_rs_typer::enable_resident_macro_engine;
 
 /// Share validated archive indexes and decoded binary signatures between
 /// sequential compilations. Source state remains local to each run.
@@ -531,7 +532,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
             for u in units.iter() {
                 collect_source_classes(&u.tree, &mut source_classes);
             }
-            let mut output_owners: std::collections::HashSet<_> =
+            let mut output_owners: rustc_hash::FxHashSet<_> =
                 source_classes.iter().copied().collect();
             for id in source_classes {
                 output_owners.insert(st.module_class_of(id));

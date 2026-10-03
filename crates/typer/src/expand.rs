@@ -116,6 +116,10 @@ pub(crate) struct MacroEngine {
     /// How to stop the shared daemon this session runs in, if it does.
     #[cfg(unix)]
     daemon: Option<DaemonStop>,
+    /// The key of the resident engine ([`ResidentEngine`]) this session runs
+    /// in, which a healthy session hands back when it ends.
+    #[cfg(unix)]
+    resident: Option<String>,
     #[cfg(test)]
     termination_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -159,6 +163,9 @@ enum EngineInput {
     Pipe(ChildStdin),
     #[cfg(unix)]
     Socket(DaemonSocket),
+    /// The pipe went back to the resident engine; nothing more is written.
+    #[cfg(unix)]
+    Parked,
 }
 
 #[cfg(unix)]
@@ -234,6 +241,8 @@ impl Write for EngineInput {
             Self::Pipe(pipe) => pipe.write(buf),
             #[cfg(unix)]
             Self::Socket(socket) => socket.write(buf),
+            #[cfg(unix)]
+            Self::Parked => Err(std::io::ErrorKind::BrokenPipe.into()),
         }
     }
 
@@ -242,6 +251,8 @@ impl Write for EngineInput {
             Self::Pipe(pipe) => pipe.flush(),
             #[cfg(unix)]
             Self::Socket(socket) => socket.flush(),
+            #[cfg(unix)]
+            Self::Parked => Err(std::io::ErrorKind::BrokenPipe.into()),
         }
     }
 }
@@ -328,6 +339,12 @@ impl MacroEngine {
         {
             self.termination_attempts
                 .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        #[cfg(unix)]
+        if let Some(key) = self.resident.take() {
+            if !self.poisoned && self.park_resident(key) {
+                return Ok(None);
+            }
         }
         if let (Some(child), Some(containment)) = (&mut self.child, &mut self.containment) {
             return terminate_engine_process(child, containment);
@@ -1033,6 +1050,8 @@ fn start_direct_daemon_engine(
         terminated: false,
         #[cfg(unix)]
         daemon: stop,
+        #[cfg(unix)]
+        resident: None,
         #[cfg(test)]
         termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     })
@@ -1051,7 +1070,9 @@ fn start_prepared_engine(
         cp.push_str(&p.display().to_string());
     }
     #[cfg(unix)]
-    if direct_macro_daemon_requested(std::env::var_os("SCALA_RS_MACRO_DAEMON").as_deref()) {
+    if direct_macro_daemon_requested(std::env::var_os("SCALA_RS_MACRO_DAEMON").as_deref())
+        && !RESIDENT_DAEMON_FAILED.load(AtomicOrdering::Relaxed)
+    {
         match start_direct_daemon_engine(dir, &cp, cancelled) {
             Ok(engine) => return Ok(engine),
             Err(error)
@@ -1060,6 +1081,25 @@ fn start_prepared_engine(
             {
                 return Err(error)
             }
+            // A resident compiler that once found the daemon out of reach
+            // keeps its own engine rather than asking again every run.
+            Err(_) if check_startup_cancelled(cancelled).is_ok() => {
+                RESIDENT_DAEMON_FAILED.store(
+                    RESIDENT_ENGINE_ENABLED.load(AtomicOrdering::Relaxed),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+            Err(_) => {}
+        }
+    }
+    #[cfg(unix)]
+    if RESIDENT_ENGINE_ENABLED.load(AtomicOrdering::Relaxed)
+        && std::env::var_os("SCALA_RS_MACRO_DAEMON_ENDPOINT").is_none()
+        && !std::env::var_os("SCALA_RS_MACRO_DAEMON").is_some_and(|value| value == "1")
+    {
+        match start_resident_session(dir, &cp, cancelled) {
+            Ok(engine) => return Ok(engine),
+            Err(error) if check_startup_cancelled(cancelled).is_err() => return Err(error),
             Err(_) => {}
         }
     }
@@ -1136,6 +1176,8 @@ fn start_prepared_engine(
         terminated: false,
         #[cfg(unix)]
         daemon: None,
+        #[cfg(unix)]
+        resident: None,
         #[cfg(test)]
         termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
@@ -1161,6 +1203,226 @@ fn start_prepared_engine(
         return Err(startup_failure(&why, status, &engine.stderr));
     }
     Ok(engine)
+}
+
+/// The engine JVM a resident compiler (`__compile_batch`) keeps between its
+/// runs when the shared daemon is out of reach -- a sandbox without sockets,
+/// say. Each run is a session over the JVM's own pipes (`--sessions`), so a
+/// build of many modules starts one JVM rather than one per module. A run
+/// takes the engine out of the slot and a healthy run hands it back
+/// ([`MacroEngine::park_resident`]); a poisoned one kills it.
+#[cfg(unix)]
+struct ResidentEngine {
+    /// The engine directory, runtime jars and `java` it was started with.
+    key: String,
+    child: Child,
+    containment: EngineContainment,
+    stdin: ChildStdin,
+    stdout: BufReader<EngineOutput>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_done: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+static RESIDENT_ENGINE: Mutex<Option<ResidentEngine>> = Mutex::new(None);
+static RESIDENT_ENGINE_ENABLED: AtomicBool = AtomicBool::new(false);
+static RESIDENT_DAEMON_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Let this process keep a macro engine between its compilations
+/// ([`ResidentEngine`]). For a resident compiler only: the engine outlives
+/// each run.
+pub fn enable_resident_macro_engine() {
+    RESIDENT_ENGINE_ENABLED.store(true, AtomicOrdering::Relaxed);
+}
+
+/// The Scala runtime jars of an engine classpath: what the engine JVM itself
+/// is started with, while each run's classpath goes to its session.
+fn engine_runtime_classpath(classpath: &str) -> String {
+    classpath
+        .split(':')
+        .filter(|entry| {
+            let name = Path::new(entry)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            name.starts_with("scala-library")
+                || name.starts_with("scala-reflect")
+                || name.starts_with("scala-compiler")
+        })
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Open a session of the resident engine for `classpath`, starting the
+/// engine first when there is none for this runtime.
+#[cfg(unix)]
+fn start_resident_session(
+    dir: &Path,
+    classpath: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<MacroEngine, String> {
+    check_startup_cancelled(cancelled)?;
+    let runtime = engine_runtime_classpath(classpath);
+    let key = format!("{}\0{}\0{}", dir.display(), runtime, jdk_tool("java").display());
+    let mut parked = RESIDENT_ENGINE
+        .lock()
+        .map_err(|_| "the resident macro engine is poisoned")?
+        .take();
+    let alive = parked
+        .as_mut()
+        .is_some_and(|engine| engine.key == key && matches!(engine.child.try_wait(), Ok(None)));
+    let (mut engine, fresh) = match parked {
+        Some(engine) if alive => {
+            if let Ok(mut stderr) = engine.stderr.lock() {
+                stderr.clear();
+            }
+            (engine, false)
+        }
+        stale => {
+            if let Some(mut stale) = stale {
+                let _ = terminate_engine_process(&mut stale.child, &mut stale.containment);
+            }
+            let mut java = Command::new(jdk_tool("java"));
+            java.arg("-Xmx2g")
+                .arg("-cp")
+                .arg(format!("{}:{runtime}", dir.display()))
+                .arg("ScalaRsMacroEngine")
+                .arg("--sessions")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            configure_engine_command(&mut java);
+            let mut child = java
+                .spawn()
+                .map_err(|e| format!("cannot start `java` to expand macros: {e}"))?;
+            let mut containment = match EngineContainment::attach(&child) {
+                Ok(containment) => containment,
+                Err(reason) => {
+                    return Err(abort_uncontained_engine(
+                        &mut child,
+                        format!("cannot contain the macro engine process tree: {reason}"),
+                    ));
+                }
+            };
+            start_contained_engine(&mut child, &mut containment)?;
+            let stdin = child.stdin.take().expect("piped stdin");
+            let stdout = BufReader::new(EngineOutput::Pipe(
+                child.stdout.take().expect("piped stdout"),
+            ));
+            let (stderr, stderr_done, _) =
+                collect_engine_stderr(child.stderr.take().expect("piped stderr"));
+            let engine = ResidentEngine {
+                key: key.clone(),
+                child,
+                containment,
+                stdin,
+                stdout,
+                stderr,
+                stderr_done,
+            };
+            (engine, true)
+        }
+    };
+    let mut start = String::from("(start \"\"");
+    for entry in classpath.split(':') {
+        start.push(' ');
+        quote_into(&mut start, entry);
+    }
+    start.push_str(")\n");
+    let sent = engine
+        .stdin
+        .write_all(start.as_bytes())
+        .and_then(|()| engine.stdin.flush());
+    if let Err(error) = sent {
+        let _ = terminate_engine_process(&mut engine.child, &mut engine.containment);
+        return Err(format!("cannot start a macro engine session: {error}"));
+    }
+    // A warm engine opens a session in moments, and one abandoned half-open
+    // would be lost; only a fresh JVM's start-up is worth cancelling.
+    let (stdout, hello) = match read_engine_hello(engine.stdout, cancelled.filter(|_| fresh)) {
+        Ok(reply) => reply,
+        Err(reason) => {
+            let _ = terminate_engine_process(&mut engine.child, &mut engine.containment);
+            return Err(reason);
+        }
+    };
+    if wire_line_payload(&hello) != "(ready)" {
+        let _ = terminate_engine_process(&mut engine.child, &mut engine.containment);
+        return Err(format!(
+            "the macro engine rejected the session: {}",
+            bounded_text(hello.as_bytes())
+        ));
+    }
+    Ok(MacroEngine {
+        child: Some(engine.child),
+        containment: Some(engine.containment),
+        stdin: EngineInput::Pipe(engine.stdin),
+        stdout: Some(stdout),
+        reader: None,
+        stderr: engine.stderr,
+        stderr_done: engine.stderr_done,
+        stderr_thread: None,
+        poisoned: false,
+        terminated: false,
+        daemon: None,
+        resident: Some(key),
+        #[cfg(test)]
+        termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    })
+}
+
+#[cfg(unix)]
+impl MacroEngine {
+    /// End this resident session between expansions and hand the engine
+    /// back. False, with nothing handed back, unless the engine confirmed the
+    /// end in step with the protocol.
+    fn park_resident(&mut self, key: String) -> bool {
+        let EngineInput::Pipe(_) = &self.stdin else {
+            return false;
+        };
+        if writeln!(self.stdin, "(end)")
+            .and_then(|()| self.stdin.flush())
+            .is_err()
+        {
+            return false;
+        }
+        let Some(stdout) = self.stdout.as_mut() else {
+            return false;
+        };
+        let deadline = Instant::now() + ENGINE_TIMING_TIMEOUT;
+        match read_wire_line_before(stdout, MAX_WIRE_BYTES, deadline) {
+            Ok((_, line)) if wire_line_payload(&line) == "(ended)" => {}
+            _ => return false,
+        }
+        if !stdout.buffer().is_empty() {
+            return false;
+        }
+        let Ok(mut slot) = RESIDENT_ENGINE.lock() else {
+            return false;
+        };
+        if slot.is_some() || self.child.is_none() || self.containment.is_none() {
+            return false;
+        }
+        let (Some(child), Some(containment), Some(stdout)) =
+            (self.child.take(), self.containment.take(), self.stdout.take())
+        else {
+            unreachable!("checked above");
+        };
+        let EngineInput::Pipe(stdin) = std::mem::replace(&mut self.stdin, EngineInput::Parked)
+        else {
+            unreachable!("checked above");
+        };
+        *slot = Some(ResidentEngine {
+            key,
+            child,
+            containment,
+            stdin,
+            stdout,
+            stderr: Arc::clone(&self.stderr),
+            stderr_done: Arc::clone(&self.stderr_done),
+        });
+        true
+    }
 }
 
 /// Whether an engine is a session of the shared macro daemon rather than a
@@ -6821,6 +7083,8 @@ mod tests {
             terminated: false,
             #[cfg(unix)]
             daemon: None,
+            #[cfg(unix)]
+            resident: None,
             termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -6858,6 +7122,8 @@ mod tests {
             terminated: false,
             #[cfg(unix)]
             daemon: None,
+            #[cfg(unix)]
+            resident: None,
             termination_attempts: Arc::clone(&attempts),
         };
         engine.send("(hello)").unwrap();
@@ -6909,6 +7175,8 @@ mod tests {
             terminated: false,
             #[cfg(unix)]
             daemon: None,
+            #[cfg(unix)]
+            resident: None,
             termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         engine.send("(hello)").unwrap();

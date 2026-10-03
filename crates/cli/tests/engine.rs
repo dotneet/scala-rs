@@ -1697,3 +1697,171 @@ fn rt_currentmirror_expands_and_runs() {
     );
     let _ = fs::remove_dir_all(&scalac_out);
 }
+
+/// One macro daemon serves consecutive compilations whose classpaths differ.
+/// It keeps the class loader (and mirror) of an earlier run only while that
+/// run's classes still resolve to the same, unchanged class files, and it
+/// forgets the classes an earlier run looked for and missed. Each expansion
+/// must see what a fresh scalac run on the same classpath sees.
+#[test]
+fn macro_daemon_follows_classpath_changes_between_runs() {
+    if !prerequisites("daemon classpath changes") {
+        return;
+    }
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let root = tmp_dir("daemon-classpath");
+    // A private TMPDIR gives this test a daemon of its own.
+    let daemon = root.join("tmp");
+    fs::create_dir_all(&daemon).unwrap();
+    let write = |name: &str, text: &str| {
+        let path = root.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    };
+    let compile = |source: &Path, out: &Path, cp: &[&Path]| {
+        let mut path = reflect.display().to_string();
+        for entry in cp {
+            path.push(':');
+            path.push_str(&entry.display().to_string());
+        }
+        let output = Command::new(bin())
+            .env("TMPDIR", &daemon)
+            .args(["compile", source.to_str().unwrap(), "-d", out.to_str().unwrap()])
+            .args(["-cp", &path, "--scala-library", jar.to_str().unwrap()])
+            .output()
+            .expect("run scala-rs compile");
+        assert!(
+            output.status.success(),
+            "compile {} failed: {}",
+            source.display(),
+            diagnostics(&output)
+        );
+    };
+    let helper = |value: &str, out: &Path| {
+        let source = write(
+            "Helper.scala",
+            &format!("package h\nobject Helper {{ def value: String = \"{value}\" }}\n"),
+        );
+        compile(&source, out, &[]);
+    };
+    let first = root.join("helper-first");
+    let second = root.join("helper-second");
+    let later = root.join("later");
+    let impls = root.join("impls");
+    for dir in [&first, &second, &later, &impls] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    helper("one", &first);
+    helper("two", &second);
+    compile(&write("Later.scala", "package q\nobject Later\n"), &later, &[]);
+    let probe = write(
+        "Probe.scala",
+        r#"package m
+import scala.language.experimental.macros
+import scala.reflect.macros.blackbox
+
+object Probe {
+  def helper: String = macro helperImpl
+  def later: String = macro laterImpl
+  def members[T]: String = macro membersImpl[T]
+
+  def helperImpl(c: blackbox.Context): c.Expr[String] = {
+    import c.universe._
+    c.Expr[String](Literal(Constant(h.Helper.value)))
+  }
+
+  def laterImpl(c: blackbox.Context): c.Expr[String] = {
+    import c.universe._
+    val found = scala.util.Try(c.mirror.staticModule("q.Later")).isSuccess
+    c.Expr[String](Literal(Constant(if (found) "present" else "absent")))
+  }
+
+  def membersImpl[T: c.WeakTypeTag](c: blackbox.Context): c.Expr[String] = {
+    import c.universe._
+    val names = weakTypeOf[T].decls.toList.map(_.name.decodedName.toString.trim).sorted
+    c.Expr[String](Literal(Constant(names.mkString(","))))
+  }
+}
+"#,
+    );
+    compile(&probe, &impls, &[&first]);
+    let main = write(
+        "Main.scala",
+        "object Main { def main(args: Array[String]): Unit = { println(m.Probe.helper); println(m.Probe.later) } }\n",
+    );
+    let run = |tag: &str, cp: &[&Path]| {
+        let out = root.join(tag);
+        fs::create_dir_all(&out).unwrap();
+        compile(&main, &out, cp);
+        run_main(&format!("{}:{}", out.display(), jar.display()), tag)
+    };
+
+    assert_eq!(run("run-first", &[&impls, &first]), "one\nabsent\n");
+    // The helper object now comes from another directory.
+    assert_eq!(run("run-second", &[&impls, &second]), "two\nabsent\n");
+    // The first directory's helper changes in place.
+    helper("three", &first);
+    assert_eq!(run("run-rewritten", &[&impls, &first]), "three\nabsent\n");
+    // A class the earlier runs looked for and missed is now there.
+    assert_eq!(run("run-later", &[&impls, &first, &later]), "three\npresent\n");
+    // A class compiled from source in one run, where a macro saw it, is a
+    // class file in the next ones, and here a rewritten one.
+    let item = write(
+        "Item.scala",
+        "package q\nclass Item { def size: Int = 1 }\nobject UseItem { val names: String = m.Probe.members[Item] }\n",
+    );
+    let items = root.join("items");
+    fs::create_dir_all(&items).unwrap();
+    compile(&item, &items, &[&impls, &first, &later]);
+    let rewritten = write("ItemAgain.scala", "package q\nclass Item { def count: Int = 1 }\n");
+    compile(&rewritten, &items, &[]);
+    let main_items = write(
+        "MainItems.scala",
+        "object Main { def main(args: Array[String]): Unit = { println(q.UseItem.names); println(m.Probe.members[q.Item]) } }\n",
+    );
+    let out = root.join("run-items");
+    fs::create_dir_all(&out).unwrap();
+    compile(&main_items, &out, &[&impls, &first, &later, &items]);
+    assert_eq!(
+        run_main(
+            &format!("{}:{}:{}", out.display(), items.display(), jar.display()),
+            "run-items"
+        ),
+        "<init>,size\n<init>,count\n"
+    );
+
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip daemon classpath changes scalac diff: scalac not obtainable");
+        let _ = fs::remove_dir_all(&root);
+        return;
+    };
+    // A fresh scalac run on the final classpath expands the same way.
+    let scalac_out = root.join("scalac");
+    fs::create_dir_all(&scalac_out).unwrap();
+    let cp = format!(
+        "{}:{}:{}:{}",
+        reflect.display(),
+        impls.display(),
+        first.display(),
+        later.display()
+    );
+    let out = Command::new(&scalac)
+        .args(["-cp", &cp, "-d", scalac_out.to_str().unwrap()])
+        .arg(&main)
+        .output()
+        .expect("scalac");
+    assert!(
+        out.status.success(),
+        "real scalac rejected Main.scala: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        run_main(
+            &format!("{}:{}", scalac_out.display(), jar.display()),
+            "daemon classpath changes (real scalac build)"
+        ),
+        "three\npresent\n"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

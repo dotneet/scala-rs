@@ -121,6 +121,7 @@ dependencies = [
 name = "scala-rs-driver"
 version = "0.1.0"
 dependencies = [
+ "rustc-hash",
  "scala-rs-backend",
  "scala-rs-lexer",
  "scala-rs-parser",

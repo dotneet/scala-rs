@@ -66,6 +66,23 @@ target/release/scala-rs run Main.scala \
 Use `scala-rs --help` for all compiler options, including `-cp`,
 `-Xfatal-warnings`, `-Xsource:3` and `-Ykind-projector`.
 
+### Compiling many modules
+
+A build of many modules should keep one compiler process rather than start
+`scala-rs compile` per module:
+
+- `scala-rs __compile_batch` compiles one module per request and keeps
+  validated archive indexes, dependency class files and library signatures
+  between them.
+- Code that uses macros needs scala-reflect on `-cp` and a JDK
+  (`JAVA_HOME`). The macro engine runs in a shared daemon JVM; where a
+  sandbox or a busy daemon prevents that, `__compile_batch` keeps an engine
+  of its own, while a `compile` per module pays a JVM start each time.
+- `--diagnostics=scalac` prints diagnostics in scalac's format.
+
+The [usage guide](docs/usage.md) describes the batch protocol, the macro
+engine and its settings, and how to compare timings with scalac fairly.
+
 ### Macros and async
 
 - Scala 2 def macros from the classpath are expanded; see
@@ -92,6 +109,7 @@ described in [the testing guide](docs/testing.md).
 
 ## Documentation
 
+- [Usage](docs/usage.md): build integration, the macro engine and settings
 - [Architecture](docs/architecture.md): compiler crates and compilation phases
 - [Language support](docs/language-support.md): implemented Scala features
 - [Known gaps](docs/not-implemented.md): intentionally incomplete behavior
