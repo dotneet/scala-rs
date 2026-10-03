@@ -462,6 +462,12 @@ pub struct BinaryIndex {
     /// Planning must not expose an invalid later archive before an earlier hit.
     archives_ready: bool,
     package_paths: HashMap<String, std::rc::Rc<Vec<usize>>>,
+    /// Each directory prefix (`a/b/`) any archive has, with the archives
+    /// that have it in path order. Built once the archives are open: the
+    /// names a run asks for are mostly misses under made-up packages (each
+    /// way of splitting a nested name), and asking every archive about each
+    /// such package was a fifth of the class lookups.
+    archive_packages: Option<rustc_hash::FxHashMap<String, Vec<usize>>>,
     /// Every answer `find_class` has given, misses included. A miss costs a
     /// probe of every jar and jmod on the classpath, and the typer asks the
     /// same questions over and over (`has_pickle`, `class_file_of`,
@@ -666,6 +672,7 @@ impl BinaryIndex {
             user_paths,
             archives_ready: false,
             package_paths: HashMap::default(),
+            archive_packages: None,
             class_cache: HashMap::default(),
             package_cache: HashMap::default(),
             archive_package_cache: HashMap::default(),
@@ -818,24 +825,49 @@ impl BinaryIndex {
             format!("{package}/")
         };
         let alt = format!("classes/{prefix}");
-        let paths: std::rc::Rc<Vec<usize>> = std::rc::Rc::new(
+        if self.archive_packages.is_none() {
+            let mut packages: rustc_hash::FxHashMap<String, Vec<usize>> =
+                rustc_hash::FxHashMap::default();
+            for (i, entry) in self.paths.iter().enumerate() {
+                if let Some(zip) = entry.zip.as_ref() {
+                    for dir in zip.dirs.get_or_init(|| directory_prefixes(&zip.sorted_names)) {
+                        packages.entry(dir.clone()).or_default().push(i);
+                    }
+                }
+            }
+            self.archive_packages = Some(packages);
+        }
+        let archives = self.archive_packages.as_ref().expect("built above");
+        let mut holders: Vec<usize> = if package.is_empty() {
+            // Any archive may hold a class of the default package.
             self.paths
                 .iter()
                 .enumerate()
-                .filter_map(|(i, entry)| {
-                    // Directory contents retain their existing lookup rules.
-                    let possible = match entry.kind {
-                        PathKind::Zip => {
-                            let zip = entry.zip.as_ref().expect("archives opened");
-                            zip.has_prefix(&prefix) || zip.has_prefix(&alt)
-                        }
-                        PathKind::Dir => true,
-                        PathKind::Absent => false,
-                    };
-                    possible.then_some(i)
-                })
-                .collect(),
-        );
+                .filter(|(_, entry)| entry.zip.as_ref().is_some_and(|z| !z.sorted_names.is_empty()))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            let mut both: Vec<usize> = archives
+                .get(&prefix)
+                .into_iter()
+                .chain(archives.get(&alt))
+                .flatten()
+                .copied()
+                .collect();
+            both.sort_unstable();
+            both.dedup();
+            both
+        };
+        // A directory is a candidate only when it has the package: each
+        // miss used to probe every output directory on the path.
+        // `has_directory_class` asks the same question.
+        for (i, entry) in self.paths.iter_mut().enumerate() {
+            if matches!(entry.kind, PathKind::Dir) && entry.has_directory_package(package) {
+                holders.push(i);
+            }
+        }
+        holders.sort_unstable();
+        let paths: std::rc::Rc<Vec<usize>> = std::rc::Rc::new(holders);
         if self.package_paths.len() >= 4096 {
             self.package_paths.clear();
         }

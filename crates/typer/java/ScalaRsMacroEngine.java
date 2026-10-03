@@ -80,6 +80,177 @@ public final class ScalaRsMacroEngine {
     static final int RUNTIME_LOADER_POOL = 8;
 
     /**
+     * A run's classpath, looked up the way a URL class loader would: the first
+     * entry holding a name wins. Each archive's names are read once per
+     * process and kept while its size and modification time hold, and a
+     * directory is probed only for a name under one of its top-level names,
+     * so a run's lookups, and the comparison of a kept loader's classes with
+     * a new classpath, need no file system access beyond that.
+     */
+    static final class ClassPath {
+        static final java.util.Map<String, Archive> archives = new java.util.HashMap<>();
+
+        static final class Archive {
+            final long size;
+            final long modified;
+            final java.util.zip.ZipFile zip;
+            final java.util.Set<String> names = new java.util.HashSet<>();
+
+            Archive(java.io.File file, long size, long modified) throws java.io.IOException {
+                this.size = size;
+                this.modified = modified;
+                this.zip = new java.util.zip.ZipFile(file);
+                for (java.util.Enumeration<? extends java.util.zip.ZipEntry> e = zip.entries(); e.hasMoreElements(); ) {
+                    names.add(e.nextElement().getName());
+                }
+            }
+        }
+
+        static final int UNKNOWN = 0, ABSENT = 1, ARCHIVE = 2, DIRECTORY = 3;
+
+        final java.io.File[] files;
+        final int[] kinds;
+        final Archive[] opened;
+        final String[] locations;
+        final java.util.Set<?>[] tops;
+        final java.util.Map<String, Integer> found = new java.util.HashMap<>();
+
+        ClassPath(List<String> entries) {
+            List<java.io.File> kept = new ArrayList<>();
+            for (String entry : entries) {
+                if (!entry.isEmpty()) kept.add(new java.io.File(entry).getAbsoluteFile());
+            }
+            files = kept.toArray(new java.io.File[kept.size()]);
+            kinds = new int[files.length];
+            opened = new Archive[files.length];
+            locations = new String[files.length];
+            tops = new java.util.Set<?>[files.length];
+        }
+
+        /** The archive of entry `i`, opened afresh when it changed. */
+        static synchronized Archive archive(java.io.File file, java.nio.file.attribute.BasicFileAttributes attrs) {
+            String key = file.getPath();
+            Archive known = archives.get(key);
+            long modified = attrs.lastModifiedTime().toMillis();
+            if (known != null && known.size == attrs.size() && known.modified == modified) return known;
+            if (known != null) {
+                try { known.zip.close(); } catch (java.io.IOException ignored) { }
+                archives.remove(key);
+            }
+            try {
+                Archive fresh = new Archive(file, attrs.size(), modified);
+                archives.put(key, fresh);
+                return fresh;
+            } catch (java.io.IOException unreadable) {
+                return null;
+            }
+        }
+
+        synchronized int kind(int i) {
+            if (kinds[i] != UNKNOWN) return kinds[i];
+            int kind = ABSENT;
+            try {
+                java.nio.file.attribute.BasicFileAttributes attrs = java.nio.file.Files.readAttributes(
+                    files[i].toPath(), java.nio.file.attribute.BasicFileAttributes.class);
+                if (attrs.isDirectory()) {
+                    kind = DIRECTORY;
+                    String[] names = files[i].list();
+                    java.util.Set<String> set = new java.util.HashSet<>();
+                    if (names != null) java.util.Collections.addAll(set, names);
+                    tops[i] = set;
+                    locations[i] = files[i].toURI().toURL().toExternalForm();
+                    if (!locations[i].endsWith("/")) locations[i] += "/";
+                } else if (attrs.isRegularFile()) {
+                    opened[i] = archive(files[i], attrs);
+                    if (opened[i] != null) {
+                        kind = ARCHIVE;
+                        locations[i] = files[i].toURI().toURL().toExternalForm();
+                    }
+                }
+            } catch (java.io.IOException missing) {
+                kind = ABSENT;
+            }
+            kinds[i] = kind;
+            return kind;
+        }
+
+        boolean holds(int i, String path) {
+            switch (kind(i)) {
+                case ARCHIVE:
+                    return opened[i].names.contains(path);
+                case DIRECTORY: {
+                    int slash = path.indexOf('/');
+                    String top = slash < 0 ? path : path.substring(0, slash);
+                    return tops[i].contains(top) && new java.io.File(files[i], path).isFile();
+                }
+                default:
+                    return false;
+            }
+        }
+
+        /** The index of the first entry holding `path`, or -1. */
+        synchronized int find(String path) {
+            Integer known = found.get(path);
+            if (known != null) return known;
+            int at = -1;
+            for (int i = 0; i < files.length; i++) {
+                if (holds(i, path)) {
+                    at = i;
+                    break;
+                }
+            }
+            found.put(path, at);
+            return at;
+        }
+
+        java.net.URL url(int i, String path) {
+            try {
+                return new java.net.URL(kinds[i] == ARCHIVE
+                    ? "jar:" + locations[i] + "!/" + path
+                    : locations[i] + path);
+            } catch (java.net.MalformedURLException failure) {
+                return null;
+            }
+        }
+
+        java.net.URL findResource(String path) {
+            int at = find(path);
+            return at < 0 ? null : url(at, path);
+        }
+
+        java.util.Enumeration<java.net.URL> findResources(String path) {
+            List<java.net.URL> all = new ArrayList<>();
+            for (int i = 0; i < files.length; i++) {
+                if (holds(i, path)) {
+                    java.net.URL url = url(i, path);
+                    if (url != null) all.add(url);
+                }
+            }
+            return java.util.Collections.enumeration(all);
+        }
+
+        byte[] read(int i, String path) throws java.io.IOException {
+            if (kinds[i] == ARCHIVE) {
+                java.util.zip.ZipFile zip = opened[i].zip;
+                java.util.zip.ZipEntry entry = zip.getEntry(path);
+                if (entry == null) throw new java.io.FileNotFoundException(path);
+                try (java.io.InputStream stream = zip.getInputStream(entry)) {
+                    return RuntimeLoader.readAll(stream);
+                }
+            }
+            return java.nio.file.Files.readAllBytes(new java.io.File(files[i], path).toPath());
+        }
+
+        /** What identifies the contents of `path` in entry `i` without reading
+         * it: the archive's stamp, or the class file's own. */
+        String stamp(int i, String path) {
+            if (kinds[i] == ARCHIVE) return opened[i].size + ":" + opened[i].modified;
+            java.io.File file = new java.io.File(files[i], path);
+            return file.length() + ":" + file.lastModified();
+        }
+    }
+
+    /**
      * The class loader of a run's libraries. Every class is found on the
      * current run's classpath, in its order, so a loader kept from an earlier
      * run defines nothing the current classpath would not. A loader is reused
@@ -87,7 +258,7 @@ public final class ScalaRsMacroEngine {
      * resource with the same contents ({@link #compatible}).
      */
     static final class RuntimeLoader extends ClassLoader {
-        java.net.URLClassLoader resolver;
+        ClassPath classpath;
         final java.util.Set<String> sharedRuntimeUrls = new java.util.HashSet<>();
         final java.util.Map<String, LoadedResource> loadedResources = new java.util.HashMap<>();
         /** Classes asked for and not found: the mirror remembers such misses. */
@@ -98,29 +269,13 @@ public final class ScalaRsMacroEngine {
 
         static final class LoadedResource {
             final String url;
-            final FileStamp stamp;
+            final String stamp;
             final byte[] digest;
 
-            LoadedResource(String url, FileStamp stamp, byte[] digest) {
+            LoadedResource(String url, String stamp, byte[] digest) {
                 this.url = url;
                 this.stamp = stamp;
                 this.digest = digest;
-            }
-        }
-
-        /** Size and modification time of a class file or of the archive that
-         * holds it; contents are compared only when the stamp changed. */
-        static final class FileStamp {
-            final long length;
-            final long modified;
-
-            FileStamp(java.io.File file) {
-                this.length = file.length();
-                this.modified = file.lastModified();
-            }
-
-            boolean same(FileStamp other) {
-                return other != null && length == other.length && modified == other.modified;
             }
         }
 
@@ -128,49 +283,16 @@ public final class ScalaRsMacroEngine {
             super(parent);
         }
 
-        static java.net.URLClassLoader resolverFor(List<String> entries) throws Exception {
-            List<java.net.URL> urls = new ArrayList<>();
-            for (String entry : entries) {
-                if (!entry.isEmpty()) urls.add(new java.io.File(entry).toURI().toURL());
-            }
-            return new java.net.URLClassLoader(urls.toArray(new java.net.URL[urls.size()]), null);
-        }
-
-        /** Resolve later classes on `entries`, through `next`, a resolver for them. */
-        void retarget(List<String> entries, java.net.URLClassLoader next) throws Exception {
-            java.net.URLClassLoader previous = resolver;
-            resolver = next;
-            if (previous != null && previous != next) previous.close();
+        /** Resolve later classes on `next`, the classpath of `entries`. */
+        void retarget(List<String> entries, ClassPath next) throws Exception {
+            classpath = next;
             sharedRuntimeUrls.clear();
             for (String entry : entries) {
                 String name = new java.io.File(entry).getName();
                 if (name.startsWith("scala-library") || name.startsWith("scala-reflect")
                         || name.startsWith("scala-compiler")) {
-                    sharedRuntimeUrls.add(new java.io.File(entry).toURI().toURL().toExternalForm());
+                    sharedRuntimeUrls.add(new java.io.File(entry).getAbsoluteFile().toURI().toURL().toExternalForm());
                 }
-            }
-        }
-
-        void close() throws java.io.IOException {
-            if (resolver != null) resolver.close();
-            resolver = null;
-        }
-
-        /** The classpath entry `resource` (found as `path`) lies in, as a URL. */
-        static String location(java.net.URL resource, String path) {
-            String url = resource.toExternalForm();
-            if (url.startsWith("jar:")) {
-                int bang = url.indexOf("!/");
-                if (bang > 0) return url.substring(4, bang);
-            }
-            return url.endsWith(path) ? url.substring(0, url.length() - path.length()) : url;
-        }
-
-        static FileStamp stamp(String location) {
-            try {
-                return new FileStamp(new java.io.File(new java.net.URI(location)));
-            } catch (Exception unknown) {
-                return null;
             }
         }
 
@@ -186,23 +308,24 @@ public final class ScalaRsMacroEngine {
 
         /** Read `path` from the current classpath, remembering where from. */
         ClassBytes readClass(String path, String name) throws ClassNotFoundException {
-            java.net.URL resource = resolver == null ? null : resolver.findResource(path);
-            if (resource == null) {
+            int at = classpath == null ? -1 : classpath.find(path);
+            if (at < 0) {
                 missingResources.add(path);
                 throw new ClassNotFoundException(name);
             }
             byte[] bytes;
-            try (java.io.InputStream stream = resource.openStream()) {
-                bytes = readAll(stream);
+            try {
+                bytes = classpath.read(at, path);
             } catch (java.io.IOException failure) {
                 throw new ClassNotFoundException(name, failure);
             }
-            String location = location(resource, path);
+            String location = classpath.locations[at];
             if (!sharedRuntimeUrls.contains(location)) {
-                String file = resource.getProtocol().equals("file") ? resource.toExternalForm() : location;
+                java.net.URL url = classpath.url(at, path);
                 try {
                     loadedResources.put(path, new LoadedResource(
-                        resource.toExternalForm(), stamp(file), digest(bytes)));
+                        url == null ? location + path : url.toExternalForm(),
+                        classpath.stamp(at, path), digest(bytes)));
                 } catch (java.security.NoSuchAlgorithmException failure) {
                     throw new ClassNotFoundException(name, failure);
                 }
@@ -247,49 +370,39 @@ public final class ScalaRsMacroEngine {
 
         @Override
         protected java.net.URL findResource(String name) {
-            return resolver == null ? null : resolver.findResource(name);
+            return classpath == null ? null : classpath.findResource(name);
         }
 
         @Override
-        protected java.util.Enumeration<java.net.URL> findResources(String name) throws java.io.IOException {
-            return resolver == null
+        protected java.util.Enumeration<java.net.URL> findResources(String name) {
+            return classpath == null
                 ? java.util.Collections.<java.net.URL>emptyEnumeration()
-                : resolver.findResources(name);
+                : classpath.findResources(name);
         }
 
         /**
-         * Whether this loader can serve the classpath `candidate` resolves:
-         * `null` when some class it defined would now be read from elsewhere
-         * or has changed, else the classes it failed to find that the
-         * candidate has, which the mirror must forget it missed. A class whose
-         * archive or directory the candidate lacks altogether stays defined:
-         * only code compiled against that entry could still reach it, and a
-         * classpath with such code but without the entry is incomplete.
+         * Whether this loader can serve `candidate`: `null` when some class it
+         * defined would now be read from elsewhere or has changed, else the
+         * classes it failed to find that the candidate has, which the mirror
+         * must forget it missed. A class whose archive or directory the
+         * candidate lacks altogether stays defined: only code compiled against
+         * that entry could still reach it, and a classpath with such code but
+         * without the entry is incomplete.
          */
-        List<String> compatible(java.net.URLClassLoader candidate) throws Exception {
-            java.util.Map<String, FileStamp> stamps = new java.util.HashMap<>();
+        List<String> compatible(ClassPath candidate) throws Exception {
             for (java.util.Map.Entry<String, LoadedResource> entry : loadedResources.entrySet()) {
-                java.net.URL resource = candidate.findResource(entry.getKey());
-                if (resource == null) continue;
+                String path = entry.getKey();
+                int at = candidate.find(path);
+                if (at < 0) continue;
                 LoadedResource loaded = entry.getValue();
-                if (!loaded.url.equals(resource.toExternalForm())) return null;
-                String file = resource.getProtocol().equals("file")
-                    ? resource.toExternalForm() : location(resource, entry.getKey());
-                FileStamp now = stamps.get(file);
-                if (now == null) {
-                    now = stamp(file);
-                    if (now != null) stamps.put(file, now);
-                }
-                if (now != null && now.same(loaded.stamp)) continue;
-                byte[] current;
-                try (java.io.InputStream stream = openUncached(resource)) {
-                    current = readAll(stream);
-                }
-                if (!java.util.Arrays.equals(loaded.digest, digest(current))) return null;
+                java.net.URL url = candidate.url(at, path);
+                if (url == null || !loaded.url.equals(url.toExternalForm())) return null;
+                if (loaded.stamp.equals(candidate.stamp(at, path))) continue;
+                if (!java.util.Arrays.equals(loaded.digest, digest(candidate.read(at, path)))) return null;
             }
             List<String> appeared = new ArrayList<>();
             for (String path : missingResources) {
-                if (candidate.findResource(path) != null) appeared.add(path);
+                if (candidate.find(path) >= 0) appeared.add(path);
             }
             return appeared;
         }
@@ -333,12 +446,6 @@ public final class ScalaRsMacroEngine {
             } catch (Exception unreachable) {
                 return false;
             }
-        }
-
-        static java.io.InputStream openUncached(java.net.URL resource) throws java.io.IOException {
-            java.net.URLConnection connection = resource.openConnection();
-            connection.setUseCaches(false);
-            return connection.getInputStream();
         }
 
         static byte[] readAll(java.io.InputStream stream) throws java.io.IOException {
@@ -734,11 +841,11 @@ public final class ScalaRsMacroEngine {
 
     static void resetRun(ClassLoader baseCl, List<String> entries) throws Exception {
         unlinkSourceSymbols();
-        java.net.URLClassLoader resolver = RuntimeLoader.resolverFor(entries);
+        ClassPath classpath = new ClassPath(entries);
         RuntimeLoader chosen = null;
         for (java.util.Iterator<RuntimeLoader> it = runtimeLoaders.iterator(); it.hasNext(); ) {
             RuntimeLoader candidate = it.next();
-            List<String> appeared = candidate.compatible(resolver);
+            List<String> appeared = candidate.compatible(classpath);
             if (appeared != null && candidate.forgetMissing(appeared)) {
                 chosen = candidate;
                 it.remove();
@@ -746,16 +853,11 @@ public final class ScalaRsMacroEngine {
             }
         }
         if (chosen == null) {
-            while (runtimeLoaders.size() >= RUNTIME_LOADER_POOL) runtimeLoaders.removeLast().close();
+            while (runtimeLoaders.size() >= RUNTIME_LOADER_POOL) runtimeLoaders.removeLast();
             chosen = new RuntimeLoader(baseCl);
         }
         runtimeLoaders.addFirst(chosen);
-        chosen.retarget(entries, resolver);
-        // An idle loader needs no open archives until a run picks it again,
-        // and then it gets that run's resolver.
-        for (RuntimeLoader idle : runtimeLoaders) {
-            if (idle != chosen) idle.close();
-        }
+        chosen.retarget(entries, classpath);
         runtimeCl = chosen;
         if (universe == null) {
             Class<?> universeClass = Class.forName("scala.reflect.runtime.JavaUniverse", true, runtimeCl);
@@ -843,7 +945,7 @@ public final class ScalaRsMacroEngine {
 
     static ClassLoader macroClassLoader(ClassLoader parent, List<String> entries) throws Exception {
         RuntimeLoader source = new RuntimeLoader(parent);
-        source.retarget(entries, RuntimeLoader.resolverFor(entries));
+        source.retarget(entries, new ClassPath(entries));
         return new ScalaTestCompatLoader(parent, source);
     }
 
